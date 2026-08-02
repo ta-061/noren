@@ -123,8 +123,46 @@ choice is made.
   fuzz stability against standards-derived expected fixtures. Parser-only
   libraries are not treated as state-engine oracles.
 
-**Supported-candidate gap:** `avt` is the one independently released
-parser-plus-screen-state candidate that passed this desk screen. The published
+### `alacritty_terminal` 0.26.0
+
+- **Function and evidence:** A published Rust library described as a "library
+  for writing terminal emulators" whose [`Term<T>`](https://docs.rs/alacritty_terminal/0.26.0/alacritty_terminal/term/struct.Term.html)
+  state type implements the full
+  [`vte::ansi::Handler`](https://docs.rs/vte/0.15.0/vte/ansi/trait.Handler.html)
+  trait—cursor, mode, scrolling-region, charset, color, clipboard, title, and
+  damage operations—plus `Grid`, `Selection`, and resize/scrollback APIs; see
+  the [versioned API](https://docs.rs/alacritty_terminal/0.26.0/alacritty_terminal/)
+  and the tagged
+  [source manifest](https://github.com/alacritty/alacritty/blob/v0.17.0/alacritty_terminal/Cargo.toml).
+  Unlike `avt`, this crate also bundles PTY, tty, and event-loop modules
+  (`rustix-openpty`, `signal-hook`, `polling`, `miow`, `windows-sys`) inside the
+  same package, coupling terminal state to I/O.
+- **Release, maintenance, and license:** Version 0.26.0 was published
+  2026-04-06 with SPDX `Apache-2.0` per the docs.rs
+  [crate page](https://docs.rs/crate/alacritty_terminal/0.26.0). It is a 0.x API;
+  no separate stability promise was found in the reviewed sources.
+- **Targets:** Rust state logic is OS-independent, but the crate's direct PTY/tty
+  and event-loop coupling means consuming only the `Term`/`Grid` state without
+  the bundled I/O layer is an adapter boundary Noren must define and test.
+- **Unsafe, dependencies, and security:** Recursive dependency and unsafe review
+  is pending. Bundling PTY and signal handling inside the same crate as terminal
+  state enlarges the surface that a state-engine PoC must audit compared with a
+  state-only crate. The same VT payload-bounds, reply, reflow, and
+  malformed-input risks apply as for `avt`.
+- **Replaceable boundary:** The same `TerminalEngine` seam; if the crate's PTY or
+  event-loop modules cross that boundary, they must be excluded or confined
+  behind a separate adapter.
+- **Validating PoC:** Run the identical parser/state corpus and fuzz suite used
+  for `avt`. Additionally measure whether the `Term`/`Grid` state can be consumed
+  without activating the bundled PTY/tty modules, and compare grid, damage, mode,
+  reply, scrollback, and resize behavior against standards-derived fixtures.
+  `alacritty_terminal` is not treated as a state-engine oracle.
+
+**Screening result:** Two published parser-plus-screen-state candidates passed
+this desk screen: `avt` and `alacritty_terminal`. `alacritty_terminal` couples
+PTY/tty and event-loop modules into the same crate, so its state boundary must be
+isolated before it can be compared like-for-like with the state-only `avt`. The
+published
 [`termwiz::Surface`](https://docs.rs/termwiz/0.23.3/termwiz/surface/struct.Surface.html)
 models cells and display changes, but the reviewed API does not itself apply the
 complete VT action/state policy under test. WezTerm's fuller
@@ -133,16 +171,17 @@ is versioned `0.1.0` in source, while an official
 [registry API query](https://crates.io/api/v1/crates?page=1&per_page=10&q=wezterm-term)
 retrieved 2026-08-03 returned no exact `wezterm-term` package. Consuming a moving
 monorepo commit or vendoring it would not be a like-for-like supported release
-candidate, so it is not counted as candidate two.
+candidate, so it is not counted as a third candidate.
 
 **PoC/drop gate:** Exercise resize/reflow, primary/alternate screen, margins,
 wide/combining cells, modes, replies, title/clipboard side effects, scrollback,
-damage, serialization boundaries, and hostile streams. Drop `avt` if the
-adapter cannot expose bounded snapshots, damage and replies; if required
-behavior needs a sustained fork; or if corpus, fuzz, memory, or throughput gates
-fail. Before any adoption ADR, either identify and pin a second supportable
-state engine or explicitly justify proceeding with a single-candidate market
-gap and a Noren-owned replacement corpus. No state-engine choice is made here.
+damage, serialization boundaries, and hostile streams for each candidate. Drop
+either candidate if the adapter cannot expose bounded snapshots, damage and
+replies; if required behavior needs a sustained fork; or if corpus, fuzz,
+memory, or throughput gates fail. Before any adoption ADR, run both candidates
+under the identical corpus, or explicitly justify proceeding with a
+single-candidate market gap and a Noren-owned replacement corpus. No
+state-engine choice is made here.
 
 ## 2. PTY and child-process control
 
@@ -560,7 +599,13 @@ is assumed to implement OpenSSH config semantics; that is a separate category.
   resolved remote hostname and `%n` is the original command-line hostname, a
   destination containing shell metacharacters can be expanded directly into
   `Match exec` shell text even when Noren passed `ssh`, `-G`, and the destination
-  as separate argv elements. `ProxyCommand`, `LocalCommand`, environment,
+  as separate argv elements. A destination token that itself starts with `-` is a
+  second argv injection vector: the official
+  [`ssh(1)` SYNOPSIS](https://man.openbsd.org/ssh.1#SYNOPSIS) does not list a
+  `--` end-of-options marker, so `ssh` will parse a leading-dash destination as
+  an option (for example, `-oProxyCommand=...`) unless Noren rejects such a
+  destination before invocation or version-tests that the installed OpenSSH
+  honors `--` before the destination. `ProxyCommand`, `LocalCommand`, environment,
   config permissions, timeouts, and output bounds are also security-critical.
   Noren must not concatenate an additional shell command or assume `ssh -G` is a
   side-effect-free host-discovery API.
@@ -572,7 +617,12 @@ is assumed to implement OpenSSH config semantics; that is a separate category.
   timeout, locale, and redaction. Add host inputs containing isolated harmless
   fixtures for semicolons, whitespace, quotes, dollar-command substitution, and
   backticks; have `Match exec` write only a nonce sentinel into a disposable
-  directory, then assert whether `%h`/`%n` changed shell parsing. The inert host
+  directory, then assert whether `%h`/`%n` changed shell parsing. Add a
+  leading-dash destination fixture (a host alias beginning with `-`) and assert
+  that the resolver rejects it before invocation or verify across pinned
+  OpenSSH versions that inserting `--` before the destination terminates option
+  parsing; structured argv alone does not prevent a leading-dash destination
+  from being consumed as an `ssh` option. The inert host
   listing experiment parses aliases and keeps executable predicates opaque; it
   must never invoke `ssh -G`. A separate, explicit user-requested resolution
   experiment may invoke pinned OpenSSH after surfacing that config evaluation
@@ -1151,6 +1201,33 @@ or unsafe inventory.
   [dependency metadata](https://crates.io/api/v1/crates/avt/0.18.0/dependencies)
   has 2 non-optional normal direct records and no declared default feature set.
 
+### `alacritty_terminal` 0.26.0 evidence dimensions
+
+- **Documented API/compatibility policy:** Versioned rustdoc and the tagged
+  source manifest are cited above; no support window or stronger 0.x
+  compatibility policy was found. The crate shares a workspace with the Alacritty
+  application, so its internal API can change with application releases.
+- **Primary-source production usage:** The Alacritty
+  [application manifest at `v0.17.0`](https://github.com/alacritty/alacritty/blob/v0.17.0/alacritty/Cargo.toml)
+  depends on `alacritty_terminal` 0.26.0 via a workspace path dependency,
+  providing first-party terminal-product integration evidence. Independent
+  consumer pin evidence was not collected.
+- **Fork/patch and replacement cost:** No current patch is required to begin the
+  state PoC. Estimated replacement cost is high because grid, modes, reflow,
+  replies, damage, scrollback, and the bundled PTY/event-loop coupling form
+  persistent compatibility state.
+- **Security-policy/advisory search (2026-08-03):** The upstream
+  [Security overview and advisory surface](https://github.com/alacritty/alacritty/security)
+  was searched; monorepo advisories are not assumed to identify every
+  crate-specific issue.
+- **Direct/default-feature dependency surface:** The tagged
+  [source manifest](https://github.com/alacritty/alacritty/blob/v0.17.0/alacritty_terminal/Cargo.toml)
+  declares 11 platform-independent normal direct records (1 optional:
+  `serde`), plus 3 Unix (`rustix-openpty`, `rustix`, `signal-hook`) and 3 Windows
+  (`miow`, `piper`, `windows-sys`) target-specific records; defaults enable
+  `serde`. The PTY and signal dependencies are inside the same crate as terminal
+  state, which the PoC must inventory separately.
+
 ### `portable-pty` 0.9.0 evidence dimensions
 
 - **Documented API/compatibility policy:** Versioned rustdoc is cited above; no
@@ -1480,9 +1557,12 @@ or unsafe inventory.
   spec version are cited above; no additional support-window policy was found.
 - **Primary-source production usage:** Cargo default-branch commit
   [`5727d3b9bd87`](https://github.com/rust-lang/cargo/blob/5727d3b9bd873a4e05fc3ee944da1b7d503947a3/Cargo.toml),
-  dated 2026-08-02, pins the 1.1 line and enables parse/display/Serde features,
-  providing
-  first-party production-tool integration evidence.
+  dated 2026-08-02, declares a caret requirement `toml = "1.1.2"` (compatible
+  range `>=1.1.2, <2.0.0`) and enables parse/display/Serde features; the
+  immutable
+  [`Cargo.lock`](https://github.com/rust-lang/cargo/blob/5727d3b9bd873a4e05fc3ee944da1b7d503947a3/Cargo.lock)
+  at the same commit locks `1.1.2+spec-1.1.0`, providing first-party
+  production-tool integration evidence.
 - **Fork/patch and replacement cost:** No current patch is required for the
   parse/serialize PoC. Estimated replacement cost is low-medium because typed
   config can stay at Noren's seam, but formatting/comment preservation may force
@@ -1521,7 +1601,11 @@ or unsafe inventory.
   crates.
 - **Primary-source production usage:** Cargo default-branch commit
   [`5727d3b9bd87`](https://github.com/rust-lang/cargo/blob/5727d3b9bd873a4e05fc3ee944da1b7d503947a3/Cargo.toml),
-  dated 2026-08-02, pins these exact versions, providing first-party
+  dated 2026-08-02, declares caret requirements `tracing = "0.1.44"` and
+  `tracing-subscriber = "0.3.23"` (compatible ranges `>=0.1.44, <0.2.0` and
+  `>=0.3.23, <0.4.0`); the immutable
+  [`Cargo.lock`](https://github.com/rust-lang/cargo/blob/5727d3b9bd873a4e05fc3ee944da1b7d503947a3/Cargo.lock)
+  at the same commit locks 0.1.44 and 0.3.23 respectively, providing first-party
   production-tool integration evidence.
 - **Fork/patch and replacement cost:** No current patch is required for the
   logging PoC. Estimated replacement cost is medium because span/event schema,
@@ -1799,9 +1883,11 @@ or unsafe inventory.
 ## Cross-category conflicts and unknowns
 
 - `vte` and `vtparse` are action parsers, not terminal-state alternatives.
-  `avt` is the only released parser-plus-screen-state candidate retained by
-  this screen, so a state-engine decision would require either a second PoC or
-  an explicit gap justification.
+  `avt` and `alacritty_terminal` are the two released
+  parser-plus-screen-state candidates retained by this screen; a state-engine
+  decision still requires running both under the identical corpus because
+  `alacritty_terminal` couples PTY/tty and event-loop modules into the same
+  crate.
 - `wgpu` has a higher major published before a later patch on the preceding
   major; the PoC must pin an explicit line rather than use “newest” ambiguously.
 - `glutin`/`glutin-winit` supply GL context integration on top of `winit`; they
@@ -1816,7 +1902,10 @@ or unsafe inventory.
   parsing unless a later approved, user-requested flow evaluates them with a
   visible side-effect policy. Structured argv protects only Noren's invocation;
   it does not shell-escape `%h`/`%n` when OpenSSH expands destination text into
-  a configured `Match exec` command.
+  a configured `Match exec` command. Structured argv also does not prevent a
+  leading-dash destination from being parsed as an `ssh` option; such
+  destinations must be rejected or guarded by a version-tested `--`
+  end-of-options contract.
 - Rust panic hooks and native crash capture solve different failure classes.
   Minidumps may contain secrets; collection, symbolication, consent, retention,
   and upload are separate decisions.

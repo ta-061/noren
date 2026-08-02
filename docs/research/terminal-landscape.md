@@ -51,7 +51,9 @@ integrates with other applications instead of reimplementing their functions,
 and lists BSD, Linux, macOS, and Windows as supported platforms in its
 [official site](https://alacritty.org/). The repository separates the reusable
 [`alacritty_terminal`](https://github.com/alacritty/alacritty/tree/v0.17.0/alacritty_terminal)
-state layer from the GUI application and consumes the separately published
+state layer from the GUI application, publishes it to crates.io as
+[`alacritty_terminal` 0.26.0](https://docs.rs/crate/alacritty_terminal/0.26.0)
+(2026-04-06, SPDX `Apache-2.0`), and consumes the separately published
 [`vte`](https://github.com/alacritty/vte) parser. Release
 [`v0.17.0`](https://github.com/alacritty/alacritty/releases/tag/v0.17.0) was
 published 2026-04-06; default-branch commit
