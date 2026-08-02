@@ -6,6 +6,7 @@
 - Reviewer: codex-lab, configured `gpt-5.6-sol`
 - Command: `codex-lab review --base main`
 - First follow-up: same session via `codex-lab exec resume`
+- Second follow-up: same session via `codex-lab exec resume`
 - Review mode: read-only
 
 ## Findings and resolution
@@ -37,4 +38,9 @@ now states both requirements explicitly.
 
 ## Follow-up status
 
-Pending a second codex-lab follow-up review of the corrected diff.
+> All prior findings resolved.
+
+The second follow-up inspected only commit `f4e9c7a` and confirmed that the
+external-manifest design removes the self-reference, the reviewer-visible
+placeholder preserves anonymity, and neither correction introduced a new
+actionable finding.
