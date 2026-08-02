@@ -223,7 +223,9 @@ choice is made.
   bytes, idle CPU, memory, resize latency, scale-factor changes, device loss,
   and surface recreation. The controlled renderer comparison uses `winit`
   0.30.13 for both candidates, so its results cannot count as an independent
-  window/event comparison.
+  window/event comparison. Before measurement, run both pinned `wgpu` 30.0.0
+  and 29.0.4 lines under the identical trace, or record and justify a single
+  selected measurement line; never combine results across lines.
 
 ### `glow` 0.18.0 with `glutin` 0.32.3 context/surface support
 
@@ -328,7 +330,10 @@ window/event choice is made.
 - **Validating PoC:** Shape pinned open-license fonts and a corpus covering Latin
   ligatures, Arabic, Devanagari, combining marks, variation selectors, emoji,
   fallback boundaries, malformed fonts, and huge tables. Differentially compare
-  against the same-version HarfBuzz reference and measure allocations/latency.
+  against the pinned C
+  [HarfBuzz 14.3.0](https://github.com/harfbuzz/harfbuzz/releases/tag/14.3.0)
+  reference and measure allocations/latency; record it as a native toolchain
+  input rather than inferring a version correspondence from `harfrust`.
 
 ### `swash` 0.2.10
 
@@ -349,8 +354,8 @@ window/event choice is made.
 - **Replaceable boundary:** The same `TextShaper` seam, with optional rasterizer
   functionality kept behind a distinct `GlyphRasterizer` PoC seam.
 - **Validating PoC:** Run the identical shaping/font fuzz corpus, compare clusters
-  and advances to HarfBuzz, then measure raster quality, atlas churn, memory,
-  fallback cost, and behavior under invalid fonts.
+  and advances to the same pinned HarfBuzz 14.3.0 reference, then measure raster
+  quality, atlas churn, memory, fallback cost, and behavior under invalid fonts.
 
 **Screening result:** Two current Rust candidates exist. Neither removes the
 need to define font discovery, fallback, rasterization, cell alignment, and
@@ -458,8 +463,10 @@ two-equal-candidate conclusion.
   interaction, binary size, startup, and packaging on both target OSes.
 
 **Screening result:** Two integration paths are documented, but their window
-ownership differs materially. No claim is made that GTK IME can be cleanly
-mixed with a non-GTK window.
+ownership differs materially. The GTK4 path entails GTK window and main-loop
+ownership as described in section 3B, so these paths are not independently
+selectable and the IME decision remains coupled to the window/event decision.
+No claim is made that GTK IME can be cleanly mixed with a non-GTK window.
 
 ## 7. SSH transport
 
@@ -673,7 +680,7 @@ authorization or application protocol; those must remain Noren-owned and tested.
   in versioned [`taplo`](https://docs.rs/taplo/0.14.0/taplo/) documentation and
   [upstream source](https://github.com/tamasfe/taplo).
 - **Release, maintenance, and license:** Version 0.14.0 was published
-  2025-05-22 with SPDX `MIT` and Rust 1.74 minimum in
+  2025-05-22 with SPDX `MIT` and a publisher-declared Rust 1.74 minimum in
   [package metadata](https://crates.io/api/v1/crates/taplo/0.14.0).
   Default-branch commit
   [`08f343be02ce`](https://github.com/tamasfe/taplo/commit/08f343be02ce) is dated
@@ -1092,8 +1099,8 @@ or unsafe inventory.
   source are cited above; no compatibility/support policy stronger than the 0.x
   release line was found.
 - **Primary-source production usage:** Alacritty's own
-  [`alacritty_terminal` manifest](https://github.com/alacritty/alacritty/blob/master/alacritty_terminal/Cargo.toml)
-  pins `vte` 0.15.0, providing current first-party integration evidence.
+  [`alacritty_terminal` manifest at `v0.17.0`](https://github.com/alacritty/alacritty/blob/v0.17.0/alacritty_terminal/Cargo.toml)
+  pins `vte` 0.15.0, providing immutable first-party integration evidence.
 - **Fork/patch and replacement cost:** No current patch is required for the
   parser PoC. Estimated replacement cost is low because normalized actions and
   the shared byte corpus stay behind `VtParser`; behavior-difference triage is
@@ -1210,7 +1217,7 @@ or unsafe inventory.
   no stronger compatibility policy was found for either 0.x line. `glutin`'s
   API documents context/surface scope, not window/event ownership.
 - **Primary-source production usage:** Alacritty's own
-  [application manifest](https://github.com/alacritty/alacritty/blob/master/alacritty/Cargo.toml)
+  [application manifest at `v0.17.0`](https://github.com/alacritty/alacritty/blob/v0.17.0/alacritty/Cargo.toml)
   pins `glutin` and its platform features. No consumer-owned production pin for
   `glow` 0.18.0 was collected, so that component has an explicit usage gap.
 - **Fork/patch and replacement cost:** No current patch is required to start the
@@ -1233,7 +1240,7 @@ or unsafe inventory.
   support window or stronger 0.x compatibility policy was found. The beta 0.31
   line is not treated as compatible evidence.
 - **Primary-source production usage:** Alacritty's own
-  [application manifest](https://github.com/alacritty/alacritty/blob/master/alacritty/Cargo.toml)
+  [application manifest at `v0.17.0`](https://github.com/alacritty/alacritty/blob/v0.17.0/alacritty/Cargo.toml)
   pins the 0.30 line and target features, providing first-party terminal
   integration evidence.
 - **Fork/patch and replacement cost:** No current patch is required to start the
@@ -1290,7 +1297,7 @@ or unsafe inventory.
   Unicode-data support window or compatibility promise beyond the released API
   was found.
 - **Primary-source production usage:** Alacritty's
-  [`alacritty_terminal` manifest](https://github.com/alacritty/alacritty/blob/master/alacritty_terminal/Cargo.toml)
+  [`alacritty_terminal` manifest at `v0.17.0`](https://github.com/alacritty/alacritty/blob/v0.17.0/alacritty_terminal/Cargo.toml)
   declares `unicode-width` 0.2, providing first-party terminal integration
   evidence, though not an exact 0.2.2 lockfile pin.
 - **Fork/patch and replacement cost:** No current patch is required for the
@@ -1471,9 +1478,10 @@ or unsafe inventory.
 
 - **Documented API/compatibility policy:** Versioned rustdoc and the encoded TOML
   spec version are cited above; no additional support-window policy was found.
-- **Primary-source production usage:** Cargo's current
-  [workspace manifest](https://github.com/rust-lang/cargo/blob/master/Cargo.toml)
-  pins the 1.1 line and enables parse/display/Serde features, providing
+- **Primary-source production usage:** Cargo default-branch commit
+  [`5727d3b9bd87`](https://github.com/rust-lang/cargo/blob/5727d3b9bd873a4e05fc3ee944da1b7d503947a3/Cargo.toml),
+  dated 2026-08-02, pins the 1.1 line and enables parse/display/Serde features,
+  providing
   first-party production-tool integration evidence.
 - **Fork/patch and replacement cost:** No current patch is required for the
   parse/serialize PoC. Estimated replacement cost is low-medium because typed
@@ -1511,10 +1519,10 @@ or unsafe inventory.
 - **Documented API/compatibility policy:** Both versioned APIs are cited above;
   no support window or stronger compatibility promise was found for these 0.x
   crates.
-- **Primary-source production usage:** Cargo's current
-  [workspace manifest](https://github.com/rust-lang/cargo/blob/master/Cargo.toml)
-  pins these exact versions, providing first-party production-tool integration
-  evidence.
+- **Primary-source production usage:** Cargo default-branch commit
+  [`5727d3b9bd87`](https://github.com/rust-lang/cargo/blob/5727d3b9bd873a4e05fc3ee944da1b7d503947a3/Cargo.toml),
+  dated 2026-08-02, pins these exact versions, providing first-party
+  production-tool integration evidence.
 - **Fork/patch and replacement cost:** No current patch is required for the
   logging PoC. Estimated replacement cost is medium because span/event schema,
   field redaction, filtering, reload, and sink behavior become operational
@@ -1592,7 +1600,7 @@ or unsafe inventory.
   no cross-release compatibility/support policy was found for the stack or its
   dump schema integration.
 - **Primary-source production usage:** `minidump-writer`'s upstream
-  [README](https://github.com/rust-minidump/minidump-writer/blob/main/README.md)
+  [`0.13.0` README](https://github.com/rust-minidump/minidump-writer/blob/a7139ad447e667bc7085e3bcdf06f57e14fc17c6/README.md)
   says it is usable with production caveats, but no consumer-owned exact stack
   deployment was collected; production-use evidence remains a gap.
 - **Fork/patch and replacement cost:** No current patch is required to begin the
@@ -1643,9 +1651,9 @@ or unsafe inventory.
   above; no guarantee was found that generated workflow/schema/install output is
   compatible across all future releases.
 - **Primary-source production usage:** The upstream
-  [README](https://github.com/axodotdev/cargo-dist/blob/main/README.md) documents
-  that `cargo-dist` self-hosts its releases. This is first-party build-pipeline
-  use, not independent consumer evidence.
+  [`v0.32.0` README](https://github.com/axodotdev/cargo-dist/blob/v0.32.0/README.md)
+  documents that `cargo-dist` self-hosts its releases. This is first-party
+  build-pipeline use, not independent consumer evidence.
 - **Fork/patch and replacement cost:** No current patch is required for the
   packaging PoC. Estimated replacement cost is medium because generated CI,
   artifact manifests, signing hooks, installer behavior, and reproducibility
@@ -1767,10 +1775,11 @@ or unsafe inventory.
 - **Documented API/compatibility policy:** Versioned APIs and architecture
   limitations are cited above; no cross-version support window or compatibility
   promise was found for the 0.x crates.
-- **Primary-source production usage:** Slint's own
-  [winit backend manifest](https://github.com/slint-ui/slint/blob/master/internal/backends/winit/Cargo.toml)
-  pins `accesskit` 0.24 and `accesskit_winit` 0.33, providing first-party UI-
-  product integration evidence. It does not prove terminal rich-text behavior.
+- **Primary-source production usage:** Slint default-branch commit
+  [`ff0cd0a52d84`](https://github.com/slint-ui/slint/blob/ff0cd0a52d841b17ea95c1b5cd9d5dc97f0fdc25/internal/backends/winit/Cargo.toml),
+  dated 2026-08-02, pins `accesskit` 0.24 and `accesskit_winit` 0.33, providing
+  first-party UI-product integration evidence. It does not prove terminal
+  rich-text behavior.
 - **Fork/patch and replacement cost:** No current patch is required for the
   accessibility PoC. Estimated replacement cost is high because stable node
   identity, incremental tree semantics, focus/actions, platform adapters,

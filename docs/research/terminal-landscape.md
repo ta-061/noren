@@ -95,11 +95,13 @@ an AppKit/SwiftUI macOS frontend and GTK4 Linux frontend in its
 [architecture overview](https://ghostty.org/docs/about). That page explicitly
 says the standalone C API is not yet stable. The official feature page records
 [Metal on macOS and OpenGL on Linux](https://ghostty.org/docs/features), and the
-VT reference labels its own coverage a work in progress. Tag
-[`v1.3.1`](https://github.com/ghostty-org/ghostty/releases/tag/v1.3.1) and
-default-branch commit
+VT reference labels its own coverage a work in progress. The signed
+[`v1.3.1` tag object](https://api.github.com/repos/ghostty-org/ghostty/git/tags/22efb0be2bbea73e5339f5426fa3b20edabcaa11)
+was created 2026-03-13 at commit
+[`332b2aefc6e7`](https://github.com/ghostty-org/ghostty/commit/332b2aefc6e72d363aa93ab6ecfc86eeeeb5ed28);
+no separate GitHub Release object was observed. Default-branch commit
 [`bab076c1a2df`](https://github.com/ghostty-org/ghostty/commit/bab076c1a2df)
-were the current tag and a 2026-08-02 commit respectively. The source license is
+is dated 2026-08-02. The source license is
 [`MIT`](https://github.com/ghostty-org/ghostty/blob/v1.3.1/LICENSE).
 
 **Interpretation to test.** A platform-native shell around a shared terminal
