@@ -29,6 +29,7 @@ Read only these project inputs before answering:
 - `docs/compatibility/zellij.md`
 - `docs/research/ssh-and-remote.md`
 - `docs/research/agent-integrations.md`
+- `docs/roadmap/risk-register.md`
 
 Treat the reports as evidence, not as predetermined architecture. Do not browse,
 modify files, run project commands, or inspect proposal/review outputs. If an
@@ -77,7 +78,8 @@ any requested floor it would defer and explain the release consequence.
 - When a terminal pane is focused, preservation of Ctrl, Alt, Ctrl+Alt, function
   keys, terminal protocols, and application input takes precedence over Noren
   convenience. Prefer Command-based defaults on macOS and avoid a large fixed
-  Ctrl map on Linux. Every Noren shortcut must be rebindable or disableable.
+  Ctrl map on Linux. Every Noren shortcut must be both rebindable and
+  disableable.
 - Zellij pass-through must minimize captured keys and allow a configurable
   leader, command-palette exit, and GUI fallback. Invalid configuration must be
   diagnosed while input continues to the child.
@@ -110,6 +112,21 @@ any requested floor it would defer and explain the release consequence.
 - Begin with one repository. A remote daemon, conformance suite, site, or
   extension repository may split only when an independent release cycle or
   security boundary is demonstrated.
+
+## Execution isolation
+
+Do not execute this task from a repository, worktree, or persisted session. For
+each proposer, construct a fresh temporary directory containing only a serialized
+copy of this task and the files listed under Shared evidence, all from the exact
+shared-input commit. Start a new non-interactive session; do not resume it later.
+Use the verified CLI-specific ephemeral/read-only/no-tool/no-persistence controls
+from the run manifest wherever the CLI provides them, disable browsing, and deny
+writes. Record the exact command and effective controls without credentials.
+
+If a CLI cannot technically disable a capability, record that residual isolation
+limitation before the run and retain the explicit no-tool/no-network instruction;
+never silently claim stronger isolation than the command provides. A run that can
+see another proposal is invalid and must be repeated from a clean snapshot.
 
 ## Assignment
 

@@ -11,12 +11,32 @@ the immutable review-pack commit below is filled in.**
 - Prompt revision: 1
 - Execution date: `TBD` (Asia/Tokyo)
 
-Every reviewer receives this file, the same Discovery evidence, and the five
-other Round 1 proposals labeled Proposal A through Proposal E. A reviewer never
+Every reviewer receives this file, the exact executed revision of
+`docs/coordination/proposals/task.md`, the same Discovery evidence, and the five
+other Round 1 outcomes labeled Proposal A through Proposal E. A reviewer never
 receives its own proposal. The per-reviewer label mappings are hidden during
 review and published after every review is captured. Responses are stored
 verbatim; command, tool version, model identifier, outcome, duration, and word
 count are recorded outside the response.
+
+An outcome that failed, timed out, or was unavailable is represented by a
+placeholder containing only the label, outcome, attempted command/model
+provenance, elapsed time, and failure reason. It is never filled with another
+model's text. The reviewer lists that label as `Unavailable`, does not score its
+proposal quality, and still evaluates the remaining labels. The comparison table
+must contain A through E even when one or more rows are unavailable.
+
+## Execution isolation
+
+Run every review in a fresh temporary directory containing only this task, the
+executed proposal-task revision, the shared Discovery evidence, and its five
+anonymized outcomes. Do not use a repository, worktree, or persisted/resumed
+session. Apply and record the verified per-CLI ephemeral/read-only/no-tool/no-
+persistence controls, disable browsing, and deny writes wherever supported. If a
+CLI cannot technically disable a capability, record the residual limitation and
+retain the explicit no-tool/no-network instruction. A review that can see its own
+proposal, another review, or the author-label mapping is invalid and must be
+repeated.
 
 ## Assignment
 
