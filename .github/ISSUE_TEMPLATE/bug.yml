@@ -1,0 +1,69 @@
+name: Bug report
+description: Report reproducible incorrect behavior in an implemented artifact.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Noren is in Discovery and has no released terminal application. Do not
+        report missing planned features as bugs.
+  - type: dropdown
+    id: artifact
+    attributes:
+      label: Affected artifact
+      options:
+        - Documentation
+        - Repository automation
+        - Approved experiment
+        - Implemented application code
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Revision
+      description: Commit SHA, branch, or release tag.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, architecture, shell, display server, and relevant tool versions.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction
+      description: Minimal deterministic steps and inputs, with secrets removed.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized evidence
+      description: Logs or screenshots with tokens, keys, hostnames, and private data removed.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I searched existing Issues.
+          required: true
+        - label: This is not a vulnerability report.
+          required: true

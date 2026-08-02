@@ -1,0 +1,56 @@
+name: Feature or enhancement
+description: Propose a user problem and a verifiable outcome.
+title: "feature: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the user and workflow problem without assuming a solution.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: State observable behavior and acceptance criteria.
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: State what the proposal intentionally does not solve.
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Input and compatibility impact
+      description: Cover Zellij, tmux, editors, shells, macOS, and Linux as applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security, privacy, and data-loss considerations
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: Explain the tests, measurements, fixtures, and target environments.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing Issues, RFCs, ADRs, and the roadmap.
+          required: true
+        - label: I have not described an unimplemented feature as supported.
+          required: true

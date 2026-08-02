@@ -1,0 +1,38 @@
+name: RFC proposal
+description: Propose a material architecture, API, security, or compatibility decision.
+title: "rfc: "
+labels:
+  - type:rfc
+body:
+  - type: input
+    id: owner
+    attributes:
+      label: Decision owner
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and decision drivers
+    validations:
+      required: true
+  - type: textarea
+    id: options
+    attributes:
+      label: Options and evidence needed
+      description: Include a smaller alternative and the experiments or benchmarks that can decide.
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Security, failure, and compatibility boundaries
+    validations:
+      required: true
+  - type: textarea
+    id: review
+    attributes:
+      label: Independent reviewers
+      description: Name implementation-independent security, maintainability, and testability reviewers.
+    validations:
+      required: true

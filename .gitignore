@@ -1,0 +1,33 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Build and packaging outputs
+/dist/
+/artifacts/
+/coverage/
+*.profraw
+
+# Python tooling
+__pycache__/
+*.py[cod]
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local test/runtime state
+/.noren/
+/tmp/
