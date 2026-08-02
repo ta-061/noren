@@ -22,12 +22,19 @@ tests, security bounds, uncertainty, and deferral discipline.
 | Codex | configured `gpt-5.6-sol` | `codex exec --ephemeral --sandbox read-only` | Completed | 1,089 |
 | codex-lab | isolated config also `gpt-5.6-sol` | `codex-lab exec --ephemeral --sandbox read-only` | Completed | 1,025 |
 | Claude Code | result reported canonical `claude-opus-5` | `claude --print --permission-mode plan --tools "" --no-session-persistence` | Completed; exceeded limit | 3,048 |
-| Qwen | `qwencloud/qwen3.8-max-preview` from model list | `opencode run --pure --agent plan` | Completed; exceeded limit | 1,339 |
-| GLM | `zai-coding-plan/glm-5.2` from model list | `opencode run --pure --agent plan` | Completed; exceeded limit | 1,258 |
-| Fugu | `sakana/fugu-ultra` from model list | `opencode run --pure --agent plan` | Completed; high latency | 1,184 |
+| Qwen | `qwencloud/qwen3.8-max-preview` from the selected 1.18.11 model list | `opencode run --pure --agent plan`; PATH resolved to the selected executable | Completed; exceeded limit | 1,339 |
+| GLM | `zai-coding-plan/glm-5.2` from the selected 1.18.11 model list | `opencode run --pure --agent plan`; PATH resolved to the selected executable | Completed; exceeded limit | 1,258 |
+| Fugu | `sakana/fugu-ultra` from the selected 1.18.11 model list | `opencode run --pure --agent plan`; PATH resolved to the selected executable | Completed; high latency | 1,184 |
 
 Authentication identifiers, organization details, session IDs, and credential
 configuration are intentionally excluded.
+
+The original OpenCode help header named the Homebrew executable even though the
+captured `1.18.11` help/model output matches the PATH-preferred
+`$HOME/.opencode/bin/opencode`. A same-day audit found a separate Homebrew
+`1.14.31` installation. The [inventory](agent-inventory.md) records both
+path/version/digest tuples. This correction does not change or relabel any
+response; future runs use the selected absolute path.
 
 ## Rubric
 
