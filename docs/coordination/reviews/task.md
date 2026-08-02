@@ -1,15 +1,15 @@
 # Independent cross-critique task
 
 Status: **Draft — do not execute until all six proposal outcomes are recorded and
-the immutable review-pack commit below is filled in.**
+`run-manifest.md` pins the proposal-task blob, evidence commit, and per-review
+pack digest.**
 
 ## Provenance
 
 - Issue: #6
-- Shared-input commit: `TBD`
-- Review-pack commit: `TBD`
 - Prompt revision: 1
-- Execution date: `TBD` (Asia/Tokyo)
+- Run-specific hashes, label mappings, date, CLI, model, controls, outcomes,
+  durations, and word counts belong in `run-manifest.md`, not in this prompt.
 
 Every reviewer receives this file, the exact executed revision of
 `docs/coordination/proposals/task.md`, the same Discovery evidence, and the five
@@ -19,12 +19,14 @@ review and published after every review is captured. Responses are stored
 verbatim; command, tool version, model identifier, outcome, duration, and word
 count are recorded outside the response.
 
-An outcome that failed, timed out, or was unavailable is represented by a
-placeholder containing only the label, outcome, attempted command/model
-provenance, elapsed time, and failure reason. It is never filled with another
-model's text. The reviewer lists that label as `Unavailable`, does not score its
-proposal quality, and still evaluates the remaining labels. The comparison table
-must contain A through E even when one or more rows are unavailable.
+An outcome that failed, timed out, or was unavailable is represented in the
+reviewer-visible pack only by its opaque label and the normalized status
+`Unavailable`. It is never filled with another model's text. Command/model,
+duration, outcome category, and failure detail remain outside the pack until all
+reviews are captured and the mappings are published in `run-manifest.md`. The
+reviewer does not score an unavailable proposal and still evaluates the remaining
+labels. The comparison table must contain A through E even when one or more rows
+are unavailable.
 
 ## Execution isolation
 

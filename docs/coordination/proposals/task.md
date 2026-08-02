@@ -1,14 +1,14 @@
 # Independent design proposal task
 
-Status: **Draft — do not execute until the Discovery input commit below is
-filled in and all listed reports pass review.**
+Status: **Draft — do not execute until all listed reports exist and pass review,
+and `run-manifest.md` records their immutable commit plus this task's blob hash.**
 
 ## Provenance
 
 - Issue: #6
-- Shared-input commit: `TBD`
 - Prompt revision: 1
-- Execution date: `TBD` (Asia/Tokyo)
+- Run-specific commit, task-blob, date, CLI, model, control, outcome, duration,
+  and word-count evidence belongs in `run-manifest.md`, not in this prompt.
 
 Every proposer receives this file and the same immutable input snapshot. Model
 responses are captured verbatim in separate files; command, tool version, model
@@ -117,8 +117,9 @@ any requested floor it would defer and explain the release consequence.
 
 Do not execute this task from a repository, worktree, or persisted session. For
 each proposer, construct a fresh temporary directory containing only a serialized
-copy of this task and the files listed under Shared evidence, all from the exact
-shared-input commit. Start a new non-interactive session; do not resume it later.
+copy of this task plus the files listed under Shared evidence from the exact
+evidence commit recorded in `run-manifest.md`. Verify this task's blob hash against
+that manifest. Start a new non-interactive session; do not resume it later.
 Use the verified CLI-specific ephemeral/read-only/no-tool/no-persistence controls
 from the run manifest wherever the CLI provides them, disable browsing, and deny
 writes. Record the exact command and effective controls without credentials.

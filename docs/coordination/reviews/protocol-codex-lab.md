@@ -5,6 +5,7 @@
 - Commit reviewed: `5d630ae`
 - Reviewer: codex-lab, configured `gpt-5.6-sol`
 - Command: `codex-lab review --base main`
+- First follow-up: same session via `codex-lab exec resume`
 - Review mode: read-only
 
 ## Findings and resolution
@@ -27,6 +28,13 @@ The project goal requires every Noren shortcut to be both changeable and
 disableable. The proposal task previously said "rebindable or disableable"; it
 now states both requirements explicitly.
 
+## First follow-up findings and resolution
+
+| Priority | Finding | Resolution |
+| --- | --- | --- |
+| P1 | Putting the shared-input commit inside the task made the provenance requirement self-referential because inserting the hash changes the commit. | Run-specific evidence commit and final task blob hash now live in an external run manifest; the prompt contains no self-hash placeholder. |
+| P1 | Detailed command/model/failure provenance inside an unavailable placeholder disclosed the hidden author-label mapping. | Reviewer-visible placeholders now contain only the opaque label and normalized `Unavailable`; detailed provenance is withheld until every review is captured. |
+
 ## Follow-up status
 
-Pending a codex-lab follow-up review of the corrected diff.
+Pending a second codex-lab follow-up review of the corrected diff.
