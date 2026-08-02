@@ -16,15 +16,20 @@ non-secret configuration fields. Raw help output is stored in
 ## OpenCode executable provenance
 
 The initial help header incorrectly paired `/opt/homebrew/bin/opencode` with
-version `1.18.11`. Revalidation found two installations. The help and model-list
-body preserved in [`cli-help/opencode.txt`](cli-help/opencode.txt) matches the
-selected `1.18.11` executable; future runs must use its explicit path instead of
-relying on `PATH` order.
+version `1.18.11`. Revalidation found two installations. The shadowed path is a
+symlink to the JavaScript launcher from the global npm package
+`opencode-ai@1.14.31` under the Homebrew prefix; `brew info opencode` reports the
+Homebrew formula as not installed. That launcher executes a package-specific
+native payload. The help and model-list body preserved in
+[`cli-help/opencode.txt`](cli-help/opencode.txt) matches the selected `1.18.11`
+executable; future runs must use its explicit path instead of relying on `PATH`
+order.
 
-| Disposition | Sanitized path | Version | SHA-256 |
+| Disposition | Artifact | Version | SHA-256 |
 | --- | --- | --- | --- |
-| Selected for Noren evidence | `$HOME/.opencode/bin/opencode` | `1.18.11` | `f554a08dee4c34f4f43df63af72f0a6afbe57f955496853f411767718927bf2c` |
-| Present but not selected | `/opt/homebrew/bin/opencode` | `1.14.31` | `3ab08cfdb3cf1213eaeae45f557fb3220e0999862d8dc90eb17ba4cacf97c57b` |
+| Selected for Noren evidence | `$HOME/.opencode/bin/opencode` native executable | `1.18.11` | `f554a08dee4c34f4f43df63af72f0a6afbe57f955496853f411767718927bf2c` |
+| Shadowed, not selected | `/opt/homebrew/bin/opencode` symlink target: global npm JavaScript launcher | `opencode-ai@1.14.31` | `3ab08cfdb3cf1213eaeae45f557fb3220e0999862d8dc90eb17ba4cacf97c57b` |
+| Shadowed, not selected | npm launcher's `opencode-darwin-arm64` native payload | `1.14.31` | `40d5686fc86e94f833ac3e5855e12802464f2de0bcc1616013c62844bf6996d4` |
 
 No executable was installed, updated, or removed during this correction.
 

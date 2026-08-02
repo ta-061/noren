@@ -3,7 +3,9 @@ Revalidated: 2026-08-03 (Asia/Tokyo)
 Selected binary: $HOME/.opencode/bin/opencode
 Version: 1.18.11
 SHA-256: f554a08dee4c34f4f43df63af72f0a6afbe57f955496853f411767718927bf2c
-Shadowed binary: /opt/homebrew/bin/opencode, version 1.14.31, SHA-256 3ab08cfdb3cf1213eaeae45f557fb3220e0999862d8dc90eb17ba4cacf97c57b
+Shadowed npm-global launcher: /opt/homebrew/bin/opencode -> /opt/homebrew/lib/node_modules/opencode-ai/bin/opencode, package opencode-ai@1.14.31, launcher SHA-256 3ab08cfdb3cf1213eaeae45f557fb3220e0999862d8dc90eb17ba4cacf97c57b
+Shadowed native payload: opencode-darwin-arm64 1.14.31, SHA-256 40d5686fc86e94f833ac3e5855e12802464f2de0bcc1616013c62844bf6996d4
+Package-manager check: npm global package present; Homebrew formula not installed
 Configured providers: qwencloud, sakana, zai-coding-plan (credential details intentionally omitted)
 Body comparison: all four sections match the selected binary; embedded section separators account for final-newline-only differences in two help blocks.
 

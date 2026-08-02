@@ -29,12 +29,14 @@ tests, security bounds, uncertainty, and deferral discipline.
 Authentication identifiers, organization details, session IDs, and credential
 configuration are intentionally excluded.
 
-The original OpenCode help header named the Homebrew executable even though the
-captured `1.18.11` help/model output matches the PATH-preferred
-`$HOME/.opencode/bin/opencode`. A same-day audit found a separate Homebrew
-`1.14.31` installation. The [inventory](agent-inventory.md) records both
-path/version/digest tuples. This correction does not change or relabel any
-response; future runs use the selected absolute path.
+The original OpenCode help header named the npm-global launcher under the
+Homebrew prefix even though the captured `1.18.11` help/model output matches the
+PATH-preferred
+`$HOME/.opencode/bin/opencode`. A same-day audit found the separate global npm
+package `opencode-ai@1.14.31`; Homebrew itself does not manage that installation.
+The [inventory](agent-inventory.md) records the selected executable and both
+artifacts in the shadowed launch chain. This correction does not change or
+relabel any response; future runs use the selected absolute path.
 
 ## Rubric
 
