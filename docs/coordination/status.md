@@ -34,8 +34,9 @@ Milestone 0 — Discovery. Production implementation has not started.
 
 ## Pull requests and CI
 
-- Open PRs: none.
-- CI: no workflows or checks exist on `main` yet.
+- Open PRs: Draft PR #2, `docs/discovery-baseline` → `main`.
+- CI: `Validate repository documentation` is pending on PR #2; no workflow
+  exists on `main` until the PR is merged.
 - Release: none.
 
 ## Next integration work
