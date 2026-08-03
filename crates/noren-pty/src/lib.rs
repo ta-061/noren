@@ -34,7 +34,7 @@ const ZSH_PROGRAM: &str = "/bin/zsh";
 const TERM_VALUE: &str = "xterm-256color";
 const TERM_PROGRAM_VALUE: &str = "Noren-PoC";
 const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
-const READER_JOIN_BUDGET: Duration = Duration::from_millis(1_900);
+const READER_JOIN_BUDGET: Duration = Duration::from_millis(1_750);
 const LIFECYCLE_SEND_BUDGET: Duration = Duration::from_millis(100);
 
 /// Validated, non-zero terminal grid dimensions.
@@ -374,19 +374,29 @@ impl PtySession {
         }
         self.request_close();
         let result = match self.done_rx.recv_timeout(SHUTDOWN_DEADLINE) {
-            Ok(result) => result,
-            Err(RecvTimeoutError::Timeout) => Err(PtyError::SupervisorJoinTimeout),
-            Err(RecvTimeoutError::Disconnected) => Err(PtyError::ChannelDisconnected),
-        };
-        if result != Err(PtyError::SupervisorJoinTimeout) {
-            if let Some(supervisor) = self.supervisor.take() {
-                if supervisor.join().is_err() {
-                    self.finished = true;
-                    return Err(PtyError::ChannelDisconnected);
+            Ok(result) => {
+                if let Some(supervisor) = self.supervisor.take() {
+                    if supervisor.join().is_err() {
+                        self.finished = true;
+                        return Err(PtyError::ChannelDisconnected);
+                    }
                 }
+                result
             }
-            self.finished = true;
-        }
+            Err(RecvTimeoutError::Timeout) => {
+                // Dropping the handle detaches the stuck supervisor. Mark the
+                // session finished so `Drop` cannot wait for a second deadline.
+                drop(self.supervisor.take());
+                Err(PtyError::SupervisorJoinTimeout)
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                if let Some(supervisor) = self.supervisor.take() {
+                    let _ = supervisor.join();
+                }
+                Err(PtyError::ChannelDisconnected)
+            }
+        };
+        self.finished = true;
         result
     }
 
