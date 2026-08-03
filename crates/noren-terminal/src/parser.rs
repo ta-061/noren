@@ -34,7 +34,7 @@ pub(crate) struct Parser {
 
 impl Parser {
     pub(crate) fn advance(&mut self, byte: u8) -> Option<Action> {
-        let state = std::mem::take(&mut self.state);
+        let state = self.state;
         match state {
             ParserState::Ground => self.advance_ground(byte),
             ParserState::Escape => self.advance_escape(byte),
