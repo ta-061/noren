@@ -49,8 +49,8 @@ register.
 ## In progress
 
 Issue #8 integration on `docs/m0-risk-register`: [risk-register.md](../roadmap/risk-register.md)
-compressed to 12 evidence-linked rows covering all ten Issue #8 categories, plus the
-disposition table for architecture-changing unknowns. The register is the required
+compressed to 13 evidence-linked rows covering all ten Issue #8 categories plus
+Process/PTY (R-PTY-01), with the disposition table for architecture-changing unknowns. The register is the required
 shared input before Round 1 execution ([protocol-codex-lab.md](reviews/protocol-codex-lab.md)).
 
 ## Blocked
