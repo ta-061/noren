@@ -1,32 +1,34 @@
 # Coordination status
 
 Last updated: 2026-08-03 (Asia/Tokyo). PR
-[#17](https://github.com/ta-061/noren/pull/17) is merged into `main` as
-`b2bb87c20365dec5d1ab6b0122b2a987ec768744`. The only open PR is Draft
-[#19](https://github.com/ta-061/noren/pull/19), branch
-`agent/terminal-core-foundation`. The sections below preserve the PR #17
-record at implementation/test head
+[#19](https://github.com/ta-061/noren/pull/19) is merged into `main` as
+`c695920d8bc99990447d0b451754ea96c91181fc`. The only open PR is Draft
+[#21](https://github.com/ta-061/noren/pull/21), branch
+`agent/terminal-scroll-regions`, for Issue
+[#20](https://github.com/ta-061/noren/issues/20). Historical sections below
+preserve the PR #17 record at implementation/test head
 `c1f66dc27ddce37a60665d319a7ca061c300947e`, corrected only where an active
 claim went stale; coordination head `ac410a82` also passed both GitHub checks.
 
 ## Current phase
 
-Terminal foundation. The first macOS local-zsh PTY PoC (PR #17) is merged.
-Draft PR #19, not merged, replaces the `avt` dependency with a
-renderer-independent Noren `TerminalState`: bounded screen cells, cursor,
-resize, printable ASCII/LF/CR/backspace, and minimal CSI cursor movement. The
-renderer consumes `TerminalSnapshot`; see
+Terminal foundation, scrolling-region slice. PR #19 merged the Noren-owned,
+renderer-independent `TerminalState`. Draft PR #21 adds DECSTBM margins,
+region-scoped LF/VT/FF/IND/NEL/RI and CSI S/T scrolling, CNL/CPL/VPA, delayed
+autowrap, and resize-reset behavior. See
 [terminal core foundation](../architecture/terminal-core-foundation.md). This
-is not VT100/xterm compatibility. Deferred order: scroll regions, alternate
-screen, SGR/erase plus cell attributes, mode state; Unicode/IME remain later.
+is not a VT100/xterm or vim/tmux/zellij compatibility claim.
 
 ## GitHub state
 
 Verified on 2026-08-03:
 
-- The only open Issue is [#18](https://github.com/ta-061/noren/issues/18), the
-  Terminal Core foundation. The only open PR is its Draft
-  [#19](https://github.com/ta-061/noren/pull/19).
+- The only open Issue is [#20](https://github.com/ta-061/noren/issues/20), the
+  scrolling-region behavior slice. The only open PR is its Draft
+  [#21](https://github.com/ta-061/noren/pull/21).
+- PR [#19](https://github.com/ta-061/noren/pull/19) and Issue
+  [#18](https://github.com/ta-061/noren/issues/18) are complete after owner
+  acceptance of the renderer-independent Terminal Core foundation.
 - PR [#17](https://github.com/ta-061/noren/pull/17) and its Issue
   [#16](https://github.com/ta-061/noren/issues/16) are complete after the owner
   accepted the macOS local-PTY PoC.
@@ -35,11 +37,11 @@ Verified on 2026-08-03:
   [#14](https://github.com/ta-061/noren/pull/14) merged the bounded Discovery
   integration and PR [#15](https://github.com/ta-061/noren/pull/15) merged the
   lean Design Council.
-- `main` is at `b2bb87c20365dec5d1ab6b0122b2a987ec768744`, the merge commit
-  for PR #17. No Discovery PR remains open and no repeated large research or
+- `main` is at `c695920d8bc99990447d0b451754ea96c91181fc`, the merge commit
+  for PR #19. No Discovery PR remains open and no repeated large research or
   review is planned.
 
-## Terminal Core handoff
+## Merged PR #19 Terminal Core handoff
 
 | Lane | Saved evidence | State |
 | --- | --- | --- |
@@ -48,6 +50,17 @@ Verified on 2026-08-03:
 | GLM boundaries | PR #19 review: module, error, and crate boundaries pass without changes | Complete |
 | Claude Code architecture | PR #19 review: ACCEPT, no VT-evolution blocker | Complete |
 | Qwen documentation | Signed `b390531`: architecture, roadmap, contributor, and status updates | Complete |
+
+## Draft PR #21 scrolling-region handoff
+
+| Lane | Saved evidence | State |
+| --- | --- | --- |
+| Codex core | Signed `9ffe79c`: margins, region scrolling, cursor/index behavior, delayed autowrap | Complete |
+| codex-lab tests | Signed `6bbac87`: eight public-API scroll/cursor/resize regression tests | Complete |
+| GLM helper | Signed `32ca7da`: behavior-preserving parser-state idiom cleanup | Complete |
+| Claude Code review | PR #21 review: `BLOCKER: NONE` | Complete |
+| Qwen documentation | Signed `328c013`: architecture, roadmap, and contributor guidance | Complete |
+| Codex integration | Exact-head local checks, CI, and launch smoke | In progress |
 
 ## PR #17 historical implementation checkpoints
 
@@ -99,10 +112,9 @@ then passed both GitHub checks: runs `30783618745` (Rust) and `30783618743`
 
 ## Current Draft gate
 
-PR #19 remains Draft until current-head CI is green and the owner can repeat a
-local macOS startup/output/resize/exit smoke check. PR #17 has no remaining
-gate; its manual verification was accepted before merge. This does not
-authorize deferred terminal features in the foundation PR.
+PR #21 remains Draft until exact-head local checks and CI pass and the existing
+local-zsh application launch is rechecked. PR #19 has no remaining gate. This
+does not authorize deferred terminal features in the scrolling-region PR.
 
 Full VT/xterm behavior, non-ASCII glyph quality, swash/font trials, production
 IME/accessibility, Linux, SSH, agent integration, tabs, panes, themes, and a
@@ -116,7 +128,7 @@ identity, and the public support/security contact before Preview publication.
 
 ## Next steps
 
-1. Save exact-head local checks and GitHub CI on Draft PR #19.
-2. Repeat the bounded macOS smoke check without changing OS security settings.
-3. Keep scroll regions and later VT work in a separate Issue/PR after this
-   foundation is accepted.
+1. Save exact-head local checks and GitHub CI on Draft PR #21.
+2. Repeat the bounded macOS launch smoke without changing OS security settings.
+3. Keep alternate screen, SGR/erase, attributes, modes, and later VT work in
+   separate Issues and PRs.
