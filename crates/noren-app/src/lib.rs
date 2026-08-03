@@ -414,7 +414,6 @@ impl std::error::Error for AppError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noren_terminal::TerminalEngine;
     use std::num::NonZeroU16;
 
     #[test]
@@ -599,7 +598,8 @@ mod tests {
     fn crates_wire_without_boundary_leak() {
         let size =
             noren_pty::PtySize::new(NonZeroU16::new(4).unwrap(), NonZeroU16::new(8).unwrap());
-        let mut engine = noren_terminal::AvtEngine::new(size.rows(), size.cols());
+        let mut engine = noren_terminal::TerminalState::new(size.rows(), size.cols())
+            .expect("valid terminal state");
         engine.feed_bytes(b"x");
         let snapshot = engine.snapshot();
         assert_eq!(
