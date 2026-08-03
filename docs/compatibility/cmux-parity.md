@@ -75,7 +75,7 @@ not implementation assignments.
 | Local IPC | Planned | cmux documents a Unix-socket API and configurable access policy ([CLI reference](https://cmux.com/docs/api)). | `parity_ipc_boundary`: exercise same-user round trips, malformed/version-mismatched/oversized frames, socket mode, stale socket recovery, and a second account's denial; assert no crash or payload in logs. Target: `C-SEC`. Owner: `codex-lab`; security review: `Claude Code`. |
 | SSH configuration loading | Planned | cmux says its SSH workflow reads host aliases, identities, and proxy settings from `~/.ssh/config` ([SSH](https://cmux.com/docs/ssh)). This does not prove complete OpenSSH semantics. | `parity_ssh_config_fixture`: resolve a synthetic config containing `Host`, `HostName`, `User`, `Port`, `IdentityFile`, `Include`, `ProxyJump`, and `ProxyCommand`; compare structured resolution with the pinned OpenSSH oracle without exposing credentials. Target: `C-SSH`. Owner: `codex-lab`; security review: `Claude Code`. |
 | SSH reconnect | Planned | cmux describes reconnect with capped exponential backoff and keepalives ([SSH](https://cmux.com/docs/ssh)). | `parity_ssh_reconnect`: interrupt transport with `tc netem`, assert a visible disconnect, bounded backoff schedule, cancellation, eventual recovery, and uninterrupted local UI responsiveness. Target: `C-SSH`. Owner: `codex-lab`. |
-| Remote session persistence | Planned | cmux describes a remote daemon that keeps PTYs across reconnects and states that daemon's responsibilities ([SSH](https://cmux.com/docs/ssh)). This is not evidence for Noren's daemonless behavior. | `parity_remote_pty_persistence`: run a monotonic sentinel in a remote PTY, sever only transport, reconnect, and assert the same remote process/PTY continues with no duplicated or lost acknowledged input. Then test the separate Noren requirement: block or disable any Noren remote helper and prove an ordinary structured OpenSSH session still works, explicitly without PTY persistence. Target: `C-SSH`. Owner: `codex-lab`; security review: `Claude Code`. |
+| Remote session persistence | Planned | cmux describes a remote daemon that keeps PTYs across reconnects and states that daemon's responsibilities ([SSH](https://cmux.com/docs/ssh)). This is not evidence for Noren's daemonless behavior. | `parity_remote_pty_persistence`: run a monotonic sentinel in a remote PTY, sever only transport, reconnect, and assert the same remote process/PTY continues with no duplicated or lost acknowledged input. Then test the separate Noren requirement with every remote helper blocked or disabled: show a visible semantic/accessibility state that persistence is unavailable, allocate an interactive PTY, verify `isatty` and the negotiated size, and run a raw-mode helper that reads a fixed numbered byte sentinel and emits its expected digest and sequence exactly once. Make the helper exit `37` and assert exact client exit-code propagation. Repeat with an abrupt disconnect while a uniquely tagged helper waits; from a clean control connection, assert its recorded PID is gone within the frozen timeout and no residual tagged process remains. The UI must continue ordinary structured OpenSSH while visibly degrading persistence rather than implying restore or continuity. Target: `C-SSH`. Owner: `codex-lab`; security review: `Claude Code`. |
 | New pane on an SSH host | Planned | cmux describes remote workspaces and native panes in remote workflows ([SSH](https://cmux.com/docs/ssh), [remote tmux](https://cmux.com/docs/remote-tmux)). | `parity_remote_new_pane`: add a pane from a connected SSH workspace and assert its host fingerprint, user, CWD policy, PTY size, and failure isolation match the frozen requirement. Target: `C-SSH`. Owner: `codex-lab`. |
 | SSH workspace restore | Planned | cmux documents app-owned layout restoration and reconnectable remote sessions, with limitations on arbitrary process restoration ([session restore](https://cmux.com/docs/session-restore), [SSH](https://cmux.com/docs/ssh)). | `parity_ssh_workspace_restore`: save an SSH workspace, restart Noren, and assert host alias/layout metadata restore without a key, passphrase, token, or raw command being persisted; require explicit reconnect behavior from the frozen policy. Target: `C-SSH`. Owner: `codex-lab`; security review: `Claude Code`. |
 
@@ -129,10 +129,32 @@ boundary, and release milestone.
 ## Independent review record
 
 Issue #4 assigns compatibility review to `codex-lab` and security review to
-`Claude Code`. No independent review result is recorded in this branch as of
-the snapshot date. Before a row advances beyond its current state, those
+`Claude Code`. For this document the assigned scopes are exclusive:
+`codex-lab` reviews compatibility and testability only, `Claude Code` reviews
+security and privacy only, and the two scopes do not duplicate each other.
+The stable review record is the discussion on
+[PR #11](https://github.com/ta-061/noren/pull/11); findings and dispositions
+are tracked there, and this section mirrors them for offline reading instead
+of claiming any pending or final outcome.
+
+Initial findings recorded as of the snapshot date:
+
+- Security review (`Claude Code`) corrected the
+  `parity_remote_pty_persistence` plan to require every remote helper to be
+  blocked or disabled, a visible persistence-unavailable state, `isatty` and
+  negotiated-size verification, exact exit-code propagation, and
+  tagged-process cleanup after abrupt disconnect. Disposition: incorporated
+  into the current text; reviewer sign-off is not claimed.
+- Compatibility review (`codex-lab`) raised the resume-checkpoint finding on
+  review-record stability, which applies to both matrices. Disposition:
+  addressed by this section and the PR #11 record; reviewer confirmation
+  remains open on the PR.
+
+No reviewer verdict is recorded, and this document does not anticipate a
+future clean verdict. Before a row advances beyond its current state, those
 reviewers must inspect the cited claim, proposed fixture, target coverage,
-secret redaction, and the actual diff; assignment alone is not review evidence.
+secret redaction, and the actual diff; assignment alone is not review
+evidence.
 
 ## Legal and trademark boundary
 

@@ -58,6 +58,162 @@ test fixtures, not upstream defaults or Noren binding decisions.
 | `Z-UF-ALT-CTRL` | `Alt` | `Ctrl` | 8284 | `2768630827f7eace331ed8fc6f2b7be4ce8538aa4b3c0e4242054f655040195e` |
 | `Z-UF-CTRL-SHIFT-ALT` | `Ctrl Shift` | `Alt` | 8286 | `4d7ca6ad9ad16a72da44d8a04c8084ea7fbf8b5ebb6768396227cc0ca8d38ac2` |
 
+The following is the exact future reproduction harness. It invokes the pinned
+Rust generator, writes its return value with `print!` rather than `println!`,
+and verifies the leading `0a` byte and final `7d` byte before counting and
+hashing. The expected byte counts and SHA-256 hashes are embedded in the
+harness manifest below and mirror the table above. Every step fails closed: a
+missing tool, a non-absolute or unreadable source path, an unresolved or
+mismatched commit or tag, a failed `git status` inspection, a dirty tree, a
+failed compile, a missing binary, an empty or boundary-invalid fixture, or any
+byte-count or hash mismatch aborts the run with a diagnostic and a nonzero
+exit before any fixture can be archived. It has not been executed in this
+docs-only branch; a future evidence run must supply a clean checkout at the
+recorded commit and a pinned Rust toolchain, then archive the command output
+and toolchain version.
+
+```sh
+set -eu
+export LC_ALL=C
+
+fail() {
+  printf 'fixture harness: %s\n' "$1" >&2
+  exit 1
+}
+
+: "${ZELLIJ_SOURCE:?export ZELLIJ_SOURCE=/absolute/path/to/zellij-v0.44.3}"
+export ZELLIJ_SOURCE
+case "$ZELLIJ_SOURCE" in
+  /*) ;;
+  *) fail "ZELLIJ_SOURCE is not an absolute path: $ZELLIJ_SOURCE" ;;
+esac
+[ -d "$ZELLIJ_SOURCE" ] || fail "ZELLIJ_SOURCE is not a directory"
+expected_commit=55a2121b73dce4be624cda425a960e893000777c
+expected_tag=v0.44.3
+
+for required_tool in git rustc mktemp od tail wc shasum awk
+do
+  command -v "$required_tool" >/dev/null 2>&1 || \
+    fail "missing required tool: $required_tool"
+done
+
+fixture_dir=$(mktemp -d)
+cleanup() {
+  cleanup_status=$?
+  trap - 0 1 2 15
+  for cleanup_file in \
+    "$fixture_dir/render-unlock-first" \
+    "$fixture_dir/source-status" \
+    "$fixture_dir/boundary.hex" \
+    "$fixture_dir/last-byte" \
+    "$fixture_dir/count.txt" \
+    "$fixture_dir/sha.txt" \
+    "$fixture_dir/Z-UF-CTRL-ALT.kdl" \
+    "$fixture_dir/Z-UF-ALT-CTRL.kdl" \
+    "$fixture_dir/Z-UF-CTRL-SHIFT-ALT.kdl"
+  do
+    if [ -e "$cleanup_file" ] && ! rm -f "$cleanup_file"
+    then
+      cleanup_status=1
+    fi
+  done
+  if [ -d "$fixture_dir" ] && ! rmdir "$fixture_dir"
+  then
+    cleanup_status=1
+  fi
+  exit "$cleanup_status"
+}
+trap cleanup 0
+trap 'exit 1' 1 2 15
+
+actual_commit=$(git -C "$ZELLIJ_SOURCE" rev-parse --verify HEAD) || \
+  fail 'cannot resolve source HEAD'
+[ "$actual_commit" = "$expected_commit" ] || \
+  fail "source commit mismatch: $actual_commit"
+actual_tag=$(git -C "$ZELLIJ_SOURCE" describe --tags --exact-match HEAD) || \
+  fail 'source HEAD is not an exact tag'
+[ "$actual_tag" = "$expected_tag" ] || \
+  fail "source tag mismatch: $actual_tag"
+: >"$fixture_dir/source-status" || fail 'cannot create source-status sentinel'
+if ! git -C "$ZELLIJ_SOURCE" status --porcelain --untracked-files=normal \
+  >"$fixture_dir/source-status"
+then
+  fail 'cannot inspect source cleanliness'
+fi
+[ -e "$fixture_dir/source-status" ] || fail 'source-status output vanished'
+[ ! -s "$fixture_dir/source-status" ] || fail 'source tree is dirty'
+
+git --version
+rustc --version
+if ! rustc --edition=2021 -o "$fixture_dir/render-unlock-first" - <<'RS'
+mod presets {
+    include!(concat!(
+        env!("ZELLIJ_SOURCE"),
+        "/default-plugins/configuration/src/presets.rs"
+    ));
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    assert_eq!(args.len(), 3, "primary and secondary modifier required");
+    print!(
+        "{}",
+        presets::unlock_first_keybinds(args[1].clone(), args[2].clone())
+    );
+}
+RS
+then
+  fail 'generator compilation failed'
+fi
+[ -x "$fixture_dir/render-unlock-first" ] || \
+  fail 'generator binary was not produced'
+
+fixture_count=0
+while IFS='|' read -r fixture_id primary secondary expected_count expected_sha256
+do
+  fixture_file="$fixture_dir/$fixture_id.kdl"
+  "$fixture_dir/render-unlock-first" "$primary" "$secondary" \
+    >"$fixture_file" || fail "generation failed: $fixture_id"
+  [ -s "$fixture_file" ] || fail "empty fixture generated: $fixture_id"
+
+  od -An -tx1 -N1 "$fixture_file" >"$fixture_dir/boundary.hex" || \
+    fail "cannot read first byte: $fixture_id"
+  first_hex=$(awk '{gsub(/[[:space:]]/, ""); printf "%s", $0}' \
+    "$fixture_dir/boundary.hex") || fail "cannot parse first byte: $fixture_id"
+  tail -c 1 "$fixture_file" >"$fixture_dir/last-byte" || \
+    fail "cannot read last byte: $fixture_id"
+  od -An -tx1 -N1 "$fixture_dir/last-byte" >"$fixture_dir/boundary.hex" || \
+    fail "cannot encode last byte: $fixture_id"
+  last_hex=$(awk '{gsub(/[[:space:]]/, ""); printf "%s", $0}' \
+    "$fixture_dir/boundary.hex") || fail "cannot parse last byte: $fixture_id"
+  [ "$first_hex" = 0a ] || fail "missing leading LF: $fixture_id"
+  [ "$last_hex" = 7d ] || fail "unexpected final byte: $fixture_id"
+
+  wc -c <"$fixture_file" >"$fixture_dir/count.txt" || \
+    fail "cannot count fixture: $fixture_id"
+  byte_count=$(awk 'NR == 1 {print $1} END {if (NR != 1) exit 1}' \
+    "$fixture_dir/count.txt") || fail "cannot parse count: $fixture_id"
+  shasum -a 256 "$fixture_file" >"$fixture_dir/sha.txt" || \
+    fail "cannot hash fixture: $fixture_id"
+  sha256=$(awk 'NR == 1 {print $1} END {if (NR != 1) exit 1}' \
+    "$fixture_dir/sha.txt") || fail "cannot parse hash: $fixture_id"
+  [ "$byte_count" = "$expected_count" ] || \
+    fail "byte-count mismatch: $fixture_id"
+  [ "$sha256" = "$expected_sha256" ] || \
+    fail "SHA-256 mismatch: $fixture_id"
+
+  printf '%s\t%s\t%s\t%s/%s\n' \
+    "$fixture_id" "$byte_count" "$sha256" "$first_hex" "$last_hex"
+  fixture_count=$((fixture_count + 1))
+done <<'FIXTURES'
+Z-UF-CTRL-ALT|Ctrl|Alt|8268|7592052cfd068c29b222d6334fb4e4e59b1a0d29f9757f8548235d22e6898f4a
+Z-UF-ALT-CTRL|Alt|Ctrl|8284|2768630827f7eace331ed8fc6f2b7be4ce8538aa4b3c0e4242054f655040195e
+Z-UF-CTRL-SHIFT-ALT|Ctrl Shift|Alt|8286|4d7ca6ad9ad16a72da44d8a04c8084ea7fbf8b5ebb6768396227cc0ca8d38ac2
+FIXTURES
+[ "$fixture_count" -eq 3 ] || fail 'fixture manifest count mismatch'
+printf 'fixture harness: all %s fixtures verified\n' "$fixture_count"
+```
+
 Future tests must regenerate and hash each fixture before use, run with
 isolated config/cache/data directories, and archive the effective KDL. A hash
 mismatch blocks comparison. A user's custom configuration can replace any
@@ -110,7 +266,7 @@ read as upstream features or copied upstream configuration.
 | --- | --- | --- | --- | --- |
 | Upstream Zellij default preset | Planned | The bundled default starts in `normal`; mode entry includes `Ctrl p` for panes, `Ctrl t` for tabs, `Ctrl o` for sessions, `Ctrl g` for locked mode, and `Alt` bindings shared outside locked mode ([pinned default KDL](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-utils/assets/config/default.kdl#L1-L225)). | Physical Command/Option/Alt mapping, non-US layouts, terminal protocol mode, and custom overrides are not implied by the names in KDL. Noren must not reserve these bytes in a focused terminal pane. | `zellij_default_preset_trace`: launch the clean pinned fixture with outer and inner recorders, exercise every mode-entry/exit binding and a frozen bound/unbound key corpus, and apply `Z-2L`: Noren-to-Zellij bytes match the direct-host control while Zellij-to-child bytes and consumed actions match the pinned v0.44.3 oracle with host/inner keyboard, application-cursor, and newline modes recorded. Target: `Z-PROTO` plus `Z-SSH`. Owner: `codex-lab`. |
 | Upstream Zellij Unlock-First preset | Planned | `Z-UF-CTRL-ALT` starts in `locked`; `Ctrl g` unlocks it, while bindings shared among `normal` and `locked` keep the generated `Alt` action chords active in Locked, including pane/tab focus, create, move, resize, layout, and grouping actions ([pinned generator entry](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/default-plugins/configuration/src/presets.rs#L1-L10), [pinned shared bindings](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/default-plugins/configuration/src/presets.rs#L166-L188)). | Bound secondary-modifier chords are Zellij actions in Locked and must not be called pass-through. Only unbound chords are forwarding candidates. Modifier mapping, alternative generated layouts, and every outer/inner keyboard or cursor mode remain fixture evidence, not a name-based assumption. | `zellij_unlock_first_trace`: regenerate and verify all three `Z-UF-*` hashes, then record both PTY boundaries. For `Z-UF-CTRL-ALT`, exercise `Ctrl g`, every bound `Alt` chord, unbound Ctrl/Alt/application keys, and unlock-action-relock paths; require bound chords to perform the pinned Zellij action and only unbound chords to follow the v0.44.3 child oracle. For every fixture apply `Z-2L`, recording host/inner keyboard, application-cursor, and newline modes. Target: `Z-PROTO` plus `Z-SSH`. Owner: `codex-lab`. |
-| Noren Zellij Compatible preset | Planned | No Zellij v0.44.3 source defines this Noren-side preset. Upstream configurations are compatibility subjects, not evidence that the Noren preset exists or should copy their bindings. | The Noren action manifest, default bindings, configuration schema, collision severity, diagnostic schemas, and fallback behavior require separate approved requirements. The preset name alone promises nothing. | `noren_zellij_compatible_preset`: against the frozen Noren action/shortcut manifest, execute every shortcut in default, rebound, and disabled forms while a pinned Zellij fixture records `Z-2L`; assert enabled Noren actions occur only when intended and all other Ctrl, Alt, Ctrl+Alt, function, and application keys continue to the child oracle. Inject exact/prefix/platform/protocol collisions and verify deterministic future `noren doctor zellij`, `noren test-keys`, and `noren keybindings conflicts` findings, versioned machine output, and nonzero error exits where the frozen contract requires them. Target: `Z-PROTO` plus `Z-SSH`. Owner: `codex-lab`. |
+| Noren Zellij Compatible preset | Planned | No Zellij v0.44.3 source defines this Noren-side preset. Upstream configurations are compatibility subjects, not evidence that the Noren preset exists or should copy their bindings. | The Noren action manifest, default bindings, configuration schema, collision severity, diagnostic schemas, and fallback behavior require separate approved requirements. Regardless of binding state or configuration validity, an approved non-keyboard recovery must always remain reachable through a pointer-invoked command palette or GUI/menu surface. The preset name alone promises nothing. | `noren_zellij_compatible_preset`: against the frozen Noren action/shortcut manifest, execute every shortcut in default, rebound, and disabled forms while a pinned Zellij fixture records `Z-2L`; assert enabled Noren actions occur only when intended and all other Ctrl, Alt, Ctrl+Alt, function, and application keys continue to the child oracle. Submit invalid-schema/key/leader configurations and exact/prefix/platform/protocol shadowing; require rejection before activation or prove the approved pointer-invoked palette or GUI/menu recovery remains reachable from the resulting session, with any keyboard trap a failure. Verify deterministic future `noren doctor zellij`, `noren test-keys`, and `noren keybindings conflicts` findings, versioned machine output, and nonzero error exits where the frozen contract requires them. Target: `Z-PROTO` plus `Z-SSH`, including pointer/accessibility recovery runs. Owner: `codex-lab`. |
 | Noren Zellij Unlock-First preset | Planned | This is Noren product intent and is distinct from Zellij's generated Unlock-First KDL. The pinned upstream generator provides child-side test fixtures only; it does not define Noren's leader or state machine. | Initial state, leader sequence, timeout/prefix replay, exact action set, recovery, and collision policy are unapproved. Every Noren shortcut must remain independently rebindable and disableable, and leader configuration must not imply child-byte equivalence. | `noren_zellij_unlock_first_preset`: use the frozen Noren manifest with its accepted default leader plus at least two valid alternative leaders; for every shortcut, exercise leader-action-return, rebound, disabled, prefix-timeout, and collision cases over `Z-2L`. Assert only the accepted Noren sequence is consumed, all other bytes continue to the pinned child oracle, and future `noren doctor zellij`, `noren test-keys`, and `noren keybindings conflicts` identify unreachable or shadowed leaders without inferring safety from a display label. Target: `Z-PROTO` plus `Z-SSH`. Owner: `codex-lab`. |
 | Noren Zellij Pass-through Mode | Planned | Zellij has no upstream contract for a Noren UI mode. "Pass-through" is a Noren requirement label, not evidence of zero transformation across Zellij or of any implemented escape path. | The minimal interception set, configurable leader, entry/exit precedence, command-palette and GUI recovery, invalid configuration handling, and accessibility behavior require approved requirements. A disabled, invalid, shadowed, or unreachable leader must never create a keyboard trap. | `noren_zellij_pass_through`: freeze the permitted interception manifest, enter the mode through every accepted route, and replay the key corpus over `Z-2L`; assert only the minimal accepted set is intercepted and child forwarding continues. Exit separately through the configured leader, command palette, and GUI; rebind and disable every remaining shortcut; then test disabled/invalid/shadowed/unreachable leaders and require configuration rejection or an always-reachable approved non-keyboard recovery, never a trapped session. Verify future `noren doctor zellij`, `noren test-keys`, and `noren keybindings conflicts` diagnostics for every failure. Target: `Z-PROTO` plus `Z-SSH`, including keyboard-only and pointer/accessibility runs. Owner: `codex-lab`. |
 | Local Zellij session | Planned | The official v0.44.3 release supplies the pinned local binary/source fixture; it makes no claim about Noren ([v0.44.3 release](https://github.com/zellij-org/zellij/releases/tag/v0.44.3)). | Shell, locale, terminfo, display server, and Noren's PTY implementation can change behavior. | `zellij_local_smoke`: start pinned Zellij under Noren with isolated state, run a raw byte helper and shell sentinel, execute both pinned upstream fixtures plus all three Noren-side preset/Pass-through workflows, resize, detach, and exit; compare `Z-2L`, exit codes, screen digest, and child ownership to the oracle. Target: `Z-LOCAL`. Owner: `codex-lab`. |
@@ -138,12 +294,12 @@ read as upstream features or copied upstream configuration.
 | Bracketed paste | Planned | The Zellij client recognizes a paste event, sends begin/content/end, and the server removes markers when the inner app has not enabled bracketed paste ([pinned client handling](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-client/src/input_handler.rs#L148-L204), [pinned pane handling](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/panes/terminal_pane.rs#L251-L275)). | Chunking, huge or binary/NUL-containing clipboard data, nesting, mode changes during a paste, SSH segmentation, and Noren's paste-confirmation policy need tests. | `zellij_bracketed_paste_trace`: paste empty, single-line, multiline, Unicode, boundary-sized, over-limit, and deliberately segmented buffers while the inner helper toggles mode 2004; assert exact markers/content once, rejection policy, responsiveness, and no shortcut interpretation. Target: `Z-PROTO` plus `Z-SSH`. Owner: `codex-lab`; security review: `Claude Code`. |
 | Focus events | Planned | v0.44.3 sets and resets inner DECSET/DECRST 1004 state and emits `CSI I`/`CSI O` when Zellij pane focus changes ([pinned DECRST state](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/panes/grid.rs#L3928-L3944), [pinned DECSET state](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/panes/grid.rs#L4036-L4052), [pinned focus handling](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/panes/grid.rs#L3264-L3279), [pinned dispatch](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/panes/active_panes.rs#L80-L105)). | Whether the outer Zellij client requests host-window focus events is separate from inner pane focus. Noren window/app focus, tab switching, minimized state, and SSH disconnect must not synthesize unsupported semantics. | `zellij_focus_event_trace`: use two raw inner panes that enable/disable mode 1004, change Zellij pane/tab and Noren window focus, and assert the exact ordered inner focus bytes required by each layer with no events after disable. Target: `Z-PROTO` plus `Z-SSH`. Owner: `codex-lab`. |
 | Mouse tracking and SGR mouse | Planned | With mouse enabled, the v0.44.3 client requests modes 1000/1002/1003/1015/1006. The inner grid sets and resets 1000/1002/1003 plus encodings 1005/1006 and encodes coordinates/buttons/modifiers ([pinned client constants](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-client/src/os_input_output.rs#L28-L33), [pinned DECRST states](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/panes/grid.rs#L3928-L3944), [pinned DECSET states](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/panes/grid.rs#L4036-L4052), [pinned inner encoder](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/panes/grid.rs#L2989-L3047)). | 1015 is requested by the client but the cited inner grid evidence does not establish an equivalent inner protocol. Pixel mouse, overflow coordinates, fractional scaling, Shift bypass, and mode precedence remain unknown. | `zellij_sgr_mouse_trace`: drive press/release/motion/wheel at corners and wide-cell boundaries with modifiers under modes 1000/1002/1003/1006 and off, compare exact bytes/coordinates to the fixture oracle, and repeat after resize/SSH segmentation. Target: `Z-PROTO` plus `Z-SSH`. Owner: `codex-lab`. |
-| SIGWINCH and PTY size | Planned | On Unix, v0.44.3 listens for `SIGWINCH`, throttles callbacks, reads the terminal size, and sends `TerminalResize` to the server ([pinned signal listener](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-client/src/os_input_output_unix.rs#L14-L69), [pinned callback](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-client/src/os_input_output.rs#L253-L270)). | Noren must update the outer PTY atomically; pane-frame deductions, resize bursts, zero dimensions, remote latency, alternate screens, and synchronized output can change the visible result. | `zellij_sigwinch_resize`: script a dimension sequence including rapid, minimum, and restored sizes; each inner pane records `SIGWINCH`, `TIOCGWINSZ`, and redraw hash; assert final dimensions, no zero-sized exposure, correct pane allocation, and no stale input coordinates. Target: `Z-PROTO` plus `Z-SSH`. Owner: `codex-lab`. |
+| SIGWINCH and PTY size | Planned | On Unix, v0.44.3 listens for `SIGWINCH` and throttles resize callbacks ([pinned signal listener](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-client/src/os_input_output_unix.rs#L14-L69), [pinned throttled dispatch](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-client/src/os_input_output.rs#L253-L270)); the registered resize callback reads the terminal size and sends `TerminalResize` to the server ([pinned `TerminalResize` callback](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-client/src/lib.rs#L1043-L1055)). | Noren must update the outer PTY atomically; pane-frame deductions, resize bursts, zero dimensions, remote latency, alternate screens, and synchronized output can change the visible result. | `zellij_sigwinch_resize`: script a dimension sequence including rapid, minimum, and restored sizes; each inner pane records `SIGWINCH`, `TIOCGWINSZ`, and redraw hash; assert final dimensions, no zero-sized exposure, correct pane allocation, and no stale input coordinates. Target: `Z-PROTO` plus `Z-SSH`. Owner: `codex-lab`. |
 | Synchronized output | Planned | v0.44.3 queries host mode 2026 at startup and, when supported, wraps render output in synchronized-output start/end sequences ([pinned query](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-client/src/stdin_handler.rs#L271-L288), [pinned render path](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-client/src/lib.rs#L1128-L1169)). | Noren's response value, nesting, incomplete groups, crash recovery, timeout, unsupported fallback, and DCS compatibility cannot be inferred from `$TERM`. | `zellij_synchronized_output_trace`: answer the startup query as supported/unsupported/malformed, force multi-chunk renders and abrupt child/client exit, and assert atomic frame presentation, byte ordering, bounded buffering, and immediate fallback without a stuck render lock. Target: `Z-PROTO` plus `Z-SSH`. Owner: `codex-lab`. |
 | OSC 8 hyperlinks | Planned | v0.44.3 parses hyperlinks and can re-emit them; `osc8_hyperlinks` defaults true ([pinned link handler](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/panes/link_handler.rs#L18-L89), [pinned option](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-utils/assets/config/default.kdl#L522-L525)). | URI schemes, IDs, BEL versus ST terminators, nested/malformed/oversized values, wrapping, click modifiers, and external-open confirmation are Noren security/UI policy. | `zellij_osc8_trace`: emit bounded valid/malformed/nested/long hyperlink fixtures from an inner pane, inspect Noren's grid link ranges after Zellij rendering, and assert safe scheme policy, no implicit open, exact wrapped selection, and bounded parsing. Target: `Z-PROTO` plus `Z-SSH`. Owner: `codex-lab`; security review: `Claude Code`. |
 | OSC 10 default foreground | Planned | v0.44.3 classifies OSC 10 queries, answers a pane-local override or forwards the query to the host while preserving the terminator ([pinned query type](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/host_query.rs#L41-L99), [pinned grid routing](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/panes/grid.rs#L3592-L3648)). | Theme changes, alpha/color-space conversion, query timeout, local override precedence, BEL/ST framing, and cross-pane reply routing require exact tests. | `zellij_osc10_query`: an inner raw pane issues BEL- and ST-terminated queries before/after a Noren theme change and Zellij pane override; assert the reply reaches only the requester, matches the rendered foreground oracle, is well-formed, and times out safely when unanswered. Target: `Z-PROTO` plus `Z-SSH`. Owner: `codex-lab`. |
 | OSC 11 default background | Planned | v0.44.3 classifies OSC 11 queries and uses the same local-override-or-host-forwarding path as OSC 10 ([pinned query type](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/host_query.rs#L41-L99), [pinned grid routing](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/panes/grid.rs#L3592-L3648)). | Transparent backgrounds, image/chrome compositing, light/dark transitions, query timeout, pane override, BEL/ST framing, and cross-pane reply routing remain unknown. | `zellij_osc11_query`: repeat the OSC 10 fixture for background under opaque/transparent and light/dark themes, asserting requester isolation, rendered-color oracle, terminator, bounded timeout, and no stale reply after pane close. Target: `Z-PROTO` plus `Z-SSH`. Owner: `codex-lab`. |
-| OSC 52 clipboard | Planned | Without a copy command, v0.44.3 emits OSC 52 for Zellij copies. It accepts an inner OSC 52 set payload, decodes UTF-8, and forwards it through the selected clipboard provider; its inner read-query branch is explicitly unsupported ([pinned provider](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/tab/clipboard.rs#L8-L49), [pinned inner handler](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/panes/grid.rs#L3693-L3711)). | Clipboard reads versus writes, user permission, system/primary destination, non-UTF-8, payload limits, logging, SSH, and nested-parser resource use are security boundaries. Noren can bound only what reaches its outer parser; it cannot guarantee Zellij's inner allocation behavior. | `zellij_osc52_security`: send a permitted 1 KiB sentinel, disabled-policy set, read query, invalid base64, and payloads at/over Noren's configured cap; assert exactly one allowed clipboard change, fail-closed rejection otherwise, responsiveness, destination policy, and absence of payloads from logs/artifacts. Target: `Z-PROTO` plus `Z-SSH`. Owner: `codex-lab`; security review: `Claude Code`. |
+| OSC 52 clipboard | Planned | Without a copy command, v0.44.3 emits OSC 52 for Zellij copies. It accepts an inner OSC 52 set payload, decodes UTF-8, and forwards it through the selected clipboard provider; its inner read-query branch is explicitly unsupported ([pinned provider](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/tab/clipboard.rs#L8-L49), [pinned inner handler](https://github.com/zellij-org/zellij/blob/55a2121b73dce4be624cda425a960e893000777c/zellij-server/src/panes/grid.rs#L3693-L3711)). | Clipboard reads versus writes, user permission, system/primary destination, non-UTF-8, payload limits, logging, SSH, and nested-parser resource use are security boundaries. Independently of Zellij's current or future behavior, Noren must never answer an OSC 52 read query or invoke the host clipboard-read API for one. Noren can bound only what reaches its outer parser; it cannot guarantee Zellij's inner allocation behavior. | `zellij_osc52_security`: seed the isolated host clipboard with a unique canary, issue OSC 52 read queries first from a direct-Noren control pane and then through pinned Zellij, and assert zero clipboard-read API calls, no OSC 52 response carrying clipboard data, and no canary in PTY output, rendering, logs, or artifacts. Repeat after substituting an oracle that forwards the nested query so future upstream support cannot weaken Noren's denial. Separately send five set-path payloads that each embed a distinct canary — `Z52-SET-PERMIT` (permitted 1 KiB sentinel), `Z52-SET-DISABLED` (disabled-policy set), `Z52-SET-BAD-B64` (invalid base64), `Z52-SET-CAP-EQ` (at Noren's configured cap), and `Z52-SET-CAP-OVER` (over the cap); assert exactly one allowed clipboard write whose content equals the full `Z52-SET-PERMIT` canary and fail-closed rejection of every other payload with no clipboard mutation, plus responsiveness and destination policy, and assert that none of the five canaries appears in Noren or Zellij logs, crash reports, PTY recordings, rendered output, or any other archived evidence. Target: `Z-PROTO` plus `Z-SSH`. Owner: `codex-lab`; security review: `Claude Code`. |
 
 ## Negotiation, layout, and IME unknowns
 
@@ -187,8 +343,30 @@ That citation records provenance and is not a library/adoption decision.
 ## Independent review record
 
 Issue #4 assigns compatibility review to `codex-lab` and security review to
-`Claude Code`. No independent review result is recorded in this branch as of
-the snapshot date. Before any row advances beyond its current Noren state, the
-reviewers must inspect the source links, byte oracles, target coverage, secret
-redaction, and claims in the actual diff; a generated summary is not review
-evidence.
+`Claude Code`. For this document the assigned scopes are exclusive:
+`codex-lab` reviews compatibility and testability only, `Claude Code` reviews
+security and privacy only, and the two scopes do not duplicate each other.
+The stable review record is the discussion on
+[PR #11](https://github.com/ta-061/noren/pull/11); findings and dispositions
+are tracked there, and this section mirrors them for offline reading instead
+of claiming any pending or final outcome.
+
+Initial findings recorded as of the snapshot date:
+
+- Security review (`Claude Code`) raised four corrections: byte-exact
+  Unlock-First fixture generation, pointer-invoked recovery for the Noren
+  Zellij Compatible preset, OSC 52 read-query denial, and the companion
+  daemonless-remote-PTY plan in the cmux matrix. Disposition: incorporated
+  into the current text; reviewer sign-off is not claimed.
+- Compatibility review (`codex-lab`) raised four resume-checkpoint findings:
+  a fail-closed reproduction harness with embedded byte counts and hashes,
+  distinct OSC 52 set-path canaries with log/crash/artifact non-leak
+  assertions, this stable review-record link, and the pinned `TerminalResize`
+  callback citation. Disposition: addressed in the current text; reviewer
+  confirmation remains open on the PR.
+
+No reviewer verdict is recorded, and this document does not anticipate a
+future clean verdict. Before any row advances beyond its current Noren state,
+the reviewers must inspect the source links, byte oracles, target coverage,
+secret redaction, and claims in the actual diff; a generated summary is not
+review evidence.
