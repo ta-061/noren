@@ -8,9 +8,8 @@ Evidence retrieved: 2026-08-03
 
 Repository baseline: `7cd56c689546bcfc38f083551813abe32e48469f`
 
-Review status: the formal Claude Code security review of PR #12 reported no
-BLOCKER or MAJOR findings; its four MINOR remediations are applied in this
-working copy. The formal codex-lab testability review remains pending.
+Review artifacts: [PR #12 discussion](https://github.com/ta-061/noren/pull/12)
+and the [2026-08-03 Claude follow-up](https://github.com/ta-061/noren/pull/12#issuecomment-5161076007).
 
 ## Scope and decision boundary
 
