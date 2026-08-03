@@ -102,8 +102,9 @@ Draft PR #23 head. No vim/tmux/zellij compatibility is claimed:
   [#32](https://github.com/ta-061/noren/pull/32): a bounded public-API
   compatibility harness for behavior present at the PR #23 baseline.
 
-Issue [#28](https://github.com/ta-061/noren/issues/28) documents the parallel
-development model running these lanes; the workflow rules live in
+Issue [#28](https://github.com/ta-061/noren/issues/28) and Draft PR
+[#33](https://github.com/ta-061/noren/pull/33) document the parallel development
+model running these lanes; the workflow rules live in
 [CONTRIBUTING.md](../../CONTRIBUTING.md).
 
 ## Deferred

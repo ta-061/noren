@@ -14,9 +14,9 @@ Last updated: 2026-08-03 (Asia/Tokyo). PR
 [#27](https://github.com/ta-061/noren/issues/27) are open and stacked on the
 exact PR #23 head as Draft PRs
 [#29](https://github.com/ta-061/noren/pull/29)–[#32](https://github.com/ta-061/noren/pull/32);
-Issue
-[#28](https://github.com/ta-061/noren/issues/28) documents the parallel
-development model. Historical sections below
+Issue [#28](https://github.com/ta-061/noren/issues/28) and Draft PR
+[#33](https://github.com/ta-061/noren/pull/33) document the parallel development
+model. Historical sections below
 preserve the PR #17 record at implementation/test head
 `c1f66dc27ddce37a60665d319a7ca061c300947e`, corrected only where an active
 claim went stale; coordination head `ac410a82` also passed both GitHub checks.
@@ -58,9 +58,9 @@ Verified on 2026-08-03:
   [#32](https://github.com/ta-061/noren/pull/32), respectively. #24 and #27
   have complete first implementations; #25 and #26 intentionally contain
   non-conflicting foundations with central parser/state wiring still pending.
-  Issue
-  [#28](https://github.com/ta-061/noren/issues/28) tracks the documentation
-  of the parallel development model.
+  Issue [#28](https://github.com/ta-061/noren/issues/28) and Draft PR
+  [#33](https://github.com/ta-061/noren/pull/33) track the documentation of the
+  parallel development model.
 - PR [#19](https://github.com/ta-061/noren/pull/19) and Issue
   [#18](https://github.com/ta-061/noren/issues/18) are complete after owner
   acceptance of the renderer-independent Terminal Core foundation.

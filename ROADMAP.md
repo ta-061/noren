@@ -36,8 +36,9 @@ input encoders, with terminal-state wiring still pending (Issue
 [#30](https://github.com/ta-061/noren/pull/30)); and a bounded current-core VT
 compatibility harness (Issue [#27](https://github.com/ta-061/noren/issues/27),
 Draft PR [#32](https://github.com/ta-061/noren/pull/32)). Issue
-[#28](https://github.com/ta-061/noren/issues/28) documents the parallel
-development model behind these lanes.
+[#28](https://github.com/ta-061/noren/issues/28) and Draft PR
+[#33](https://github.com/ta-061/noren/pull/33) document the parallel development
+model behind these lanes.
 
 Tabs, origin mode, query/reply, Unicode/IME, and the later milestone scope
 remain deferred. No milestone date is promised. Implementation advances
