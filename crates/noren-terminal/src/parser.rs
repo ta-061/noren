@@ -19,10 +19,16 @@ pub(crate) enum Action {
     MoveLeft(u16),
     MoveNextLine(u16),
     MovePreviousLine(u16),
-    MoveTo { row: u16, col: u16 },
+    MoveTo {
+        row: u16,
+        col: u16,
+    },
     MoveToColumn(u16),
     MoveToRow(u16),
-    SetScrollRegion { top: u16, bottom: Option<u16> },
+    SetScrollRegion {
+        top: u16,
+        bottom: Option<u16>,
+    },
     ScrollUp(u16),
     ScrollDown(u16),
     EraseInDisplay(EraseMode),
@@ -32,9 +38,16 @@ pub(crate) enum Action {
     DeleteCharacters(u16),
     InsertLines(u16),
     DeleteLines(u16),
+    SelectGraphicRendition {
+        params: [u16; MAX_CSI_PARAMS],
+        len: usize,
+    },
     SaveCursor,
     RestoreCursor,
-    SetPrivateMode { mode: PrivateMode, enabled: bool },
+    SetPrivateMode {
+        mode: PrivateMode,
+        enabled: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,6 +270,10 @@ impl Csi {
             b'r' if self.len <= 2 => Some(Action::SetScrollRegion {
                 top: self.param_or(0, 1).saturating_sub(1),
                 bottom: self.zero_based_param(1),
+            }),
+            b'm' => Some(Action::SelectGraphicRendition {
+                params: self.params,
+                len: self.len,
             }),
             b's' if self.is_default_only() => Some(Action::SaveCursor),
             b'u' if self.is_default_only() => Some(Action::RestoreCursor),

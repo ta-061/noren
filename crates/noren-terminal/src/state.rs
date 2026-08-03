@@ -1,4 +1,7 @@
-use crate::parser::{Action, EraseMode, Parser, PrivateMode};
+use crate::{
+    attributes::{AnsiColor, CellAttributes, Color},
+    parser::{Action, EraseMode, Parser, PrivateMode},
+};
 use std::fmt;
 
 /// Hard allocation bound for a visible Terminal Core screen.
@@ -13,6 +16,7 @@ pub const MAX_SCREEN_CELLS: usize = 1024 * 1024;
 pub struct Cell {
     text: String,
     width: u8,
+    attributes: CellAttributes,
 }
 
 impl Cell {
@@ -22,6 +26,7 @@ impl Cell {
         Self {
             text: text.into(),
             width,
+            attributes: CellAttributes::default(),
         }
     }
 
@@ -43,14 +48,24 @@ impl Cell {
         self.width
     }
 
+    /// Renderer-independent visual attributes captured when this cell was written.
+    #[must_use]
+    pub const fn attributes(&self) -> &CellAttributes {
+        &self.attributes
+    }
+
     /// Whether this is the baseline blank cell.
     #[must_use]
     pub fn is_blank(&self) -> bool {
         self.text == " "
     }
 
-    fn from_ascii(byte: u8) -> Self {
-        Self::new(char::from(byte).to_string(), 1)
+    fn from_ascii(byte: u8, attributes: CellAttributes) -> Self {
+        Self {
+            text: char::from(byte).to_string(),
+            width: 1,
+            attributes,
+        }
     }
 }
 
@@ -383,6 +398,9 @@ pub struct TerminalState {
     active: ScreenState,
     primary_screen: Option<ScreenState>,
     modes: TerminalModes,
+    // SGR is terminal-global in this bounded slice; cells retain the value
+    // captured when written, independently of screen-buffer selection.
+    pen: CellAttributes,
     parser: Parser,
 }
 
@@ -393,6 +411,7 @@ impl TerminalState {
             active: ScreenState::new(rows, cols)?,
             primary_screen: None,
             modes: TerminalModes::default(),
+            pen: CellAttributes::default(),
             parser: Parser::default(),
         })
     }
@@ -454,6 +473,12 @@ impl TerminalState {
     #[must_use]
     pub const fn modes(&self) -> TerminalModes {
         self.modes
+    }
+
+    /// Current renderer-independent attributes captured by newly printed cells.
+    #[must_use]
+    pub const fn attributes(&self) -> &CellAttributes {
+        &self.pen
     }
 
     /// Save the active screen's cursor position.
@@ -562,6 +587,9 @@ impl TerminalState {
             Action::DeleteCharacters(count) => self.delete_characters(count),
             Action::InsertLines(count) => self.insert_lines(count),
             Action::DeleteLines(count) => self.delete_lines(count),
+            Action::SelectGraphicRendition { params, len } => {
+                self.select_graphic_rendition(&params[..len]);
+            }
             Action::SaveCursor => self.save_cursor(),
             Action::RestoreCursor => self.restore_cursor(),
             Action::SetPrivateMode { mode, enabled } => self.set_private_mode(mode, enabled),
@@ -576,7 +604,7 @@ impl TerminalState {
         self.active.screen.put(
             self.active.cursor.row,
             self.active.cursor.column,
-            Cell::from_ascii(byte),
+            Cell::from_ascii(byte, self.pen),
         );
         if self.active.cursor.column == self.active.screen.cols - 1 {
             self.active.wrap_pending = true;
@@ -690,6 +718,54 @@ impl TerminalState {
         }
     }
 
+    fn select_graphic_rendition(&mut self, params: &[u16]) {
+        let mut index = 0;
+        while index < params.len() {
+            let param = params[index];
+            match param {
+                0 => self.pen = CellAttributes::default(),
+                1 => self.pen = self.pen.with_bold(true),
+                22 => self.pen = self.pen.with_bold(false),
+                4 => self.pen = self.pen.with_underline(true),
+                24 => self.pen = self.pen.with_underline(false),
+                7 => self.pen = self.pen.with_reverse(true),
+                27 => self.pen = self.pen.with_reverse(false),
+                30..=37 => {
+                    self.pen = self
+                        .pen
+                        .with_foreground(Color::Ansi(AnsiColor::ALL[usize::from(param - 30)]));
+                }
+                39 => self.pen = self.pen.with_foreground(Color::Default),
+                40..=47 => {
+                    self.pen = self
+                        .pen
+                        .with_background(Color::Ansi(AnsiColor::ALL[usize::from(param - 40)]));
+                }
+                49 => self.pen = self.pen.with_background(Color::Default),
+                90..=97 => {
+                    self.pen = self
+                        .pen
+                        .with_foreground(Color::Ansi(AnsiColor::ALL[usize::from(param - 90 + 8)]));
+                }
+                100..=107 => {
+                    self.pen = self
+                        .pen
+                        .with_background(Color::Ansi(AnsiColor::ALL[usize::from(param - 100 + 8)]));
+                }
+                // Indexed, direct, and underline colors are deferred. Consume
+                // their semicolon-form arguments as one unsupported group so
+                // channel values such as 1, 4, or 7 are never reinterpreted as
+                // independent bold/underline/reverse controls.
+                38 | 48 | 58 => {
+                    index += extended_color_parameter_count(&params[index..]);
+                    continue;
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+    }
+
     fn reset_scroll_region(&mut self) {
         self.active.scroll_region = ScrollRegion::full_screen(self.active.screen.rows);
         self.active.cursor = Cursor::default();
@@ -733,6 +809,14 @@ impl TerminalState {
             self.active.restore_cursor();
         }
         self.modes.alternate_screen = false;
+    }
+}
+
+fn extended_color_parameter_count(params: &[u16]) -> usize {
+    match params.get(1) {
+        Some(5) => params.len().min(3),
+        Some(2) => params.len().min(5),
+        _ => 1,
     }
 }
 

@@ -4,9 +4,9 @@
 //! PTY bytes enter through [`TerminalEngine::feed_bytes`]; renderers receive an
 //! immutable [`TerminalSnapshot`] and never depend on PTY or parser types.
 //!
-//! This foundation supports a bounded ASCII/CSI subset, scrolling regions,
-//! cursor save/restore, and DEC private mode 1049 screen switching. It is not
-//! a VT100/xterm compatibility claim.
+//! This foundation supports a bounded ASCII/CSI subset, basic SGR attributes,
+//! scrolling regions, cursor save/restore, and DEC private mode 1049 screen
+//! switching. It is not a VT100/xterm compatibility claim.
 
 mod attributes;
 mod parser;
