@@ -1,19 +1,24 @@
 # Coordination status
 
-Last updated: 2026-08-03 (Asia/Tokyo), implementation/test head
-`c1f66dc27ddce37a60665d319a7ca061c300947e` on Draft PR
-[#17](https://github.com/ta-061/noren/pull/17), branch
-`feat/macos-local-pty-poc`. Coordination head `ac410a82` also passed both
-GitHub checks; this final status-only update follows those verified heads.
+Last updated: 2026-08-03 (Asia/Tokyo). PR
+[#17](https://github.com/ta-061/noren/pull/17) is merged into `main` as
+`b2bb87c20365dec5d1ab6b0122b2a987ec768744`. The only open PR is Draft
+[#19](https://github.com/ta-061/noren/pull/19), branch
+`agent/terminal-core-foundation`. The sections below preserve the PR #17
+record at implementation/test head
+`c1f66dc27ddce37a60665d319a7ca061c300947e`, corrected only where an active
+claim went stale; coordination head `ac410a82` also passed both GitHub checks.
 
 ## Current phase
 
-Milestone 1 — first macOS local-zsh PTY PoC implementation. Discovery and the
-lean Design Council are merged. The Rust workspace, CI, local PTY, window,
-input adapter, terminal state, bounded GPU view, resize path, and shutdown path
-now exist on one Draft PR. The PR stays Draft until the remaining local rendered
-frame and real window-interaction checkpoint is saved; deferred product features
-remain closed.
+Terminal foundation. The first macOS local-zsh PTY PoC (PR #17) is merged.
+Draft PR #19, not merged, replaces the `avt` dependency with a
+renderer-independent Noren `TerminalState`: bounded screen cells, cursor,
+resize, printable ASCII/LF/CR/backspace, and minimal CSI cursor movement. The
+renderer consumes `TerminalSnapshot`; see
+[terminal core foundation](../architecture/terminal-core-foundation.md). This
+is not VT100/xterm compatibility. Deferred order: scroll regions, alternate
+screen, SGR/erase plus cell attributes, mode state; Unicode/IME remain later.
 
 ## GitHub state
 
@@ -21,16 +26,17 @@ Verified on 2026-08-03:
 
 - The only open Issue is [#16](https://github.com/ta-061/noren/issues/16), the
   scoped macOS local-zsh PTY PoC.
-- The only open PR is Draft [#17](https://github.com/ta-061/noren/pull/17),
-  `feat/macos-local-pty-poc` into `main`; GitHub reports the merge state clean.
+- Draft [#17](https://github.com/ta-061/noren/pull/17),
+  `feat/macos-local-pty-poc` into `main`, had a clean merge state and is now
+  merged.
 - Issues [#6](https://github.com/ta-061/noren/issues/6) and
   [#8](https://github.com/ta-061/noren/issues/8) are closed. PR
   [#14](https://github.com/ta-061/noren/pull/14) merged the bounded Discovery
   integration and PR [#15](https://github.com/ta-061/noren/pull/15) merged the
   lean Design Council.
-- `main` is at `54ed3cfc9abaab97bd45ad8dedac71070832b54e`, the merge commit for
-  PR #15. No Discovery PR remains open and no repeated large research or review
-  is planned.
+- `main` was at `54ed3cfc9abaab97bd45ad8dedac71070832b54e`, the merge commit
+  for PR #15, at this verification. No Discovery PR remains open and no
+  repeated large research or review is planned.
 
 ## Implementation checkpoints
 
@@ -71,11 +77,12 @@ then passed both GitHub checks: runs `30783618745` (Rust) and `30783618743`
 - `rustc 1.88.0 (6b00bc388 2025-06-23)`, `cargo 1.88.0
   (873a06493 2025-05-10)`, active/installed target
   `aarch64-apple-darwin`; local host arm64 on macOS 26.4.1.
-- Direct implementation candidates are exact `portable-pty 0.9.0`, `avt
-  0.18.0`, `unicode-width 0.2.2`, `winit 0.30.13`, and `wgpu 30.0.0` with
-  Metal/WGSL features. The first view uses a bounded built-in ASCII raster
-  fallback; `swash 0.2.10` remains an accepted but unmeasured replacement seam,
-  not a claimed implementation dependency.
+- At this head, direct implementation candidates were exact `portable-pty
+  0.9.0`, `avt 0.18.0`, `unicode-width 0.2.2`, `winit 0.30.13`, and `wgpu
+  30.0.0` with Metal/WGSL features. On branch `agent/terminal-core-foundation`,
+  `avt` is removed and the terminal state is Noren-owned. The first view uses a
+  bounded built-in ASCII raster fallback; `swash 0.2.10` remains an accepted
+  but unmeasured replacement seam, not a claimed implementation dependency.
 - No async runtime, SSH, agent-state UI, tabs, panes, themes, persistence, or
   remote daemon was added.
 

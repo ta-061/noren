@@ -1,8 +1,9 @@
 # Contributing to Noren
 
-Thank you for helping build Noren. The project is in Discovery: documentation,
-research, test design, fixtures, and narrowly approved experiments are welcome,
-but production terminal implementation is gated on Milestone 1.
+Thank you for helping build Noren. Discovery and the first macOS local-zsh PTY
+PoC are merged, and terminal foundation work is in progress; contributions
+follow the [roadmap](ROADMAP.md) through Issue-backed, narrowly scoped Draft
+PRs.
 
 ## Before starting
 
@@ -29,10 +30,16 @@ Before opening a PR:
 - ensure no credentials, cookies, SSH keys, passphrases, or private data appear
   in the diff or logs.
 
-Rust-specific commands will become mandatory once the workspace and pinned
-toolchain exist. The intended baseline is formatting, Clippy with warnings
-denied, all workspace tests/features, dependency audit, and license policy
-checks; the repository will not claim these pass before CI actually runs them.
+The Rust workspace and pinned toolchain exist, so Rust changes must pass:
+
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+Dependency audit and license policy checks remain intended additions; the
+repository will not claim these pass before CI actually runs them.
 
 ## Pull requests and review
 
