@@ -8,9 +8,11 @@
 //! cursor save/restore, and DEC private mode 1049 screen switching. It is not
 //! a VT100/xterm compatibility claim.
 
+mod attributes;
 mod parser;
 mod state;
 
+pub use attributes::{AnsiColor, CellAttributes, Color};
 pub use state::{
     Cell, Cursor, CursorMove, MAX_SCREEN_CELLS, ScreenBuffer, ScrollRegion, TerminalError,
     TerminalModes, TerminalSnapshot, TerminalState,
