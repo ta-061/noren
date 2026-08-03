@@ -3,8 +3,8 @@
 Last updated: 2026-08-03 (Asia/Tokyo), implementation/test head
 `c1f66dc27ddce37a60665d319a7ca061c300947e` on Draft PR
 [#17](https://github.com/ta-061/noren/pull/17), branch
-`feat/macos-local-pty-poc`. This coordination-only update follows that tested
-head.
+`feat/macos-local-pty-poc`. Coordination head `ac410a82` also passed both
+GitHub checks; this final status-only update follows those verified heads.
 
 ## Current phase
 
@@ -61,9 +61,10 @@ codex-lab and Claude reviewed distinct concerns.
 | Exit and clean up | Child kill/reap ownership, EOF/exit events, idempotent single 2 s deadline, and saturated-output close test | Implemented and exercised; real close-button injection pending |
 
 At `c1f66dc2`, local formatting and Clippy with warnings denied pass, 31 Rust
-tests pass, the PTY crate passes five consecutive stress runs, the documentation
-validator and its seven tests pass, and both GitHub checks pass. The current
-GitHub Actions runs are `30783344844` (Rust) and `30783344827` (documentation).
+tests pass, the PTY crate passes five consecutive stress runs, and the
+documentation validator and its seven tests pass. Coordination head `ac410a82`
+then passed both GitHub checks: runs `30783618745` (Rust) and `30783618743`
+(documentation).
 
 ## Toolchain and candidate status
 
@@ -101,7 +102,7 @@ identity, and the public support/security contact before Preview publication.
 
 1. Capture the one remaining local window checkpoint without changing OS
    security settings; if unavailable, leave the PR Draft with this exact gap.
-2. Re-run current-head CI after this coordination commit and update the Issue
-   #16 / PR #17 checklists to the actual evidence.
+2. Save that evidence in Issue #16 and PR #17. If code changes, require new
+   exact-head CI; otherwise preserve the already-passing implementation gates.
 3. Mark ready and merge only after the scoped rendered-frame/window checkpoint;
    do not open deferred feature work in this PR.
