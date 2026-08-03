@@ -1,6 +1,6 @@
 # Test strategy: first macOS local-PTY PoC
 
-- Status: Accepted strategy; requires codex-lab testability review
+- Status: Accepted strategy; codex-lab correction check clean at `2bdd7bea`
 - Date: 2026-08-03
 - Requirements: [v0.1 requirements](../requirements/v0.1.md)
 - Threat model: [local-PTY PoC](../security/threat-model.md)

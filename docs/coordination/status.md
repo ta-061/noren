@@ -6,10 +6,11 @@ PR [#15](https://github.com/ta-061/noren/pull/15), branch
 
 ## Current phase
 
-Milestone 1 — scoped gate review for the first macOS local-PTY PoC. Discovery is
-complete and integrated. Production implementation is still closed until the
-two bounded Issue #6 reviews are addressed and PR #15 merges. That merge may
-open only FR-001 through FR-007; all deferred v0.1 features retain their gates.
+Milestone 1 — scoped gate approval for the first macOS local-PTY PoC. Discovery
+is complete and integrated. Both bounded Issue #6 review lanes are addressed
+and clean at `2bdd7bea`; production implementation remains closed only until PR
+#15 merges. That merge may open only FR-001 through FR-007; all deferred v0.1
+features retain their gates.
 
 ## GitHub state
 
@@ -35,9 +36,9 @@ Verified on 2026-08-03:
 | --- | --- | --- |
 | GLM core proposal | Signed commit `02ae9d8b`, 898 words | Complete |
 | Qwen minimum UI proposal | Signed commit `22a4307c`, 686 words | Complete |
-| Codex integration | Requirements, architecture/crates/candidates, threat model, test strategy, ADR 0001/0002 | In progress |
-| Claude Code security critique | PTY/process spawn/input boundary only | Pending |
-| codex-lab test critique | PTY I/O/resize/requirements testability only | Pending |
+| Codex integration | Requirements, architecture/crates/candidates, threat model, test strategy, ADR 0001/0002 | Complete |
+| Claude Code security critique | Five bounded findings at `3682d17`; correction check clean at `2bdd7bea` | Complete |
+| codex-lab test critique | Three bounded findings at `80a9786`; correction check clean at `2bdd7bea` | Complete |
 | Fugu | Reserved for later SSH design | Not used |
 
 The required integrated artifacts are
@@ -77,18 +78,15 @@ identity, and the public support/security contact before Preview publication.
 
 ## Next steps
 
-1. Run exactly one bounded Claude security critique and one bounded codex-lab
-   PTY/testability critique on the integrated Draft PR; save both results.
-2. Codex addresses non-duplicate blockers, records the scoped gate decision,
-   and merges PR #15 if current-head documentation CI is green.
-3. Create one implementation Issue with the seven PoC steps and explicit
+1. Run current-head documentation checks/CI and merge PR #15 without changing
+   repository protection settings.
+2. Create one implementation Issue with the seven PoC steps and explicit
    non-goals, then assign GLM core, Qwen UI, codex-lab tests, Claude review.
-4. The first implementation Draft PR must include root `Cargo.toml`, pinned
+3. The first implementation Draft PR must include root `Cargo.toml`, pinned
    toolchain, initial crates, CI, exact version/target evidence, and unfinished
    handoff items before any model limit.
 
 ## Production gate
 
-Closed at this checkpoint. It opens only for the first local macOS PTY PoC when
-Issue #6 review is addressed and PR #15 merges. Deferred v0.1 features do not
-inherit that approval.
+Approved but closed until PR #15 merges. On merge it opens only for the first
+local macOS PTY PoC. Deferred v0.1 features do not inherit that approval.

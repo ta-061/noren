@@ -1,6 +1,7 @@
 # Threat model: first macOS local-PTY PoC
 
-- Status: Accepted for scoped implementation; requires Claude Code review
+- Status: Accepted for scoped implementation; Claude Code correction check
+  clean at `2bdd7bea`
 - Date: 2026-08-03
 - Scope: FR-001 through FR-007 in
   [v0.1 requirements](../requirements/v0.1.md)
