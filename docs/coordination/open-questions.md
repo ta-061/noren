@@ -32,14 +32,3 @@
   interfaces.
 - cmux feature behavior from lawful public sources without copying code, assets,
   or marks.
-
-## Disposition mapping for architecture-changing unknowns
-
-Each item above under "Design council must decide" is mapped to a bounded
-experiment, a named RFC/design-council question, or an explicit deferral in
-the [risk register](../roadmap/risk-register.md#architecture-changing-unknowns-and-dispositions)
-(Issue [#8](https://github.com/ta-061/noren/issues/8)). The mappings do not
-answer the questions. `Unknown` states persist until the referenced gates
-pass; for example, remote PTY persistence stays `Unknown` until `REM-02`,
-and agent semantic state stays `Unknown` until the version-scoped adapter
-gates pass.

@@ -15,7 +15,7 @@ presenting compatibility claims.
 | Library comparison | Official docs/source, licenses, releases/commits, platform support, unsafe/dependency/security notes | Every required category has at least two viable candidates or a documented reason it does not |
 | Agent integration report | Official hooks/plugins/structured output/help for Codex, Claude Code, and OpenCode | State claims map to trusted signals; unsupported state remains `Unknown` |
 | SSH architecture report | OpenSSH manuals/source and candidate-library official evidence | Config/host-key/agent/proxy/reconnect/failure semantics are testable |
-| Risk register | Evidence-linked likelihood, impact, owner, mitigation, trigger, and design/release gate | [Risk register](../roadmap/risk-register.md) ([Issue #8](https://github.com/ta-061/noren/issues/8)): risk rows cover input loss, data loss, security, SSH, agent trust, portability, performance, dependencies/licenses, accessibility, and release integrity; architecture-changing unknowns map to bounded experiments, named RFC/design-council questions, or explicit deferrals |
+| Risk register | Evidence-linked likelihood, impact, owner, mitigation, trigger, and design/release gate | [Risk register](../roadmap/risk-register.md) ([Issue #8](https://github.com/ta-061/noren/issues/8)): covers all ten Issue #8 categories with per-row gates, and maps architecture-changing unknowns to bounded experiments, named design-council questions, or explicit deferrals |
 | Agent calibration | Identical task, preserved outputs, scored rubric, role decision | Every available role is completed, timed out, failed, or explicitly unavailable |
 
 ## Source policy
