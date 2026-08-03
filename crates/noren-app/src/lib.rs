@@ -1,12 +1,12 @@
 //! App-owned event model and bounded wiring budgets for the macOS local-PTY
 //! PoC.
 //!
-//! This baseline defines the application's own lifecycle, resize, and key
-//! types plus the exact channel-capacity and byte-budget constants from the
+//! This crate defines the application's own lifecycle, resize, and key types
+//! plus the exact channel-capacity and byte-budget constants from the
 //! [minimum architecture](https://github.com/ta-061/noren/blob/main/docs/architecture/minimal-local-pty-poc.md).
-//! No `winit` / `wgpu` / `swash` dependency belongs here yet: the window event
-//! adapter, renderer, and supervisor wiring land in later steps behind these
-//! app-owned seams so no platform type crosses a crate boundary.
+//! The binary translates `winit` callbacks into these types; platform and GPU
+//! types stay inside `noren-app` and never cross into the PTY or terminal
+//! crates.
 
 use std::fmt;
 use std::time::Duration;
@@ -35,6 +35,11 @@ pub const REPLY_BUDGET_BYTES_PER_SECOND: usize = 64 * 1024;
 /// and join both worker threads. The retained-slave fallback detaches within
 /// the same deadline rather than hang.
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
+
+/// Fixed PoC cell width in physical pixels.
+pub const POC_CELL_WIDTH: u32 = 10;
+/// Fixed PoC cell height in physical pixels.
+pub const POC_CELL_HEIGHT: u32 = 20;
 
 /// Physical window size reported by the platform, before pixel-to-cell
 /// conversion.
@@ -73,6 +78,79 @@ impl Resize {
     #[must_use]
     pub const fn is_zero(self) -> bool {
         self.physical_width == 0 || self.physical_height == 0
+    }
+}
+
+/// Non-zero terminal grid calculated from physical window pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridSize {
+    rows: u16,
+    cols: u16,
+}
+
+impl GridSize {
+    /// Row count, always non-zero.
+    #[must_use]
+    pub const fn rows(self) -> u16 {
+        self.rows
+    }
+
+    /// Column count, always non-zero.
+    #[must_use]
+    pub const fn cols(self) -> u16 {
+        self.cols
+    }
+}
+
+/// Deterministic fixed-cell geometry and resize coalescing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GridGeometry {
+    cell_width: u32,
+    cell_height: u32,
+    current: Option<GridSize>,
+}
+
+impl GridGeometry {
+    /// PoC geometry: 10 physical pixels wide by 20 physical pixels high.
+    #[must_use]
+    pub const fn poc() -> Self {
+        Self {
+            cell_width: POC_CELL_WIDTH,
+            cell_height: POC_CELL_HEIGHT,
+            current: None,
+        }
+    }
+
+    /// Current last valid grid.
+    #[must_use]
+    pub const fn current(self) -> Option<GridSize> {
+        self.current
+    }
+
+    /// Convert a physical resize and return only a changed, non-zero grid.
+    ///
+    /// A zero physical dimension keeps the previous grid. Pixel sizes smaller
+    /// than one cell still produce a one-by-one PTY. Values are capped to
+    /// `u16::MAX` before crossing the PTY boundary.
+    pub fn update(&mut self, resize: Resize) -> Option<GridSize> {
+        if resize.is_zero() {
+            return None;
+        }
+        let cols = (resize.width() / self.cell_width)
+            .clamp(1, u32::from(u16::MAX))
+            .try_into()
+            .unwrap_or(u16::MAX);
+        let rows = (resize.height() / self.cell_height)
+            .clamp(1, u32::from(u16::MAX))
+            .try_into()
+            .unwrap_or(u16::MAX);
+        let next = GridSize { rows, cols };
+        if self.current == Some(next) {
+            None
+        } else {
+            self.current = Some(next);
+            Some(next)
+        }
     }
 }
 
@@ -133,6 +211,24 @@ impl Modifiers {
     #[must_use]
     pub const fn is_ctrl(self) -> bool {
         self.ctrl
+    }
+
+    /// Whether Shift is held.
+    #[must_use]
+    pub const fn is_shift(self) -> bool {
+        self.shift
+    }
+
+    /// Whether Alt/Option is held.
+    #[must_use]
+    pub const fn is_alt(self) -> bool {
+        self.alt
+    }
+
+    /// Whether Super/Command is held.
+    #[must_use]
+    pub const fn is_super(self) -> bool {
+        self.super_key
     }
 }
 
@@ -204,6 +300,69 @@ impl KeyInput {
     #[must_use]
     pub const fn modifiers(self) -> Modifiers {
         self.modifiers
+    }
+}
+
+/// Payload-free reason that a key event produced no terminal bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyDropReason {
+    Released,
+    UnsupportedModifier,
+    UnsupportedKey,
+    UnsupportedControl,
+    ImeOrDeadKey,
+}
+
+/// Pure encoder from app-owned key events to terminal bytes.
+pub struct KeyEncoder;
+
+impl KeyEncoder {
+    /// Encode one pressed or repeated key event.
+    pub fn encode(input: KeyInput) -> Result<Vec<u8>, KeyDropReason> {
+        if input.phase() == KeyPhase::Released {
+            return Err(KeyDropReason::Released);
+        }
+        let modifiers = input.modifiers();
+        if modifiers.is_alt() || modifiers.is_super() {
+            return Err(KeyDropReason::UnsupportedModifier);
+        }
+        if modifiers.is_ctrl() {
+            return match input.key() {
+                Key::Character(character) => control_byte(character)
+                    .map(|byte| vec![byte])
+                    .ok_or(KeyDropReason::UnsupportedControl),
+                _ => Err(KeyDropReason::UnsupportedControl),
+            };
+        }
+
+        match input.key() {
+            Key::Character(character) if !character.is_control() => {
+                let mut buffer = [0_u8; 4];
+                Ok(character.encode_utf8(&mut buffer).as_bytes().to_vec())
+            }
+            Key::Character(_) => Err(KeyDropReason::UnsupportedKey),
+            Key::Enter => Ok(vec![0x0d]),
+            Key::Backspace => Ok(vec![0x7f]),
+            Key::Tab => Ok(vec![0x09]),
+            Key::Escape => Ok(vec![0x1b]),
+            Key::Arrow(Arrow::Up) => Ok(b"\x1b[A".to_vec()),
+            Key::Arrow(Arrow::Down) => Ok(b"\x1b[B".to_vec()),
+            Key::Arrow(Arrow::Right) => Ok(b"\x1b[C".to_vec()),
+            Key::Arrow(Arrow::Left) => Ok(b"\x1b[D".to_vec()),
+        }
+    }
+}
+
+fn control_byte(character: char) -> Option<u8> {
+    match character.to_ascii_uppercase() {
+        '@' | ' ' => Some(0x00),
+        'A'..='Z' => Some((character.to_ascii_uppercase() as u8) - b'A' + 1),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' => Some(0x1f),
+        _ => None,
     }
 }
 
@@ -286,11 +445,94 @@ mod tests {
     }
 
     #[test]
+    fn geometry_coalesces_duplicate_and_zero_resizes() {
+        let mut geometry = GridGeometry::poc();
+        let first = geometry.update(Resize::new(900, 600)).expect("new grid");
+        assert_eq!((first.rows(), first.cols()), (30, 90));
+        assert_eq!(geometry.update(Resize::new(900, 600)), None);
+        assert_eq!(geometry.update(Resize::new(0, 0)), None);
+        assert_eq!(geometry.current(), Some(first));
+        let tiny = geometry.update(Resize::new(1, 1)).expect("changed grid");
+        assert_eq!((tiny.rows(), tiny.cols()), (1, 1));
+    }
+
+    #[test]
+    fn geometry_caps_values_before_the_pty_boundary() {
+        let mut geometry = GridGeometry::poc();
+        let grid = geometry
+            .update(Resize::new(u32::MAX, u32::MAX))
+            .expect("new grid");
+        assert_eq!((grid.rows(), grid.cols()), (u16::MAX, u16::MAX));
+    }
+
+    #[test]
     fn key_input_records_identity_phase_and_modifiers() {
         let event = KeyInput::new(Key::Enter, KeyPhase::Pressed, Modifiers::empty().ctrl());
         assert_eq!(event.key(), Key::Enter);
         assert_eq!(event.phase(), KeyPhase::Pressed);
         assert!(event.modifiers().is_ctrl());
+    }
+
+    #[test]
+    fn key_encoder_emits_the_poc_byte_contract() {
+        let plain = Modifiers::empty();
+        let cases = [
+            (Key::Character('é'), "é".as_bytes()),
+            (Key::Enter, b"\r".as_slice()),
+            (Key::Backspace, b"\x7f".as_slice()),
+            (Key::Tab, b"\t".as_slice()),
+            (Key::Escape, b"\x1b".as_slice()),
+            (Key::Arrow(Arrow::Up), b"\x1b[A".as_slice()),
+            (Key::Arrow(Arrow::Down), b"\x1b[B".as_slice()),
+            (Key::Arrow(Arrow::Right), b"\x1b[C".as_slice()),
+            (Key::Arrow(Arrow::Left), b"\x1b[D".as_slice()),
+        ];
+        for (key, expected) in cases {
+            let input = KeyInput::new(key, KeyPhase::Pressed, plain);
+            assert_eq!(KeyEncoder::encode(input).as_deref(), Ok(expected));
+        }
+
+        for (character, byte) in [
+            ('a', 1),
+            ('Z', 26),
+            ('[', 27),
+            ('\\', 28),
+            (']', 29),
+            ('^', 30),
+            ('_', 31),
+            (' ', 0),
+        ] {
+            let input = KeyInput::new(
+                Key::Character(character),
+                KeyPhase::Repeat,
+                Modifiers::empty().ctrl(),
+            );
+            assert_eq!(KeyEncoder::encode(input), Ok(vec![byte]));
+        }
+    }
+
+    #[test]
+    fn key_encoder_drops_releases_and_unsupported_modifiers() {
+        let released = KeyInput::new(Key::Character('x'), KeyPhase::Released, Modifiers::empty());
+        assert_eq!(KeyEncoder::encode(released), Err(KeyDropReason::Released));
+
+        for modifiers in [Modifiers::empty().alt(), Modifiers::empty().super_key()] {
+            let input = KeyInput::new(Key::Character('x'), KeyPhase::Pressed, modifiers);
+            assert_eq!(
+                KeyEncoder::encode(input),
+                Err(KeyDropReason::UnsupportedModifier)
+            );
+        }
+
+        let unsupported_control = KeyInput::new(
+            Key::Character('1'),
+            KeyPhase::Pressed,
+            Modifiers::empty().ctrl(),
+        );
+        assert_eq!(
+            KeyEncoder::encode(unsupported_control),
+            Err(KeyDropReason::UnsupportedControl)
+        );
     }
 
     #[test]

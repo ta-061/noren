@@ -3,14 +3,15 @@
 //! This crate owns the [`TerminalEngine`] contract from the
 //! [minimum architecture](https://github.com/ta-061/noren/blob/main/docs/architecture/minimal-local-pty-poc.md):
 //! bytes and dimensions in; bounded snapshot out. Replies, damage, and a
-//! stricter byte budget are wired by the drain loop in a later step.
+//! stricter byte budget are wired by the application drain loop.
 //!
 //! The PoC trials `avt` 0.18.0 behind [`AvtEngine`]. Passing this baseline
 //! makes no terminal-compatibility claim: the adapter is a replaceable
-//! candidate, full VT/xterm semantics remain deferred, and the byte-to-text
-//! boundary here uses a lossy placeholder until the streaming UTF-8 buffer
-//! lands. `unicode-width` 0.2.2 is the direct cell-width policy seed; `avt`
-//! itself uses an older `unicode-width` internally and the two coexist.
+//! candidate and full VT/xterm semantics remain deferred. A bounded streaming
+//! UTF-8 boundary preserves code points split across PTY reads and replaces
+//! malformed sequences. `unicode-width` 0.2.2 is the direct cell-width policy
+//! seed; `avt` itself uses an older `unicode-width` internally and the two
+//! coexist.
 
 use unicode_width::UnicodeWidthChar;
 
@@ -113,6 +114,7 @@ pub fn cell_width(ch: char) -> usize {
 /// (a streaming UTF-8 buffer lands later) and no compatibility is claimed.
 pub struct AvtEngine {
     vt: avt::Vt,
+    pending_utf8: Vec<u8>,
 }
 
 impl AvtEngine {
@@ -121,16 +123,40 @@ impl AvtEngine {
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
             vt: avt::Vt::new(usize::from(cols), usize::from(rows)),
+            pending_utf8: Vec::with_capacity(4),
         }
     }
 }
 
 impl TerminalEngine for AvtEngine {
     fn feed_bytes(&mut self, bytes: &[u8]) {
-        let text = String::from_utf8_lossy(bytes);
-        // avt applies all operations eagerly inside feed_str; the returned
-        // change record is not needed for the baseline snapshot path.
-        let _ = self.vt.feed_str(&text);
+        self.pending_utf8.extend_from_slice(bytes);
+        let mut consumed = 0;
+        while consumed < self.pending_utf8.len() {
+            match std::str::from_utf8(&self.pending_utf8[consumed..]) {
+                Ok(text) => {
+                    let _ = self.vt.feed_str(text);
+                    consumed = self.pending_utf8.len();
+                }
+                Err(error) => {
+                    let valid_end = consumed + error.valid_up_to();
+                    if valid_end > consumed {
+                        let text = std::str::from_utf8(&self.pending_utf8[consumed..valid_end])
+                            .expect("valid_up_to identifies valid UTF-8");
+                        let _ = self.vt.feed_str(text);
+                        consumed = valid_end;
+                    }
+                    let Some(error_len) = error.error_len() else {
+                        break;
+                    };
+                    let _ = self.vt.feed_str("\u{fffd}");
+                    consumed = consumed.saturating_add(error_len);
+                }
+            }
+        }
+        if consumed > 0 {
+            self.pending_utf8.drain(..consumed);
+        }
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
@@ -199,6 +225,23 @@ mod tests {
         let snapshot = engine.snapshot();
         assert_eq!((snapshot.rows(), snapshot.cols()), (3, 5));
         assert_eq!(snapshot.lines(), ["hi".to_owned()]);
+    }
+
+    #[test]
+    fn avt_engine_preserves_utf8_split_across_reads() {
+        let mut engine = AvtEngine::new(2, 4);
+        let bytes = "全".as_bytes();
+        engine.feed_bytes(&bytes[..2]);
+        assert!(engine.snapshot().lines().is_empty());
+        engine.feed_bytes(&bytes[2..]);
+        assert_eq!(engine.snapshot().lines(), ["全".to_owned()]);
+    }
+
+    #[test]
+    fn avt_engine_replaces_malformed_utf8_and_continues() {
+        let mut engine = AvtEngine::new(2, 8);
+        engine.feed_bytes(&[0xff, b'A']);
+        assert_eq!(engine.snapshot().lines(), ["�A".to_owned()]);
     }
 
     #[test]
