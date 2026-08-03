@@ -958,6 +958,29 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn ctrl_d_reaches_eof_or_exit_and_shutdown_remains_bounded() {
+        let home = TestHome::new();
+        let mut session = test_session(&home);
+        session.send_input(&[0x04]).expect("send Ctrl-D");
+
+        let mut output = Vec::new();
+        let mut lifecycle = false;
+        poll_events(
+            &session,
+            Instant::now() + Duration::from_secs(2),
+            &mut output,
+            &mut lifecycle,
+            |_, observed| observed,
+        );
+
+        let started = Instant::now();
+        session.shutdown().expect("reap zsh after Ctrl-D");
+        assert!(started.elapsed() <= SHUTDOWN_DEADLINE);
+        session.shutdown().expect("shutdown remains idempotent");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn live_resize_duplicate_and_storm_leave_last_size_authoritative() {
         const FINAL_SIZE: &[u8] = b"37 113\r\n";
 

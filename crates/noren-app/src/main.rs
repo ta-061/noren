@@ -166,14 +166,13 @@ impl NorenApp {
 
     fn drain_pty(&mut self) {
         let mut remaining = PARSE_BUDGET_BYTES_PER_TURN;
+        let mut terminal_status = None;
         while remaining >= noren_pty::READ_CHUNK_BYTES {
             let event = match self.pty.as_ref().map(PtySession::try_recv) {
                 Some(Ok(Some(event))) => event,
                 Some(Ok(None)) | None => break,
                 Some(Err(_)) => {
-                    self.status = "Noren PTY channel closed";
-                    self.show_status = true;
-                    self.redraw_needed = true;
+                    terminal_status = Some("Noren PTY channel closed");
                     break;
                 }
             };
@@ -192,25 +191,38 @@ impl NorenApp {
                     self.redraw_needed = true;
                 }
                 PtyEvent::Eof => {
-                    self.status = "Noren shell reached EOF";
-                    self.show_status = true;
-                    self.redraw_needed = true;
+                    terminal_status = Some("Noren shell reached EOF");
+                    break;
                 }
                 PtyEvent::Exited { code } => {
-                    self.status = if code == Some(0) {
+                    terminal_status = Some(if code == Some(0) {
                         "Noren shell exited"
                     } else {
                         "Noren shell exited with failure"
-                    };
-                    self.show_status = true;
-                    self.redraw_needed = true;
+                    });
+                    break;
                 }
                 PtyEvent::Error(_) => {
-                    self.status = "Noren PTY operation failed";
-                    self.show_status = true;
-                    self.redraw_needed = true;
+                    terminal_status = Some("Noren PTY operation failed");
+                    break;
                 }
             }
+        }
+        if let Some(status) = terminal_status {
+            self.finish_pty(status);
+        }
+    }
+
+    // This one-session PoC preserves the final frame and status until the user
+    // closes the window; it has no inactive-session input or restart path.
+    fn finish_pty(&mut self, status: &'static str) {
+        self.status = status;
+        self.show_status = true;
+        self.redraw_needed = true;
+        if let Some(mut session) = self.pty.take()
+            && session.shutdown().is_err()
+        {
+            self.status = "Noren PTY shutdown failed";
         }
     }
 
@@ -306,7 +318,15 @@ fn translate_key(event: &KeyEvent, modifiers: Modifiers) -> Result<KeyInput, Key
         ElementState::Pressed if event.repeat => KeyPhase::Repeat,
         ElementState::Pressed => KeyPhase::Pressed,
     };
-    let key = match &event.logical_key {
+    translate_logical_key(&event.logical_key, phase, modifiers)
+}
+
+fn translate_logical_key(
+    logical_key: &WinitKey,
+    phase: KeyPhase,
+    modifiers: Modifiers,
+) -> Result<KeyInput, KeyDropReason> {
+    let key = match logical_key {
         WinitKey::Character(text) => {
             let mut characters = text.chars();
             let character = characters.next().ok_or(KeyDropReason::UnsupportedKey)?;
@@ -319,6 +339,7 @@ fn translate_key(event: &KeyEvent, modifiers: Modifiers) -> Result<KeyInput, Key
         WinitKey::Named(NamedKey::Backspace) => Key::Backspace,
         WinitKey::Named(NamedKey::Tab) => Key::Tab,
         WinitKey::Named(NamedKey::Escape) => Key::Escape,
+        WinitKey::Named(NamedKey::Space) => Key::Character(' '),
         WinitKey::Named(NamedKey::ArrowUp) => Key::Arrow(Arrow::Up),
         WinitKey::Named(NamedKey::ArrowDown) => Key::Arrow(Arrow::Down),
         WinitKey::Named(NamedKey::ArrowLeft) => Key::Arrow(Arrow::Left),
@@ -338,5 +359,34 @@ fn main() {
     let mut app = NorenApp::default();
     if event_loop.run_app(&mut app).is_err() {
         eprintln!("Noren event loop failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn winit_space_variants_encode_ascii_space() {
+        let variants = [
+            WinitKey::Named(NamedKey::Space),
+            WinitKey::Character(" ".into()),
+        ];
+        for logical_key in variants {
+            let input = translate_logical_key(&logical_key, KeyPhase::Pressed, Modifiers::empty())
+                .expect("space is supported terminal input");
+            assert_eq!(KeyEncoder::encode(input), Ok(vec![0x20]));
+        }
+    }
+
+    #[test]
+    fn terminal_event_finishes_the_session_without_closing_the_window() {
+        let mut app = NorenApp::default();
+        app.finish_pty("Noren shell reached EOF");
+
+        assert!(app.pty.is_none());
+        assert_eq!(app.status, "Noren shell reached EOF");
+        assert!(app.show_status);
+        assert!(app.redraw_needed);
     }
 }

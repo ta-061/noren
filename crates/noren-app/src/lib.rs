@@ -477,6 +477,7 @@ mod tests {
     fn key_encoder_emits_the_poc_byte_contract() {
         let plain = Modifiers::empty();
         let cases = [
+            (Key::Character(' '), b" ".as_slice()),
             (Key::Character('é'), "é".as_bytes()),
             (Key::Enter, b"\r".as_slice()),
             (Key::Backspace, b"\x7f".as_slice()),
@@ -508,6 +509,51 @@ mod tests {
                 Modifiers::empty().ctrl(),
             );
             assert_eq!(KeyEncoder::encode(input), Ok(vec![byte]));
+        }
+    }
+
+    #[test]
+    fn common_shell_input_regression_preserves_spaces_and_control_bytes() {
+        fn encode_text(text: &str) -> Vec<u8> {
+            text.chars()
+                .flat_map(|character| {
+                    KeyEncoder::encode(KeyInput::new(
+                        Key::Character(character),
+                        KeyPhase::Pressed,
+                        Modifiers::empty(),
+                    ))
+                    .expect("plain shell text is supported")
+                })
+                .collect()
+        }
+
+        assert_eq!(encode_text("abc XYZ123"), b"abc XYZ123");
+        assert_eq!(encode_text("cd ~/Documents"), b"cd ~/Documents");
+        assert_eq!(
+            KeyEncoder::encode(KeyInput::new(
+                Key::Enter,
+                KeyPhase::Pressed,
+                Modifiers::empty(),
+            )),
+            Ok(vec![0x0d])
+        );
+        assert_eq!(
+            KeyEncoder::encode(KeyInput::new(
+                Key::Backspace,
+                KeyPhase::Pressed,
+                Modifiers::empty(),
+            )),
+            Ok(vec![0x7f])
+        );
+        for (character, byte) in [('c', 0x03), ('d', 0x04)] {
+            assert_eq!(
+                KeyEncoder::encode(KeyInput::new(
+                    Key::Character(character),
+                    KeyPhase::Pressed,
+                    Modifiers::empty().ctrl(),
+                )),
+                Ok(vec![byte])
+            );
         }
     }
 
