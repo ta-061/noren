@@ -8,8 +8,9 @@ Evidence retrieved: 2026-08-03
 
 Repository baseline: `7cd56c689546bcfc38f083551813abe32e48469f`
 
-Review gates: pending. This artifact does not claim completion of either the
-required Claude Code security review or the codex-lab testability review.
+Review status: the formal Claude Code security review of PR #12 reported no
+BLOCKER or MAJOR findings; its four MINOR remediations are applied in this
+working copy. The formal codex-lab testability review remains pending.
 
 ## Scope and decision boundary
 
@@ -57,11 +58,13 @@ first-value rule is material when evaluating aliases and included files.
 | Surface | Upstream meaning | Noren contract risk | Future gate |
 | --- | --- | --- | --- |
 | `Host` | Conditional pattern matched against the destination name given on the command line; it can be an alias and can use negation/wildcards. | Treating it as a DNS name loses the alias and may select the wrong block. | SSH-01 |
+| `Match` | Starts an ordered conditional block. Criteria include connection attributes; `exec` runs a local command under the user's shell during evaluation. Options selected inside the block still interact with the first-obtained-value rule and earlier `Host`/`Match` blocks. | Ignoring `Match` can silently apply or omit connection/security settings and misses the local-code-execution boundary of `Match exec`. A partial parser cannot claim equivalence for affected destinations. | SSH-02, SEC-02 |
 | `HostName` | Real host name or address selected after a matching block; tokens are allowed. | Resolving the alias in Noren can disagree with OpenSSH token/canonicalization behavior. | SSH-01, SSH-02 |
 | `User`, `Port` | Remote login name and server port, subject to first-value precedence. | Rebuilding a destination string can override or drop configuration. | SSH-01 |
 | `Include` | Includes one or more files; paths may use globbing, tokens, environment variables, or `~`; wildcard expansion is lexical. | A partial parser can miss nested or ordered policy, including security settings. | SSH-02 |
 | `IdentityFile` | May appear multiple times. A public-key filename can identify the corresponding private key held by an agent. | Selecting only one path or reading private-key bytes changes authentication behavior. | SSH-03 |
 | `IdentityAgent` | Selects the agent socket and overrides `SSH_AUTH_SOCK`; `none` disables agent use. | Blindly inheriting an environment agent defeats explicit user policy. | SSH-03 |
+| `IdentitiesOnly` | When `yes`, only the identities from `IdentityFile`/`CertificateFile` are offered, even if the agent holds additional keys; `no` (default) also offers extra agent-held keys. | Ignoring it can offer unintended agent keys, changing which identity authenticates, the order of attempts, and lockout/audit behavior. | SSH-03 |
 | `ProxyJump` | Connects through one or more jump hosts. The first value between `ProxyJump` and `ProxyCommand` wins. Destination configuration does not generally become jump-host configuration. | Flattening the hop list or applying destination settings to jumps changes routing/authentication. | SSH-04 |
 | `ProxyCommand` | Executes a command via the shell; percent tokens are expanded and are not shell-escaped by OpenSSH. `CheckHostIP` is unavailable for connections using it. | The user's config is an executable-code trust boundary. Reconstructing it from tokens is unsafe and can be semantically wrong; hostname-only checks cannot be assumed. | SSH-04, SEC-02 |
 | `ForwardAgent` | Disabled by default. A remote party with access to the forwarded socket cannot extract key material, but can ask the agent to authenticate/sign while the socket is available. | Agent forwarding is delegated signing authority, not a harmless convenience. Never enable it implicitly. | SSH-03, SEC-03 |
@@ -120,8 +123,16 @@ data.
 
 OpenSSH returns the remote command's exit status, or `255` when an SSH error
 occurs. A remote program can also exit `255`, so exit status alone cannot
-unambiguously classify transport failure. Classification needs stderr/event
-evidence or an authenticated helper protocol; otherwise it is `Unknown`.
+unambiguously classify transport failure. The client's stderr does not resolve
+the ambiguity on its own: a remote program shares that stream and can emit text
+that imitates an OpenSSH transport error, so mixed stderr plus exit `255` is
+untrusted evidence. Transport failure may be asserted only from a separately
+attributable client/protocol signal: for example, OpenSSH client diagnostics
+captured on a channel the remote command cannot write (such as a dedicated
+`LogLevel`/stderr file descriptor the remote peer does not inherit), a
+control-socket/`-O check` observation, or an authenticated helper protocol
+event. Absent such a signal, classification is `Unknown` rather than assumed
+transport loss or assumed clean remote exit.
 
 ## Host identity and credentials
 
@@ -154,8 +165,8 @@ The following are candidates for a PoC, not an adoption ranking.
 
 | Candidate and pinned evidence | Config/proxy fidelity | Host keys and agent | Runtime/dependency boundary | License and currentness | Unknowns that block adoption |
 | --- | --- | --- | --- | --- | --- |
-| Installed OpenSSH subprocess; stable reference `10.4p1`; portable source `ec048563…` | Highest available reuse because OpenSSH itself evaluates `Host`, `Include`, tokens, jump/proxy rules, and system/user files. `ssh -G` can serve as an oracle. | OpenSSH owns known-hosts prompts/checks and agent selection. | External binary and OS packaging vary. Process supervision, stderr parsing, control sockets, and remote-command shell semantics stay in Noren's boundary. | Upstream multi-license notices; 10.4p1 released 2026-07-06; portable head inspected 2026-08-01. | Executable discovery/integrity, Apple-vs-portable behavior, noninteractive prompts, exit-255 ambiguity, cancellation/process-tree cleanup, and multiplex failure isolation. |
-| [Russh](https://github.com/Eugeny/russh/tree/4882af71cf27ea5293636bf4985ef296dcf20896) `0.62.5` plus [russh-config](https://github.com/Eugeny/russh/tree/4882af71cf27ea5293636bf4985ef296dcf20896/russh-config) `0.58.0` | Native Tokio SSH client/server with channels, PTY, forwarding, keepalive, and agent features. The pinned config source implements only a subset and has the confirmed incompatibilities below. It is not an OpenSSH config-equivalence layer. | Client `Handler::check_server_key` defaults to rejection, so an application must implement policy. Agent support exists, but the pinned config parser has no `IdentityAgent` support. | Rust/Tokio stack. [0.62.4](https://github.com/Eugeny/russh/releases/tag/v0.62.4) fixed malformed-input panics; 0.62.5 added a security fix and channel backpressure. Malformed-input robustness remains a fuzz target. | Apache-2.0; [0.62.5 release](https://github.com/Eugeny/russh/releases/tag/v0.62.5), 2026-07-31, commit `4882af71…`; [license](https://github.com/Eugeny/russh/blob/4882af71cf27ea5293636bf4985ef296dcf20896/LICENSE.txt). | Equivalence-fixture results, certificate/revocation behavior, algorithm/platform coverage, cancellation, and security-update response. Unsupported config semantics require the ordinary OpenSSH path. |
+| Installed OpenSSH subprocess; stable reference `10.4p1`; portable source `ec048563…` | Highest available reuse because OpenSSH itself evaluates `Host`, `Match`, `Include`, tokens, jump/proxy rules, and system/user files. `ssh -G` can serve as an oracle. | OpenSSH owns known-hosts prompts/checks and agent selection. | External binary and OS packaging vary. Process supervision, stderr parsing, control sockets, and remote-command shell semantics stay in Noren's boundary. | Upstream multi-license notices; 10.4p1 released 2026-07-06; portable head inspected 2026-08-01. | Executable discovery/integrity, Apple-vs-portable behavior, noninteractive prompts, exit-255 ambiguity, cancellation/process-tree cleanup, and multiplex failure isolation. |
+| [Russh](https://github.com/Eugeny/russh/tree/4882af71cf27ea5293636bf4985ef296dcf20896) `0.62.5` plus [russh-config](https://github.com/Eugeny/russh/tree/4882af71cf27ea5293636bf4985ef296dcf20896/russh-config) `0.58.0` | Native Tokio SSH client/server with channels, PTY, forwarding, keepalive, and agent features. The pinned config source implements only a subset and has the confirmed incompatibilities below. It is not an OpenSSH config-equivalence layer. | Client `Handler::check_server_key` defaults to rejection, so an application must implement policy. Agent support exists, but the pinned config parser has no `IdentityAgent` or `IdentitiesOnly` support, so it cannot restrict extra agent keys. | Rust/Tokio stack. [0.62.4](https://github.com/Eugeny/russh/releases/tag/v0.62.4) fixed malformed-input panics; 0.62.5 added a security fix and channel backpressure. Malformed-input robustness remains a fuzz target. | Apache-2.0; [0.62.5 release](https://github.com/Eugeny/russh/releases/tag/v0.62.5), 2026-07-31, commit `4882af71…`; [license](https://github.com/Eugeny/russh/blob/4882af71cf27ea5293636bf4985ef296dcf20896/LICENSE.txt). | Equivalence-fixture results, certificate/revocation behavior, algorithm/platform coverage, cancellation, and security-update response. Unsupported config semantics require the ordinary OpenSSH path. |
 | [ssh2-rs](https://github.com/rust-lang/ssh2-rs/tree/5b39b5fabb6b5a6b953519a571cd6af30d460ac3) `0.9.6` over [libssh2](https://libssh2.org/) `1.11.1` | Provides SSH primitives, not an evidenced OpenSSH-config evaluator. Config and ProxyJump/ProxyCommand compatibility would be application work or another dependency. | APIs expose host keys, known-host checks/files, agent authentication, PTYs, channels, and keepalive. The application must explicitly perform verification and select/persist policy. | Rust wrapper over the C libssh2 library with native TLS/crypto/build concerns and an FFI/unsafe audit boundary. | ssh2-rs is MIT OR Apache-2.0 ([MIT](https://github.com/rust-lang/ssh2-rs/blob/5b39b5fabb6b5a6b953519a571cd6af30d460ac3/LICENSE-MIT), [Apache-2.0](https://github.com/rust-lang/ssh2-rs/blob/5b39b5fabb6b5a6b953519a571cd6af30d460ac3/LICENSE-APACHE)); versioned [0.9.6 docs](https://docs.rs/crate/ssh2/0.9.6) and the [annotated 0.9.6 tag](https://github.com/rust-lang/ssh2-rs/tree/0.9.6) resolve to release commit `5b39b5fabb6b5a6b953519a571cd6af30d460ac3` (2026-06-30). libssh2 1.11.1 released 2024-10-16 under its [revised BSD license](https://libssh2.org/license.html). | OpenSSH config layer, jump chaining, host certificates/revocation parity, crypto packaging, async integration, cancellation, and dependency vulnerability/update ownership. |
 
 ### Confirmed russh-config limits at the pinned source
@@ -164,8 +175,11 @@ These are source-confirmed properties of Russh tag `v0.62.5`,
 `russh-config` crate `0.58.0`, commit `4882af71…`; they are not
 `Unknown`:
 
-- The parser has no handlers for `Include`, `Match`, or `IdentityAgent`,
-  and implements no hostname canonicalization.
+- The parser has no handlers for `Include`, `Match`, `IdentityAgent`, or
+  `IdentitiesOnly`, and implements no hostname canonicalization. Because it
+  neither models agent selection nor an identities-only restriction, it cannot
+  reproduce `IdentitiesOnly` behavior when the agent holds extra keys; those
+  destinations require the ordinary OpenSSH path.
 - `parse_home()` reads only `~/.ssh/config`. `parse_path()` can read one
   caller-selected file, but there is no automatic system
   `/etc/ssh/ssh_config` load or multi-file merge.
@@ -211,6 +225,9 @@ and independently:
 This is a test vocabulary, not a UI/API decision. Required behavior:
 
 - A clean shell exit is not a disconnect (SSH-08, REM-01).
+- Exit `255` with only mixed/forged stderr is not classified as transport loss;
+  without a separately attributable client/protocol signal it is `Unknown` and
+  does not trigger automatic reconnect (SSH-08, REM-09).
 - EOF, keepalive exhaustion, control-master loss, local suspend/resume, and
   remote reboot are different failure causes even if the UI ultimately offers
   reconnect (SSH-06, SSH-10, REM-09).
@@ -314,6 +331,10 @@ All fixtures use generated throwaway host/user keys and isolated temporary
 configuration. They must never read a developer's real `~/.ssh`. Each run
 records client/server versions and OS/architecture.
 
+At this point of use, `ssh -G` oracle output and diffs remain redacted or only
+in isolated fixture storage. Raw values must never enter normal CI logs or
+Issue/PR text; SEC-06 must seed and detect canaries in this evidence path.
+
 Target environments:
 
 - **M-ARM**: the observed macOS 26.4.1 (build 25E253) arm64 host with
@@ -329,13 +350,13 @@ Target environments:
 | ID | State/failure exercised | Executable assertion | Environment |
 | --- | --- | --- | --- |
 | SSH-01 | Alias selects destination/user/port | Compare actual server-observed peer user/port and `ssh -G` oracle for overlapping specific/general blocks. | M-ARM, L-X64 → S-X64 |
-| SSH-02 | Include/token/precedence | Generate nested includes, lexical globs, `~`, and first-value conflicts; candidate output must match `ssh -G` or mark unsupported. | M-ARM, L-X64 |
-| SSH-03 | Identity/agent success, disabled agent, forwarding | Use two keys and isolated agent sockets; prove repeated identity selection, `IdentityAgent none`, no implicit forwarding, and clean refusal. | PAIR |
+| SSH-02 | Include/Match/token/precedence | Generate nested includes, lexical globs, `~`, first-value conflicts, ordered `Host`/`Match` blocks, and harmless `Match exec` marker predicates. Compare effective configuration and expected marker execution with the isolated `ssh -G` oracle; a candidate that ignores `Match` fails unless it explicitly marks the destination unsupported. | M-ARM, L-X64 |
+| SSH-03 | Identity/agent success, `IdentitiesOnly`, disabled agent, forwarding | Use two keys and isolated agent sockets; prove repeated identity selection, `IdentityAgent none`, no implicit forwarding, and clean refusal. Load extra unrelated keys into the agent and assert `IdentitiesOnly yes` offers only the configured `IdentityFile` identities while `no` also offers the extra agent keys, matching the `ssh -G`/server-observed oracle; a candidate that cannot honor `IdentitiesOnly` marks the destination unsupported and falls back to ordinary OpenSSH. | PAIR |
 | SSH-04 | ProxyJump/ProxyCommand success and malformed input | Traverse two disposable jumps; compare OpenSSH oracle; inject whitespace/metacharacter/percent-token fixtures without interpolating secrets. | L-X64 lab |
 | SSH-05 | New, trusted, changed, revoked, non-default-port host keys | Assert the configured policy and file are used; changed/revoked keys never auto-retry or auto-accept. | PAIR |
 | SSH-06 | Healthy idle, blackhole, spoofable TCP keepalive | Fault proxy drops packets independently; encrypted server-alive exhaustion drives transport loss only at configured thresholds. | PAIR |
 | SSH-07 | New/reused/stale/colliding/control-socket permissions | Assert context isolation, parent ownership/mode, safe fallback, `-O check` behavior, and cleanup after master death. | M-ARM, L-X64 |
-| SSH-08 | Remote exit 0, nonzero, 255; SSH error 255 | Demonstrate ambiguity; candidate must not label remote 255 as transport failure without corroborating protocol evidence. | PAIR |
+| SSH-08 | Remote exit 0, nonzero, 255; SSH error 255; remote command forging SSH-style stderr | Demonstrate ambiguity; a remote program that exits 255 while printing imitation OpenSSH error text to shared stderr must not be labeled transport failure. Transport loss is asserted only from a separately attributable client/protocol signal (client diagnostics on a channel the remote peer cannot write, control-socket/`-O check`, or authenticated helper event); otherwise the result is `Unknown`. | PAIR |
 | SSH-09 | Authentication rejection/cancel/timeout | No automatic retry loop; error is scoped to one connection and other panes/hosts remain live. | PAIR |
 | SSH-10 | Local cancel, client crash, suspend/resume, server reboot | Descendants/channels/sockets are cleaned or retained only by documented persistent owner; no orphaned UI state. | M-ARM + S-X64 VM |
 | SSH-11 | Host search, favorite, and history privacy/corruption | Wildcards are not offered as concrete hosts; no network scan; provenance is visible; delete/migrate/corrupt-store fixtures cannot leak or cross users. | M-ARM, L-X64 |
@@ -353,7 +374,7 @@ Target environments:
 | SEC-03 | Agent delegation | A compromised fixture host can request signatures only when forwarding was explicitly enabled; no key bytes or socket paths enter logs. | S-X64 lab |
 | SEC-04 | Remote-command injection | Hostile CWD/session strings arrive as exact framed values and cannot add a remote shell command. | PAIR |
 | SEC-05 | Helper authorization | Fuzz IDs/paths and race symlinks/PIDs; only resources owned by the authenticated user/session are reachable. | S-X64 |
-| SEC-06 | Redaction and bounds | Seed unique canary credentials/paths/prompts in every input field; captured logs/crash reports contain none and remain bounded under large input. | M-ARM, L-X64, S-X64 |
+| SEC-06 | Redaction and bounds | Seed unique canary credentials/paths/prompts in every input field, including `ssh -G` oracle output/diffs; normal CI logs, Issue/PR text, captured logs, and crash reports contain none and remain bounded under large input. | M-ARM, L-X64, S-X64 |
 
 ## Open questions carried forward
 

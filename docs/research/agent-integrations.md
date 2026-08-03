@@ -8,8 +8,9 @@ Evidence retrieved: 2026-08-03
 
 Repository baseline: `7cd56c689546bcfc38f083551813abe32e48469f`
 
-Review gates: pending. This artifact does not claim completion of either the
-required Claude Code security review or the codex-lab testability review.
+Review status: the formal Claude Code security review of PR #12 reported no
+BLOCKER or MAJOR findings; its four MINOR remediations are applied in this
+working copy. The formal codex-lab testability review remains pending.
 
 ## Scope and evidence rule
 
@@ -41,7 +42,7 @@ The repository stores sanitized, reproducible `--help` captures:
 
 | Agent | Local executable evidence | Version inspected | Relevant locally advertised capabilities |
 | --- | --- | --- | --- |
-| Codex | [codex.txt](../coordination/cli-help/codex.txt) | `codex-cli 0.146.0` | lifecycle hook trust flag; plugins; `exec --json`; output schema/file; resume; experimental app server |
+| Codex | [codex.txt](../coordination/cli-help/codex.txt) | `codex-cli 0.146.0` | hook-trust bypass flag (negative evidence only); plugins; `exec --json`; output schema/file; top-level resume and `exec resume` subcommand existence; experimental app server |
 | Claude Code | [claude.txt](../coordination/cli-help/claude.txt) | `2.1.220` | hooks/plugins; `--output-format json/stream-json`; `--include-hook-events`; JSON schema; session/resume |
 | OpenCode | Current corrected [opencode.txt](../coordination/cli-help/opencode.txt), including selected and shadowed artifact provenance | Selected `1.18.11`; shadowed npm-global `1.14.31` also inventoried | plugins; `run --format json`; serve/attach; ACP; session continuation |
 
@@ -103,15 +104,26 @@ The following vocabulary is proposed only to make tests precise:
 | `Running` | A known session has begun or resumed a turn and no later conclusive transition supersedes it. | A matching process name, recent terminal output, or an old start hook. |
 | `AwaitingApproval` | A documented approval request for the known session is presently unresolved. | A pre-tool event or hook that may itself approve/deny. |
 | `AwaitingInput` | A documented user-input request, or a completed response explicitly waiting for the next prompt, is presently unresolved. | A quiet PTY, shell prompt heuristic, or “stop candidate” hook. |
-| `Completed` | A conclusive turn/response completion transition. It can emit a notification and then settle at `AwaitingInput`. | Process exit alone, session end, or a hook that another hook can reverse. |
+| `Completed` | A conclusive successful turn/response completion transition. It can emit a notification and then settle at `AwaitingInput`. | Process exit alone, session end, a hook that another hook can reverse, or a return-to-idle notification that only proves the prompt is free after a cancelled or errored turn. |
 | `Error` | The agent's documented terminal error transition for this turn/session. | An observer-hook failure, nonzero child tool exit, or SSH loss alone. |
 | `ProcessExited` | The supervised OS process exited. This is a notification/lifecycle fact, not successful completion. | Process disappearance found by name scanning. |
 | `Unknown` | No fresh, mutually consistent documented signal proves another value. | Guessing from elapsed time, text, color, title, or executable basename. |
 
 Each semantic event carries an adapter ID, version/capability snapshot, opaque
-session correlation key, pane/host identity, monotonic sequence or receive
-order, source class, and monotonic timestamp. State is rejected if the
-session/pane does not match, ordering regresses, or its source lease expires.
+session correlation key, pane/host identity, a source-provided ordering token
+(sequence number, turn/monotonic counter, or equivalent), source class, and a
+local monotonic receive timestamp. State is rejected if the session/pane does
+not match, the ordering token regresses, or its source lease expires.
+
+Ordering between two events is trusted only when a source-provided
+sequence/turn token orders them, or when the delivery channel is documented to
+serialize them (for example, a single in-order stream). Local receive time
+alone does not order concurrently delivered events: when matching hooks or
+plugins run in parallel, receive order reflects scheduling, not causality. If
+the relative order of two events would change the emitted transition and no
+sequence/turn token or proven serialized channel establishes it, the affected
+transition is `Unknown` rather than a guessed `Completed`/`Error` (CORE-02).
+
 `Completed` and `Error` are transitions suitable for notifications; a
 still-open interactive agent can subsequently be `AwaitingInput`.
 
@@ -129,6 +141,8 @@ documents `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
 and compaction events. Common hook input includes `session_id`,
 `transcript_path`, `cwd`, event name, and model; turn-scoped events add a
 turn ID. The transcript format is explicitly not a stable hook interface.
+These lifecycle points are derived from the official documentation, not
+attested by the local help capture, and remain exact-version-gated by CX-01.
 
 Matching hook commands from multiple sources run concurrently. Non-managed
 hooks require trust for their exact definition, and plugins can bundle the same
@@ -186,9 +200,13 @@ documents lifecycle hooks and, importantly, passive `Notification` types:
 
 The last two require Claude Code `2.1.198+` and fire only while the agent view
 is open. `agent_completed` deliberately combines success and failure, so it
-does not prove either `Completed` or `Error` by itself. Notification hooks
-cannot block or modify the notification, which makes the first two stronger
-observation points than `PermissionRequest` or `Stop`.
+does not prove either `Completed` or `Error` by itself. The inspected
+`agent_needs_input` payload carries no child/agent identifier, so with more
+than one concurrent background agent it cannot be attributed to a specific
+session and stays `Unknown` rather than marking one waiting (CL-06).
+Notification hooks cannot block or modify the notification, which makes
+`permission_prompt` and `idle_prompt` stronger observation points than
+`PermissionRequest` or `Stop`.
 
 `Stop` runs when Claude finishes responding, but Stop hooks can feed back and
 continue the loop. `StopFailure` runs instead when a turn ends because of an
@@ -213,11 +231,11 @@ session ID, and resume.
 | --- | --- | --- | --- |
 | Hook `UserPromptSubmit` and subsequent activity | `Running` with lease | Official start point; dropped/stale observer becomes `Unknown`. | CL-01, CORE-02 |
 | Notification `permission_prompt` | `AwaitingApproval` until a later correlated activity/stop/idle event | Passive official notification explicitly says approval is needed. Event ordering and duplicate behavior still require fixture validation. | CL-02 |
-| Notification `idle_prompt` after an active turn | emit `Completed`, then `AwaitingInput` | Official notification explicitly says response is done and the next prompt is awaited. Do not emit completion for an initial idle process without a preceding turn. | CL-03 |
+| Notification `idle_prompt` | `AwaitingInput`; emit `Completed` first only when the immediately preceding correlated turn is known to have completed successfully | The notification proves the prompt is free, not that the last turn succeeded. Do not emit `Completed` for an initial idle process with no preceding turn, or when the preceding turn was cancelled or ended via `StopFailure`/error; those cases settle at `AwaitingInput` (or `Error` first) without a success notification. | CL-03 |
 | Hook `PermissionRequest` | Approval-request candidate only | A hook can return a decision; it does not alone prove unresolved UI wait. | CL-02 |
 | Hook `Stop` | Completion candidate only | Another Stop hook can continue the loop. Correlate to `idle_prompt` or structured terminal result. | CL-04 |
 | Hook `StopFailure` | emit `Error` with allowlisted category | Official terminal API-error hook; never persist `error_details` or last message without redaction. Tool failure is a different event. | CL-05, CORE-05 |
-| Notification `agent_needs_input` | `AwaitingInput` for the identified background session | Requires 2.1.198+ and an open agent view; absence is not evidence. | CL-06 |
+| Notification `agent_needs_input` | `Unknown` for the ambiguous background session; do not emit a per-session `AwaitingInput` | Requires 2.1.198+ and an open agent view; absence is not evidence. The inspected notification carries no child/agent ID, so with two or more concurrent background agents it cannot be correlated to a specific session and must not mark the wrong one waiting. Only a documented correlating identifier upgrades it beyond `Unknown`. | CL-06 |
 | Notification `agent_completed` | terminal-candidate, then inspect a stronger result; otherwise `Unknown` | The docs say “finishes or fails,” so outcome cannot be inferred. | CL-06 |
 | Headless JSON/stream final `result` plus exit status | emit `Completed` or `Error` according to documented result/exit fields | Strong for the supervised `-p` process. Truncated/missing/conflicting final data becomes `Unknown`. | CL-07 |
 | `system/api_retry` stream event | remain `Running` with retry detail | A retry is not terminal `Error`; alert only if product policy later requests it. | CL-07 |
@@ -272,7 +290,7 @@ correlated post-subscription event arrives (OC-01, OC-07).
 | Fresh post-subscription `session.status` with `busy` | `Running` | Official typed event for the correlated session. An initial snapshot cannot independently prove stream continuity. | OC-01 |
 | `permission.asked` until correlated `permission.replied` | `AwaitingApproval` | Official request/reply IDs; never expose patterns/metadata as trusted display or log data. | OC-02 |
 | `question.asked` until reply/reject | `AwaitingInput` | Present in pinned generated types. Current plugin page omits question events from its summary, so require pinned version capability discovery. | OC-03 |
-| `session.idle` after known active status | emit `Completed`, then `AwaitingInput` | Official docs use it for completion. Initial/default idle without an observed active turn does not prove a completed turn. | OC-04 |
+| `session.idle` after known active status | emit `Completed`, then `AwaitingInput`, only when no correlated `session.error` or abort preceded this idle for the same turn | Official docs use it for completion, but idle is also the resting state after a failed or aborted turn. Initial/default idle without an observed active turn does not prove a completed turn, and idle following a correlated `session.error`/abort settles at `AwaitingInput` (after `Error`) without a success notification. | OC-04, OC-05 |
 | `session.status` with `retry` | remain `Running` with retry detail | Retry is not terminal error. Message content is untrusted/sensitive and must be redacted or omitted. | OC-05 |
 | `session.error` | emit `Error` when session correlation is present | The pinned type permits an absent session ID/error. An uncorrelated event is an adapter diagnostic and affected sessions become `Unknown`. | OC-05 |
 | `run --format json` raw events | Only transitions proven by the captured 1.18.11 schema | Officially structured, but exact events/order are not frozen on the CLI page. No text inference. | OC-06 |
@@ -294,11 +312,17 @@ repository, branch, session ID, and resume command have separate trust rules:
 | Resume command | Adapter template plus a version-verified session argument | Never render a raw shell string for automatic execution. Store executable and argv fields separately and require explicit user action. |
 | Last activity | Monotonic receipt time of a validated event or terminal input/output | It is not proof of `Running`; terminal bytes are untrusted and can be generated by unrelated children. |
 
-Codex `exec resume`, Claude `--resume`, and OpenCode
-`--session/--continue` are present in the local evidence. Their session scope,
-retention, remote path behavior, and behavior after upgrades are not assumed;
-CORE-06 must verify each exact version. Noren must not surface session IDs in OS
-notifications or webhook payloads.
+For Codex, the local capture proves top-level `resume --help` and only that
+`exec --help` lists an `exec resume` subcommand; it does not capture the exact
+`exec resume --help` flags. Claude `--resume` and OpenCode
+`--session/--continue` are present in their local evidence. Session scope,
+retention, remote path behavior, and behavior after upgrades are not assumed.
+CORE-06 must capture the exact installed version's resume help/argv contract
+before enabling each resume adapter, and verifies that a valid correlated
+session resumes. Rejection of hostile or malformed session IDs and resume
+arguments is exercised separately as adversarial fuzzing under CORE-13 so that
+a green valid-resume path is never mistaken for injection safety. Noren must not
+surface session IDs in OS notifications or webhook payloads.
 
 For an SSH pane, event correlation must originate on the machine where the
 agent runs and travel over the authenticated workspace channel. A remote hook
@@ -351,9 +375,9 @@ execution is outside this report (CORE-12).
 | --- | --- | --- | --- |
 | Workspace hook/plugin configuration | Repository code executes as the user or forges state. | Explicit trust/install UI, exact-file/hash provenance, passive observer, no automatic dangerous bypass, removal path. | CORE-01 |
 | Hook/plugin payload to Noren | Prompt, command, tool input, transcript path, provider error, session ID, or secret reaches logs/notifications. | Strict per-event field allowlist, size/type limits, redaction before formatting, no raw payload logging. | CORE-05 |
-| Event stream to state machine | Replay, duplicate, out-of-order, cross-session, stale, or snapshot/subscription-gap event creates false status. | Pane/session/source binding, sequence/monotonic time, idempotence, lease expiry, buffered reconciliation only with documented continuity; otherwise `Unknown`. | CORE-02, CORE-03, OC-01 |
+| Event stream to state machine | Replay, duplicate, out-of-order, concurrently delivered, cross-session, stale, or snapshot/subscription-gap event creates false status. | Pane/session/source binding, ordering by a source sequence/turn token or a proven serialized channel rather than receive time, idempotence, lease expiry, buffered reconciliation only with documented continuity; otherwise `Unknown`. | CORE-02, CORE-03, OC-01 |
 | Terminal content/OSC to UI | Agent or remote program spoofs trusted state/notification or escapes display. | Treat bytes as untrusted terminal data; sanitize notification text; OSC never supplies authoritative agent state. | CORE-07 |
-| Adapter to process launcher | Resume command/ID/CWD becomes shell injection. | Executable plus argv representation, no shell, typed fields, explicit user action, hostile-character tests. | CORE-06 |
+| Adapter to process launcher | Resume command/ID/CWD becomes shell injection or resumes the wrong session. | Executable plus argv representation, no shell, typed fields, explicit user action; valid-session resume integration is verified separately from hostile-ID/argv rejection fuzzing. | CORE-06, CORE-13 |
 | Local/remote adapter channel | Other user/process injects events or reads session metadata. | User-only endpoint, peer ownership/authentication, SSH transport remotely, fresh nonce, bounded frames. | CORE-08 |
 | Agent server/API | Optional server is exposed or unauthenticated. | Loopback/Unix socket, SSH tunnel, credentials outside logs/config exports, version/health check, least privilege. | OC-07 |
 | Observer failure | Hook timeout/crash blocks or changes the agent. | Passive success response, tight resource bounds, fail-open for observation only, observer failure reported separately from agent `Error`. | CORE-09 |
@@ -381,18 +405,19 @@ Target environments:
 | --- | --- | --- | --- |
 | OC-00 | OpenCode PATH-order variation, package provenance, launcher/payload digest mismatch, and replacement between probe/launch | Run isolated bare-PATH fixtures with the global npm symlink first and with the user-local file first; reject bare-command provenance in both. The npm-first inventory attributes its artifact to `opencode-ai@1.14.31`, confirms no Homebrew formula is installed, and records the JS launcher (`3ab08cf…`) separately from its native payload (`40d5686…`). Only the approved absolute 1.18.11 file with digest `f554a08…` enables A-MAC capabilities; replacement invalidates the probe without exposing the user path. | A-MAC |
 | CORE-01 | Unconfigured, trusted, changed, disabled, and malicious hook/plugin | No silent install or trust bypass; hash/config change invalidates trust; absence keeps normal terminal use and `Unknown`. | A-MAC, A-LNX |
-| CORE-02 | Running, duplicate/out-of-order/cross-session/stale events | State machine accepts only correlated monotonic transitions; lease expiry and irreconcilable conflict yield `Unknown`. | Unit fixtures + A-MAC |
+| CORE-02 | Running, duplicate/out-of-order/cross-session/stale, and concurrently delivered events | State machine accepts only correlated transitions ordered by a source sequence/turn token or a proven serialized channel; deliver two order-sensitive events with interleaved/reversed receive order and no ordering token and assert the transition is `Unknown`, not a guessed completion. Lease expiry and irreconcilable conflict also yield `Unknown`. | Unit fixtures + A-MAC |
 | CORE-03 | Malformed, truncated, oversized, unknown-version structured stream | Parser remains bounded, does not crash/execute content, keeps the pane usable, and marks semantic state `Unknown`. | Unit/fuzz + A-LNX |
 | CORE-04 | Clean/nonzero/signal process exit with/without terminal event | Always emit `ProcessExited`; emit `Completed`/`Error` only with the corresponding trusted semantic event. | A-MAC, A-LNX, A-PTY |
 | CORE-05 | Error and payload redaction | Seed canaries in prompt/tool/path/session/error fields; logs, OS notifications, webhook fixtures, and crash reports contain none. | Unit + A-MAC |
-| CORE-06 | CWD/session/resume and argv injection | Resume the exact session in paths/IDs with spaces, quotes, newlines, Unicode, and option-like prefixes using executable+argv; no shell expansion or cross-project resume. | A-MAC, A-LNX, A-SSH |
+| CORE-06 | Valid CWD/session/resume integration | Before use, capture and pin the exact installed executable/version's resume help and argv contract, including Codex `exec resume` flags; missing evidence disables that resume path. Then resume a valid, correlated session (well-formed UUID or documented session token) via executable+argv, in a working directory whose legitimate path contains spaces/Unicode, and confirm the exact session resumes with no shell expansion and no cross-project resume. | A-MAC, A-LNX, A-SSH |
+| CORE-13 | Hostile resume-ID/argv rejection fuzzing | Fuzz malformed and hostile session IDs and resume arguments (spaces, quotes, newlines, Unicode, option-like `-`/`--` prefixes, separator and metacharacter injection); each is passed as a distinct non-shell argv element and is rejected or neutralized before launch, never expanded, never reinterpreted as an option, and never resumes a different or cross-project session. | Unit/fuzz + A-MAC, A-LNX |
 | CORE-07 | Terminal/OSC/process-name spoofing | A program named like each agent and forged output/title/OSC cannot leave `Unknown` or create a trusted completion/approval notification. | A-PTY, A-SSH |
 | CORE-08 | Local/remote event-channel impersonation | Wrong owner, wrong nonce/session/pane, replay, and cross-host frames are rejected; endpoint is never publicly bound. | Multi-user A-LNX, A-SSH |
 | CORE-09 | Observer timeout/crash/backpressure | Agent continues; observer failure is visible separately; event backlog is bounded and one pane cannot stall others. | A-MAC, A-LNX |
 | CORE-10 | Live process with event silence and timer reset | Emit one rate-limited long-unresponsive alert, set semantic state Unknown rather than Error, and clear/reset only on a fresh correlated event or explicit policy action. | Fake-clock unit + A-MAC/A-SSH |
 | CORE-11 | Approval/input/completion/error/exit notification dedupe and navigation | Emit once per transition; OS text remains generic; click/shortcut focuses the exact local/SSH pane; stale locator performs no unrelated navigation. | A-MAC, A-SSH |
 | CORE-12 | Local-hook/webhook timeout, replay, malicious response, and secret canary | Sink receives only the minimal schema, cannot command execution/state, is bounded/cancelable, and leaks no canary under retry/error logging. | Loopback fixture, A-MAC/A-LNX |
-| CX-01 | Codex prompt/start/activity | Passive hooks correlate session/turn/CWD and renew `Running`; dropped delivery expires to `Unknown`. | Codex 0.146.0, A-MAC/A-LNX/A-SSH |
+| CX-01 | Codex prompt/start/activity | Pin the exact CLI version and verify the officially documented hook availability and event shape before enabling the lifecycle mapping; otherwise remain `Unknown`. Passive hooks then correlate session/turn/CWD and renew `Running`; dropped delivery expires to `Unknown`. | Codex 0.146.0, A-MAC/A-LNX/A-SSH |
 | CX-02 | Codex approval allow/deny/interactive prompt with concurrent hook | `PermissionRequest` alone never claims durable wait; experimental app-server request does until resolved. | Codex 0.146.0, A-MAC/A-LNX |
 | CX-03 | Codex Stop continued by another hook vs final stop | Stop candidate cannot emit completion before conclusive terminal event; concurrent ordering is deterministic or `Unknown`. | Codex 0.146.0, isolated config |
 | CX-04 | Codex close/archive/idle SessionEnd | No SessionEnd reason is mislabeled as task completion; cleanup uses only allowlisted fields. | Codex 0.146.0, A-MAC |
@@ -400,15 +425,15 @@ Target environments:
 | CX-06 | Experimental Codex app-server turn/approval/user-input lifecycle | Negotiate capability; validate request resolution, interrupted/failed/completed distinction, disconnect/reconnect, and experimental opt-out. | Codex 0.146.0, A-MAC/A-LNX |
 | CL-01 | Claude prompt/activity and CWD change | Running/session/CWD correlation survives direct/nested PTY use and stales safely. | Claude 2.1.220, A-PTY/A-SSH |
 | CL-02 | Claude permission prompt, hook auto-decision, denial | Only passive `permission_prompt` creates AwaitingApproval; later correlated activity/idle/error clears it exactly once. | Claude 2.1.220, isolated config |
-| CL-03 | Claude successful response and idle | One completion notification per active turn, followed by AwaitingInput; startup idle cannot create false completion. | Claude 2.1.220, A-MAC/A-LNX |
+| CL-03 | Claude successful, cancelled, and errored response followed by idle | A successful turn then `idle_prompt` emits exactly one completion followed by AwaitingInput; startup idle, a cancelled/interrupted turn then idle, and a `StopFailure`/error turn then idle each reach AwaitingInput (error first where applicable) and emit no false completion. | Claude 2.1.220, A-MAC/A-LNX |
 | CL-04 | Claude Stop continuation and hook ordering | A Stop hook that feeds back prevents premature completion; observer cannot alter the turn. | Claude 2.1.220, isolated config |
 | CL-05 | Claude StopFailure categories | Each documented category produces sanitized Error; hook failure/tool failure do not. | Claude 2.1.220, mocked API failure harness |
-| CL-06 | Claude background needs-input/completed with view open/closed | Version/view limitation is honored; combined completed-or-failed event stays `Unknown` without stronger outcome. | Claude 2.1.220, A-MAC |
+| CL-06 | Claude background needs-input/completed with view open/closed and two simultaneous agents | Version/view limitation is honored; combined completed-or-failed event stays `Unknown` without stronger outcome; with two concurrent background agents, an uncorrelated `agent_needs_input` marks neither session `AwaitingInput` and stays `Unknown` rather than guessing which agent waits. | Claude 2.1.220, A-MAC |
 | CL-07 | Claude headless JSON/stream success/error/retry/SIGTERM/truncation | Final result and exit agree; retries remain Running; missing/conflicting final record becomes `Unknown`; no lost tail under backpressure. | Claude 2.1.220, A-MAC/A-LNX |
 | OC-01 | OpenCode initialization and snapshot/subscription boundary transitions | Start Unknown; establish subscription and buffer before snapshot; force busy/idle changes across every boundary. Require a documented cursor/epoch or adapter handshake to claim continuity; otherwise remain Unknown until a fresh post-subscription event. | Intended OpenCode 1.18.11, A-MAC/A-LNX |
 | OC-02 | OpenCode permission asked/replied/rejected/duplicate | AwaitingApproval is request-ID scoped and clears once without logging patterns/metadata. | Intended OpenCode 1.18.11, A-MAC/A-LNX |
 | OC-03 | OpenCode question asked/replied/rejected | AwaitingInput is request-ID scoped; capability is disabled and state Unknown if the installed schema omits it. | Intended OpenCode 1.18.11, A-MAC/A-LNX |
-| OC-04 | OpenCode initial idle vs active-to-idle | Only an observed active turn emits Completed; stable idle maps to AwaitingInput without duplicate notifications. | Intended OpenCode 1.18.11, A-MAC/A-LNX |
+| OC-04 | OpenCode initial idle, active-to-idle, and error/abort-then-idle | Only an observed successful active turn emits Completed; initial idle, and a correlated `session.error` or abort followed by `session.idle`, map to AwaitingInput (error first for the error case) and suppress the false completion; stable idle emits no duplicate notifications. | Intended OpenCode 1.18.11, A-MAC/A-LNX |
 | OC-05 | OpenCode retry and correlated/uncorrelated error | Retry remains Running; correlated error emits Error; missing-session error degrades affected scope to Unknown. | Intended OpenCode 1.18.11, A-MAC/A-LNX |
 | OC-06 | OpenCode run raw JSON events and schema drift | Capture/version the exact 1.18.11 sequence for success, denial, question, error, and cancel; unknown shapes fail safely. | Intended OpenCode 1.18.11, A-MAC/A-LNX |
 | OC-07 | OpenCode server restart/auth failure/tunnel loss/plugin failure | No public bind; authenticated health/version check; reconnect reconciles state; fallback terminal remains usable and state becomes Unknown. | Intended OpenCode 1.18.11, A-SSH |
