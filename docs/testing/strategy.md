@@ -30,7 +30,9 @@ input as a shell command.
 ## Fault, security, and resource cases
 
 - Inject spawn, read, write, resize, parser, renderer, channel-disconnect, and
-  child-wait failures one at a time; assert a typed error and completed teardown.
+  child-wait failures one at a time. After each PTY/parser/renderer/channel
+  failure, enqueue a sentinel lifecycle/redraw event and require it within
+  100 ms; then Close must complete teardown within 2 s.
 - Fill each bounded channel before close. Cover normal blocked-read EOF/join and
   a helper descendant that retains the slave: the latter must emit
   `ReaderJoinTimeout`, detach, and exit within NFR-004 rather than hang.
@@ -52,8 +54,10 @@ On a recorded Apple Silicon reference Mac in `--release`:
    presented frame for at least 100 samples; FR/NFR pass at p95 <= 100 ms.
 2. Stream 100 MiB from the helper while issuing lifecycle events. Record
    throughput, maximum queue occupancy, main-loop gaps, peak RSS, and RSS after
-   60 s idle. Pass NFR-003; do not claim a stable throughput benchmark from one
-   machine.
+   60 s idle. Pass only if maximum gap <= 250 ms, output occupancy <= 64 chunks
+   of <= 16 KiB, command occupancy <= 256 messages, peak RSS increase <= 64 MiB,
+   and post-idle increase <= 16 MiB. Do not claim a stable throughput benchmark
+   from one machine.
 3. Replay at least 100 final-size changes; record event-to-PTY and
    event-to-present latency, exact final kernel dimensions, and duplicate count.
 4. Measure natural and forced shutdown from close request through child reap
@@ -68,7 +72,9 @@ The first Draft PR must contain:
 - `cargo fmt --all -- --check`;
 - `cargo clippy --workspace --all-targets -- -D warnings`;
 - `cargo test --workspace`;
-- repository documentation checks and `git diff --check`;
+- `python3 scripts/check_docs.py` and
+  `python3 -m unittest scripts/test_check_docs.py`, each exiting zero;
+- `git diff --check`;
 - recorded `rustc`/`cargo` verbose versions, installed targets, runner OS and
   architecture;
 - direct dependency versions/features/licenses and any unreviewed `unsafe`.

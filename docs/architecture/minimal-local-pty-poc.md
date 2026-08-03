@@ -40,9 +40,13 @@ crate.
    `Output(Vec<u8>)`, `Eof`, or typed error events to the main loop. It observes
    EOF when the last slave descriptor closes; receiver disconnect terminates a
    blocked channel send, but reaping alone is not assumed to cancel `read`.
+   Each read/output chunk is at most 16 KiB and the output channel holds at most
+   64 chunks (1 MiB queued payload).
 4. The main loop drains a bounded amount of output per callback, feeds it to a
    `TerminalEngine`, applies bounded side effects, and requests redraw. Channel
-   capacity and per-turn byte budget are constants covered by load tests.
+   capacity and per-turn byte budget are constants covered by load tests: at
+   most 64 KiB is parsed per turn; the ordered input/resize/reply command channel
+   holds at most 256 messages.
 5. On redraw, `RenderBackend` consumes an immutable cell snapshot. Parser state
    never receives a surface or GPU handle, and renderer failure leaves PTY
    teardown possible.
