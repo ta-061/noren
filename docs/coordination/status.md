@@ -2,20 +2,22 @@
 
 Last updated: 2026-08-03 (Asia/Tokyo). PR
 [#19](https://github.com/ta-061/noren/pull/19) is merged into `main` as
-`c695920d8bc99990447d0b451754ea96c91181fc`. The only open PR is Draft
-[#21](https://github.com/ta-061/noren/pull/21), branch
-`agent/terminal-scroll-regions`, for Issue
-[#20](https://github.com/ta-061/noren/issues/20). Historical sections below
+`c695920d8bc99990447d0b451754ea96c91181fc`. Draft PR
+[#21](https://github.com/ta-061/noren/pull/21) remains in review for Issue
+[#20](https://github.com/ta-061/noren/issues/20). Draft PR
+[#23](https://github.com/ta-061/noren/pull/23), branch
+`agent/terminal-alternate-screen`, is stacked on #21 for Issue
+[#22](https://github.com/ta-061/noren/issues/22). Historical sections below
 preserve the PR #17 record at implementation/test head
 `c1f66dc27ddce37a60665d319a7ca061c300947e`, corrected only where an active
 claim went stale; coordination head `ac410a82` also passed both GitHub checks.
 
 ## Current phase
 
-Terminal foundation, scrolling-region slice. PR #19 merged the Noren-owned,
-renderer-independent `TerminalState`. Draft PR #21 adds DECSTBM margins,
-region-scoped LF/VT/FF/IND/NEL/RI and CSI S/T scrolling, CNL/CPL/VPA, delayed
-autowrap, and resize-reset behavior. See
+Terminal foundation, alternate-screen slice. PR #19 merged the Noren-owned,
+renderer-independent `TerminalState`; Draft PR #21 adds scrolling regions.
+Stacked Draft PR #23 adds primary/alternate screen ownership, DEC private mode
+1049, cursor save/restore, mode snapshots, and both-buffer resize behavior. See
 [terminal core foundation](../architecture/terminal-core-foundation.md). This
 is not a VT100/xterm or vim/tmux/zellij compatibility claim.
 
@@ -23,9 +25,11 @@ is not a VT100/xterm or vim/tmux/zellij compatibility claim.
 
 Verified on 2026-08-03:
 
-- The only open Issue is [#20](https://github.com/ta-061/noren/issues/20), the
-  scrolling-region behavior slice. The only open PR is its Draft
-  [#21](https://github.com/ta-061/noren/pull/21).
+- The open Issues are [#20](https://github.com/ta-061/noren/issues/20), the
+  scrolling-region behavior slice, and stacked alternate-screen Issue
+  [#22](https://github.com/ta-061/noren/issues/22). Their open Draft PRs are
+  [#21](https://github.com/ta-061/noren/pull/21) and
+  [#23](https://github.com/ta-061/noren/pull/23), respectively.
 - PR [#19](https://github.com/ta-061/noren/pull/19) and Issue
   [#18](https://github.com/ta-061/noren/issues/18) are complete after owner
   acceptance of the renderer-independent Terminal Core foundation.
@@ -60,6 +64,17 @@ Verified on 2026-08-03:
 | GLM helper | Signed `32ca7da`: behavior-preserving parser-state idiom cleanup | Complete |
 | Claude Code review | PR #21 review: `BLOCKER: NONE` | Complete |
 | Qwen documentation | Signed `328c013`: architecture, roadmap, and contributor guidance | Complete |
+| Codex integration | Exact-head local checks, CI, and bounded local-zsh launch smoke | Complete |
+
+## Draft PR #23 alternate-screen handoff
+
+| Lane | Saved evidence | State |
+| --- | --- | --- |
+| Codex core | Signed `84da736`: screen ownership, mode 1049, cursor save/restore, and resize behavior | Complete |
+| codex-lab tests | Signed `454d995`: seven public-API alternate/mode/cursor/resize tests | Complete |
+| GLM helper | PR #23 review: parser/enum/module organization is clean; no change needed | Complete |
+| Claude Code review | PR #23 review: `BLOCKER: NONE` | Complete |
+| Qwen documentation | Signed `29f7362`: focused terminal-core architecture update | Complete |
 | Codex integration | Exact-head local checks, CI, and bounded local-zsh launch smoke | Complete |
 
 ## PR #17 historical implementation checkpoints
@@ -112,10 +127,11 @@ then passed both GitHub checks: runs `30783618745` (Rust) and `30783618743`
 
 ## Current Draft gate
 
-PR #21 has passed exact-head local checks and CI, and the existing local-zsh
-application launch was rechecked. It remains Draft for owner review and
-acceptance. PR #19 has no remaining gate. This does not authorize deferred
-terminal features in the scrolling-region PR.
+PR #21 remains Draft for owner review and acceptance. Stacked PR #23 has passed
+local checks and CI, and the existing local-zsh application launch was
+rechecked; it remains Draft and based on `agent/terminal-scroll-regions` until
+#21 is accepted and merged. PR #19 has no remaining gate. This does not
+authorize deferred terminal features in either Draft PR.
 
 Full VT/xterm behavior, non-ASCII glyph quality, swash/font trials, production
 IME/accessibility, Linux, SSH, agent integration, tabs, panes, themes, and a
@@ -130,5 +146,7 @@ identity, and the public support/security contact before Preview publication.
 ## Next steps
 
 1. Review and accept Draft PR #21, then promote and merge its exact tested head.
-2. Keep alternate screen, SGR/erase, attributes, modes, and later VT work in
-   separate Issues and PRs.
+2. Retarget Draft PR #23 to `main` only after #21 merges, then review its exact
+   tested head.
+3. Keep SGR/erase, attributes, remaining modes, and later VT work in separate
+   Issues and PRs.
