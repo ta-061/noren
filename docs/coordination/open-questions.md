@@ -9,11 +9,12 @@
   artifacts? No credential is assumed.
 - Which public support/security contact should be published before Preview?
 
-## Design council must decide
+## Design required before later implementation
 
-- Terminal parser/state library boundary and replacement strategy.
-- Window, GPU renderer, font shaping, IME, and accessibility stack.
-- PTY abstraction and platform-specific ownership.
+- Permanent terminal parser/state adoption after the PoC corpus.
+- Permanent window, GPU renderer, font shaping, IME, and accessibility stack;
+  Discovery found no second like-for-like window candidate.
+- Linux PTY/window ownership and parity after the macOS PoC.
 - OpenSSH subprocess/config integration versus an SSH library, including
   ProxyCommand/ProxyJump and host-key behavior.
 - Whether a remote daemon is justified for Preview, and whether it needs a
@@ -22,13 +23,24 @@
 - Key protocol negotiation and the exact semantics of pass-through escape.
 - Trust boundary and permissions for agent hooks, OSC notifications, IPC,
   webhooks, and future plugins.
-- Preview MSRV and the reproducible Rust toolchain installation/pinning method.
 
-## Discovery must verify
+## Resolved only for the first macOS local-PTY PoC
 
-- Current upstream behavior and licenses for every library candidate.
-- Current Zellij defaults and protocol behavior by supported version.
-- Current official Codex, Claude Code, and OpenCode hook/plugin/structured-output
-  interfaces.
-- cmux feature behavior from lawful public sources without copying code, assets,
-  or marks.
+- [ADR 0001](../adr/0001-rust-toolchain-and-msrv.md) pins Rust/MSRV 1.88.0,
+  edition 2024, resolver 3, and the `aarch64-apple-darwin` target. The first
+  implementation must still record installed versions/targets and compile.
+- [ADR 0002](../adr/0002-local-pty-poc-architecture.md) defines three crates,
+  PTY supervisor/reader ownership, bounded channels, and reversible candidate
+  versions. It is not permanent library adoption.
+- The PoC key contract covers printable UTF-8, Enter, Backspace, Tab, Escape,
+  arrows, and Ctrl bytes. IME/dead keys, Cmd/Option policy, key negotiation, and
+  pass-through escape remain closed to implementation.
+
+## Later gates must verify
+
+- Locked dependency features/licenses and unsafe inventory for any candidate
+  used in implementation.
+- Executable terminal/PTy/window/renderer behavior and the drop gates in the
+  risk register; Discovery evidence alone is not adoption.
+- Current upstream behavior again when a later Issue begins SSH, Zellij,
+  agent-integration, packaging, or release work.

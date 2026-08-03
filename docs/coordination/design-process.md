@@ -3,6 +3,19 @@
 Production implementation is gated on the three rounds below. Technical spikes
 before the gate must be disposable and confined to `experiments/`.
 
+## Scoped owner amendment for Issue #6
+
+The owner narrowed Issue [#6](https://github.com/ta-061/noren/issues/6) on
+2026-08-03 to avoid repeating merged Discovery and to start one evidence-producing
+macOS local-PTY PoC. For this gate only, GLM supplies the core proposal, Qwen the
+non-overlapping UI proposal, Claude Code one PTY/process/input security review,
+codex-lab one PTY I/O/resize/testability review, and Codex integrates. Fugu is
+reserved for SSH work. The required artifacts are v0.1 functional and
+non-functional requirements, minimum architecture, initial crates, candidate
+libraries, threat model, test strategy, and the ADRs needed to start. The gate
+may open only for FR-001 through FR-007; the full process below remains the
+default before implementing deferred v0.1 features.
+
 ## Round 1: independent proposals
 
 Codex, Claude Code, codex-lab, GLM, Qwen, and Fugu receive the same product brief

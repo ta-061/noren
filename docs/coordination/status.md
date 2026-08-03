@@ -1,95 +1,94 @@
 # Coordination status
 
-Last updated: 2026-08-03 (Asia/Tokyo), Issue #8 compression checkpoint on
-branch `docs/m0-risk-register` (Draft PR [#14](https://github.com/ta-061/noren/pull/14)).
+Last updated: 2026-08-03 (Asia/Tokyo), lean Design Council integration on Draft
+PR [#15](https://github.com/ta-061/noren/pull/15), branch
+`docs/m1-lean-design`.
 
 ## Current phase
 
-Milestone 0 — Discovery, evidence integration. Production implementation has not
-started, and the production gate remains closed (D-0001 in [decisions.md](decisions.md);
-criteria in [design-process.md](design-process.md)) pending Issue
-[#6](https://github.com/ta-061/noren/issues/6). No architecture, library, or dependency
-selection is made here.
+Milestone 1 — scoped gate review for the first macOS local-PTY PoC. Discovery is
+complete and integrated. Production implementation is still closed until the
+two bounded Issue #6 reviews are addressed and PR #15 merges. That merge may
+open only FR-001 through FR-007; all deferred v0.1 features retain their gates.
 
-## Issues (verified against GitHub 2026-08-03)
+## GitHub state
 
-Closed: [#1](https://github.com/ta-061/noren/issues/1) Discovery/governance baseline;
-[#3](https://github.com/ta-061/noren/issues/3) terminal/library landscape;
-[#4](https://github.com/ta-061/noren/issues/4) cmux parity and Zellij matrices;
-[#5](https://github.com/ta-061/noren/issues/5) OpenSSH and CLI-agent evidence;
-[#9](https://github.com/ta-061/noren/issues/9) OpenCode provenance correction.
+Verified on 2026-08-03:
 
-Open: [#8](https://github.com/ta-061/noren/issues/8) (this Issue) — compressed risk
-register drafted, independent reviews pending, integrator is Codex;
-[#6](https://github.com/ta-061/noren/issues/6) — Milestone 1 proposals, critiques, and
-integrated design; not started.
+- Closed Issues: [#1](https://github.com/ta-061/noren/issues/1),
+  [#3](https://github.com/ta-061/noren/issues/3),
+  [#4](https://github.com/ta-061/noren/issues/4),
+  [#5](https://github.com/ta-061/noren/issues/5),
+  [#8](https://github.com/ta-061/noren/issues/8), and
+  [#9](https://github.com/ta-061/noren/issues/9).
+- Open Issue: [#6](https://github.com/ta-061/noren/issues/6), lean Design
+  Council and scoped Milestone 1 gate.
+- Open PR: Draft [#15](https://github.com/ta-061/noren/pull/15), Issue #6.
+- PR [#14](https://github.com/ta-061/noren/pull/14) merged Issue #8 as
+  `f393bdc9`; `main` is at `f393bdc9537a8ac52b77d932b247bb1d3280ea2d`.
+- PRs #2, #7, #10, #11, #12, #13, and #14 are merged. No Discovery PR remains
+  open and no new large or duplicate Discovery review is planned.
 
-## Pull requests and CI (verified against GitHub 2026-08-03)
+## Issue #6 checkpoints
 
-All six Discovery PRs are merged into `main`; the only open PR at this check is
-Draft PR [#14](https://github.com/ta-061/noren/pull/14) for Issue #8.
-
-| PR | Scope | Merge commit |
+| Lane | Saved evidence | State |
 | --- | --- | --- |
-| [#2](https://github.com/ta-061/noren/pull/2) | Discovery and governance baseline | `1288c909` |
-| [#7](https://github.com/ta-061/noren/pull/7) | Design council execution protocol | `40588c90` |
-| [#10](https://github.com/ta-061/noren/pull/10) | OpenCode provenance correction | `f76fbd46` |
-| [#11](https://github.com/ta-061/noren/pull/11) | cmux parity and Zellij compatibility | `7049908a` |
-| [#12](https://github.com/ta-061/noren/pull/12) | OpenSSH and agent integration evidence | `b37126cd` |
-| [#13](https://github.com/ta-061/noren/pull/13) | Terminal and library landscape | `38db222d` |
+| GLM core proposal | Signed commit `02ae9d8b`, 898 words | Complete |
+| Qwen minimum UI proposal | Signed commit `22a4307c`, 686 words | Complete |
+| Codex integration | Requirements, architecture/crates/candidates, threat model, test strategy, ADR 0001/0002 | In progress |
+| Claude Code security critique | PTY/process spawn/input boundary only | Pending |
+| codex-lab test critique | PTY I/O/resize/requirements testability only | Pending |
+| Fugu | Reserved for later SSH design | Not used |
 
-`main` is at `b37126cd0f40c350f0ea4e28661aa7bdcd3dd3ac` (PR #12 merge).
-CI: the `Documentation` workflow (`python3 scripts/check_docs.py` plus its unittest
-suite) has succeeded after every merge into `main`
-([workflow runs](https://github.com/ta-061/noren/actions)); Dependabot `github_actions`
-updates succeed, while Dependabot `cargo` runs fail (no Cargo manifest or Rust
-toolchain yet) — expected Discovery-stage state, tracked as R-PORT-01 in the risk
-register.
+The required integrated artifacts are
+[v0.1 requirements](../requirements/v0.1.md),
+[minimum architecture](../architecture/minimal-local-pty-poc.md),
+[threat model](../security/threat-model.md),
+[test strategy](../testing/strategy.md),
+[ADR 0001](../adr/0001-rust-toolchain-and-msrv.md), and
+[ADR 0002](../adr/0002-local-pty-poc-architecture.md).
 
-## In progress
+## Toolchain and build state
 
-Issue #8 integration on `docs/m0-risk-register`: [risk-register.md](../roadmap/risk-register.md)
-compressed to 13 evidence-linked rows covering all ten Issue #8 categories plus
-Process/PTY (R-PTY-01), with the disposition table for architecture-changing unknowns. The register is the required
-shared input before Round 1 execution ([protocol-codex-lab.md](reviews/protocol-codex-lab.md)).
+Rust remains absent at this documentation checkpoint. ADR 0001 accepts the
+exact Rust/MSRV 1.88.0 pin and required `aarch64-apple-darwin` target. Versioned
+crates.io metadata shows the highest declared MSRV in the scoped direct set is
+wgpu's 1.87; `portable-pty` and `swash` declare none. R-PORT-01 therefore remains
+partly open until the first implementation Issue installs the pin, records
+`rustc`/`cargo`/targets/host, commits `Cargo.toml` and the lockfile, and passes
+minimal workspace CI.
 
-## Blocked
+## Active risks and cut line
 
-No Rust toolchain is installed, so compilation is impossible and every executable
-gate in the risk register is blocked (R-PORT-01). Discovery, design, and
-documentation work are not blocked.
+The [risk register](../roadmap/risk-register.md) remains authoritative. The first
+PoC directly exercises R-PORT-01, R-PTY-01, R-IN-01, R-SEC-01/R-SEC-02,
+R-PERF-01, and R-TEST-01. Candidate libraries remain reversible; passing the
+PoC is not permanent adoption or a Preview compatibility claim.
 
-## Risks
+Prohibited in the first implementation Issue: SSH, AI-agent state UI, tabs,
+panes, themes, remote daemon, persistence, production IME/accessibility, and
+broad Linux/cross-platform work.
 
-See [risk-register.md](../roadmap/risk-register.md). Highest-pair rows: R-IN-01 (input
-loss, L3/I5), R-SEC-01/R-SEC-02 (injection and untrusted bytes/secrets, L3–L4/I5),
-R-SSH-01 (OpenSSH config/host-key semantics, L4/I5), R-REL-01 (release integrity,
-L4/I5 envelope). Repository access controls remain unchanged; branch protection
-requires explicit human confirmation. No CI proves Rust buildability yet (no
-toolchain, no manifest).
+## Human decisions still required
 
-## Human decisions required
+No repository access control was changed. The owner still must separately
+decide branch protection/required CI/merge policy, macOS signing/notarization
+identity, and the public support/security contact before Preview publication.
 
-From [open-questions.md](open-questions.md); none answered: whether `main` should
-require PRs and successful CI, block force pushes/deletion, and prefer squash
-merging; which signing/notarization identity for macOS Preview artifacts (R-REL-01);
-which public support/security contact before Preview.
+## Next steps
 
-## Next integration work
-
-1. `codex-lab` testability/gate review and `Claude Code` security/maintainability
-   review of the risk register; Codex integrates findings and closes Issue #8 only if
-   the acceptance criteria hold.
-2. Start Milestone 1 ([#6](https://github.com/ta-061/noren/issues/6)) Round 1
-   independent proposals with the merged evidence and risk register as the shared
-   pack ([design-process.md](design-process.md)).
-3. Close the human decisions above before any access-control, signing, or publication
-   work.
+1. Run exactly one bounded Claude security critique and one bounded codex-lab
+   PTY/testability critique on the integrated Draft PR; save both results.
+2. Codex addresses non-duplicate blockers, records the scoped gate decision,
+   and merges PR #15 if current-head documentation CI is green.
+3. Create one implementation Issue with the seven PoC steps and explicit
+   non-goals, then assign GLM core, Qwen UI, codex-lab tests, Claude review.
+4. The first implementation Draft PR must include root `Cargo.toml`, pinned
+   toolchain, initial crates, CI, exact version/target evidence, and unfinished
+   handoff items before any model limit.
 
 ## Production gate
 
-Closed. D-0001 stands: production implementation is prohibited until the Milestone 1
-gate in [design-process.md](design-process.md) passes (requirements, architecture,
-threat model, test strategy, release plan, risk register, addressed independent
-reviews). This update neither opens it nor selects production architecture,
-libraries, or dependencies.
+Closed at this checkpoint. It opens only for the first local macOS PTY PoC when
+Issue #6 review is addressed and PR #15 merges. Deferred v0.1 features do not
+inherit that approval.
