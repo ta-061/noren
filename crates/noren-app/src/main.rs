@@ -7,7 +7,7 @@ use noren_app::{
     PARSE_BUDGET_BYTES_PER_TURN, Resize,
 };
 use noren_pty::{PtyEvent, PtySession, PtySize};
-use noren_terminal::{AvtEngine, TerminalEngine};
+use noren_terminal::{TerminalEngine, TerminalState};
 use renderer::{RenderOutcome, Renderer};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,7 +27,7 @@ struct NorenApp {
     renderer: Option<Renderer>,
     geometry: GridGeometry,
     pending_grid: Option<GridSize>,
-    terminal: Option<AvtEngine>,
+    terminal: Option<TerminalState>,
     pty: Option<PtySession>,
     modifiers: Modifiers,
     status: &'static str,
@@ -76,7 +76,12 @@ impl NorenApp {
             return;
         };
 
-        self.terminal = Some(AvtEngine::new(grid.rows(), grid.cols()));
+        let Ok(terminal) = TerminalState::new(grid.rows(), grid.cols()) else {
+            eprintln!("Noren terminal state creation failed");
+            event_loop.exit();
+            return;
+        };
+        self.terminal = Some(terminal);
         self.pty = match pty_size(grid).and_then(PtySession::spawn) {
             Ok(session) => {
                 self.status = "Noren PoC ready";
@@ -153,7 +158,10 @@ impl NorenApp {
             return;
         };
         if let Some(terminal) = &mut self.terminal {
-            terminal.resize(grid.rows(), grid.cols());
+            if terminal.resize(grid.rows(), grid.cols()).is_err() {
+                self.status = "Noren terminal resize failed";
+                self.show_status = true;
+            }
         }
         if let (Some(session), Ok(size)) = (&self.pty, pty_size(grid)) {
             if session.resize(size).is_err() {
@@ -227,18 +235,20 @@ impl NorenApp {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
-        let mut lines = self
-            .terminal
-            .as_ref()
-            .map(|terminal| terminal.snapshot().lines().to_vec())
-            .unwrap_or_default();
-        if lines.is_empty() || self.show_status {
-            lines.push(self.status.to_owned());
-        }
+        let snapshot = self.terminal.as_ref().map(TerminalEngine::snapshot);
+        let status = if self.show_status
+            || snapshot
+                .as_ref()
+                .is_none_or(|snapshot| snapshot.lines().is_empty())
+        {
+            Some(self.status)
+        } else {
+            None
+        };
         let outcome = self
             .renderer
             .as_mut()
-            .map(|renderer| renderer.render(&lines));
+            .map(|renderer| renderer.render(snapshot.as_ref(), status));
         match outcome {
             Some(RenderOutcome::DeviceLost) => {
                 self.status = "Noren renderer device lost";

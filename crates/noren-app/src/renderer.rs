@@ -11,6 +11,7 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use noren_app::{POC_CELL_HEIGHT as CELL_HEIGHT, POC_CELL_WIDTH as CELL_WIDTH};
+use noren_terminal::TerminalSnapshot;
 const GLYPH_SCALE: u32 = 2;
 const GLYPH_TOP: u32 = 3;
 const MAX_RENDER_ROWS: usize = 60;
@@ -168,12 +169,16 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    pub(crate) fn render(&mut self, lines: &[String]) -> RenderOutcome {
+    pub(crate) fn render(
+        &mut self,
+        terminal: Option<&TerminalSnapshot>,
+        status: Option<&str>,
+    ) -> RenderOutcome {
         if self.device_lost.load(Ordering::Acquire) {
             return RenderOutcome::DeviceLost;
         }
 
-        let vertices = glyph_vertices(lines, self.config.width, self.config.height);
+        let vertices = glyph_vertices(terminal, status, self.config.width, self.config.height);
         let bytes = vertex_bytes(&vertices);
         let required = u64::try_from(bytes.len()).unwrap_or(u64::MAX).max(8);
         if required > self.vertex_capacity {
@@ -267,7 +272,12 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-fn glyph_vertices(lines: &[String], width: u32, height: u32) -> Vec<[f32; 2]> {
+fn glyph_vertices(
+    terminal: Option<&TerminalSnapshot>,
+    status: Option<&str>,
+    width: u32,
+    height: u32,
+) -> Vec<[f32; 2]> {
     if width == 0 || height == 0 {
         return Vec::new();
     }
@@ -277,10 +287,17 @@ fn glyph_vertices(lines: &[String], width: u32, height: u32) -> Vec<[f32; 2]> {
     let visible_cols = usize::try_from(width / CELL_WIDTH)
         .unwrap_or(usize::MAX)
         .clamp(1, MAX_RENDER_COLS);
-    let first_line = lines.len().saturating_sub(visible_rows);
+    let lines = terminal.map(TerminalSnapshot::lines).unwrap_or_default();
+    let total_lines = lines.len() + usize::from(status.is_some());
+    let first_line = total_lines.saturating_sub(visible_rows);
     let mut vertices = Vec::new();
 
-    for (row, line) in lines[first_line..].iter().enumerate() {
+    for (row, line_index) in (first_line..total_lines).enumerate() {
+        let line = if line_index < lines.len() {
+            lines[line_index].as_str()
+        } else {
+            status.unwrap_or_default()
+        };
         for (col, character) in line.chars().take(visible_cols).enumerate() {
             let glyph = glyph_rows(character);
             for (glyph_y, bits) in glyph.into_iter().enumerate() {
@@ -407,18 +424,27 @@ fn glyph_rows(character: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use noren_terminal::TerminalState;
+
+    fn snapshot(rows: u16, cols: u16, bytes: &[u8]) -> TerminalSnapshot {
+        let mut terminal = TerminalState::new(rows, cols).expect("valid test terminal");
+        terminal.feed_bytes(bytes);
+        terminal.snapshot()
+    }
 
     #[test]
     fn glyph_input_is_bounded_to_visible_poc_grid() {
-        let lines = vec!["A".repeat(500); 100];
-        let vertices = glyph_vertices(&lines, u32::MAX, u32::MAX);
+        let terminal = snapshot(100, 500, &vec![b'A'; 50_000]);
+        let vertices = glyph_vertices(Some(&terminal), None, u32::MAX, u32::MAX);
         assert!(vertices.len() <= MAX_VERTICES);
     }
 
     #[test]
     fn empty_and_zero_sized_inputs_have_no_vertices() {
-        assert!(glyph_vertices(&[], 900, 600).is_empty());
-        assert!(glyph_vertices(&["text".to_owned()], 0, 600).is_empty());
+        let empty = snapshot(1, 1, b"");
+        let text = snapshot(1, 8, b"text");
+        assert!(glyph_vertices(Some(&empty), None, 900, 600).is_empty());
+        assert!(glyph_vertices(Some(&text), None, 0, 600).is_empty());
     }
 
     #[test]
@@ -430,7 +456,8 @@ mod tests {
 
     #[test]
     fn vertex_encoding_has_two_floats_per_vertex() {
-        let vertices = glyph_vertices(&["A".to_owned()], 900, 600);
+        let terminal = snapshot(1, 2, b"A");
+        let vertices = glyph_vertices(Some(&terminal), None, 900, 600);
         assert_eq!(vertex_bytes(&vertices).len(), vertices.len() * 8);
     }
 }
