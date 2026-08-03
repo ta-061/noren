@@ -1,4 +1,4 @@
-use crate::parser::{Action, Parser, PrivateMode};
+use crate::parser::{Action, EraseMode, Parser, PrivateMode};
 use std::fmt;
 
 /// Hard allocation bound for a visible Terminal Core screen.
@@ -235,6 +235,61 @@ impl ScreenBuffer {
         let shift = rows * columns;
         self.cells[start..end].rotate_right(shift);
         self.cells[start..start + shift].fill(Cell::blank());
+    }
+
+    fn erase_in_display(&mut self, cursor: Cursor, mode: EraseMode) {
+        let Some(cursor_index) = self.index(cursor.row, cursor.column) else {
+            return;
+        };
+        match mode {
+            EraseMode::ToEnd => self.cells[cursor_index..].fill(Cell::default()),
+            EraseMode::ToBeginning => self.cells[..cursor_index + 1].fill(Cell::default()),
+            EraseMode::All => self.cells.fill(Cell::default()),
+        }
+    }
+
+    fn erase_in_line(&mut self, cursor: Cursor, mode: EraseMode) {
+        let Some(cursor_index) = self.index(cursor.row, cursor.column) else {
+            return;
+        };
+        let row_start = usize::from(cursor.row) * usize::from(self.cols);
+        let row_end = row_start + usize::from(self.cols);
+        match mode {
+            EraseMode::ToEnd => self.cells[cursor_index..row_end].fill(Cell::default()),
+            EraseMode::ToBeginning => {
+                self.cells[row_start..cursor_index + 1].fill(Cell::default());
+            }
+            EraseMode::All => self.cells[row_start..row_end].fill(Cell::default()),
+        }
+    }
+
+    fn erase_characters(&mut self, cursor: Cursor, count: u16) {
+        let Some(start) = self.index(cursor.row, cursor.column) else {
+            return;
+        };
+        let row_end = (usize::from(cursor.row) + 1) * usize::from(self.cols);
+        let count = usize::from(count).min(row_end - start);
+        self.cells[start..start + count].fill(Cell::default());
+    }
+
+    fn insert_characters(&mut self, cursor: Cursor, count: u16) {
+        let Some(start) = self.index(cursor.row, cursor.column) else {
+            return;
+        };
+        let row_end = (usize::from(cursor.row) + 1) * usize::from(self.cols);
+        let count = usize::from(count).min(row_end - start);
+        self.cells[start..row_end].rotate_right(count);
+        self.cells[start..start + count].fill(Cell::default());
+    }
+
+    fn delete_characters(&mut self, cursor: Cursor, count: u16) {
+        let Some(start) = self.index(cursor.row, cursor.column) else {
+            return;
+        };
+        let row_end = (usize::from(cursor.row) + 1) * usize::from(self.cols);
+        let count = usize::from(count).min(row_end - start);
+        self.cells[start..row_end].rotate_left(count);
+        self.cells[row_end - count..row_end].fill(Cell::default());
     }
 
     fn index(&self, row: u16, column: u16) -> Option<usize> {
@@ -500,6 +555,13 @@ impl TerminalState {
             }
             Action::ScrollUp(count) => self.scroll_up(count),
             Action::ScrollDown(count) => self.scroll_down(count),
+            Action::EraseInDisplay(mode) => self.erase_in_display(mode),
+            Action::EraseInLine(mode) => self.erase_in_line(mode),
+            Action::EraseCharacters(count) => self.erase_characters(count),
+            Action::InsertCharacters(count) => self.insert_characters(count),
+            Action::DeleteCharacters(count) => self.delete_characters(count),
+            Action::InsertLines(count) => self.insert_lines(count),
+            Action::DeleteLines(count) => self.delete_lines(count),
             Action::SaveCursor => self.save_cursor(),
             Action::RestoreCursor => self.restore_cursor(),
             Action::SetPrivateMode { mode, enabled } => self.set_private_mode(mode, enabled),
@@ -563,6 +625,69 @@ impl TerminalState {
         self.active
             .screen
             .scroll_down(self.active.scroll_region, count);
+    }
+
+    fn erase_in_display(&mut self, mode: EraseMode) {
+        self.active.wrap_pending = false;
+        self.active
+            .screen
+            .erase_in_display(self.active.cursor, mode);
+    }
+
+    fn erase_in_line(&mut self, mode: EraseMode) {
+        self.active.wrap_pending = false;
+        self.active.screen.erase_in_line(self.active.cursor, mode);
+    }
+
+    fn erase_characters(&mut self, count: u16) {
+        self.active.wrap_pending = false;
+        self.active
+            .screen
+            .erase_characters(self.active.cursor, count);
+    }
+
+    fn insert_characters(&mut self, count: u16) {
+        self.active.wrap_pending = false;
+        self.active
+            .screen
+            .insert_characters(self.active.cursor, count);
+    }
+
+    fn delete_characters(&mut self, count: u16) {
+        self.active.wrap_pending = false;
+        self.active
+            .screen
+            .delete_characters(self.active.cursor, count);
+    }
+
+    fn insert_lines(&mut self, count: u16) {
+        self.active.wrap_pending = false;
+        let cursor_row = self.active.cursor.row;
+        let region = self.active.scroll_region;
+        if (region.top..=region.bottom).contains(&cursor_row) {
+            self.active.screen.scroll_down(
+                ScrollRegion {
+                    top: cursor_row,
+                    bottom: region.bottom,
+                },
+                count,
+            );
+        }
+    }
+
+    fn delete_lines(&mut self, count: u16) {
+        self.active.wrap_pending = false;
+        let cursor_row = self.active.cursor.row;
+        let region = self.active.scroll_region;
+        if (region.top..=region.bottom).contains(&cursor_row) {
+            self.active.screen.scroll_up(
+                ScrollRegion {
+                    top: cursor_row,
+                    bottom: region.bottom,
+                },
+                count,
+            );
+        }
     }
 
     fn reset_scroll_region(&mut self) {

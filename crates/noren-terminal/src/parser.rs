@@ -25,9 +25,23 @@ pub(crate) enum Action {
     SetScrollRegion { top: u16, bottom: Option<u16> },
     ScrollUp(u16),
     ScrollDown(u16),
+    EraseInDisplay(EraseMode),
+    EraseInLine(EraseMode),
+    EraseCharacters(u16),
+    InsertCharacters(u16),
+    DeleteCharacters(u16),
+    InsertLines(u16),
+    DeleteLines(u16),
     SaveCursor,
     RestoreCursor,
     SetPrivateMode { mode: PrivateMode, enabled: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EraseMode {
+    ToEnd,
+    ToBeginning,
+    All,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,6 +233,7 @@ impl Csi {
     fn standard_action(&self, final_byte: u8) -> Option<Action> {
         let count = self.param_or(0, 1);
         match final_byte {
+            b'@' if self.len == 1 => Some(Action::InsertCharacters(count)),
             b'A' => Some(Action::MoveUp(count)),
             b'B' => Some(Action::MoveDown(count)),
             b'C' => Some(Action::MoveRight(count)),
@@ -230,9 +245,15 @@ impl Csi {
                 row: self.param_or(0, 1).saturating_sub(1),
                 col: self.param_or(1, 1).saturating_sub(1),
             }),
+            b'J' => self.erase_mode().map(Action::EraseInDisplay),
+            b'K' => self.erase_mode().map(Action::EraseInLine),
+            b'L' if self.len == 1 => Some(Action::InsertLines(count)),
+            b'P' if self.len == 1 => Some(Action::DeleteCharacters(count)),
             b'S' if self.len <= 1 => Some(Action::ScrollUp(count)),
             b'T' if self.len <= 1 => Some(Action::ScrollDown(count)),
+            b'X' if self.len == 1 => Some(Action::EraseCharacters(count)),
             b'd' => Some(Action::MoveToRow(count.saturating_sub(1))),
+            b'M' if self.len == 1 => Some(Action::DeleteLines(count)),
             b'r' if self.len <= 2 => Some(Action::SetScrollRegion {
                 top: self.param_or(0, 1).saturating_sub(1),
                 bottom: self.zero_based_param(1),
@@ -266,6 +287,18 @@ impl Csi {
 
     fn is_default_only(&self) -> bool {
         self.len == 1 && self.params[0] == 0
+    }
+
+    fn erase_mode(&self) -> Option<EraseMode> {
+        if self.len != 1 {
+            return None;
+        }
+        match self.params[0] {
+            0 => Some(EraseMode::ToEnd),
+            1 => Some(EraseMode::ToBeginning),
+            2 => Some(EraseMode::All),
+            _ => None,
+        }
     }
 
     fn param_or(&self, index: usize, default: u16) -> u16 {
