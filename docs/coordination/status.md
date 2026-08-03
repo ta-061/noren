@@ -11,10 +11,13 @@ Last updated: 2026-08-03 (Asia/Tokyo). PR
 [#24](https://github.com/ta-061/noren/issues/24),
 [#25](https://github.com/ta-061/noren/issues/25),
 [#26](https://github.com/ta-061/noren/issues/26), and
-[#27](https://github.com/ta-061/noren/issues/27) are open and stacked on the
-exact PR #23 head as Draft PRs
-[#29](https://github.com/ta-061/noren/pull/29)–[#32](https://github.com/ta-061/noren/pull/32);
-Issue [#28](https://github.com/ta-061/noren/issues/28) and Draft PR
+[#27](https://github.com/ta-061/noren/issues/27) now have complete Draft PRs
+[#31](https://github.com/ta-061/noren/pull/31),
+[#29](https://github.com/ta-061/noren/pull/29),
+[#30](https://github.com/ta-061/noren/pull/30), and
+[#32](https://github.com/ta-061/noren/pull/32); PRs #29–#33 all remain Draft
+and review waiting, and none is merged. Issue
+[#28](https://github.com/ta-061/noren/issues/28) and Draft PR
 [#33](https://github.com/ta-061/noren/pull/33) document the parallel development
 model. Historical sections below
 preserve the PR #17 record at implementation/test head
@@ -50,17 +53,27 @@ Verified on 2026-08-03:
   (SGR and cell attributes),
   [#26](https://github.com/ta-061/noren/issues/26) (application cursor/keypad
   modes), and [#27](https://github.com/ta-061/noren/issues/27) (bounded VT
-  compatibility test suite) are open, stacked on the exact PR #23 head
-  `c6a1e3fef469c09e243a0b5cc88c2bee2aedddb7`. Their Draft checkpoints are
-  [#31](https://github.com/ta-061/noren/pull/31),
-  [#29](https://github.com/ta-061/noren/pull/29),
-  [#30](https://github.com/ta-061/noren/pull/30), and
-  [#32](https://github.com/ta-061/noren/pull/32), respectively. #24 and #27
-  have complete first implementations; #25 and #26 intentionally contain
-  non-conflicting foundations with central parser/state wiring still pending.
-  Issue [#28](https://github.com/ta-061/noren/issues/28) and Draft PR
-  [#33](https://github.com/ta-061/noren/pull/33) track the documentation of the
-  parallel development model.
+  compatibility test suite) each have a complete Draft PR, all remaining Draft
+  and review waiting:
+  - [#31](https://github.com/ta-061/noren/pull/31) for #24 at
+    `a630c93605e309c2fd23558c8807500ac12a684e`, with exact-head macOS and docs
+    CI green.
+  - [#29](https://github.com/ta-061/noren/pull/29) for #25 at
+    `0daa7d6aff2dbcdc547358288346a9804fa35011`, stacked on branch
+    `agent/terminal-erase-ops`; both CI green and Claude `BLOCKER: NONE`.
+  - [#30](https://github.com/ta-061/noren/pull/30) for #26 at
+    `fd1ea69584acbfdf2d0c08debbd148989f3f9f6b`, stacked on
+    `agent/terminal-sgr-attributes`; 96 local tests, both CI green, and Claude
+    `BLOCKER: NONE`.
+  - [#32](https://github.com/ta-061/noren/pull/32) for #27 at
+    `c03e8b30ec82597b32b597b7b8961c30d61c6556`; both CI green and Claude
+    `BLOCKER: NONE`.
+
+  The central parser/state file lease sequence #24 -> #25 -> #26 is complete
+  and released; none of these PRs is merged and none is a vim/tmux/zellij
+  compatibility claim. Issue [#28](https://github.com/ta-061/noren/issues/28)
+  and Draft PR [#33](https://github.com/ta-061/noren/pull/33) track the
+  documentation of the parallel development model.
 - PR [#19](https://github.com/ta-061/noren/pull/19) and Issue
   [#18](https://github.com/ta-061/noren/issues/18) are complete after owner
   acceptance of the renderer-independent Terminal Core foundation.
@@ -162,8 +175,11 @@ PR #21 remains Draft for owner review and acceptance. Stacked PR #23 has passed
 local checks and CI, and the existing local-zsh application launch was
 rechecked; it remains Draft and based on `agent/terminal-scroll-regions` until
 #21 is accepted and merged. PR #19 has no remaining gate. This does not
-authorize deferred terminal features in either Draft PR. Issues #24–#28 start
-only from the exact PR #23 head and must not modify Draft PRs #21 or #23.
+authorize deferred terminal features in either Draft PR. Compatibility Issues
+#24–#27 started only from the exact PR #23 head and did not modify Draft PRs
+#21 or #23; their central parser/state file lease sequence #24 -> #25 -> #26
+is complete and released, and Draft PRs #29–#32 are complete, review waiting,
+and unmerged. Draft PR #33 is this documentation update and also remains Draft.
 
 Full VT/xterm behavior, non-ASCII glyph quality, swash/font trials, production
 IME/accessibility, Linux, SSH, agent integration, tabs, panes, themes, and a
@@ -180,9 +196,11 @@ identity, and the public support/security contact before Preview publication.
 1. Review and accept Draft PR #21, then promote and merge its exact tested head.
 2. Retarget Draft PR #23 to `main` only after #21 merges, then review its exact
    tested head.
-3. Review compatibility Draft PRs #29–#32, keeping erase, SGR, application
-   modes, the compatibility test suite, and later VT work in separate Issues
-   and PRs.
-4. After Draft PR #31 passes exact-head CI, hand the central parser/state file
-   lease once to #25; keep #26 terminal-state wiring queued behind that
-   checkpoint.
+3. Review the complete compatibility Draft PRs in stack order — #31, then #29
+   (stacked on `agent/terminal-erase-ops`), then #30 (stacked on
+   `agent/terminal-sgr-attributes`), plus #32 — keeping erase, SGR,
+   application modes, the compatibility test suite, and later VT work in
+   separate Issues and PRs.
+4. No central parser/state file lease queue remains: the #24 -> #25 -> #26
+   lease sequence is complete and released. Review Draft PR #33 (Issue #28)
+   as the documentation record of this parallel model.

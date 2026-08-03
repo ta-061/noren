@@ -7,8 +7,12 @@
   [#23](https://github.com/ta-061/noren/pull/23) for Issue
   [#22](https://github.com/ta-061/noren/issues/22); compatibility Issues
   [#24](https://github.com/ta-061/noren/issues/24)–[#27](https://github.com/ta-061/noren/issues/27)
-  have isolated Draft PRs
-  [#29](https://github.com/ta-061/noren/pull/29)–[#32](https://github.com/ta-061/noren/pull/32)
+  have complete Draft PRs
+  [#31](https://github.com/ta-061/noren/pull/31),
+  [#29](https://github.com/ta-061/noren/pull/29),
+  [#30](https://github.com/ta-061/noren/pull/30), and
+  [#32](https://github.com/ta-061/noren/pull/32) — all review waiting, none
+  merged
 - Supersedes nothing: the accepted [local-PTY PoC
   architecture](minimal-local-pty-poc.md) still applies
 
@@ -84,25 +88,35 @@ Added by Draft PR #23 / Issue #22 (alternate screen, stacked on #21):
 This slice makes `?1049` round-trips reliable; it is not full xterm, vim,
 tmux, or zellij compatibility.
 
-## In progress, not implemented
+## Implemented in Draft PRs, not yet supported
 
-These compatibility slices are isolated Draft checkpoints based on the exact
-Draft PR #23 head. No vim/tmux/zellij compatibility is claimed:
+These compatibility slices are implemented in complete, review-waiting Draft
+PRs; none is merged, so none is supported in Noren yet. No vim/tmux/zellij
+compatibility is claimed:
 
 - Issue [#24](https://github.com/ta-061/noren/issues/24) / Draft PR
   [#31](https://github.com/ta-061/noren/pull/31): ED, EL, ECH, ICH, DCH, IL,
-  and DL implementation.
+  and DL at `a630c93605e309c2fd23558c8807500ac12a684e`; exact-head macOS and
+  docs CI green.
 - Issue [#25](https://github.com/ta-061/noren/issues/25) / Draft PR
-  [#29](https://github.com/ta-061/noren/pull/29): attribute value types only;
-  Cell/current-pen and SGR parser integration remain pending.
+  [#29](https://github.com/ta-061/noren/pull/29): SGR and cell attributes at
+  `0daa7d6aff2dbcdc547358288346a9804fa35011`, stacked on branch
+  `agent/terminal-erase-ops`; both CI green and Claude `BLOCKER: NONE`.
 - Issue [#26](https://github.com/ta-061/noren/issues/26) / Draft PR
-  [#30](https://github.com/ta-061/noren/pull/30): input encoders only;
-  DECCKM/DECKPAM/DECKPNM parsing, state, and call-site wiring remain pending.
+  [#30](https://github.com/ta-061/noren/pull/30): application cursor/keypad
+  modes (DECCKM/DECKPAM/DECKPNM) at
+  `fd1ea69584acbfdf2d0c08debbd148989f3f9f6b`, stacked on
+  `agent/terminal-sgr-attributes`; 96 local tests, both CI green, and Claude
+  `BLOCKER: NONE`.
 - Issue [#27](https://github.com/ta-061/noren/issues/27) / Draft PR
   [#32](https://github.com/ta-061/noren/pull/32): a bounded public-API
-  compatibility harness for behavior present at the PR #23 baseline.
+  compatibility harness at `c03e8b30ec82597b32b597b7b8961c30d61c6556`; both CI
+  green and Claude `BLOCKER: NONE`.
 
-Issue [#28](https://github.com/ta-061/noren/issues/28) and Draft PR
+The central parser/state file lease sequence #24 -> #25 -> #26 is complete and
+released; #31 is based on the exact Draft PR #23 head, and #29 and #30 are
+stacked behind it in lease order. Issue
+[#28](https://github.com/ta-061/noren/issues/28) and Draft PR
 [#33](https://github.com/ta-061/noren/pull/33) document the parallel development
 model running these lanes; the workflow rules live in
 [CONTRIBUTING.md](../../CONTRIBUTING.md).

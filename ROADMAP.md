@@ -24,18 +24,21 @@ screen is Draft PR [#23](https://github.com/ta-061/noren/pull/23) for Issue
 [#22](https://github.com/ta-061/noren/issues/22); neither Draft PR is merged.
 
 Compatibility development priority is vim first, then tmux and zellij, then
-SSH, then agent integration. The next slices are Draft checkpoints based on
-the exact Draft PR #23 head: erase and insert/delete operations (Issue
-[#24](https://github.com/ta-061/noren/issues/24), Draft PR
-[#31](https://github.com/ta-061/noren/pull/31)); SGR attribute value types,
-with parser/state integration still pending (Issue
+SSH, then agent integration. The compatibility slices are implemented in
+complete Draft PRs that all remain Draft and review waiting; none is merged
+and none is a vim/tmux/zellij compatibility claim: erase and insert/delete
+operations (Issue [#24](https://github.com/ta-061/noren/issues/24), Draft PR
+[#31](https://github.com/ta-061/noren/pull/31) at
+`a630c93605e309c2fd23558c8807500ac12a684e`); SGR and cell attributes (Issue
 [#25](https://github.com/ta-061/noren/issues/25), Draft PR
-[#29](https://github.com/ta-061/noren/pull/29)); application cursor/keypad
-input encoders, with terminal-state wiring still pending (Issue
+[#29](https://github.com/ta-061/noren/pull/29) stacked on
+`agent/terminal-erase-ops`); application cursor/keypad modes (Issue
 [#26](https://github.com/ta-061/noren/issues/26), Draft PR
-[#30](https://github.com/ta-061/noren/pull/30)); and a bounded current-core VT
-compatibility harness (Issue [#27](https://github.com/ta-061/noren/issues/27),
-Draft PR [#32](https://github.com/ta-061/noren/pull/32)). Issue
+[#30](https://github.com/ta-061/noren/pull/30) stacked on
+`agent/terminal-sgr-attributes`); and a bounded current-core VT compatibility
+harness (Issue [#27](https://github.com/ta-061/noren/issues/27), Draft PR
+[#32](https://github.com/ta-061/noren/pull/32)). The central parser/state
+file lease sequence #24 -> #25 -> #26 is complete and released. Issue
 [#28](https://github.com/ta-061/noren/issues/28) and Draft PR
 [#33](https://github.com/ta-061/noren/pull/33) document the parallel development
 model behind these lanes.

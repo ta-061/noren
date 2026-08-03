@@ -50,15 +50,19 @@ Changes to `crates/noren-terminal/` additionally keep these conventions:
 - Scrolling-region changes must preserve rows outside the active margins.
 - Renderer and PTY concerns stay out of `noren-terminal` tests; the core
   neither reads from a PTY nor renders.
-- The active compatibility lanes — erase/insert/delete
-  ([#24](https://github.com/ta-061/noren/issues/24)), SGR and cell attributes
-  ([#25](https://github.com/ta-061/noren/issues/25)), application
-  cursor/keypad modes ([#26](https://github.com/ta-061/noren/issues/26)), and
-  the bounded VT compatibility test suite
-  ([#27](https://github.com/ta-061/noren/issues/27)) — are in progress as
-  Draft PRs [#29](https://github.com/ta-061/noren/pull/29)–[#32](https://github.com/ta-061/noren/pull/32).
-  A Draft checkpoint is not a compatibility-complete claim. The lanes follow
-  the file leases below and test through the public API.
+- The compatibility lanes — erase/insert/delete
+  ([#24](https://github.com/ta-061/noren/issues/24) / Draft PR
+  [#31](https://github.com/ta-061/noren/pull/31)), SGR and cell attributes
+  ([#25](https://github.com/ta-061/noren/issues/25) / Draft PR
+  [#29](https://github.com/ta-061/noren/pull/29)), application
+  cursor/keypad modes ([#26](https://github.com/ta-061/noren/issues/26) /
+  Draft PR [#30](https://github.com/ta-061/noren/pull/30)), and the bounded VT
+  compatibility test suite ([#27](https://github.com/ta-061/noren/issues/27) /
+  Draft PR [#32](https://github.com/ta-061/noren/pull/32)) — are implemented
+  in complete Draft PRs that all remain Draft and review waiting; none is
+  merged. Implemented in a Draft PR is not supported behavior and not a
+  compatibility claim. The lanes followed the file leases below and test
+  through the public API.
 
 ## Parallel development model
 
@@ -73,9 +77,15 @@ Terminal Core advances through parallel lanes under these rules:
   PR is retargeted to `main` only after its dependency merges. The current
   dependency chain starts with Draft PR
   [#21](https://github.com/ta-061/noren/pull/21), then Draft PR
-  [#23](https://github.com/ta-061/noren/pull/23). Compatibility Draft PRs
-  #29–#32 are isolated siblings based on the exact #23 head until the next
-  central-file lease is handed off.
+  [#23](https://github.com/ta-061/noren/pull/23). The compatibility lanes
+  followed the central parser/state file lease sequence: Draft PR #31 (erase,
+  Issue #24) is based on the exact #23 head, Draft PR #29 (SGR, Issue #25) is
+  stacked on `agent/terminal-erase-ops`, and Draft PR #30 (application
+  cursor/keypad modes, Issue #26) is stacked on
+  `agent/terminal-sgr-attributes`; that lease sequence is complete and
+  released. Draft PR #32 (Issue #27) adds the bounded VT compatibility
+  harness, and Draft PR #33 (Issue #28) documents this model. All of PRs
+  #29–#33 remain Draft and review waiting; none is merged.
 - Every lane ends with a checkpoint handoff: signed commits plus the lane
   state recorded in the Issue and in
   [coordination status](docs/coordination/status.md), so the next lane starts
