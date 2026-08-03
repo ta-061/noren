@@ -1,0 +1,16 @@
+[package]
+name = "noren-app"
+description = "macOS entry point, app-owned event adapter, and bounded wiring for the local-PTY PoC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+noren-pty.workspace = true
+noren-terminal.workspace = true
+
+[lints]
+workspace = true

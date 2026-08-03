@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/noren-pty",
+    "crates/noren-terminal",
+    "crates/noren-app",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ta-061/noren"
+publish = false
+
+# Noren baseline policy: no hand-written `unsafe` in the PoC crates. Candidate
+# libraries are compiled and reviewed independently; this deny does not audit
+# their internals.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+# Exact candidate versions live in one place so a later replacement or upgrade
+# is a single reviewed change. The `=` pins are intentional: ADR 0001 records
+# these as the measured PoC candidates, not floating ranges.
+[workspace.dependencies]
+portable-pty = { version = "=0.9.0" }
+avt = { version = "=0.18.0" }
+unicode-width = { version = "=0.2.2" }
+noren-pty = { path = "crates/noren-pty" }
+noren-terminal = { path = "crates/noren-terminal" }

@@ -1,0 +1,16 @@
+[package]
+name = "noren-terminal"
+description = "Noren-owned terminal state, cell-width, and bounded snapshot contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+avt.workspace = true
+unicode-width.workspace = true
+
+[lints]
+workspace = true
