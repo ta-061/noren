@@ -41,6 +41,16 @@ cargo test --workspace
 Dependency audit and license policy checks remain intended additions; the
 repository will not claim these pass before CI actually runs them.
 
+Changes to `crates/noren-terminal/` additionally keep these conventions:
+
+- Internal coordinates are zero-based; CSI parameters are one-based. Convert
+  at the parse boundary and keep the two schemes out of each other's layers.
+- Test through the public API with byte-driven fixtures: feed raw bytes into
+  `TerminalState::feed_bytes` and assert on `snapshot()`, not on internals.
+- Scrolling-region changes must preserve rows outside the active margins.
+- Renderer and PTY concerns stay out of `noren-terminal` tests; the core
+  neither reads from a PTY nor renders.
+
 ## Pull requests and review
 
 Open a Draft PR early. Complete the PR template and link the Issue. The
