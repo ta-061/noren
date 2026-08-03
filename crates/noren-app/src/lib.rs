@@ -378,14 +378,21 @@ impl KeyEncoder {
     /// mode.
     ///
     /// Numeric mode emits the literal key character; application mode emits the
-    /// `SS3` (`ESC O`) sequence. Releases are dropped for parity with the
-    /// main key path.
+    /// `SS3` (`ESC O`) sequence. Release, Control, Option, and Command handling
+    /// follows the main key path; Shift does not alter these bounded sequences.
     pub fn encode_keypad_with(
         input: KeypadInput,
         mode: InputMode,
     ) -> Result<Vec<u8>, KeyDropReason> {
         if input.phase() == KeyPhase::Released {
             return Err(KeyDropReason::Released);
+        }
+        let modifiers = input.modifiers();
+        if modifiers.is_alt() || modifiers.is_super() {
+            return Err(KeyDropReason::UnsupportedModifier);
+        }
+        if modifiers.is_ctrl() {
+            return Err(KeyDropReason::UnsupportedControl);
         }
         Ok(input::keypad_bytes(input.key(), mode.keypad()).to_vec())
     }
@@ -761,6 +768,31 @@ mod tests {
         assert_eq!(
             KeyEncoder::encode_keypad_with(released, application),
             Err(KeyDropReason::Released)
+        );
+    }
+
+    #[test]
+    fn keypad_encoder_preserves_the_existing_modifier_policy() {
+        let mode = InputMode::normal().with_keypad(KeypadMode::Application);
+        let pressed = KeypadInput::new(KeypadKey::One, KeyPhase::Pressed);
+
+        assert_eq!(
+            KeyEncoder::encode_keypad_with(pressed.with_modifiers(Modifiers::empty().ctrl()), mode),
+            Err(KeyDropReason::UnsupportedControl)
+        );
+        for modifiers in [Modifiers::empty().alt(), Modifiers::empty().super_key()] {
+            assert_eq!(
+                KeyEncoder::encode_keypad_with(pressed.with_modifiers(modifiers), mode),
+                Err(KeyDropReason::UnsupportedModifier)
+            );
+        }
+        assert_eq!(
+            KeyEncoder::encode_keypad_with(
+                pressed.with_modifiers(Modifiers::empty().shift()),
+                mode
+            )
+            .as_deref(),
+            Ok(b"\x1bOq".as_slice())
         );
     }
 

@@ -44,6 +44,7 @@ pub(crate) enum Action {
     },
     SaveCursor,
     RestoreCursor,
+    SetKeypadApplication(bool),
     SetPrivateMode {
         mode: PrivateMode,
         enabled: bool,
@@ -60,6 +61,7 @@ pub(crate) enum EraseMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrivateMode {
     AlternateScreen,
+    ApplicationCursorKey,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -124,6 +126,14 @@ impl Parser {
             b'[' => self.state = ParserState::Csi(Csi::default()),
             b']' => self.state = ParserState::Osc,
             ESC => self.state = ParserState::Escape,
+            b'=' => {
+                self.state = ParserState::Ground;
+                return Some(Action::SetKeypadApplication(true));
+            }
+            b'>' => {
+                self.state = ParserState::Ground;
+                return Some(Action::SetKeypadApplication(false));
+            }
             b'D' => {
                 self.state = ParserState::Ground;
                 return Some(Action::Index);
@@ -286,6 +296,7 @@ impl Csi {
             return None;
         }
         let mode = match self.params[0] {
+            1 => PrivateMode::ApplicationCursorKey,
             1049 => PrivateMode::AlternateScreen,
             _ => return None,
         };

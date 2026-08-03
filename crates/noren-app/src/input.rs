@@ -2,14 +2,10 @@
 //!
 //! This is the input-side mirror of DECCKM (`CSI ?1 h/l`, DEC cursor key mode)
 //! and DECKPAM / DECKPNM (`ESC =` / `ESC >`, keypad application / numeric
-//! mode). The terminal-state parser that consumes those escapes from the PTY
-//! lives in `noren-terminal` and is wired only after Issue #24 releases
-//! `parser.rs` and `state.rs`; this module owns only the encoding-side
-//! selection so the PoC key encoder emits the byte sequence the active mode
-//! expects. DECCKM / DECKPAM parser and state integration is a later,
-//! documented checkpoint and is intentionally absent here.
+//! mode). `noren-terminal` owns the parser and mode state; this module owns the
+//! app-side encoding selection.
 
-use crate::{Arrow, KeyPhase};
+use crate::{Arrow, KeyPhase, Modifiers};
 
 /// DEC cursor key mode (DECCKM) input-side selector.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -125,13 +121,25 @@ pub enum KeypadKey {
 pub struct KeypadInput {
     key: KeypadKey,
     phase: KeyPhase,
+    modifiers: Modifiers,
 }
 
 impl KeypadInput {
-    /// Create a keypad key event.
+    /// Create a keypad key event without active modifiers.
     #[must_use]
     pub const fn new(key: KeypadKey, phase: KeyPhase) -> Self {
-        Self { key, phase }
+        Self {
+            key,
+            phase,
+            modifiers: Modifiers::empty(),
+        }
+    }
+
+    /// Return this event with the active modifiers captured by the window layer.
+    #[must_use]
+    pub const fn with_modifiers(mut self, modifiers: Modifiers) -> Self {
+        self.modifiers = modifiers;
+        self
     }
 
     /// The keypad key identity.
@@ -144,6 +152,12 @@ impl KeypadInput {
     #[must_use]
     pub const fn phase(self) -> KeyPhase {
         self.phase
+    }
+
+    /// Active modifiers captured with this event.
+    #[must_use]
+    pub const fn modifiers(self) -> Modifiers {
+        self.modifiers
     }
 }
 
