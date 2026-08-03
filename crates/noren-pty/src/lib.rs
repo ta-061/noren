@@ -1,27 +1,43 @@
-//! Noren-owned process/PTY boundary contracts for the macOS local-PTY PoC.
+//! Noren-owned process and PTY boundary for the macOS local-shell PoC.
 //!
-//! This crate owns structured spawn, master I/O, resize, status, and teardown
-//! behind the `PtyBackend` contract defined by the
-//! [minimum architecture](https://github.com/ta-061/noren/blob/main/docs/architecture/minimal-local-pty-poc.md).
-//!
-//! This first baseline defines only the typed seams: a validated non-zero
-//! [`PtySize`] and the placeholder [`PtyCommand`], [`PtyEvent`], and
-//! [`PtyError`] shapes. Spawning, the supervisor/reader threads, resize
-//! propagation, and child reaping land in a later step behind the same
-//! contract. `portable-pty` 0.9.0 is declared as the exact trial candidate and
-//! is compiled on the target, but no PTY is opened here.
+//! The public API deliberately exposes no `portable-pty` types. A session
+//! always launches `/bin/zsh` without caller-controlled arguments or `-c`,
+//! moves blocking I/O off the UI thread, bounds every queue and payload, and
+//! owns child termination and reaping in one supervisor thread.
 
+use portable_pty::{CommandBuilder, PtySize as PortablePtySize, native_pty_system};
 use std::ffi::OsString;
 use std::fmt;
+use std::io::{self, Read, Write};
 use std::num::NonZeroU16;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+/// Maximum bytes in one reader chunk or input command.
+pub const READ_CHUNK_BYTES: usize = 16 * 1024;
+/// Maximum buffered output chunks (one MiB at the maximum chunk size).
+pub const OUTPUT_CHANNEL_CAPACITY: usize = 64;
+/// Maximum buffered input, reply, resize, and close commands.
+pub const COMMAND_CHANNEL_CAPACITY: usize = 256;
+/// Maximum bytes in one terminal-generated reply.
+pub const REPLY_BYTES_PER_MESSAGE: usize = 4 * 1024;
+/// Maximum terminal-generated reply bytes accepted in one second.
+pub const REPLY_BYTES_PER_SECOND: usize = 64 * 1024;
+/// Total orderly-shutdown deadline.
+pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
+
+const ZSH_PROGRAM: &str = "/bin/zsh";
+const TERM_VALUE: &str = "xterm-256color";
+const TERM_PROGRAM_VALUE: &str = "Noren-PoC";
+const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
+const READER_JOIN_BUDGET: Duration = Duration::from_millis(1_900);
+const LIFECYCLE_SEND_BUDGET: Duration = Duration::from_millis(100);
 
 /// Validated, non-zero terminal grid dimensions.
-///
-/// Rows and columns are guaranteed non-zero at construction. A zero-sized
-/// window must never reach a PTY; [`PtySize::new`] and [`PtySize::from_raw`]
-/// reject zero so the coalescing rule in the architecture cannot produce a zero
-/// resize on the spawn or resize paths.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PtySize {
     rows: NonZeroU16,
@@ -29,17 +45,13 @@ pub struct PtySize {
 }
 
 impl PtySize {
-    /// Create a size from already-validated non-zero rows and columns.
+    /// Construct a size from already validated values.
     #[must_use]
     pub const fn new(rows: NonZeroU16, cols: NonZeroU16) -> Self {
         Self { rows, cols }
     }
 
-    /// Create a size from raw dimensions, rejecting any zero side.
-    ///
-    /// Returns `None` when either `rows` or `cols` is zero. The coalescing
-    /// layer is expected to retain the last valid grid instead of sending a
-    /// zero dimension; this is the defensive boundary that enforces it.
+    /// Construct a size while rejecting a zero row or column.
     #[must_use]
     pub const fn from_raw(rows: u16, cols: u16) -> Option<Self> {
         match (NonZeroU16::new(rows), NonZeroU16::new(cols)) {
@@ -48,129 +60,673 @@ impl PtySize {
         }
     }
 
-    /// Number of rows, always non-zero.
+    /// Row count.
     #[must_use]
     pub const fn rows(self) -> u16 {
         self.rows.get()
     }
 
-    /// Number of columns, always non-zero.
+    /// Column count.
     #[must_use]
     pub const fn cols(self) -> u16 {
         self.cols.get()
     }
 
-    /// Raw `(rows, cols)` pair.
+    /// Raw `(rows, columns)` pair.
     #[must_use]
     pub const fn into_raw(self) -> (u16, u16) {
         (self.rows.get(), self.cols.get())
     }
-}
 
-/// Structured spawn request.
-///
-/// PoC policy fixes the executable to `/bin/zsh` with no `-c`; the full spawn
-/// policy (validated absolute `$HOME` cwd, inherited environment with
-/// `TERM=xterm-256color` / `TERM_PROGRAM=Noren-PoC` overrides, and
-/// `COLUMNS` / `LINES` removal) is enforced by the future `PtyBackend`. This
-/// baseline only carries the typed shape so later wiring has a stable target.
-/// No process is spawned by this type.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PtyCommand {
-    program: PathBuf,
-    args: Vec<OsString>,
-    cwd: PathBuf,
-}
-
-impl PtyCommand {
-    /// Start a structured command for `program` with `cwd`.
-    ///
-    /// Arguments stay structured; the future supervisor never concatenates a
-    /// caller-supplied command string.
-    #[must_use]
-    pub fn new(program: impl Into<PathBuf>, cwd: impl Into<PathBuf>) -> Self {
-        Self {
-            program: program.into(),
-            args: Vec::new(),
-            cwd: cwd.into(),
+    fn portable(self) -> PortablePtySize {
+        PortablePtySize {
+            rows: self.rows(),
+            cols: self.cols(),
+            pixel_width: 0,
+            pixel_height: 0,
         }
     }
+}
 
-    /// Append one structured argument.
-    #[must_use]
-    pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
-        self.args.push(arg.into());
-        self
+/// Fixed local-zsh launch policy.
+///
+/// The home path is intentionally private and its `Debug` representation is
+/// redacted. Callers can choose neither an executable nor arguments.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ZshLaunchPolicy {
+    home: PathBuf,
+}
+
+impl ZshLaunchPolicy {
+    /// Read and validate the inherited `HOME` value.
+    pub fn from_environment() -> Result<Self, PtyError> {
+        validate_home(std::env::var_os("HOME"))
     }
 
-    /// Program path that will be executed.
+    /// Return only non-sensitive, constant launch metadata.
     #[must_use]
-    pub fn program(&self) -> &std::path::Path {
-        &self.program
-    }
-
-    /// Structured argv after the program.
-    #[must_use]
-    pub fn args(&self) -> &[OsString] {
-        &self.args
-    }
-
-    /// Working directory for the child.
-    #[must_use]
-    pub fn cwd(&self) -> &std::path::Path {
-        &self.cwd
+    pub const fn metadata(&self) -> LaunchMetadata {
+        LaunchMetadata {
+            program: ZSH_PROGRAM,
+            term: TERM_VALUE,
+            term_program: TERM_PROGRAM_VALUE,
+            removes_columns: true,
+            removes_lines: true,
+        }
     }
 }
 
-/// Events emitted by a PTY supervisor to the application main loop.
-///
-/// Output bytes are opaque and non-authoritative: the app forwards them to a
-/// terminal engine and never interprets them as commands. This baseline defines
-/// the contract; the supervisor and reader thread land in a later step. The
-/// enum intentionally does not implement `Clone`/`PartialEq` because the error
-/// variant carries an `std::io::Error`.
-#[derive(Debug)]
-pub enum PtyEvent {
-    /// A bounded chunk of PTY output bytes. Non-authoritative.
-    Output(Vec<u8>),
-    /// The PTY reader observed EOF on the master.
-    Eof,
-    /// The child process exited. `code` is the raw wait status when known.
-    Exited { code: Option<i32> },
-    /// A typed PTY error.
-    Error(PtyError),
+impl fmt::Debug for ZshLaunchPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ZshLaunchPolicy")
+            .field("home", &"<redacted>")
+            .finish()
+    }
 }
 
-/// Typed PTY errors.
-///
-/// Component errors carry a component, operation, and safe status; they never
-/// embed terminal contents, environment values, or input bytes.
-#[derive(Debug)]
+/// Validate an optional `HOME` without mutating process-global environment.
+pub fn validate_home(home: Option<OsString>) -> Result<ZshLaunchPolicy, PtyError> {
+    let home = PathBuf::from(home.ok_or(PtyError::MissingHome)?);
+    if !home.is_absolute() {
+        return Err(PtyError::HomeNotAbsolute);
+    }
+    if !home.is_dir() {
+        return Err(PtyError::HomeNotDirectory);
+    }
+    Ok(ZshLaunchPolicy { home })
+}
+
+/// Safe inspection data for the fixed launch policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaunchMetadata {
+    /// Fixed executable.
+    pub program: &'static str,
+    /// Fixed `TERM` override.
+    pub term: &'static str,
+    /// Fixed `TERM_PROGRAM` override.
+    pub term_program: &'static str,
+    /// Whether inherited `COLUMNS` is removed.
+    pub removes_columns: bool,
+    /// Whether inherited `LINES` is removed.
+    pub removes_lines: bool,
+}
+
+fn build_zsh_command(policy: &ZshLaunchPolicy) -> CommandBuilder {
+    let mut command = CommandBuilder::new(ZSH_PROGRAM);
+    command.cwd(&policy.home);
+    command.env("TERM", TERM_VALUE);
+    command.env("TERM_PROGRAM", TERM_PROGRAM_VALUE);
+    command.env_remove("COLUMNS");
+    command.env_remove("LINES");
+    command
+}
+
+/// PTY operations named by payload-free errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PtyOperation {
+    Open,
+    CloneReader,
+    TakeWriter,
+    SpawnChild,
+    SpawnThread,
+    Read,
+    Write,
+    Flush,
+    Resize,
+    ChildStatus,
+    Kill,
+    Reap,
+}
+
+/// Typed PTY failure without terminal, input, cwd, or environment contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PtyError {
-    /// A non-zero terminal size was required but a side was zero.
+    MissingHome,
+    HomeNotAbsolute,
+    HomeNotDirectory,
     InvalidSize,
-    /// Spawn failed before a child existed.
-    Spawn,
-    /// Blocking PTY I/O failed.
-    Io(std::io::Error),
+    InputTooLarge,
+    ReplyTooLarge,
+    ReplyRateExceeded,
+    CommandQueueFull,
+    ChannelDisconnected,
+    SessionClosing,
+    ReaderJoinTimeout,
+    SupervisorJoinTimeout,
+    Backend {
+        operation: PtyOperation,
+    },
+    Io {
+        operation: PtyOperation,
+        kind: io::ErrorKind,
+    },
+}
+
+impl PtyError {
+    fn io(operation: PtyOperation, error: &io::Error) -> Self {
+        Self::Io {
+            operation,
+            kind: error.kind(),
+        }
+    }
 }
 
 impl fmt::Display for PtyError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::MissingHome => f.write_str("HOME is required"),
+            Self::HomeNotAbsolute => f.write_str("HOME must be absolute"),
+            Self::HomeNotDirectory => f.write_str("HOME must name an existing directory"),
             Self::InvalidSize => f.write_str("terminal size must be non-zero"),
-            Self::Spawn => f.write_str("PTY spawn failed"),
-            Self::Io(err) => write!(f, "PTY I/O failed: {err}"),
+            Self::InputTooLarge => f.write_str("PTY input message exceeds its byte limit"),
+            Self::ReplyTooLarge => f.write_str("terminal reply exceeds its message byte limit"),
+            Self::ReplyRateExceeded => f.write_str("terminal reply rate exceeds its byte limit"),
+            Self::CommandQueueFull => f.write_str("PTY command queue is full"),
+            Self::ChannelDisconnected => f.write_str("PTY channel disconnected"),
+            Self::SessionClosing => f.write_str("PTY session is closing"),
+            Self::ReaderJoinTimeout => f.write_str("PTY reader did not stop before the deadline"),
+            Self::SupervisorJoinTimeout => {
+                f.write_str("PTY supervisor did not stop before the deadline")
+            }
+            Self::Backend { operation } => {
+                write!(f, "PTY backend operation {operation:?} failed")
+            }
+            Self::Io { operation, kind } => {
+                write!(f, "PTY operation {operation:?} failed with {kind:?}")
+            }
         }
     }
 }
 
-impl std::error::Error for PtyError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(err) => Some(err),
-            _ => None,
+impl std::error::Error for PtyError {}
+
+/// Events delivered from the PTY workers to the application.
+#[derive(Debug)]
+pub enum PtyEvent {
+    /// Opaque, bounded PTY bytes.
+    Output(Vec<u8>),
+    /// The cloned reader observed EOF.
+    Eof,
+    /// The child was reaped.
+    Exited { code: Option<u32> },
+    /// A safe typed error.
+    Error(PtyError),
+}
+
+enum SupervisorCommand {
+    Input(Vec<u8>),
+    Reply(Vec<u8>),
+    Resize(PtySize),
+    Close,
+}
+
+/// Running local-zsh PTY session.
+///
+/// The UI side is nonblocking: command methods use `try_send`, while
+/// [`PtySession::try_recv`] drains ready output. [`PtySession::shutdown`] is
+/// the only bounded wait and is idempotent.
+pub struct PtySession {
+    command_tx: SyncSender<SupervisorCommand>,
+    event_rx: Receiver<PtyEvent>,
+    done_rx: Receiver<Result<(), PtyError>>,
+    closing: Arc<AtomicBool>,
+    supervisor: Option<JoinHandle<()>>,
+    finished: bool,
+}
+
+impl fmt::Debug for PtySession {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PtySession")
+            .field("closing", &self.closing.load(Ordering::Acquire))
+            .field("finished", &self.finished)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PtySession {
+    /// Spawn `/bin/zsh` at the supplied initial non-zero size.
+    pub fn spawn(size: PtySize) -> Result<Self, PtyError> {
+        Self::spawn_with_policy(ZshLaunchPolicy::from_environment()?, size)
+    }
+
+    /// Spawn using an already validated fixed-zsh policy.
+    pub fn spawn_with_policy(policy: ZshLaunchPolicy, size: PtySize) -> Result<Self, PtyError> {
+        let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_CHANNEL_CAPACITY);
+        let (event_tx, event_rx) = mpsc::sync_channel(OUTPUT_CHANNEL_CAPACITY);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let closing = Arc::new(AtomicBool::new(false));
+        let supervisor_closing = Arc::clone(&closing);
+
+        let supervisor = thread::Builder::new()
+            .name("noren-pty-supervisor".to_owned())
+            .spawn(move || {
+                supervisor_main(
+                    policy,
+                    size,
+                    command_rx,
+                    event_tx,
+                    ready_tx,
+                    done_tx,
+                    supervisor_closing,
+                );
+            })
+            .map_err(|error| PtyError::io(PtyOperation::SpawnThread, &error))?;
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                command_tx,
+                event_rx,
+                done_rx,
+                closing,
+                supervisor: Some(supervisor),
+                finished: false,
+            }),
+            Ok(Err(error)) => {
+                let _ = supervisor.join();
+                Err(error)
+            }
+            Err(_) => {
+                let _ = supervisor.join();
+                Err(PtyError::ChannelDisconnected)
+            }
         }
+    }
+
+    /// Queue user input without blocking the UI thread.
+    pub fn send_input(&self, bytes: &[u8]) -> Result<(), PtyError> {
+        validate_input(bytes)?;
+        self.send_command(SupervisorCommand::Input(bytes.to_vec()))
+    }
+
+    /// Queue an opaque terminal-generated reply without blocking the UI.
+    pub fn send_reply(&self, bytes: &[u8]) -> Result<(), PtyError> {
+        validate_reply(bytes)?;
+        self.send_command(SupervisorCommand::Reply(bytes.to_vec()))
+    }
+
+    /// Queue one coalesced, non-zero PTY resize.
+    pub fn resize(&self, size: PtySize) -> Result<(), PtyError> {
+        self.send_command(SupervisorCommand::Resize(size))
+    }
+
+    /// Receive one ready event without blocking.
+    pub fn try_recv(&self) -> Result<Option<PtyEvent>, PtyError> {
+        match self.event_rx.try_recv() {
+            Ok(event) => Ok(Some(event)),
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(TryRecvError::Disconnected) if self.finished => Ok(None),
+            Err(TryRecvError::Disconnected) => Err(PtyError::ChannelDisconnected),
+        }
+    }
+
+    /// Stop accepting input and request an idempotent close.
+    pub fn request_close(&self) {
+        if !self.closing.swap(true, Ordering::AcqRel) {
+            let _ = self.command_tx.try_send(SupervisorCommand::Close);
+        }
+    }
+
+    /// Close, reap, and join within the documented deadline.
+    pub fn shutdown(&mut self) -> Result<(), PtyError> {
+        if self.finished {
+            return Ok(());
+        }
+        self.request_close();
+        let result = match self.done_rx.recv_timeout(SHUTDOWN_DEADLINE) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => Err(PtyError::SupervisorJoinTimeout),
+            Err(RecvTimeoutError::Disconnected) => Err(PtyError::ChannelDisconnected),
+        };
+        if result != Err(PtyError::SupervisorJoinTimeout) {
+            if let Some(supervisor) = self.supervisor.take() {
+                if supervisor.join().is_err() {
+                    self.finished = true;
+                    return Err(PtyError::ChannelDisconnected);
+                }
+            }
+            self.finished = true;
+        }
+        result
+    }
+
+    fn send_command(&self, command: SupervisorCommand) -> Result<(), PtyError> {
+        if self.closing.load(Ordering::Acquire) {
+            return Err(PtyError::SessionClosing);
+        }
+        match self.command_tx.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(PtyError::CommandQueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(PtyError::ChannelDisconnected),
+        }
+    }
+}
+
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+fn validate_input(bytes: &[u8]) -> Result<(), PtyError> {
+    if bytes.len() > READ_CHUNK_BYTES {
+        Err(PtyError::InputTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_reply(bytes: &[u8]) -> Result<(), PtyError> {
+    if bytes.len() > REPLY_BYTES_PER_MESSAGE {
+        Err(PtyError::ReplyTooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+fn supervisor_main(
+    policy: ZshLaunchPolicy,
+    size: PtySize,
+    command_rx: Receiver<SupervisorCommand>,
+    event_tx: SyncSender<PtyEvent>,
+    ready_tx: SyncSender<Result<(), PtyError>>,
+    done_tx: SyncSender<Result<(), PtyError>>,
+    closing: Arc<AtomicBool>,
+) {
+    let setup = setup_pty(&policy, size, &event_tx, Arc::clone(&closing));
+    let (master, writer, mut child, reader, reader_done) = match setup {
+        Ok(parts) => {
+            let _ = ready_tx.send(Ok(()));
+            parts
+        }
+        Err(error) => {
+            let _ = ready_tx.send(Err(error));
+            let _ = done_tx.send(Err(error));
+            return;
+        }
+    };
+
+    let mut writer = Some(writer);
+    let mut child_exited = false;
+    let mut first_error = None;
+    let mut replies = ReplyWindow::new();
+
+    while !closing.load(Ordering::Acquire) {
+        match command_rx.recv_timeout(SUPERVISOR_POLL) {
+            Ok(SupervisorCommand::Input(bytes)) => {
+                if let Err(error) = write_bytes(writer.as_mut(), &bytes) {
+                    send_lifecycle(&event_tx, PtyEvent::Error(error));
+                    first_error.get_or_insert(error);
+                    break;
+                }
+            }
+            Ok(SupervisorCommand::Reply(bytes)) => {
+                if let Err(error) = replies.accept(bytes.len()) {
+                    send_lifecycle(&event_tx, PtyEvent::Error(error));
+                } else if let Err(error) = write_bytes(writer.as_mut(), &bytes) {
+                    send_lifecycle(&event_tx, PtyEvent::Error(error));
+                    first_error.get_or_insert(error);
+                    break;
+                }
+            }
+            Ok(SupervisorCommand::Resize(size)) => {
+                if master.resize(size.portable()).is_err() {
+                    let error = PtyError::Backend {
+                        operation: PtyOperation::Resize,
+                    };
+                    send_lifecycle(&event_tx, PtyEvent::Error(error));
+                    first_error.get_or_insert(error);
+                    break;
+                }
+            }
+            Ok(SupervisorCommand::Close) | Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                child_exited = true;
+                send_lifecycle(
+                    &event_tx,
+                    PtyEvent::Exited {
+                        code: Some(status.exit_code()),
+                    },
+                );
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let error = PtyError::io(PtyOperation::ChildStatus, &error);
+                send_lifecycle(&event_tx, PtyEvent::Error(error));
+                first_error.get_or_insert(error);
+                break;
+            }
+        }
+    }
+
+    closing.store(true, Ordering::Release);
+    drop(writer.take());
+
+    if !child_exited {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                send_lifecycle(
+                    &event_tx,
+                    PtyEvent::Exited {
+                        code: Some(status.exit_code()),
+                    },
+                );
+            }
+            Ok(None) => {
+                if let Err(error) = child.kill() {
+                    let error = PtyError::io(PtyOperation::Kill, &error);
+                    send_lifecycle(&event_tx, PtyEvent::Error(error));
+                    first_error.get_or_insert(error);
+                }
+                match child.wait() {
+                    Ok(status) => send_lifecycle(
+                        &event_tx,
+                        PtyEvent::Exited {
+                            code: Some(status.exit_code()),
+                        },
+                    ),
+                    Err(error) => {
+                        let error = PtyError::io(PtyOperation::Reap, &error);
+                        send_lifecycle(&event_tx, PtyEvent::Error(error));
+                        first_error.get_or_insert(error);
+                    }
+                }
+            }
+            Err(error) => {
+                let error = PtyError::io(PtyOperation::ChildStatus, &error);
+                send_lifecycle(&event_tx, PtyEvent::Error(error));
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+
+    drop(master);
+    let reader_result = match reader_done.recv_timeout(READER_JOIN_BUDGET) {
+        Ok(()) => {
+            if reader.join().is_err() {
+                Err(PtyError::ChannelDisconnected)
+            } else {
+                Ok(())
+            }
+        }
+        Err(_) => {
+            drop(reader);
+            Err(PtyError::ReaderJoinTimeout)
+        }
+    };
+
+    let result = match reader_result {
+        Err(error) => Err(error),
+        Ok(()) => first_error.map_or(Ok(()), Err),
+    };
+    if let Err(error) = result {
+        send_lifecycle(&event_tx, PtyEvent::Error(error));
+    }
+    let _ = done_tx.send(result);
+}
+
+type PtyParts = (
+    Box<dyn portable_pty::MasterPty + Send>,
+    Box<dyn Write + Send>,
+    Box<dyn portable_pty::Child + Send + Sync>,
+    JoinHandle<()>,
+    Receiver<()>,
+);
+
+fn setup_pty(
+    policy: &ZshLaunchPolicy,
+    size: PtySize,
+    event_tx: &SyncSender<PtyEvent>,
+    closing: Arc<AtomicBool>,
+) -> Result<PtyParts, PtyError> {
+    let pair = native_pty_system()
+        .openpty(size.portable())
+        .map_err(|_| PtyError::Backend {
+            operation: PtyOperation::Open,
+        })?;
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|_| PtyError::Backend {
+            operation: PtyOperation::CloneReader,
+        })?;
+    let writer = pair.master.take_writer().map_err(|_| PtyError::Backend {
+        operation: PtyOperation::TakeWriter,
+    })?;
+    let command = build_zsh_command(policy);
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|_| PtyError::Backend {
+            operation: PtyOperation::SpawnChild,
+        })?;
+    drop(pair.slave);
+
+    let (reader_done_tx, reader_done_rx) = mpsc::sync_channel(1);
+    let reader_events = event_tx.clone();
+    let reader_thread = match thread::Builder::new()
+        .name("noren-pty-reader".to_owned())
+        .spawn(move || reader_main(reader, reader_events, reader_done_tx, closing))
+    {
+        Ok(thread) => thread,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(PtyError::io(PtyOperation::SpawnThread, &error));
+        }
+    };
+
+    Ok((pair.master, writer, child, reader_thread, reader_done_rx))
+}
+
+fn write_bytes(writer: Option<&mut Box<dyn Write + Send>>, bytes: &[u8]) -> Result<(), PtyError> {
+    let writer = writer.ok_or(PtyError::SessionClosing)?;
+    writer
+        .write_all(bytes)
+        .map_err(|error| PtyError::io(PtyOperation::Write, &error))?;
+    writer
+        .flush()
+        .map_err(|error| PtyError::io(PtyOperation::Flush, &error))
+}
+
+fn reader_main(
+    mut reader: Box<dyn Read + Send>,
+    event_tx: SyncSender<PtyEvent>,
+    done_tx: SyncSender<()>,
+    closing: Arc<AtomicBool>,
+) {
+    let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                send_lifecycle(&event_tx, PtyEvent::Eof);
+                break;
+            }
+            Ok(count) => {
+                if !send_output(&event_tx, buffer[..count].to_vec(), &closing) {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) if closing.load(Ordering::Acquire) => {
+                send_lifecycle(&event_tx, PtyEvent::Eof);
+                break;
+            }
+            Err(error) => {
+                send_lifecycle(
+                    &event_tx,
+                    PtyEvent::Error(PtyError::io(PtyOperation::Read, &error)),
+                );
+                break;
+            }
+        }
+    }
+    let _ = done_tx.send(());
+}
+
+fn send_output(event_tx: &SyncSender<PtyEvent>, bytes: Vec<u8>, closing: &AtomicBool) -> bool {
+    let mut event = PtyEvent::Output(bytes);
+    loop {
+        match event_tx.try_send(event) {
+            Ok(()) => return true,
+            Err(TrySendError::Full(returned)) => {
+                if closing.load(Ordering::Acquire) {
+                    return false;
+                }
+                event = returned;
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(TrySendError::Disconnected(_)) => return false,
+        }
+    }
+}
+
+fn send_lifecycle(event_tx: &SyncSender<PtyEvent>, event: PtyEvent) {
+    let deadline = Instant::now() + LIFECYCLE_SEND_BUDGET;
+    let mut event = event;
+    loop {
+        match event_tx.try_send(event) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => return,
+            Err(TrySendError::Full(returned)) => {
+                if Instant::now() >= deadline {
+                    return;
+                }
+                event = returned;
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+struct ReplyWindow {
+    started: Instant,
+    bytes: usize,
+}
+
+impl ReplyWindow {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            bytes: 0,
+        }
+    }
+
+    fn accept(&mut self, count: usize) -> Result<(), PtyError> {
+        if self.started.elapsed() >= Duration::from_secs(1) {
+            self.started = Instant::now();
+            self.bytes = 0;
+        }
+        let next = self.bytes.saturating_add(count);
+        if next > REPLY_BYTES_PER_SECOND {
+            return Err(PtyError::ReplyRateExceeded);
+        }
+        self.bytes = next;
+        Ok(())
     }
 }
 
@@ -178,99 +734,113 @@ impl std::error::Error for PtyError {
 mod tests {
     use super::*;
     use std::error::Error as _;
-    use std::num::NonZeroU16;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn nz(value: u16) -> NonZeroU16 {
-        NonZeroU16::new(value).expect("non-zero")
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_directory() -> PathBuf {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("noren-pty-test-{}-{sequence}", std::process::id()));
+        fs::create_dir(&path).expect("create test directory");
+        path
     }
 
     #[test]
-    fn nonzero_size_round_trips() {
-        let size = PtySize::new(nz(24), nz(80));
-        assert_eq!(size.rows(), 24);
-        assert_eq!(size.cols(), 80);
+    fn nonzero_size_round_trips_and_zero_is_rejected() {
+        let size = PtySize::from_raw(24, 80).expect("valid size");
         assert_eq!(size.into_raw(), (24, 80));
-    }
-
-    #[test]
-    fn from_raw_rejects_any_zero_side() {
-        assert!(PtySize::from_raw(0, 0).is_none());
         assert!(PtySize::from_raw(0, 80).is_none());
         assert!(PtySize::from_raw(24, 0).is_none());
+    }
+
+    #[test]
+    fn home_validation_is_pure_and_requires_an_absolute_directory() {
+        assert_eq!(validate_home(None), Err(PtyError::MissingHome));
         assert_eq!(
-            PtySize::from_raw(24, 80).map(PtySize::into_raw),
-            Some((24, 80))
+            validate_home(Some(OsString::from("relative"))),
+            Err(PtyError::HomeNotAbsolute)
+        );
+        let missing = std::env::temp_dir().join("noren-definitely-missing-home");
+        assert_eq!(
+            validate_home(Some(missing.into_os_string())),
+            Err(PtyError::HomeNotDirectory)
+        );
+
+        let directory = temp_directory();
+        let policy = validate_home(Some(directory.clone().into_os_string())).expect("valid home");
+        assert_eq!(
+            policy.metadata(),
+            LaunchMetadata {
+                program: "/bin/zsh",
+                term: "xterm-256color",
+                term_program: "Noren-PoC",
+                removes_columns: true,
+                removes_lines: true,
+            }
+        );
+        assert!(format!("{policy:?}").contains("<redacted>"));
+        assert!(!format!("{policy:?}").contains(&directory.display().to_string()));
+        fs::remove_dir(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn policy_builder_is_fixed_and_has_no_caller_arguments() {
+        let directory = temp_directory();
+        let policy = validate_home(Some(directory.clone().into_os_string())).expect("valid home");
+        let command = build_zsh_command(&policy);
+        assert_eq!(command.get_argv(), &[OsString::from(ZSH_PROGRAM)]);
+        assert_eq!(
+            command.get_cwd().map(OsString::as_os_str),
+            Some(directory.as_os_str())
+        );
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new(TERM_VALUE))
+        );
+        assert_eq!(
+            command.get_env("TERM_PROGRAM"),
+            Some(std::ffi::OsStr::new(TERM_PROGRAM_VALUE))
+        );
+        assert_eq!(command.get_env("COLUMNS"), None);
+        assert_eq!(command.get_env("LINES"), None);
+        fs::remove_dir(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn payload_limits_are_exact() {
+        assert_eq!(validate_input(&vec![0; READ_CHUNK_BYTES]), Ok(()));
+        assert_eq!(
+            validate_input(&vec![0; READ_CHUNK_BYTES + 1]),
+            Err(PtyError::InputTooLarge)
+        );
+        assert_eq!(validate_reply(&vec![0; REPLY_BYTES_PER_MESSAGE]), Ok(()));
+        assert_eq!(
+            validate_reply(&vec![0; REPLY_BYTES_PER_MESSAGE + 1]),
+            Err(PtyError::ReplyTooLarge)
         );
     }
 
     #[test]
-    fn command_keeps_arguments_structured() {
-        let home = std::env::temp_dir();
-        let command = PtyCommand::new("/bin/zsh", home.as_path())
-            .arg("-l")
-            .arg("--login");
-        assert_eq!(command.program(), std::path::Path::new("/bin/zsh"));
-        assert_eq!(command.cwd(), home.as_path());
-        assert_eq!(
-            command.args(),
-            [OsString::from("-l"), OsString::from("--login")]
-        );
-    }
-
-    #[test]
-    fn events_carry_payloads_without_interpreting_them() {
-        let output = PtyEvent::Output(vec![b'a', b'b']);
-        if let PtyEvent::Output(bytes) = &output {
-            assert_eq!(bytes, &vec![b'a', b'b']);
-        } else {
-            panic!("expected Output event");
+    fn reply_window_rejects_excess_without_logging_payload() {
+        let mut window = ReplyWindow::new();
+        for _ in 0..(REPLY_BYTES_PER_SECOND / REPLY_BYTES_PER_MESSAGE) {
+            assert_eq!(window.accept(REPLY_BYTES_PER_MESSAGE), Ok(()));
         }
-
-        assert!(matches!(PtyEvent::Eof, PtyEvent::Eof));
-        assert!(matches!(
-            PtyEvent::Exited { code: Some(0) },
-            PtyEvent::Exited { code: Some(0) }
-        ));
-        assert!(matches!(
-            PtyEvent::Exited { code: None },
-            PtyEvent::Exited { code: None }
-        ));
-        assert!(matches!(
-            PtyEvent::Error(PtyError::Spawn),
-            PtyEvent::Error(_)
-        ));
+        assert_eq!(window.accept(1), Err(PtyError::ReplyRateExceeded));
     }
 
     #[test]
-    fn invalid_size_error_displays_safely() {
-        let error = PtyError::InvalidSize;
-        assert_eq!(error.to_string(), "terminal size must be non-zero");
-        assert!(error.source().is_none());
-    }
-
-    #[test]
-    fn io_error_surfaces_source_without_payload() {
-        let error = PtyError::Io(std::io::Error::other("boom"));
-        assert!(error.source().is_some());
-        assert!(error.to_string().contains("PTY I/O failed"));
-    }
-
-    /// Candidate PTY library seam: the validated non-zero size maps to the
-    /// `portable-pty` size type with zero pixel dimensions. The PoC has no font
-    /// yet, so pixel size stays zero. This proves the exact candidate links and
-    /// matches the documented spawn-path mapping without opening a PTY.
-    #[test]
-    fn portable_pty_size_mapping_is_nonzero() {
-        let size = PtySize::new(nz(24), nz(80));
-        let raw = portable_pty::PtySize {
-            rows: size.rows(),
-            cols: size.cols(),
-            pixel_width: 0,
-            pixel_height: 0,
+    fn errors_have_no_source_or_sensitive_values() {
+        let error = PtyError::Io {
+            operation: PtyOperation::SpawnChild,
+            kind: io::ErrorKind::PermissionDenied,
         };
-        assert_eq!(raw.rows, 24);
-        assert_eq!(raw.cols, 80);
-        assert_eq!(raw.pixel_width, 0);
-        assert_eq!(raw.pixel_height, 0);
+        assert!(error.source().is_none());
+        assert_eq!(
+            error.to_string(),
+            "PTY operation SpawnChild failed with PermissionDenied"
+        );
     }
 }
