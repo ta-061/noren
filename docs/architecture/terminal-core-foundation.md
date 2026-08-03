@@ -5,7 +5,10 @@
   [#21](https://github.com/ta-061/noren/pull/21); the alternate-screen slice
   (core commit `84da736`) is stacked on top as Draft PR
   [#23](https://github.com/ta-061/noren/pull/23) for Issue
-  [#22](https://github.com/ta-061/noren/issues/22)
+  [#22](https://github.com/ta-061/noren/issues/22); compatibility Issues
+  [#24](https://github.com/ta-061/noren/issues/24)–[#27](https://github.com/ta-061/noren/issues/27)
+  have isolated Draft PRs
+  [#29](https://github.com/ta-061/noren/pull/29)–[#32](https://github.com/ta-061/noren/pull/32)
 - Supersedes nothing: the accepted [local-PTY PoC
   architecture](minimal-local-pty-poc.md) still applies
 
@@ -14,6 +17,11 @@ state core in `crates/noren-terminal/`. It is a foundation slice, not a
 VT100/xterm compatibility claim and not vim/tmux/zellij compatibility.
 
 ## Data flow
+
+The pipeline is PTY -> Parser -> TerminalState -> Renderer: the PTY layer
+delivers bytes, the parser turns them into bounded state changes,
+`TerminalState` owns screens, modes, and cursor state, and the renderer
+consumes only immutable snapshots.
 
 ```text
 PTY bytes -> TerminalState::feed_bytes -> parser -> bounded screen/cursor state
@@ -76,10 +84,31 @@ Added by Draft PR #23 / Issue #22 (alternate screen, stacked on #21):
 This slice makes `?1049` round-trips reliable; it is not full xterm, vim,
 tmux, or zellij compatibility.
 
+## In progress, not implemented
+
+These compatibility slices are isolated Draft checkpoints based on the exact
+Draft PR #23 head. No vim/tmux/zellij compatibility is claimed:
+
+- Issue [#24](https://github.com/ta-061/noren/issues/24) / Draft PR
+  [#31](https://github.com/ta-061/noren/pull/31): ED, EL, ECH, ICH, DCH, IL,
+  and DL implementation.
+- Issue [#25](https://github.com/ta-061/noren/issues/25) / Draft PR
+  [#29](https://github.com/ta-061/noren/pull/29): attribute value types only;
+  Cell/current-pen and SGR parser integration remain pending.
+- Issue [#26](https://github.com/ta-061/noren/issues/26) / Draft PR
+  [#30](https://github.com/ta-061/noren/pull/30): input encoders only;
+  DECCKM/DECKPAM/DECKPNM parsing, state, and call-site wiring remain pending.
+- Issue [#27](https://github.com/ta-061/noren/issues/27) / Draft PR
+  [#32](https://github.com/ta-061/noren/pull/32): a bounded public-API
+  compatibility harness for behavior present at the PR #23 baseline.
+
+Issue [#28](https://github.com/ta-061/noren/issues/28) documents the parallel
+development model running these lanes; the workflow rules live in
+[CONTRIBUTING.md](../../CONTRIBUTING.md).
+
 ## Deferred
 
-SGR/erase/insert/delete, cell attributes, tabs, origin mode, and
-query/reply sequences remain deferred, along with other DEC private modes
-(such as 1047/1048, 25, and 2004), application cursor/keypad modes, OSC
-titles, alternate-screen scrollback, and saved-cursor state beyond
-position. Unicode and IME remain later.
+Beyond the in-progress slices above, tabs, origin mode, and query/reply
+sequences remain deferred, along with other DEC private modes (such as
+1047/1048, 25, and 2004), OSC titles, alternate-screen scrollback, and
+saved-cursor state beyond position. Unicode and IME remain later.

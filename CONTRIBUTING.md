@@ -50,6 +50,39 @@ Changes to `crates/noren-terminal/` additionally keep these conventions:
 - Scrolling-region changes must preserve rows outside the active margins.
 - Renderer and PTY concerns stay out of `noren-terminal` tests; the core
   neither reads from a PTY nor renders.
+- The active compatibility lanes — erase/insert/delete
+  ([#24](https://github.com/ta-061/noren/issues/24)), SGR and cell attributes
+  ([#25](https://github.com/ta-061/noren/issues/25)), application
+  cursor/keypad modes ([#26](https://github.com/ta-061/noren/issues/26)), and
+  the bounded VT compatibility test suite
+  ([#27](https://github.com/ta-061/noren/issues/27)) — are in progress as
+  Draft PRs [#29](https://github.com/ta-061/noren/pull/29)–[#32](https://github.com/ta-061/noren/pull/32).
+  A Draft checkpoint is not a compatibility-complete claim. The lanes follow
+  the file leases below and test through the public API.
+
+## Parallel development model
+
+Terminal Core advances through parallel lanes under these rules:
+
+- Each lane runs in an isolated git worktree branched from the current
+  dependency head; never on `main` and never in a shared checkout.
+- Issues assign non-overlapping file leases. Concurrent lanes never edit the
+  same file, and lanes that need the same central files queue behind the
+  checkpoint that owns them.
+- Work lands as stacked Draft PRs that name their exact base head. A stacked
+  PR is retargeted to `main` only after its dependency merges. The current
+  dependency chain starts with Draft PR
+  [#21](https://github.com/ta-061/noren/pull/21), then Draft PR
+  [#23](https://github.com/ta-061/noren/pull/23). Compatibility Draft PRs
+  #29–#32 are isolated siblings based on the exact #23 head until the next
+  central-file lease is handed off.
+- Every lane ends with a checkpoint handoff: signed commits plus the lane
+  state recorded in the Issue and in
+  [coordination status](docs/coordination/status.md), so the next lane starts
+  from evidence instead of memory.
+- CI must pass on the exact head before review; documentation lanes run
+  `python3 scripts/check_docs.py`.
+- Every commit includes a `Signed-off-by` trailer (DCO, below).
 
 ## Pull requests and review
 

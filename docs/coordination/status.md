@@ -7,7 +7,16 @@ Last updated: 2026-08-03 (Asia/Tokyo). PR
 [#20](https://github.com/ta-061/noren/issues/20). Draft PR
 [#23](https://github.com/ta-061/noren/pull/23), branch
 `agent/terminal-alternate-screen`, is stacked on #21 for Issue
-[#22](https://github.com/ta-061/noren/issues/22). Historical sections below
+[#22](https://github.com/ta-061/noren/issues/22). Compatibility Issues
+[#24](https://github.com/ta-061/noren/issues/24),
+[#25](https://github.com/ta-061/noren/issues/25),
+[#26](https://github.com/ta-061/noren/issues/26), and
+[#27](https://github.com/ta-061/noren/issues/27) are open and stacked on the
+exact PR #23 head as Draft PRs
+[#29](https://github.com/ta-061/noren/pull/29)–[#32](https://github.com/ta-061/noren/pull/32);
+Issue
+[#28](https://github.com/ta-061/noren/issues/28) documents the parallel
+development model. Historical sections below
 preserve the PR #17 record at implementation/test head
 `c1f66dc27ddce37a60665d319a7ca061c300947e`, corrected only where an active
 claim went stale; coordination head `ac410a82` also passed both GitHub checks.
@@ -21,6 +30,12 @@ Stacked Draft PR #23 adds primary/alternate screen ownership, DEC private mode
 [terminal core foundation](../architecture/terminal-core-foundation.md). This
 is not a VT100/xterm or vim/tmux/zellij compatibility claim.
 
+Compatibility lanes follow the roadmap priority — vim first, then tmux/zellij,
+then SSH, then agent integration — under the parallel development model in
+[CONTRIBUTING.md](../../CONTRIBUTING.md): isolated worktrees, non-overlapping
+file leases, stacked Draft PRs, exact-head CI, DCO signoff, and checkpoint
+handoffs.
+
 ## GitHub state
 
 Verified on 2026-08-03:
@@ -30,6 +45,22 @@ Verified on 2026-08-03:
   [#22](https://github.com/ta-061/noren/issues/22). Their open Draft PRs are
   [#21](https://github.com/ta-061/noren/pull/21) and
   [#23](https://github.com/ta-061/noren/pull/23), respectively.
+- Compatibility Issues [#24](https://github.com/ta-061/noren/issues/24)
+  (erase/insert/delete), [#25](https://github.com/ta-061/noren/issues/25)
+  (SGR and cell attributes),
+  [#26](https://github.com/ta-061/noren/issues/26) (application cursor/keypad
+  modes), and [#27](https://github.com/ta-061/noren/issues/27) (bounded VT
+  compatibility test suite) are open, stacked on the exact PR #23 head
+  `c6a1e3fef469c09e243a0b5cc88c2bee2aedddb7`. Their Draft checkpoints are
+  [#31](https://github.com/ta-061/noren/pull/31),
+  [#29](https://github.com/ta-061/noren/pull/29),
+  [#30](https://github.com/ta-061/noren/pull/30), and
+  [#32](https://github.com/ta-061/noren/pull/32), respectively. #24 and #27
+  have complete first implementations; #25 and #26 intentionally contain
+  non-conflicting foundations with central parser/state wiring still pending.
+  Issue
+  [#28](https://github.com/ta-061/noren/issues/28) tracks the documentation
+  of the parallel development model.
 - PR [#19](https://github.com/ta-061/noren/pull/19) and Issue
   [#18](https://github.com/ta-061/noren/issues/18) are complete after owner
   acceptance of the renderer-independent Terminal Core foundation.
@@ -131,7 +162,8 @@ PR #21 remains Draft for owner review and acceptance. Stacked PR #23 has passed
 local checks and CI, and the existing local-zsh application launch was
 rechecked; it remains Draft and based on `agent/terminal-scroll-regions` until
 #21 is accepted and merged. PR #19 has no remaining gate. This does not
-authorize deferred terminal features in either Draft PR.
+authorize deferred terminal features in either Draft PR. Issues #24–#28 start
+only from the exact PR #23 head and must not modify Draft PRs #21 or #23.
 
 Full VT/xterm behavior, non-ASCII glyph quality, swash/font trials, production
 IME/accessibility, Linux, SSH, agent integration, tabs, panes, themes, and a
@@ -148,5 +180,9 @@ identity, and the public support/security contact before Preview publication.
 1. Review and accept Draft PR #21, then promote and merge its exact tested head.
 2. Retarget Draft PR #23 to `main` only after #21 merges, then review its exact
    tested head.
-3. Keep SGR/erase, attributes, remaining modes, and later VT work in separate
-   Issues and PRs.
+3. Review compatibility Draft PRs #29–#32, keeping erase, SGR, application
+   modes, the compatibility test suite, and later VT work in separate Issues
+   and PRs.
+4. After Draft PR #31 passes exact-head CI, hand the central parser/state file
+   lease once to #25; keep #26 terminal-state wiring queued behind that
+   checkpoint.
