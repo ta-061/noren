@@ -1,4 +1,4 @@
-use crate::parser::{Action, Parser};
+use crate::parser::{Action, Parser, PrivateMode};
 use std::fmt;
 
 /// Hard allocation bound for a visible Terminal Core screen.
@@ -136,6 +136,20 @@ impl ScrollRegion {
     }
 }
 
+/// Renderer-independent terminal modes that affect visible state selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TerminalModes {
+    alternate_screen: bool,
+}
+
+impl TerminalModes {
+    /// Whether DEC private mode 1049 currently selects the alternate screen.
+    #[must_use]
+    pub const fn is_alternate_screen_active(self) -> bool {
+        self.alternate_screen
+    }
+}
+
 /// Fixed-size visible screen buffer in row-major order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScreenBuffer {
@@ -253,12 +267,67 @@ impl fmt::Display for TerminalError {
 
 impl std::error::Error for TerminalError {}
 
-/// Noren-owned mutable terminal state.
-pub struct TerminalState {
+struct ScreenState {
     screen: ScreenBuffer,
     cursor: Cursor,
+    saved_cursor: Option<Cursor>,
     scroll_region: ScrollRegion,
     wrap_pending: bool,
+}
+
+impl ScreenState {
+    fn new(rows: u16, cols: u16) -> Result<Self, TerminalError> {
+        Ok(Self {
+            screen: ScreenBuffer::new(rows, cols)?,
+            cursor: Cursor::default(),
+            saved_cursor: None,
+            scroll_region: ScrollRegion::full_screen(rows),
+            wrap_pending: false,
+        })
+    }
+
+    fn blank_like(&self) -> Self {
+        Self {
+            screen: ScreenBuffer {
+                rows: self.screen.rows,
+                cols: self.screen.cols,
+                cells: vec![Cell::blank(); self.screen.cells.len()],
+            },
+            cursor: Cursor::default(),
+            saved_cursor: None,
+            scroll_region: ScrollRegion::full_screen(self.screen.rows),
+            wrap_pending: false,
+        }
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) -> Result<(), TerminalError> {
+        self.screen.resize(rows, cols)?;
+        self.cursor = clamp_cursor(self.cursor, rows, cols);
+        self.saved_cursor = self
+            .saved_cursor
+            .map(|cursor| clamp_cursor(cursor, rows, cols));
+        self.scroll_region = ScrollRegion::full_screen(rows);
+        self.wrap_pending = false;
+        Ok(())
+    }
+
+    fn save_cursor(&mut self) {
+        self.saved_cursor = Some(self.cursor);
+    }
+
+    fn restore_cursor(&mut self) {
+        if let Some(cursor) = self.saved_cursor {
+            self.cursor = clamp_cursor(cursor, self.screen.rows, self.screen.cols);
+        }
+        self.wrap_pending = false;
+    }
+}
+
+/// Noren-owned mutable terminal state.
+pub struct TerminalState {
+    active: ScreenState,
+    primary_screen: Option<ScreenState>,
+    modes: TerminalModes,
     parser: Parser,
 }
 
@@ -266,10 +335,9 @@ impl TerminalState {
     /// Create a bounded non-zero visible terminal.
     pub fn new(rows: u16, cols: u16) -> Result<Self, TerminalError> {
         Ok(Self {
-            screen: ScreenBuffer::new(rows, cols)?,
-            cursor: Cursor::default(),
-            scroll_region: ScrollRegion::full_screen(rows),
-            wrap_pending: false,
+            active: ScreenState::new(rows, cols)?,
+            primary_screen: None,
+            modes: TerminalModes::default(),
             parser: Parser::default(),
         })
     }
@@ -287,87 +355,110 @@ impl TerminalState {
         }
     }
 
-    /// Resize while preserving the overlapping top-left screen area.
+    /// Resize active and inactive screens while preserving their overlap.
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), TerminalError> {
-        self.screen.resize(rows, cols)?;
-        self.cursor.row = self.cursor.row.min(rows - 1);
-        self.cursor.column = self.cursor.column.min(cols - 1);
-        self.scroll_region = ScrollRegion::full_screen(rows);
-        self.wrap_pending = false;
+        checked_cell_count(rows, cols)?;
+        self.active.resize(rows, cols)?;
+        if let Some(primary) = &mut self.primary_screen {
+            primary.resize(rows, cols)?;
+        }
         Ok(())
     }
 
     /// Current `(rows, cols)`.
     #[must_use]
     pub const fn size(&self) -> (u16, u16) {
-        (self.screen.rows, self.screen.cols)
+        (self.active.screen.rows, self.active.screen.cols)
     }
 
     /// Current cursor position.
     #[must_use]
     pub const fn cursor(&self) -> Cursor {
-        self.cursor
+        self.active.cursor
     }
 
     /// Current visible screen.
     #[must_use]
     pub const fn screen(&self) -> &ScreenBuffer {
-        &self.screen
+        &self.active.screen
     }
 
     /// Active inclusive vertical scrolling margins.
     #[must_use]
     pub const fn scroll_region(&self) -> ScrollRegion {
-        self.scroll_region
+        self.active.scroll_region
     }
 
     /// Whether the next printable byte will wrap before it is written.
     #[must_use]
     pub const fn is_wrap_pending(&self) -> bool {
-        self.wrap_pending
+        self.active.wrap_pending
+    }
+
+    /// Current renderer-independent terminal mode state.
+    #[must_use]
+    pub const fn modes(&self) -> TerminalModes {
+        self.modes
+    }
+
+    /// Save the active screen's cursor position.
+    pub fn save_cursor(&mut self) {
+        self.active.save_cursor();
+    }
+
+    /// Restore the active screen's saved cursor position, if present.
+    pub fn restore_cursor(&mut self) {
+        self.active.restore_cursor();
     }
 
     /// Set zero-based inclusive scrolling margins and move the cursor home.
     pub fn set_scroll_region(&mut self, top: u16, bottom: u16) -> Result<(), TerminalError> {
-        self.scroll_region = ScrollRegion::checked(self.screen.rows, top, bottom)?;
-        self.cursor = Cursor::default();
-        self.wrap_pending = false;
+        self.active.scroll_region = ScrollRegion::checked(self.active.screen.rows, top, bottom)?;
+        self.active.cursor = Cursor::default();
+        self.active.wrap_pending = false;
         Ok(())
     }
 
     /// Apply a clamped renderer-independent cursor operation.
     pub fn move_cursor(&mut self, movement: CursorMove) {
-        self.wrap_pending = false;
-        let last_row = self.screen.rows - 1;
-        let last_column = self.screen.cols - 1;
+        self.active.wrap_pending = false;
+        let last_row = self.active.screen.rows - 1;
+        let last_column = self.active.screen.cols - 1;
         match movement {
-            CursorMove::Up(count) => self.cursor.row = self.cursor.row.saturating_sub(count),
+            CursorMove::Up(count) => {
+                self.active.cursor.row = self.active.cursor.row.saturating_sub(count);
+            }
             CursorMove::Down(count) => {
-                self.cursor.row = self.cursor.row.saturating_add(count).min(last_row);
+                self.active.cursor.row = self.active.cursor.row.saturating_add(count).min(last_row);
             }
             CursorMove::Right(count) => {
-                self.cursor.column = self.cursor.column.saturating_add(count).min(last_column);
+                self.active.cursor.column = self
+                    .active
+                    .cursor
+                    .column
+                    .saturating_add(count)
+                    .min(last_column);
             }
             CursorMove::Left(count) => {
-                self.cursor.column = self.cursor.column.saturating_sub(count);
+                self.active.cursor.column = self.active.cursor.column.saturating_sub(count);
             }
             CursorMove::NextLine(count) => {
-                self.cursor.row = self.cursor.row.saturating_add(count).min(last_row);
-                self.cursor.column = 0;
+                self.active.cursor.row = self.active.cursor.row.saturating_add(count).min(last_row);
+                self.active.cursor.column = 0;
             }
             CursorMove::PreviousLine(count) => {
-                self.cursor.row = self.cursor.row.saturating_sub(count);
-                self.cursor.column = 0;
+                self.active.cursor.row = self.active.cursor.row.saturating_sub(count);
+                self.active.cursor.column = 0;
             }
             CursorMove::To { row, column } => {
-                self.cursor.row = row.min(last_row);
-                self.cursor.column = column.min(last_column);
+                self.active.cursor.row = row.min(last_row);
+                self.active.cursor.column = column.min(last_column);
             }
             CursorMove::ToColumn(column) => {
-                self.cursor.column = column.min(last_column);
+                self.active.cursor.column = column.min(last_column);
             }
             CursorMove::ToRow(row) => {
-                self.cursor.row = row.min(last_row);
+                self.active.cursor.row = row.min(last_row);
             }
         }
     }
@@ -383,12 +474,12 @@ impl TerminalState {
             Action::Print(byte) => self.print_ascii(byte),
             Action::LineFeed => self.line_feed(),
             Action::CarriageReturn => {
-                self.cursor.column = 0;
-                self.wrap_pending = false;
+                self.active.cursor.column = 0;
+                self.active.wrap_pending = false;
             }
             Action::Backspace => {
-                self.cursor.column = self.cursor.column.saturating_sub(1);
-                self.wrap_pending = false;
+                self.active.cursor.column = self.active.cursor.column.saturating_sub(1);
+                self.active.wrap_pending = false;
             }
             Action::Index => self.index(),
             Action::NextLine => self.next_line(),
@@ -409,74 +500,114 @@ impl TerminalState {
             }
             Action::ScrollUp(count) => self.scroll_up(count),
             Action::ScrollDown(count) => self.scroll_down(count),
+            Action::SaveCursor => self.save_cursor(),
+            Action::RestoreCursor => self.restore_cursor(),
+            Action::SetPrivateMode { mode, enabled } => self.set_private_mode(mode, enabled),
         }
     }
 
     fn print_ascii(&mut self, byte: u8) {
-        if self.wrap_pending {
-            self.cursor.column = 0;
+        if self.active.wrap_pending {
+            self.active.cursor.column = 0;
             self.index();
         }
-        self.screen
-            .put(self.cursor.row, self.cursor.column, Cell::from_ascii(byte));
-        if self.cursor.column == self.screen.cols - 1 {
-            self.wrap_pending = true;
+        self.active.screen.put(
+            self.active.cursor.row,
+            self.active.cursor.column,
+            Cell::from_ascii(byte),
+        );
+        if self.active.cursor.column == self.active.screen.cols - 1 {
+            self.active.wrap_pending = true;
         } else {
-            self.cursor.column += 1;
+            self.active.cursor.column += 1;
         }
     }
 
     fn line_feed(&mut self) {
-        self.wrap_pending = false;
+        self.active.wrap_pending = false;
         self.index();
     }
 
     fn index(&mut self) {
-        self.wrap_pending = false;
-        if self.cursor.row == self.scroll_region.bottom {
-            self.screen.scroll_up(self.scroll_region, 1);
-        } else if self.cursor.row < self.screen.rows - 1 {
-            self.cursor.row += 1;
+        self.active.wrap_pending = false;
+        if self.active.cursor.row == self.active.scroll_region.bottom {
+            self.active.screen.scroll_up(self.active.scroll_region, 1);
+        } else if self.active.cursor.row < self.active.screen.rows - 1 {
+            self.active.cursor.row += 1;
         }
     }
 
     fn next_line(&mut self) {
-        self.cursor.column = 0;
+        self.active.cursor.column = 0;
         self.index();
     }
 
     fn reverse_index(&mut self) {
-        self.wrap_pending = false;
-        if self.cursor.row == self.scroll_region.top {
-            self.screen.scroll_down(self.scroll_region, 1);
-        } else if self.cursor.row > 0 {
-            self.cursor.row -= 1;
+        self.active.wrap_pending = false;
+        if self.active.cursor.row == self.active.scroll_region.top {
+            self.active.screen.scroll_down(self.active.scroll_region, 1);
+        } else if self.active.cursor.row > 0 {
+            self.active.cursor.row -= 1;
         }
     }
 
     fn scroll_up(&mut self, count: u16) {
-        self.wrap_pending = false;
-        self.screen.scroll_up(self.scroll_region, count);
+        self.active.wrap_pending = false;
+        self.active
+            .screen
+            .scroll_up(self.active.scroll_region, count);
     }
 
     fn scroll_down(&mut self, count: u16) {
-        self.wrap_pending = false;
-        self.screen.scroll_down(self.scroll_region, count);
+        self.active.wrap_pending = false;
+        self.active
+            .screen
+            .scroll_down(self.active.scroll_region, count);
     }
 
     fn reset_scroll_region(&mut self) {
-        self.scroll_region = ScrollRegion::full_screen(self.screen.rows);
-        self.cursor = Cursor::default();
-        self.wrap_pending = false;
+        self.active.scroll_region = ScrollRegion::full_screen(self.active.screen.rows);
+        self.active.cursor = Cursor::default();
+        self.active.wrap_pending = false;
     }
 
     fn apply_scroll_region(&mut self, top: u16, bottom: Option<u16>) {
         if top == 0 && bottom.is_none() {
             self.reset_scroll_region();
         } else {
-            let bottom = bottom.unwrap_or(self.screen.rows - 1);
+            let bottom = bottom.unwrap_or(self.active.screen.rows - 1);
             let _ = self.set_scroll_region(top, bottom);
         }
+    }
+
+    fn set_private_mode(&mut self, mode: PrivateMode, enabled: bool) {
+        match (mode, enabled) {
+            (PrivateMode::AlternateScreen, true) => self.enter_alternate_screen(),
+            (PrivateMode::AlternateScreen, false) => self.leave_alternate_screen(),
+        }
+    }
+
+    fn enter_alternate_screen(&mut self) {
+        if self.modes.alternate_screen {
+            return;
+        }
+        self.active.save_cursor();
+        let alternate = self.active.blank_like();
+        let primary = std::mem::replace(&mut self.active, alternate);
+        debug_assert!(self.primary_screen.is_none());
+        self.primary_screen = Some(primary);
+        self.modes.alternate_screen = true;
+    }
+
+    fn leave_alternate_screen(&mut self) {
+        if !self.modes.alternate_screen {
+            return;
+        }
+        if let Some(primary) = self.primary_screen.take() {
+            self.active = primary;
+            self.active.restore_cursor();
+        }
+        self.modes.alternate_screen = false;
     }
 }
 
@@ -484,9 +615,10 @@ impl fmt::Debug for TerminalState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TerminalState")
             .field("size", &self.size())
-            .field("cursor", &self.cursor)
-            .field("scroll_region", &self.scroll_region)
-            .field("wrap_pending", &self.wrap_pending)
+            .field("cursor", &self.active.cursor)
+            .field("scroll_region", &self.active.scroll_region)
+            .field("wrap_pending", &self.active.wrap_pending)
+            .field("modes", &self.modes)
             .finish_non_exhaustive()
     }
 }
@@ -498,17 +630,19 @@ pub struct TerminalSnapshot {
     cursor: Cursor,
     scroll_region: ScrollRegion,
     wrap_pending: bool,
+    modes: TerminalModes,
     lines: Vec<String>,
 }
 
 impl TerminalSnapshot {
     fn from_state(state: &TerminalState) -> Self {
         Self {
-            screen: state.screen.clone(),
-            cursor: state.cursor,
-            scroll_region: state.scroll_region,
-            wrap_pending: state.wrap_pending,
-            lines: visible_lines(&state.screen),
+            screen: state.active.screen.clone(),
+            cursor: state.active.cursor,
+            scroll_region: state.active.scroll_region,
+            wrap_pending: state.active.wrap_pending,
+            modes: state.modes,
+            lines: visible_lines(&state.active.screen),
         }
     }
 
@@ -542,6 +676,12 @@ impl TerminalSnapshot {
         self.wrap_pending
     }
 
+    /// Terminal modes captured with the visible screen.
+    #[must_use]
+    pub const fn modes(&self) -> TerminalModes {
+        self.modes
+    }
+
     /// Captured visible screen.
     #[must_use]
     pub const fn screen(&self) -> &ScreenBuffer {
@@ -564,6 +704,13 @@ fn checked_cell_count(rows: u16, cols: u16) -> Result<usize, TerminalError> {
         Err(TerminalError::ScreenTooLarge)
     } else {
         Ok(count)
+    }
+}
+
+fn clamp_cursor(cursor: Cursor, rows: u16, cols: u16) -> Cursor {
+    Cursor {
+        row: cursor.row.min(rows - 1),
+        column: cursor.column.min(cols - 1),
     }
 }
 

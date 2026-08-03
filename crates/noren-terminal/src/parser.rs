@@ -25,6 +25,14 @@ pub(crate) enum Action {
     SetScrollRegion { top: u16, bottom: Option<u16> },
     ScrollUp(u16),
     ScrollDown(u16),
+    SaveCursor,
+    RestoreCursor,
+    SetPrivateMode { mode: PrivateMode, enabled: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrivateMode {
+    AlternateScreen,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -101,6 +109,14 @@ impl Parser {
                 self.state = ParserState::Ground;
                 return Some(Action::ReverseIndex);
             }
+            b'7' => {
+                self.state = ParserState::Ground;
+                return Some(Action::SaveCursor);
+            }
+            b'8' => {
+                self.state = ParserState::Ground;
+                return Some(Action::RestoreCursor);
+            }
             _ => self.state = ParserState::Ground,
         }
         None
@@ -125,6 +141,7 @@ struct Csi {
     has_current: bool,
     overflowed: bool,
     ignored: bool,
+    private_marker: Option<u8>,
 }
 
 impl Default for Csi {
@@ -136,6 +153,7 @@ impl Default for Csi {
             has_current: false,
             overflowed: false,
             ignored: false,
+            private_marker: None,
         }
     }
 }
@@ -155,7 +173,11 @@ impl Csi {
                 self.push_current();
                 CsiAdvance::pending()
             }
-            b'?' | b'>' if self.len == 0 && !self.has_current => {
+            b'?' | b'>' if self.len == 0 && !self.has_current && self.private_marker.is_none() => {
+                self.private_marker = Some(byte);
+                CsiAdvance::pending()
+            }
+            b'?' | b'>' => {
                 self.ignored = true;
                 CsiAdvance::pending()
             }
@@ -187,6 +209,14 @@ impl Csi {
     }
 
     fn action(&self, final_byte: u8) -> Option<Action> {
+        match self.private_marker {
+            None => self.standard_action(final_byte),
+            Some(b'?') => self.private_action(final_byte),
+            Some(_) => None,
+        }
+    }
+
+    fn standard_action(&self, final_byte: u8) -> Option<Action> {
         let count = self.param_or(0, 1);
         match final_byte {
             b'A' => Some(Action::MoveUp(count)),
@@ -207,8 +237,35 @@ impl Csi {
                 top: self.param_or(0, 1).saturating_sub(1),
                 bottom: self.zero_based_param(1),
             }),
+            b's' if self.is_default_only() => Some(Action::SaveCursor),
+            b'u' if self.is_default_only() => Some(Action::RestoreCursor),
             _ => None,
         }
+    }
+
+    fn private_action(&self, final_byte: u8) -> Option<Action> {
+        if self.len != 1 {
+            return None;
+        }
+        let mode = match self.params[0] {
+            1049 => PrivateMode::AlternateScreen,
+            _ => return None,
+        };
+        match final_byte {
+            b'h' => Some(Action::SetPrivateMode {
+                mode,
+                enabled: true,
+            }),
+            b'l' => Some(Action::SetPrivateMode {
+                mode,
+                enabled: false,
+            }),
+            _ => None,
+        }
+    }
+
+    fn is_default_only(&self) -> bool {
+        self.len == 1 && self.params[0] == 0
     }
 
     fn param_or(&self, index: usize, default: u16) -> u16 {
@@ -320,5 +377,27 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parses_cursor_save_restore_and_alternate_screen_mode() {
+        assert_eq!(
+            actions(b"\x1b7\x1b8\x1b[s\x1b[u\x1b[?1049h\x1b[?1049l"),
+            [
+                Action::SaveCursor,
+                Action::RestoreCursor,
+                Action::SaveCursor,
+                Action::RestoreCursor,
+                Action::SetPrivateMode {
+                    mode: PrivateMode::AlternateScreen,
+                    enabled: true,
+                },
+                Action::SetPrivateMode {
+                    mode: PrivateMode::AlternateScreen,
+                    enabled: false,
+                },
+            ]
+        );
+        assert!(actions(b"\x1b[?2004h\x1b[?1049;1h\x1b[>1049h").is_empty());
     }
 }

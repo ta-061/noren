@@ -4,16 +4,16 @@
 //! PTY bytes enter through [`TerminalEngine::feed_bytes`]; renderers receive an
 //! immutable [`TerminalSnapshot`] and never depend on PTY or parser types.
 //!
-//! This first foundation deliberately supports printable ASCII, line feed,
-//! carriage return, backspace, and a small CSI cursor-movement subset. It is
-//! not a VT100/xterm compatibility claim.
+//! This foundation supports a bounded ASCII/CSI subset, scrolling regions,
+//! cursor save/restore, and DEC private mode 1049 screen switching. It is not
+//! a VT100/xterm compatibility claim.
 
 mod parser;
 mod state;
 
 pub use state::{
     Cell, Cursor, CursorMove, MAX_SCREEN_CELLS, ScreenBuffer, ScrollRegion, TerminalError,
-    TerminalSnapshot, TerminalState,
+    TerminalModes, TerminalSnapshot, TerminalState,
 };
 
 use unicode_width::UnicodeWidthChar;
