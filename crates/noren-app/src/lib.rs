@@ -8,6 +8,10 @@
 //! types stay inside `noren-app` and never cross into the PTY or terminal
 //! crates.
 
+mod input;
+
+pub use input::{CursorKeyMode, InputMode, KeypadInput, KeypadKey, KeypadMode};
+
 use std::fmt;
 use std::time::Duration;
 
@@ -317,8 +321,23 @@ pub enum KeyDropReason {
 pub struct KeyEncoder;
 
 impl KeyEncoder {
-    /// Encode one pressed or repeated key event.
+    /// Encode one pressed or repeated key event in the PoC default
+    /// ([`InputMode::normal`]) mode.
+    ///
+    /// This entry point preserves the original byte contract and stays
+    /// source-compatible with PoC callers that do not yet track terminal
+    /// modes. Mode-aware callers use [`KeyEncoder::encode_with`].
     pub fn encode(input: KeyInput) -> Result<Vec<u8>, KeyDropReason> {
+        Self::encode_with(input, InputMode::normal())
+    }
+
+    /// Encode one pressed or repeated key event for the active application
+    /// input mode.
+    ///
+    /// Only bare arrow keys observe [`CursorKeyMode`]; release, modifier,
+    /// control-byte, and printable handling is identical to
+    /// [`KeyEncoder::encode`], so the normal mode is byte-for-byte compatible.
+    pub fn encode_with(input: KeyInput, mode: InputMode) -> Result<Vec<u8>, KeyDropReason> {
         if input.phase() == KeyPhase::Released {
             return Err(KeyDropReason::Released);
         }
@@ -345,11 +364,30 @@ impl KeyEncoder {
             Key::Backspace => Ok(vec![0x7f]),
             Key::Tab => Ok(vec![0x09]),
             Key::Escape => Ok(vec![0x1b]),
-            Key::Arrow(Arrow::Up) => Ok(b"\x1b[A".to_vec()),
-            Key::Arrow(Arrow::Down) => Ok(b"\x1b[B".to_vec()),
-            Key::Arrow(Arrow::Right) => Ok(b"\x1b[C".to_vec()),
-            Key::Arrow(Arrow::Left) => Ok(b"\x1b[D".to_vec()),
+            Key::Arrow(arrow) => Ok(input::cursor_bytes(arrow, mode.cursor()).to_vec()),
         }
+    }
+
+    /// Encode one pressed or repeated keypad key event in the PoC default
+    /// ([`InputMode::normal`]) numeric-keypad mode.
+    pub fn encode_keypad(input: KeypadInput) -> Result<Vec<u8>, KeyDropReason> {
+        Self::encode_keypad_with(input, InputMode::normal())
+    }
+
+    /// Encode one pressed or repeated keypad key event for the active keypad
+    /// mode.
+    ///
+    /// Numeric mode emits the literal key character; application mode emits the
+    /// `SS3` (`ESC O`) sequence. Releases are dropped for parity with the
+    /// main key path.
+    pub fn encode_keypad_with(
+        input: KeypadInput,
+        mode: InputMode,
+    ) -> Result<Vec<u8>, KeyDropReason> {
+        if input.phase() == KeyPhase::Released {
+            return Err(KeyDropReason::Released);
+        }
+        Ok(input::keypad_bytes(input.key(), mode.keypad()).to_vec())
     }
 }
 
@@ -611,6 +649,157 @@ mod tests {
                 .lines()
                 .first()
                 .is_some_and(|line| line.contains('x'))
+        );
+    }
+
+    #[test]
+    fn input_mode_defaults_to_normal_cursor_and_numeric_keypad() {
+        let mode = InputMode::normal();
+        assert_eq!(mode.cursor(), CursorKeyMode::Normal);
+        assert_eq!(mode.keypad(), KeypadMode::Numeric);
+        assert_eq!(InputMode::default(), mode);
+    }
+
+    #[test]
+    fn cursor_keys_select_normal_or_application_sequences_by_mode() {
+        let normal = InputMode::normal();
+        let application = normal.with_cursor(CursorKeyMode::Application);
+        let cases = [
+            (Arrow::Up, b"\x1b[A".as_slice(), b"\x1bOA".as_slice()),
+            (Arrow::Down, b"\x1b[B", b"\x1bOB"),
+            (Arrow::Right, b"\x1b[C", b"\x1bOC"),
+            (Arrow::Left, b"\x1b[D", b"\x1bOD"),
+        ];
+        for (arrow, normal_bytes, application_bytes) in cases {
+            let input = KeyInput::new(Key::Arrow(arrow), KeyPhase::Pressed, Modifiers::empty());
+            assert_eq!(KeyEncoder::encode(input).as_deref(), Ok(normal_bytes));
+            assert_eq!(
+                KeyEncoder::encode_with(input, normal).as_deref(),
+                Ok(normal_bytes)
+            );
+            assert_eq!(
+                KeyEncoder::encode_with(input, application).as_deref(),
+                Ok(application_bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn application_cursor_mode_leaves_modifier_and_control_paths_unchanged() {
+        let application = InputMode::normal().with_cursor(CursorKeyMode::Application);
+        for modifiers in [Modifiers::empty().alt(), Modifiers::empty().super_key()] {
+            let input = KeyInput::new(Key::Arrow(Arrow::Up), KeyPhase::Pressed, modifiers);
+            assert_eq!(
+                KeyEncoder::encode_with(input, application),
+                Err(KeyDropReason::UnsupportedModifier)
+            );
+        }
+        let ctrl_arrow = KeyInput::new(
+            Key::Arrow(Arrow::Up),
+            KeyPhase::Pressed,
+            Modifiers::empty().ctrl(),
+        );
+        assert_eq!(
+            KeyEncoder::encode_with(ctrl_arrow, application),
+            Err(KeyDropReason::UnsupportedControl)
+        );
+        let printable = KeyInput::new(Key::Character('a'), KeyPhase::Pressed, Modifiers::empty());
+        assert_eq!(
+            KeyEncoder::encode_with(printable, application).as_deref(),
+            Ok(b"a".as_slice())
+        );
+    }
+
+    #[test]
+    fn keypad_keys_select_numeric_or_application_sequences_by_mode() {
+        let numeric = InputMode::normal();
+        let application = numeric.with_keypad(KeypadMode::Application);
+        let cases = [
+            (KeypadKey::Zero, b"0".as_slice(), b"\x1bOp".as_slice()),
+            (KeypadKey::One, b"1", b"\x1bOq"),
+            (KeypadKey::Two, b"2", b"\x1bOr"),
+            (KeypadKey::Three, b"3", b"\x1bOs"),
+            (KeypadKey::Four, b"4", b"\x1bOt"),
+            (KeypadKey::Five, b"5", b"\x1bOu"),
+            (KeypadKey::Six, b"6", b"\x1bOv"),
+            (KeypadKey::Seven, b"7", b"\x1bOw"),
+            (KeypadKey::Eight, b"8", b"\x1bOx"),
+            (KeypadKey::Nine, b"9", b"\x1bOy"),
+            (KeypadKey::Decimal, b".", b"\x1bOn"),
+            (KeypadKey::Plus, b"+", b"\x1bOk"),
+            (KeypadKey::Minus, b"-", b"\x1bOm"),
+            (KeypadKey::Star, b"*", b"\x1bOj"),
+            (KeypadKey::Slash, b"/", b"\x1bOo"),
+            (KeypadKey::Enter, b"\r", b"\x1bOM"),
+        ];
+        for (key, numeric_bytes, application_bytes) in cases {
+            let input = KeypadInput::new(key, KeyPhase::Pressed);
+            assert_eq!(
+                KeyEncoder::encode_keypad(input).as_deref(),
+                Ok(numeric_bytes)
+            );
+            assert_eq!(
+                KeyEncoder::encode_keypad_with(input, numeric).as_deref(),
+                Ok(numeric_bytes)
+            );
+            assert_eq!(
+                KeyEncoder::encode_keypad_with(input, application).as_deref(),
+                Ok(application_bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn keypad_encoder_drops_releases_in_both_modes() {
+        let numeric = InputMode::normal();
+        let application = numeric.with_keypad(KeypadMode::Application);
+        let released = KeypadInput::new(KeypadKey::Five, KeyPhase::Released);
+        assert_eq!(
+            KeyEncoder::encode_keypad(released),
+            Err(KeyDropReason::Released)
+        );
+        assert_eq!(
+            KeyEncoder::encode_keypad_with(released, application),
+            Err(KeyDropReason::Released)
+        );
+    }
+
+    #[test]
+    fn input_mode_setters_are_idempotent_and_independent() {
+        let base = InputMode::normal();
+        let once = base
+            .with_cursor(CursorKeyMode::Application)
+            .with_keypad(KeypadMode::Application);
+        let twice = once
+            .with_cursor(CursorKeyMode::Application)
+            .with_keypad(KeypadMode::Application);
+        assert_eq!(once, twice);
+
+        // Resetting to the already-active selector is a no-op.
+        assert_eq!(
+            InputMode::normal().with_cursor(CursorKeyMode::Normal),
+            InputMode::normal()
+        );
+        assert_eq!(
+            InputMode::normal().with_keypad(KeypadMode::Numeric),
+            InputMode::normal()
+        );
+
+        // Cursor and keypad selectors are independent.
+        let cursor_only = base.with_cursor(CursorKeyMode::Application);
+        assert_eq!(cursor_only.cursor(), CursorKeyMode::Application);
+        assert_eq!(cursor_only.keypad(), KeypadMode::Numeric);
+
+        // Idempotent modes produce byte-identical encodings for every key.
+        let arrow = KeyInput::new(Key::Arrow(Arrow::Up), KeyPhase::Pressed, Modifiers::empty());
+        assert_eq!(
+            KeyEncoder::encode_with(arrow, once),
+            KeyEncoder::encode_with(arrow, twice)
+        );
+        let keypad = KeypadInput::new(KeypadKey::Enter, KeyPhase::Pressed);
+        assert_eq!(
+            KeyEncoder::encode_keypad_with(keypad, once),
+            KeyEncoder::encode_keypad_with(keypad, twice)
         );
     }
 }
