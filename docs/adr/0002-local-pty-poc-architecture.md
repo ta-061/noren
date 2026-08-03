@@ -52,7 +52,17 @@ has one reader thread. The supervisor is the sole child reaper. Output travels
 through a bounded channel; the main loop drains a bounded amount per callback.
 Latest non-zero size is coalesced once per event-loop turn and sent only when
 rows/columns change. Shutdown follows one idempotent state machine and joins both
-workers before event-loop exit.
+workers on the normal path. Reaping is not assumed to unblock a reader while a
+descendant retains the slave; after the 2 s deadline the app reports
+`ReaderJoinTimeout`, detaches that reader for process-exit cleanup, and exits.
+
+The spawn policy is fixed: executable `/bin/zsh`, no `-c`, validated absolute
+inherited `HOME` as cwd with typed failure and no fallback, inherited launch
+environment with `TERM=xterm-256color` and `TERM_PROGRAM=Noren-PoC` overrides,
+and `COLUMNS`/`LINES` removed. No other environment value is scrubbed or logged.
+Terminal-generated replies return only as opaque PTY bytes capped at 4 KiB per
+turn and 64 KiB/s; unsupported modifier/dead-key input produces zero bytes and
+a payload-free typed event.
 
 Trial these exact direct candidates behind the documented contracts:
 
@@ -83,8 +93,9 @@ no Preview compatibility claim.
 Structured spawn prevents command concatenation; PTY output remains
 non-authoritative; bounded queues/snapshots constrain exhaustion; the dedicated
 supervisor centralizes ownership and reaping. Native/dependency unsafe,
-environment inheritance, parser/font hostility, renderer loss, and blocked
-reader teardown still require the threat-model tests and Claude review.
+deliberately inherited environment contents, parser/font hostility, renderer
+loss, descendant-held slave descriptors, and blocked-reader teardown still
+require the threat-model tests and Claude review.
 
 ## Validation evidence
 
@@ -96,10 +107,11 @@ PTY/resize review, and Claude process/input review.
 ## Reversal or replacement plan
 
 Each third-party candidate can be replaced behind its Noren-owned contract using
-the same corpus. If the two-thread PTY design cannot terminate deterministically,
-stop the PoC and amend this ADR before adding polling/async dependencies or
-lower-level `nix`. Reverting the implementation leaves documentation and no
-persisted user format to migrate.
+the same corpus. If normal paths cannot join, or the retained-slave case cannot
+reach the explicit deadline fallback, stop the PoC and amend this ADR before
+adding polling/async dependencies or lower-level `nix`. Any
+`ReaderJoinTimeout` triggers that same replacement review. Reverting the
+implementation leaves documentation and no persisted user format to migrate.
 
 ## Dissent and unresolved questions
 

@@ -14,10 +14,10 @@ input correctness.
 
 | Layer | Owner and seam | Required coverage |
 | --- | --- | --- |
-| Unit | `noren-app`: `KeyEncoder`, size conversion, shutdown state machine | Exact bytes for printable UTF-8, Enter/Backspace/Tab/Escape/arrows/Ctrl, press/repeat/release and unsupported modifiers; checked pixel-to-cell boundaries; duplicate/zero/overflow sizes; every valid and repeated shutdown transition. |
+| Unit | `noren-app`: `KeyEncoder`, size conversion, shutdown state machine | Exact bytes for printable UTF-8, Enter/Backspace/Tab/Escape/arrows/Ctrl, press/repeat/release and unsupported modifiers; zero bytes plus payload-free drop event for unsupported input; checked pixel-to-cell boundaries; duplicate/zero/overflow sizes; every valid and repeated shutdown transition. |
 | Unit | `noren-terminal`: `TerminalEngine`, `CellWidth` | Prompt/ASCII/UTF-8/control/scroll fixtures, primary/alternate state subset used by the PoC, resize snapshots, bounded title/OSC, hostile streams, Unicode version and width fixtures; no authority side effect. |
 | Unit/headless | `noren-app`: `RenderBackend` fake | A numbered immutable grid produces deterministic glyph batches/damage; parser errors and renderer errors stay isolated; safe exit status is visible. |
-| Integration | `noren-pty`: fixed Rust helper behind `PtyBackend` | Structured argv/cwd, controlling TTY, exact binary/UTF-8 round-trip, partial reads/writes, EOF, exit code/signal, blocked output, close races, descriptor ownership, child reaping. |
+| Integration | `noren-pty`: fixed Rust helper behind `PtyBackend` | Structured argv; validated `$HOME` cwd and invalid-home failure; inherited sentinel environment with exact TERM overrides and COLUMNS/LINES removal; controlling TTY; exact binary/UTF-8 round-trip; partial reads/writes; EOF, exit/signal, blocked output, close races, descriptor ownership, child reaping. |
 | Integration | Real macOS PTY kernel | Final dimensions read by the helper through `TIOCGWINSZ` after duplicate, zero-size, rapid, and final resize traces; no zero dimension reaches the PTY. |
 | App integration | Fake PTY + fake renderer + replayed app events | Window lifecycle, bounded drain/redraw scheduling, input ordering, output backpressure, final resize ordering, component failure, and repeated close without an interactive window. |
 | macOS smoke | Real window + real PTY + deterministic helper, then `/bin/zsh` manual check | Window appears; fixture text is visible; supported keys round-trip; resize reaches kernel; EOF/close shows status and exits cleanly. Record macOS/architecture/toolchain, not user terminal contents. |
@@ -31,11 +31,14 @@ input as a shell command.
 
 - Inject spawn, read, write, resize, parser, renderer, channel-disconnect, and
   child-wait failures one at a time; assert a typed error and completed teardown.
-- Fill each bounded channel before close and hold the reader blocked before
-  child termination; both workers must join within the NFR-004 deadline.
+- Fill each bounded channel before close. Cover normal blocked-read EOF/join and
+  a helper descendant that retains the slave: the latter must emit
+  `ReaderJoinTimeout`, detach, and exit within NFR-004 rather than hang.
 - Feed truncated escape sequences, oversized OSC/title data, invalid UTF-8,
   control bytes, wide/combining sequences, and malformed font fixtures; assert
   bounds and no authority call or panic.
+- Drive terminal queries that generate replies; assert exact opaque PTY bytes,
+  the 4 KiB/turn and 64 KiB/s caps, and no app interpretation.
 - Capture logs with unique sentinels in input, PTY output, cwd, and environment;
   no sentinel may appear.
 - Run at least 100 rapid resize/input/output interleavings and preserve the
@@ -54,7 +57,8 @@ On a recorded Apple Silicon reference Mac in `--release`:
 3. Replay at least 100 final-size changes; record event-to-PTY and
    event-to-present latency, exact final kernel dimensions, and duplicate count.
 4. Measure natural and forced shutdown from close request through child reap
-   and worker joins; pass within 2 s or fail with retained diagnostics.
+   and worker joins. Normal paths join within 2 s; the retained-slave case must
+   detach with explicit failure and process exit within the same deadline.
 
 ## CI and evidence
 

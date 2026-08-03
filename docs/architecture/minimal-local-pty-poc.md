@@ -37,8 +37,9 @@ crate.
    commands. It polls child status between commands and is the only code allowed
    to kill or reap the child.
 3. A PTY reader thread owns a cloned blocking reader. It sends bounded
-   `Output(Vec<u8>)`, `Eof`, or typed error events to the main loop. Closing or
-   reaping the child must unblock the reader; receiver disconnect terminates it.
+   `Output(Vec<u8>)`, `Eof`, or typed error events to the main loop. It observes
+   EOF when the last slave descriptor closes; receiver disconnect terminates a
+   blocked channel send, but reaping alone is not assumed to cancel `read`.
 4. The main loop drains a bounded amount of output per callback, feeds it to a
    `TerminalEngine`, applies bounded side effects, and requests redraw. Channel
    capacity and per-turn byte budget are constants covered by load tests.
@@ -50,19 +51,30 @@ crate.
    sends one PTY resize when the grid changed. A zero-sized window retains the
    last valid grid and never sends zero dimensions.
 7. Shutdown is an idempotent state machine: stop accepting input, send `Close`,
-   close the writer, terminate the child only if still running, reap it, let the
-   reader observe EOF, join both workers, drop renderer/window state, then exit
-   the event loop. The app reports timeout/forced termination instead of hiding
-   it.
+   close the writer, terminate the child only if still running, reap it, and drop
+   the supervisor's master handle so the PTY hangup reaches remaining slave
+   holders. The app waits for reader EOF and joins both workers until the 2 s
+   deadline. If a descendant still retains the slave, it emits
+   `ReaderJoinTimeout`, drops the reader `JoinHandle` (detaching it for process
+   exit), and exits rather than block forever. Normal close must join; the
+   detach path is a visible failed acceptance case, not silent success.
 
 ## Narrow contracts
 
 - `PtyBackend`: structured executable/argv/cwd/environment policy; spawn, byte
   I/O, resize, status, and teardown. The PoC executable is fixed to `/bin/zsh`;
-  no caller-supplied command string or `-c` path exists.
+  no caller-supplied command string or `-c` path exists. Cwd is the inherited
+  `HOME` only after it is validated as an absolute existing directory; missing
+  or invalid `HOME` is a typed spawn failure with no ambient fallback. The child
+  inherits the launch environment because this terminal is not a sandbox, then
+  Noren sets `TERM=xterm-256color` and `TERM_PROGRAM=Noren-PoC` and removes
+  `COLUMNS`/`LINES` so PTY dimensions are authoritative. No other variable is
+  scrubbed or logged in this PoC, and no runtime configuration may add one.
 - `TerminalEngine`: bytes and dimensions in; bounded snapshot, damage, replies,
-  and non-authoritative title metadata out. Clipboard, filesystem, IPC, and
-  process side effects are disabled.
+  and non-authoritative title metadata out. Replies return through a distinct
+  PTY command only as opaque bytes: at most 4 KiB per main-loop turn and 64 KiB
+  per second. Excess replies produce a typed error; `noren-app` never interprets
+  them. Clipboard, filesystem, IPC, and process side effects are disabled.
 - `CellWidth`: grapheme plus explicit Unicode/ambiguous-width policy in; a
   bounded cell count out.
 - `WindowInputAdapter`: platform callbacks in; timestamped app-owned lifecycle,
@@ -70,6 +82,8 @@ crate.
 - `KeyEncoder`: pressed app-owned key events in; zero or more terminal bytes
   out. Printable UTF-8, Enter `0x0D`, Backspace `0x7F`, Tab `0x09`, Escape
   `0x1B`, arrows `ESC [ A/B/C/D`, and Ctrl `0x00..0x1F` are the PoC contract.
+  Key releases and unsupported Cmd/Option/IME/dead-key combinations emit zero
+  bytes and a payload-free typed drop event; they never degrade to the base key.
 - `RenderBackend`: immutable grid/glyph batches plus an opaque surface handle
   in; recoverable render status out.
 
@@ -99,7 +113,7 @@ terminal contents, environment values, and input bytes are not logged. Natural
 exit freezes the last grid and shows a non-sensitive exit status until the user
 closes the window. Spawn failure is visible without starting the event loop's
 PTY state. Panics are bugs and must not be used for expected EOF, resize,
-surface loss, or child-exit paths.
+surface loss, reader-join timeout, or child-exit paths.
 
 ## Deferred design decisions
 
