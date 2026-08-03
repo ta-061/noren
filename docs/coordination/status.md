@@ -60,7 +60,7 @@ Verified on 2026-08-03:
 | GLM helper | Signed `32ca7da`: behavior-preserving parser-state idiom cleanup | Complete |
 | Claude Code review | PR #21 review: `BLOCKER: NONE` | Complete |
 | Qwen documentation | Signed `328c013`: architecture, roadmap, and contributor guidance | Complete |
-| Codex integration | Exact-head local checks, CI, and launch smoke | In progress |
+| Codex integration | Exact-head local checks, CI, and bounded local-zsh launch smoke | Complete |
 
 ## PR #17 historical implementation checkpoints
 
@@ -112,9 +112,10 @@ then passed both GitHub checks: runs `30783618745` (Rust) and `30783618743`
 
 ## Current Draft gate
 
-PR #21 remains Draft until exact-head local checks and CI pass and the existing
-local-zsh application launch is rechecked. PR #19 has no remaining gate. This
-does not authorize deferred terminal features in the scrolling-region PR.
+PR #21 has passed exact-head local checks and CI, and the existing local-zsh
+application launch was rechecked. It remains Draft for owner review and
+acceptance. PR #19 has no remaining gate. This does not authorize deferred
+terminal features in the scrolling-region PR.
 
 Full VT/xterm behavior, non-ASCII glyph quality, swash/font trials, production
 IME/accessibility, Linux, SSH, agent integration, tabs, panes, themes, and a
@@ -128,7 +129,6 @@ identity, and the public support/security contact before Preview publication.
 
 ## Next steps
 
-1. Save exact-head local checks and GitHub CI on Draft PR #21.
-2. Repeat the bounded macOS launch smoke without changing OS security settings.
-3. Keep alternate screen, SGR/erase, attributes, modes, and later VT work in
+1. Review and accept Draft PR #21, then promote and merge its exact tested head.
+2. Keep alternate screen, SGR/erase, attributes, modes, and later VT work in
    separate Issues and PRs.
