@@ -125,7 +125,7 @@ impl fmt::Debug for ZshLaunchPolicy {
 }
 
 /// Validate an optional `HOME` without mutating process-global environment.
-pub fn validate_home(home: Option<OsString>) -> Result<ZshLaunchPolicy, PtyError> {
+fn validate_home(home: Option<OsString>) -> Result<ZshLaunchPolicy, PtyError> {
     let home = PathBuf::from(home.ok_or(PtyError::MissingHome)?);
     if !home.is_absolute() {
         return Err(PtyError::HomeNotAbsolute);
@@ -154,6 +154,11 @@ pub struct LaunchMetadata {
 fn build_zsh_command(policy: &ZshLaunchPolicy) -> CommandBuilder {
     let mut command = CommandBuilder::new(ZSH_PROGRAM);
     command.cwd(&policy.home);
+    // Normal construction reads this exact value from the inherited HOME.
+    // Re-applying it keeps cwd and child HOME consistent while allowing the
+    // crate-local test harness to use an isolated directory without mutating
+    // process-global environment.
+    command.env("HOME", &policy.home);
     command.env("TERM", TERM_VALUE);
     command.env("TERM_PROGRAM", TERM_PROGRAM_VALUE);
     command.env_remove("COLUMNS");
@@ -290,7 +295,7 @@ impl PtySession {
     }
 
     /// Spawn using an already validated fixed-zsh policy.
-    pub fn spawn_with_policy(policy: ZshLaunchPolicy, size: PtySize) -> Result<Self, PtyError> {
+    fn spawn_with_policy(policy: ZshLaunchPolicy, size: PtySize) -> Result<Self, PtyError> {
         let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::sync_channel(OUTPUT_CHANNEL_CAPACITY);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -813,6 +818,7 @@ mod tests {
             command.get_env("TERM_PROGRAM"),
             Some(std::ffi::OsStr::new(TERM_PROGRAM_VALUE))
         );
+        assert_eq!(command.get_env("HOME"), Some(directory.as_os_str()));
         assert_eq!(command.get_env("COLUMNS"), None);
         assert_eq!(command.get_env("LINES"), None);
         fs::remove_dir(directory).expect("remove test directory");
