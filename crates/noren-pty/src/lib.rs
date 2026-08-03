@@ -762,6 +762,63 @@ mod tests {
         path
     }
 
+    #[cfg(target_os = "macos")]
+    struct TestHome(PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl TestHome {
+        fn new() -> Self {
+            Self(temp_directory())
+        }
+
+        fn policy(&self) -> ZshLaunchPolicy {
+            validate_home(Some(self.0.clone().into_os_string())).expect("valid isolated home")
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).expect("remove isolated home");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn test_session(home: &TestHome) -> PtySession {
+        let size = PtySize::from_raw(24, 80).expect("valid initial size");
+        PtySession::spawn_with_policy(home.policy(), size).expect("spawn fixed zsh")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn poll_events(
+        session: &PtySession,
+        deadline: Instant,
+        output: &mut Vec<u8>,
+        lifecycle: &mut bool,
+        done: impl Fn(&[u8], bool) -> bool,
+    ) {
+        while Instant::now() < deadline {
+            match session.try_recv().expect("receive PTY event") {
+                Some(PtyEvent::Output(bytes)) => output.extend(bytes),
+                Some(PtyEvent::Eof | PtyEvent::Exited { .. }) => *lifecycle = true,
+                Some(PtyEvent::Error(error)) => panic!("unexpected typed PTY error: {error}"),
+                None => thread::sleep(Duration::from_millis(1)),
+            }
+            if done(output, *lifecycle) {
+                return;
+            }
+        }
+        panic!("PTY event polling deadline expired");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+        haystack
+            .windows(needle.len())
+            .filter(|window| *window == needle)
+            .count()
+    }
+
     #[test]
     fn nonzero_size_round_trips_and_zero_is_rejected() {
         let size = PtySize::from_raw(24, 80).expect("valid size");
@@ -858,5 +915,104 @@ mod tests {
             error.to_string(),
             "PTY operation SpawnChild failed with PermissionDenied"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fixed_zsh_round_trips_partial_ascii_and_split_utf8_then_reaps() {
+        const MARKER: &[u8] = b"NOREN_PTY_PARTIAL_7f3a:\xe2\x98\x83\r\n";
+
+        let home = TestHome::new();
+        let mut session = test_session(&home);
+        session.send_input(b"stty -echo\n").expect("disable echo");
+        session
+            .send_input(b"printf 'NOREN_PTY_PART")
+            .expect("send partial command");
+        session
+            .send_input(b"IAL_7f3a:\xe2")
+            .expect("send first UTF-8 byte");
+        session
+            .send_input(b"\x98\x83\\n'\nexit\n")
+            .expect("complete UTF-8 and exit");
+
+        let mut output = Vec::new();
+        let mut lifecycle = false;
+        poll_events(
+            &session,
+            Instant::now() + Duration::from_secs(2),
+            &mut output,
+            &mut lifecycle,
+            |bytes, _| occurrences(bytes, MARKER) == 1,
+        );
+        assert_eq!(occurrences(&output, MARKER), 1);
+        poll_events(
+            &session,
+            Instant::now() + Duration::from_secs(2),
+            &mut output,
+            &mut lifecycle,
+            |_, observed| observed,
+        );
+        session.shutdown().expect("reap fixed zsh");
+        session.shutdown().expect("shutdown remains idempotent");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn live_resize_duplicate_and_storm_leave_last_size_authoritative() {
+        const FINAL_SIZE: &[u8] = b"37 113\r\n";
+
+        let home = TestHome::new();
+        let mut session = test_session(&home);
+        session.send_input(b"stty -echo\n").expect("disable echo");
+        for (rows, cols) in [(31, 97), (31, 97), (32, 101), (35, 107), (37, 113)] {
+            session
+                .resize(PtySize::from_raw(rows, cols).expect("nonzero storm size"))
+                .expect("queue resize");
+        }
+        session
+            .send_input(b"/bin/stty size\nexit\n")
+            .expect("query kernel PTY size");
+
+        let mut output = Vec::new();
+        let mut lifecycle = false;
+        poll_events(
+            &session,
+            Instant::now() + Duration::from_secs(2),
+            &mut output,
+            &mut lifecycle,
+            |bytes, _| occurrences(bytes, FINAL_SIZE) == 1,
+        );
+        assert_eq!(occurrences(&output, FINAL_SIZE), 1);
+        session.shutdown().expect("reap resized zsh");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn output_pressure_close_has_one_bounded_shutdown() {
+        let home = TestHome::new();
+        let mut session = test_session(&home);
+        session.send_input(b"stty -echo\n").expect("disable echo");
+        session
+            .send_input(b"while true; do print -r -- 0123456789abcdef0123456789abcdef; done\n")
+            .expect("start builtin output loop");
+
+        let mut output = Vec::new();
+        let mut lifecycle = false;
+        poll_events(
+            &session,
+            Instant::now() + Duration::from_secs(2),
+            &mut output,
+            &mut lifecycle,
+            |bytes, _| bytes.len() >= READ_CHUNK_BYTES,
+        );
+        thread::sleep(Duration::from_millis(100));
+        session.request_close();
+        let started = Instant::now();
+        let result = session.shutdown();
+        assert!(started.elapsed() <= SHUTDOWN_DEADLINE);
+        assert!(matches!(
+            result,
+            Ok(()) | Err(PtyError::ReaderJoinTimeout | PtyError::SupervisorJoinTimeout)
+        ));
     }
 }
