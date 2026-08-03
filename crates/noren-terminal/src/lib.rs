@@ -12,8 +12,8 @@ mod parser;
 mod state;
 
 pub use state::{
-    Cell, Cursor, CursorMove, MAX_SCREEN_CELLS, ScreenBuffer, TerminalError, TerminalSnapshot,
-    TerminalState,
+    Cell, Cursor, CursorMove, MAX_SCREEN_CELLS, ScreenBuffer, ScrollRegion, TerminalError,
+    TerminalSnapshot, TerminalState,
 };
 
 use unicode_width::UnicodeWidthChar;

@@ -75,16 +75,22 @@ fn cursor_commands_apply_defaults_absolute_positions_and_clamping() {
 }
 
 #[test]
-fn wrapping_at_the_bottom_scrolls_one_row_and_blanks_the_last() {
+fn delayed_wrap_scrolls_only_when_the_next_character_arrives() {
     let mut state = TerminalState::new(2, 3).expect("valid terminal");
     state.feed_bytes(b"abc");
     assert_eq!(state.snapshot().lines(), ["abc"]);
-    assert_eq!(cursor(&state), (1, 0));
+    assert_eq!(cursor(&state), (0, 2));
+    assert!(state.is_wrap_pending());
 
     state.feed_bytes(b"def");
-    assert_eq!(state.snapshot().lines(), ["def"]);
-    assert_eq!(cursor(&state), (1, 0));
-    assert!(state.screen().cell(1, 0).is_some_and(Cell::is_blank));
+    assert_eq!(state.snapshot().lines(), ["abc", "def"]);
+    assert_eq!(cursor(&state), (1, 2));
+    assert!(state.is_wrap_pending());
+
+    state.feed_bytes(b"g");
+    assert_eq!(state.snapshot().lines(), ["def", "g"]);
+    assert_eq!(cursor(&state), (1, 1));
+    assert!(!state.is_wrap_pending());
 }
 
 #[test]

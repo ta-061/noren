@@ -88,8 +88,52 @@ pub enum CursorMove {
     Down(u16),
     Right(u16),
     Left(u16),
+    NextLine(u16),
+    PreviousLine(u16),
     To { row: u16, column: u16 },
     ToColumn(u16),
+    ToRow(u16),
+}
+
+/// Inclusive vertical margins used by index and explicit scroll operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollRegion {
+    top: u16,
+    bottom: u16,
+}
+
+impl ScrollRegion {
+    fn full_screen(rows: u16) -> Self {
+        Self {
+            top: 0,
+            bottom: rows - 1,
+        }
+    }
+
+    fn checked(rows: u16, top: u16, bottom: u16) -> Result<Self, TerminalError> {
+        if top >= bottom || bottom >= rows {
+            return Err(TerminalError::InvalidScrollRegion);
+        }
+        Ok(Self { top, bottom })
+    }
+
+    /// Zero-based first row in the region.
+    #[must_use]
+    pub const fn top(self) -> u16 {
+        self.top
+    }
+
+    /// Zero-based last row in the region.
+    #[must_use]
+    pub const fn bottom(self) -> u16 {
+        self.bottom
+    }
+
+    /// Number of rows in the inclusive region.
+    #[must_use]
+    pub const fn height(self) -> u16 {
+        self.bottom - self.top + 1
+    }
 }
 
 /// Fixed-size visible screen buffer in row-major order.
@@ -159,11 +203,24 @@ impl ScreenBuffer {
         Ok(())
     }
 
-    fn scroll_up(&mut self) {
+    fn scroll_up(&mut self, region: ScrollRegion, count: u16) {
         let columns = usize::from(self.cols);
-        self.cells.rotate_left(columns);
-        let first_blank = self.cells.len().saturating_sub(columns);
-        self.cells[first_blank..].fill(Cell::blank());
+        let rows = usize::from(count.min(region.height()));
+        let start = usize::from(region.top) * columns;
+        let end = (usize::from(region.bottom) + 1) * columns;
+        let shift = rows * columns;
+        self.cells[start..end].rotate_left(shift);
+        self.cells[end - shift..end].fill(Cell::blank());
+    }
+
+    fn scroll_down(&mut self, region: ScrollRegion, count: u16) {
+        let columns = usize::from(self.cols);
+        let rows = usize::from(count.min(region.height()));
+        let start = usize::from(region.top) * columns;
+        let end = (usize::from(region.bottom) + 1) * columns;
+        let shift = rows * columns;
+        self.cells[start..end].rotate_right(shift);
+        self.cells[start..start + shift].fill(Cell::blank());
     }
 
     fn index(&self, row: u16, column: u16) -> Option<usize> {
@@ -179,6 +236,7 @@ impl ScreenBuffer {
 pub enum TerminalError {
     InvalidSize,
     ScreenTooLarge,
+    InvalidScrollRegion,
 }
 
 impl fmt::Display for TerminalError {
@@ -186,6 +244,9 @@ impl fmt::Display for TerminalError {
         match self {
             Self::InvalidSize => f.write_str("terminal rows and columns must be non-zero"),
             Self::ScreenTooLarge => f.write_str("terminal screen exceeds the cell limit"),
+            Self::InvalidScrollRegion => {
+                f.write_str("terminal scroll region must be ordered and within the screen")
+            }
         }
     }
 }
@@ -196,6 +257,8 @@ impl std::error::Error for TerminalError {}
 pub struct TerminalState {
     screen: ScreenBuffer,
     cursor: Cursor,
+    scroll_region: ScrollRegion,
+    wrap_pending: bool,
     parser: Parser,
 }
 
@@ -205,6 +268,8 @@ impl TerminalState {
         Ok(Self {
             screen: ScreenBuffer::new(rows, cols)?,
             cursor: Cursor::default(),
+            scroll_region: ScrollRegion::full_screen(rows),
+            wrap_pending: false,
             parser: Parser::default(),
         })
     }
@@ -227,6 +292,8 @@ impl TerminalState {
         self.screen.resize(rows, cols)?;
         self.cursor.row = self.cursor.row.min(rows - 1);
         self.cursor.column = self.cursor.column.min(cols - 1);
+        self.scroll_region = ScrollRegion::full_screen(rows);
+        self.wrap_pending = false;
         Ok(())
     }
 
@@ -248,8 +315,29 @@ impl TerminalState {
         &self.screen
     }
 
+    /// Active inclusive vertical scrolling margins.
+    #[must_use]
+    pub const fn scroll_region(&self) -> ScrollRegion {
+        self.scroll_region
+    }
+
+    /// Whether the next printable byte will wrap before it is written.
+    #[must_use]
+    pub const fn is_wrap_pending(&self) -> bool {
+        self.wrap_pending
+    }
+
+    /// Set zero-based inclusive scrolling margins and move the cursor home.
+    pub fn set_scroll_region(&mut self, top: u16, bottom: u16) -> Result<(), TerminalError> {
+        self.scroll_region = ScrollRegion::checked(self.screen.rows, top, bottom)?;
+        self.cursor = Cursor::default();
+        self.wrap_pending = false;
+        Ok(())
+    }
+
     /// Apply a clamped renderer-independent cursor operation.
     pub fn move_cursor(&mut self, movement: CursorMove) {
+        self.wrap_pending = false;
         let last_row = self.screen.rows - 1;
         let last_column = self.screen.cols - 1;
         match movement {
@@ -263,12 +351,23 @@ impl TerminalState {
             CursorMove::Left(count) => {
                 self.cursor.column = self.cursor.column.saturating_sub(count);
             }
+            CursorMove::NextLine(count) => {
+                self.cursor.row = self.cursor.row.saturating_add(count).min(last_row);
+                self.cursor.column = 0;
+            }
+            CursorMove::PreviousLine(count) => {
+                self.cursor.row = self.cursor.row.saturating_sub(count);
+                self.cursor.column = 0;
+            }
             CursorMove::To { row, column } => {
                 self.cursor.row = row.min(last_row);
                 self.cursor.column = column.min(last_column);
             }
             CursorMove::ToColumn(column) => {
                 self.cursor.column = column.min(last_column);
+            }
+            CursorMove::ToRow(row) => {
+                self.cursor.row = row.min(last_row);
             }
         }
     }
@@ -283,35 +382,100 @@ impl TerminalState {
         match action {
             Action::Print(byte) => self.print_ascii(byte),
             Action::LineFeed => self.line_feed(),
-            Action::CarriageReturn => self.cursor.column = 0,
-            Action::Backspace => self.cursor.column = self.cursor.column.saturating_sub(1),
+            Action::CarriageReturn => {
+                self.cursor.column = 0;
+                self.wrap_pending = false;
+            }
+            Action::Backspace => {
+                self.cursor.column = self.cursor.column.saturating_sub(1);
+                self.wrap_pending = false;
+            }
+            Action::Index => self.index(),
+            Action::NextLine => self.next_line(),
+            Action::ReverseIndex => self.reverse_index(),
             Action::MoveUp(count) => self.move_cursor(CursorMove::Up(count)),
             Action::MoveDown(count) => self.move_cursor(CursorMove::Down(count)),
             Action::MoveRight(count) => self.move_cursor(CursorMove::Right(count)),
             Action::MoveLeft(count) => self.move_cursor(CursorMove::Left(count)),
+            Action::MoveNextLine(count) => self.move_cursor(CursorMove::NextLine(count)),
+            Action::MovePreviousLine(count) => self.move_cursor(CursorMove::PreviousLine(count)),
             Action::MoveTo { row, col } => {
                 self.move_cursor(CursorMove::To { row, column: col });
             }
             Action::MoveToColumn(column) => self.move_cursor(CursorMove::ToColumn(column)),
+            Action::MoveToRow(row) => self.move_cursor(CursorMove::ToRow(row)),
+            Action::SetScrollRegion { top, bottom } => {
+                self.apply_scroll_region(top, bottom);
+            }
+            Action::ScrollUp(count) => self.scroll_up(count),
+            Action::ScrollDown(count) => self.scroll_down(count),
         }
     }
 
     fn print_ascii(&mut self, byte: u8) {
+        if self.wrap_pending {
+            self.cursor.column = 0;
+            self.index();
+        }
         self.screen
             .put(self.cursor.row, self.cursor.column, Cell::from_ascii(byte));
         if self.cursor.column == self.screen.cols - 1 {
-            self.cursor.column = 0;
-            self.line_feed();
+            self.wrap_pending = true;
         } else {
             self.cursor.column += 1;
         }
     }
 
     fn line_feed(&mut self) {
-        if self.cursor.row == self.screen.rows - 1 {
-            self.screen.scroll_up();
-        } else {
+        self.wrap_pending = false;
+        self.index();
+    }
+
+    fn index(&mut self) {
+        self.wrap_pending = false;
+        if self.cursor.row == self.scroll_region.bottom {
+            self.screen.scroll_up(self.scroll_region, 1);
+        } else if self.cursor.row < self.screen.rows - 1 {
             self.cursor.row += 1;
+        }
+    }
+
+    fn next_line(&mut self) {
+        self.cursor.column = 0;
+        self.index();
+    }
+
+    fn reverse_index(&mut self) {
+        self.wrap_pending = false;
+        if self.cursor.row == self.scroll_region.top {
+            self.screen.scroll_down(self.scroll_region, 1);
+        } else if self.cursor.row > 0 {
+            self.cursor.row -= 1;
+        }
+    }
+
+    fn scroll_up(&mut self, count: u16) {
+        self.wrap_pending = false;
+        self.screen.scroll_up(self.scroll_region, count);
+    }
+
+    fn scroll_down(&mut self, count: u16) {
+        self.wrap_pending = false;
+        self.screen.scroll_down(self.scroll_region, count);
+    }
+
+    fn reset_scroll_region(&mut self) {
+        self.scroll_region = ScrollRegion::full_screen(self.screen.rows);
+        self.cursor = Cursor::default();
+        self.wrap_pending = false;
+    }
+
+    fn apply_scroll_region(&mut self, top: u16, bottom: Option<u16>) {
+        if top == 0 && bottom.is_none() {
+            self.reset_scroll_region();
+        } else {
+            let bottom = bottom.unwrap_or(self.screen.rows - 1);
+            let _ = self.set_scroll_region(top, bottom);
         }
     }
 }
@@ -321,6 +485,8 @@ impl fmt::Debug for TerminalState {
         f.debug_struct("TerminalState")
             .field("size", &self.size())
             .field("cursor", &self.cursor)
+            .field("scroll_region", &self.scroll_region)
+            .field("wrap_pending", &self.wrap_pending)
             .finish_non_exhaustive()
     }
 }
@@ -330,6 +496,8 @@ impl fmt::Debug for TerminalState {
 pub struct TerminalSnapshot {
     screen: ScreenBuffer,
     cursor: Cursor,
+    scroll_region: ScrollRegion,
+    wrap_pending: bool,
     lines: Vec<String>,
 }
 
@@ -338,6 +506,8 @@ impl TerminalSnapshot {
         Self {
             screen: state.screen.clone(),
             cursor: state.cursor,
+            scroll_region: state.scroll_region,
+            wrap_pending: state.wrap_pending,
             lines: visible_lines(&state.screen),
         }
     }
@@ -358,6 +528,18 @@ impl TerminalSnapshot {
     #[must_use]
     pub const fn cursor(&self) -> Cursor {
         self.cursor
+    }
+
+    /// Active scrolling margins captured with the screen.
+    #[must_use]
+    pub const fn scroll_region(&self) -> ScrollRegion {
+        self.scroll_region
+    }
+
+    /// Whether a printable byte would wrap before being written.
+    #[must_use]
+    pub const fn is_wrap_pending(&self) -> bool {
+        self.wrap_pending
     }
 
     /// Captured visible screen.
@@ -427,5 +609,31 @@ mod tests {
         assert_eq!(state.screen().cell(0, 1).map(Cell::text), Some("X"));
         assert_eq!(state.screen().cell(2, 3).map(Cell::text), Some("Y"));
         assert_eq!(state.cursor(), Cursor { row: 2, column: 4 });
+    }
+
+    #[test]
+    fn index_and_reverse_index_scroll_only_inside_the_active_region() {
+        let mut state = TerminalState::new(5, 2).expect("valid terminal");
+        state.feed_bytes(b"A\x1b[2;1HB\x1b[3;1HC\x1b[4;1HD\x1b[5;1HE");
+        state.feed_bytes(b"\x1b[2;4r\x1b[4;1H\x1bD");
+
+        assert_eq!(state.snapshot().lines(), ["A", "C", "D", "", "E"]);
+        assert_eq!(state.cursor(), Cursor { row: 3, column: 0 });
+
+        state.feed_bytes(b"\x1b[2;1H\x1bM");
+        assert_eq!(state.snapshot().lines(), ["A", "", "C", "D", "E"]);
+        assert_eq!(state.cursor(), Cursor { row: 1, column: 0 });
+    }
+
+    #[test]
+    fn carriage_return_cancels_delayed_wrap_without_scrolling() {
+        let mut state = TerminalState::new(2, 3).expect("valid terminal");
+        state.feed_bytes(b"abc");
+        assert!(state.is_wrap_pending());
+
+        state.feed_bytes(b"\rZ");
+        assert_eq!(state.snapshot().lines(), ["Zbc"]);
+        assert_eq!(state.cursor(), Cursor { row: 0, column: 1 });
+        assert!(!state.is_wrap_pending());
     }
 }

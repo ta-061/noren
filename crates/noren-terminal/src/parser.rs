@@ -10,12 +10,21 @@ pub(crate) enum Action {
     LineFeed,
     CarriageReturn,
     Backspace,
+    Index,
+    NextLine,
+    ReverseIndex,
     MoveUp(u16),
     MoveDown(u16),
     MoveRight(u16),
     MoveLeft(u16),
+    MoveNextLine(u16),
+    MovePreviousLine(u16),
     MoveTo { row: u16, col: u16 },
     MoveToColumn(u16),
+    MoveToRow(u16),
+    SetScrollRegion { top: u16, bottom: Option<u16> },
+    ScrollUp(u16),
+    ScrollDown(u16),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -67,7 +76,7 @@ impl Parser {
                 self.state = ParserState::Escape;
                 None
             }
-            b'\n' => Some(Action::LineFeed),
+            b'\n' | 0x0b | 0x0c => Some(Action::LineFeed),
             b'\r' => Some(Action::CarriageReturn),
             0x08 => Some(Action::Backspace),
             0x20..=0x7e => Some(Action::Print(byte)),
@@ -76,12 +85,24 @@ impl Parser {
     }
 
     fn advance_escape(&mut self, byte: u8) -> Option<Action> {
-        self.state = match byte {
-            b'[' => ParserState::Csi(Csi::default()),
-            b']' => ParserState::Osc,
-            ESC => ParserState::Escape,
-            _ => ParserState::Ground,
-        };
+        match byte {
+            b'[' => self.state = ParserState::Csi(Csi::default()),
+            b']' => self.state = ParserState::Osc,
+            ESC => self.state = ParserState::Escape,
+            b'D' => {
+                self.state = ParserState::Ground;
+                return Some(Action::Index);
+            }
+            b'E' => {
+                self.state = ParserState::Ground;
+                return Some(Action::NextLine);
+            }
+            b'M' => {
+                self.state = ParserState::Ground;
+                return Some(Action::ReverseIndex);
+            }
+            _ => self.state = ParserState::Ground,
+        }
         None
     }
 }
@@ -172,10 +193,19 @@ impl Csi {
             b'B' => Some(Action::MoveDown(count)),
             b'C' => Some(Action::MoveRight(count)),
             b'D' => Some(Action::MoveLeft(count)),
+            b'E' => Some(Action::MoveNextLine(count)),
+            b'F' => Some(Action::MovePreviousLine(count)),
             b'G' => Some(Action::MoveToColumn(count.saturating_sub(1))),
             b'H' | b'f' => Some(Action::MoveTo {
                 row: self.param_or(0, 1).saturating_sub(1),
                 col: self.param_or(1, 1).saturating_sub(1),
+            }),
+            b'S' if self.len <= 1 => Some(Action::ScrollUp(count)),
+            b'T' if self.len <= 1 => Some(Action::ScrollDown(count)),
+            b'd' => Some(Action::MoveToRow(count.saturating_sub(1))),
+            b'r' if self.len <= 2 => Some(Action::SetScrollRegion {
+                top: self.param_or(0, 1).saturating_sub(1),
+                bottom: self.zero_based_param(1),
             }),
             _ => None,
         }
@@ -187,6 +217,13 @@ impl Csi {
             .copied()
             .filter(|value| *value != 0)
             .unwrap_or(default)
+    }
+
+    fn zero_based_param(&self, index: usize) -> Option<u16> {
+        if index >= self.len {
+            return None;
+        }
+        self.params[index].checked_sub(1)
     }
 }
 
@@ -226,9 +263,11 @@ mod tests {
     #[test]
     fn parses_basic_text_controls_and_cursor_sequences() {
         assert_eq!(
-            actions(b"A\n\r\x08\x1b[2A\x1b[3;4H"),
+            actions(b"A\n\x0b\x0c\r\x08\x1b[2A\x1b[3;4H"),
             [
                 Action::Print(b'A'),
+                Action::LineFeed,
+                Action::LineFeed,
                 Action::LineFeed,
                 Action::CarriageReturn,
                 Action::Backspace,
@@ -247,5 +286,39 @@ mod tests {
     #[test]
     fn escape_restarts_an_incomplete_csi_sequence() {
         assert_eq!(actions(b"\x1b[9\x1b[2A"), [Action::MoveUp(2)]);
+    }
+
+    #[test]
+    fn parses_index_scroll_region_and_extended_cursor_actions() {
+        assert_eq!(
+            actions(b"\x1bD\x1bE\x1bM\x1b[2;4r\x1b[3S\x1b[T\x1b[2E\x1b[F\x1b[4d"),
+            [
+                Action::Index,
+                Action::NextLine,
+                Action::ReverseIndex,
+                Action::SetScrollRegion {
+                    top: 1,
+                    bottom: Some(3),
+                },
+                Action::ScrollUp(3),
+                Action::ScrollDown(1),
+                Action::MoveNextLine(2),
+                Action::MovePreviousLine(1),
+                Action::MoveToRow(3),
+            ]
+        );
+        assert_eq!(
+            actions(b"\x1b[r\x1b[2r"),
+            [
+                Action::SetScrollRegion {
+                    top: 0,
+                    bottom: None,
+                },
+                Action::SetScrollRegion {
+                    top: 1,
+                    bottom: None,
+                },
+            ]
+        );
     }
 }
