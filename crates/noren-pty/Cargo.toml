@@ -1,0 +1,15 @@
+[package]
+name = "noren-pty"
+description = "Noren-owned process/PTY boundary contracts for the macOS local-PTY PoC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+portable-pty.workspace = true
+
+[lints]
+workspace = true
