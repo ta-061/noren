@@ -97,19 +97,30 @@ impl Parser {
                 };
                 action.action
             }
-            ParserState::Osc => {
+            // Control-string payload swallowing. Entered by OSC (`ESC ]`),
+            // DCS (`ESC P`), SOS (`ESC X`), PM (`ESC ^`), and APC (`ESC _`).
+            // The payload is consumed byte-by-byte and never stored, so the
+            // machine stays bounded regardless of payload length. A payload
+            // terminates on BEL, or on ST (`ESC \`).
+            ParserState::ControlString => {
                 self.state = match byte {
                     BEL => ParserState::Ground,
-                    ESC => ParserState::OscEscape,
-                    _ => ParserState::Osc,
+                    ESC => ParserState::ControlStringEscape,
+                    _ => ParserState::ControlString,
                 };
                 None
             }
-            ParserState::OscEscape => {
+            // `ESC` seen mid-payload begins ST detection, mirroring OSC. The
+            // next byte decides: `\\` completes ST and ends the string; another
+            // `ESC` keeps waiting for a terminator (so `ESC ESC \` still ends
+            // the string); any other byte returns to payload swallowing. This
+            // matches the Williams reference state machine's string-escape
+            // transition and keeps the parser bounded.
+            ParserState::ControlStringEscape => {
                 self.state = match byte {
                     b'\\' => ParserState::Ground,
-                    ESC => ParserState::OscEscape,
-                    _ => ParserState::Osc,
+                    ESC => ParserState::ControlStringEscape,
+                    _ => ParserState::ControlString,
                 };
                 None
             }
@@ -134,7 +145,10 @@ impl Parser {
     fn advance_escape(&mut self, byte: u8) -> Option<Action> {
         match byte {
             b'[' => self.state = ParserState::Csi(Csi::default()),
-            b']' => self.state = ParserState::Osc,
+            // Control-string introducers all share one swallowing state: OSC
+            // (`]`), DCS (`P`), SOS (`X`), PM (`^`), APC (`_`). None of their
+            // payload may reach Ground as printable text; ST/BEL ends them.
+            b']' | b'P' | b'X' | b'^' | b'_' => self.state = ParserState::ControlString,
             ESC => self.state = ParserState::Escape,
             b'=' => {
                 self.state = ParserState::Ground;
@@ -182,8 +196,8 @@ enum ParserState {
     Escape,
     EscapeIntermediate,
     Csi(Csi),
-    Osc,
-    OscEscape,
+    ControlString,
+    ControlStringEscape,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -226,11 +240,18 @@ impl Csi {
                 self.push_current();
                 CsiAdvance::pending()
             }
-            b'?' | b'>' if self.len == 0 && !self.has_current && self.private_marker.is_none() => {
+            // ECMA-48 private markers occupy 0x3c..=0x3f: `<`, `=`, `>`, `?`.
+            // The first one (before any param) seeds the marker; later ones, or
+            // any private marker that is not the DEC `?`, must poison the whole
+            // sequence so a mangled private CSI never executes its final byte
+            // (e.g. SGR-mouse-shaped `CSI < 2 M` must not become DeleteLines).
+            b'?' | b'>' | b'<' | b'='
+                if self.len == 0 && !self.has_current && self.private_marker.is_none() =>
+            {
                 self.private_marker = Some(byte);
                 CsiAdvance::pending()
             }
-            b'?' | b'>' => {
+            b'?' | b'>' | b'<' | b'=' => {
                 self.ignored = true;
                 CsiAdvance::pending()
             }
