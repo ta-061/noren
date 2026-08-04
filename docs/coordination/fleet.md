@@ -42,6 +42,26 @@ an account is unauthenticated, erroring, or below `FLOOR_PERCENT` remaining.
 `.fleet/` is runtime state and is gitignored; only this contract and the lane
 prompts under `.fleet/prompts/` describe intent.
 
+### Dispatch pitfalls
+
+Three failure modes cost real time and are worth knowing:
+
+- **opencode's `external_directory` permission stalls a lane silently.** Running
+  a lane in a worktree outside the project root can trigger an interactive
+  permission prompt that a non-interactive run can never answer; the log simply
+  stops growing at `message=asking`. Check for a stalled log size, and prefer
+  running a lane in a worktree the engine already treats as its project, or
+  pre-approve the path.
+- **A backgrounded dispatch has stdin on `/dev/null`.** A heredoc piped into
+  `ssh` therefore delivers nothing. Copy the prompt with `scp` and use `ssh -n`.
+- **Never pass a prompt as `-p "$(cat file)"` across `ssh`.** Prompts contain
+  markdown backticks, which the remote shell re-expands as command
+  substitution — the run produces empty output with exit 0. Feed the prompt on
+  stdin instead.
+
+A lane that stalls has usually still done useful work. Inspect its worktree and
+commits before discarding the run.
+
 ## Failover and resumption
 
 When a lane exits 3 (no headroom), its work moves to the backup below and the
