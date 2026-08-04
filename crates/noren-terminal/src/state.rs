@@ -260,6 +260,7 @@ pub struct TerminalModes {
     alternate_screen: bool,
     application_cursor_key: bool,
     application_keypad: bool,
+    bracketed_paste: bool,
 }
 
 impl TerminalModes {
@@ -279,6 +280,16 @@ impl TerminalModes {
     #[must_use]
     pub const fn is_application_keypad_mode(self) -> bool {
         self.application_keypad
+    }
+
+    /// Whether DEC private mode 2004 (bracketed paste) is enabled.
+    ///
+    /// When enabled, the application expects user-initiated paste text wrapped
+    /// in `CSI 200 ~` / `CSI 201 ~` markers; when disabled, paste must be
+    /// gated rather than silently sent unbracketed.
+    #[must_use]
+    pub const fn is_bracketed_paste_enabled(self) -> bool {
+        self.bracketed_paste
     }
 }
 
@@ -741,6 +752,16 @@ impl TerminalState {
         self.scrollback.len()
     }
 
+    /// Borrow one retained scrollback row by eviction order index (oldest
+    /// first), without cloning the buffer.
+    ///
+    /// Each row keeps the cells (and width) it had when it scrolled off; see
+    /// [`TerminalSnapshot::scrollback`] for the cloned ordered view.
+    #[must_use]
+    pub fn scrollback_row(&self, index: usize) -> Option<&[Cell]> {
+        self.scrollback.get(index).map(Vec::as_slice)
+    }
+
     /// Save the active screen's cursor position.
     pub fn save_cursor(&mut self) {
         self.active.save_cursor();
@@ -1194,6 +1215,9 @@ impl TerminalState {
             (PrivateMode::AlternateScreen, false) => self.leave_alternate_screen(),
             (PrivateMode::ApplicationCursorKey, enabled) => {
                 self.modes.application_cursor_key = enabled;
+            }
+            (PrivateMode::BracketedPaste, enabled) => {
+                self.modes.bracketed_paste = enabled;
             }
         }
     }

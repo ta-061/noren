@@ -12,12 +12,14 @@
 mod attributes;
 mod parser;
 mod search;
+mod selection;
 mod state;
 
 pub use attributes::{AnsiColor, CellAttributes, Color};
 pub use search::{
     CaseSensitivity, Search, SearchDirection, SearchIter, SearchMatch, SearchPosition,
 };
+pub use selection::{GridPoint, Selection, SelectionGrid, SelectionMode};
 pub use state::{
     Cell, Cursor, CursorMove, MAX_COMBINING_MARKS_PER_CELL, MAX_SCREEN_CELLS, MAX_SCROLLBACK_LINES,
     ScreenBuffer, ScrollRegion, TerminalError, TerminalModes, TerminalSnapshot, TerminalState,
