@@ -50,7 +50,9 @@ Verified on 2026-08-05 with `gh pr list` and `gh issue list`:
   was carried into PR [#34](https://github.com/ta-061/noren/pull/34) instead.
   Both branches predated the stack landing, and their unrebased diffs would have
   deleted the erase-ops, SGR, and application-mode test files.
-- Subsequent merges on `main`, all with both new audit checks green:
+- Subsequent merges on `main`. The audit workflow did not exist until PR
+  #44 introduced it, so only #45 onward could have run `cargo deny` and MSRV;
+  earlier entries passed the two checks that existed at the time:
   [#34](https://github.com/ta-061/noren/pull/34) fleet contract and status
   correction; [#38](https://github.com/ta-061/noren/pull/38) renderer/PTY grid
   agreement (Issue #35); [#39](https://github.com/ta-061/noren/pull/39)
@@ -73,8 +75,11 @@ Verified on 2026-08-05 with `gh pr list` and `gh issue list`:
   [#46](https://github.com/ta-061/noren/issues/46) is open: legacy X10 `CSI M`
   deletes a line and prints its coordinate bytes, found by the Zellij gap
   analysis after #41 had fixed only the `<`/`=` markers.
-- CI now runs four required checks per PR: the Rust build/lint/test job, the
-  documentation validator, `cargo deny check`, and MSRV verification.
+- CI runs four checks per PR: the Rust build/lint/test job, the documentation
+  validator, `cargo deny check`, and MSRV verification. These became *required*
+  when branch protection was enabled on 2026-08-05 (see [resolved
+  decisions](#human-decisions--resolved-2026-08-05)); before that they ran
+  automatically but did not block a merge.
 - PR [#19](https://github.com/ta-061/noren/pull/19) and Issue
   [#18](https://github.com/ta-061/noren/issues/18) are complete after owner
   acceptance of the renderer-independent Terminal Core foundation.
@@ -125,9 +130,19 @@ tracked to closure rather than left implicit.
 | C0 controls embedded inside a CSI were swallowed rather than executed | MINOR | [GLM](reviews/terminal-stack-glm.md) | Fixed, PR #45 (Issue #37) |
 | DCS/SOS/PM/APC payloads rendered as screen text, allowing a program to spoof screen content | MAJOR | [Kimi](reviews/terminal-stack-kimi.md) | Fixed, PR #43 (Issue #41) |
 | CSI private markers `<` and `=` executed as destructive plain CSI | MAJOR | [Kimi](reviews/terminal-stack-kimi.md) | Fixed, PR #43 (Issue #41) |
-| Legacy X10 `CSI M` deletes a line and prints its coordinate bytes | MAJOR | [Zellij gap analysis](../compatibility/zellij-gap-analysis.md) | **Open** — Issue #46 |
+| Legacy X10 `CSI M` "misparse" on the output channel | — | [Zellij gap analysis](../compatibility/zellij-gap-analysis.md) | **Not a bug** — Issue #46 and PR #52 closed; see below |
 | Unicode/CJK character width is not modeled, so wide characters misalign the grid | MAJOR | [Zellij gap analysis](../compatibility/zellij-gap-analysis.md) | **Open** — no Issue yet |
 | No mouse support: modes untracked and no pointer events reach the PTY | MAJOR | [Zellij gap analysis](../compatibility/zellij-gap-analysis.md) | **Open** — no Issue yet |
+
+The X10 `CSI M` item was withdrawn after review. `TerminalState::feed_bytes`
+parses PTY **output**, where parameterless `CSI M` is the valid Delete Line
+command; an X10 mouse report shares the prefix but travels the other way
+(terminal to PTY **input**), and no mouse input path exists at all. The
+coordinator's original reproduction was a misreading: the deleted line was DL
+working correctly, and the following bytes printed as text because on that
+channel they *are* text. PR #52 would have made a legitimate DL discard itself
+plus three output bytes; it was closed before merge. Mouse-mode tracking remains
+useful for a future mouse *input* encoder and will be re-proposed on that basis.
 
 An adversarial hostile-input sweep now exists (PR #39, 23 tests) and was
 mutation-tested to confirm it detects breakage rather than passing vacuously. An
