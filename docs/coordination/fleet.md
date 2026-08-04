@@ -62,6 +62,27 @@ an account is unauthenticated, erroring, or below `FLOOR_PERCENT` remaining.
 `.fleet/` is runtime state and is gitignored; only this contract and the lane
 prompts under `.fleet/prompts/` describe intent.
 
+### The merge gate
+
+`scripts/fleet/merge_gate.py <pr>` exits 0 only when every required check passed,
+**a review has actually been submitted**, and no review thread is unresolved. Run
+it before every merge.
+
+The review condition is the one that matters. Automated reviewers post *after* the
+checks finish, so a PR can report `CLEAN` while findings are still in flight.
+Three PRs in one session needed follow-up Issues because they were merged, or
+nearly merged, on green CI alone:
+
+| PR | What review caught that CI could not |
+| --- | --- |
+| #52 | The premise was wrong — output-side `CSI M` is Delete Line, not a mouse report. The "fix" would have broken legitimate DL. |
+| #53 | `lines()` collapsed the second column of every wide character, so the renderer misaligned — the exact breakage the PR fixed at the state layer. |
+| #56 | Combined `fg;bg` truecolor needs 10 parameter slots against a cap of 8, so both colors were silently lost — the ordinary emission pattern. |
+
+None would have been caught by more tests. They were wrong premises and untested
+*combinations*, not wrong code. The recurring coordinator failure was verifying
+each case in isolation and never the combination.
+
 ### Dispatch pitfalls
 
 Three failure modes cost real time and are worth knowing:
