@@ -79,8 +79,30 @@ Three failure modes cost real time and are worth knowing:
   substitution — the run produces empty output with exit 0. Feed the prompt on
   stdin instead.
 
-A lane that stalls has usually still done useful work. Inspect its worktree and
-commits before discarding the run.
+- **A lane can die during `init`, before it ever reaches the model.** The
+  symptom is a log that stops at `message=init` and never grows past roughly
+  1.4 KB, with no session id recorded and no branch created. It appears when
+  several opencode instances start at once. Distinguish it from a slow start by
+  checking whether a branch exists and whether the log is still growing; a lane
+  killed this way has produced nothing, so relaunching it costs only time.
+
+Distinguishing the two stall modes matters:
+
+| Symptom | Meaning | Action |
+| --- | --- | --- |
+| Log frozen at `message=init`, ~1.4 KB, no branch | died before starting | relaunch, nothing lost |
+| Log frozen at `message=asking`, large, branch exists | blocked on a permission prompt | inspect the branch — the work is usually **already done** |
+| Log still growing | working, just slow | leave it alone |
+
+A lane that stalls after starting has usually still done useful work. Inspect its
+worktree and commits before discarding the run — that has been true every time so
+far, including for two lanes whose complete, correct fixes were sitting
+uncommitted or committed-but-unreported.
+
+Uncommitted changes are worth reading rather than discarding for a second reason:
+a lane fixing behavior often has to update a *sibling* test suite that asserted
+the old behavior, and may leave that edit unstaged. Deleting it silently
+reintroduces a failing gate.
 
 ## Failover and resumption
 

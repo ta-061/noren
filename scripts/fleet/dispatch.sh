@@ -28,6 +28,9 @@ case "$lane" in
   glm-*)   engine=glm;   account=glm-main;   model="zai-coding-plan/glm-5.2" ;;
   qwen-*)  engine=qwen;  account=qwen-main;  model="qwencloud/qwen3.8-max-preview" ;;
   kimi-*)  engine=kimi;  account=kimi-main;  model="" ;;
+  # Codex work goes through the codex-lab wrapper only (portal `codex-main`).
+  # The plain `codex` binary maps to `codex-tatu`, which is nearly exhausted and
+  # is deliberately not reachable from this script.
   lab-*)   engine=lab;   account=codex-main; model="" ;;
   *) echo "unknown lane: $lane" >&2; exit 2 ;;
 esac
