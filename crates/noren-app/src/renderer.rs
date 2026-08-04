@@ -287,7 +287,11 @@ fn glyph_vertices(
     let visible_cols = usize::try_from(width / CELL_WIDTH)
         .unwrap_or(usize::MAX)
         .clamp(1, usize::from(MAX_RENDER_COLS));
-    let lines = terminal.map(TerminalSnapshot::lines).unwrap_or_default();
+    // display_lines preserves wide-character continuation columns, so the
+    // character index below is the display column for every glyph.
+    let lines = terminal
+        .map(TerminalSnapshot::display_lines)
+        .unwrap_or_default();
     let total_lines = lines.len() + usize::from(status.is_some());
     let first_line = total_lines.saturating_sub(visible_rows);
     let mut vertices = Vec::new();
@@ -459,5 +463,49 @@ mod tests {
         let terminal = snapshot(1, 2, b"A");
         let vertices = glyph_vertices(Some(&terminal), None, 900, 600);
         assert_eq!(vertex_bytes(&vertices).len(), vertices.len() * 8);
+    }
+
+    fn ndc_left(column: u32) -> f32 {
+        (column * CELL_WIDTH) as f32 / 900.0 * 2.0 - 1.0
+    }
+
+    fn ndc_top_row_zero() -> f32 {
+        1.0 - GLYPH_TOP as f32 / 600.0 * 2.0
+    }
+
+    fn has_rect_top_left(vertices: &[[f32; 2]], left: f32) -> bool {
+        let top = ndc_top_row_zero();
+        vertices.chunks_exact(6).any(|rect| rect[0] == [left, top])
+    }
+
+    #[test]
+    fn wide_characters_place_following_glyphs_at_display_columns() {
+        let terminal = snapshot(1, 6, "a日b".as_bytes());
+        let vertices = glyph_vertices(Some(&terminal), None, 900, 600);
+
+        // a occupies column 0, 日 columns 1-2, so b must start at display
+        // column 3 and nothing may draw at column 2's lead edge.
+        assert!(has_rect_top_left(&vertices, ndc_left(3)));
+        assert!(!has_rect_top_left(&vertices, ndc_left(2)));
+    }
+
+    #[test]
+    fn wide_output_renders_like_the_equivalent_single_width_layout() {
+        let wide = snapshot(1, 6, "a日b".as_bytes());
+        let aligned = snapshot(1, 6, b"a? b");
+        assert_eq!(
+            glyph_vertices(Some(&wide), None, 900, 600),
+            glyph_vertices(Some(&aligned), None, 900, 600),
+            "the wide lead draws in column 1, its continuation column stays empty, and b lands in column 3"
+        );
+    }
+
+    #[test]
+    fn ascii_glyphs_keep_their_character_columns() {
+        let terminal = snapshot(1, 4, b"BD");
+        let vertices = glyph_vertices(Some(&terminal), None, 900, 600);
+        assert!(has_rect_top_left(&vertices, ndc_left(0)));
+        assert!(has_rect_top_left(&vertices, ndc_left(1)));
+        assert!(!has_rect_top_left(&vertices, ndc_left(2)));
     }
 }

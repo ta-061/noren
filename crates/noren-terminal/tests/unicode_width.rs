@@ -10,6 +10,17 @@ fn cell(state: &TerminalState, row: u16, column: u16) -> &Cell {
     state.screen().cell(row, column).expect("cell is in bounds")
 }
 
+fn assert_cursor_off_continuation(state: &TerminalState) {
+    let (row, column) = cursor(state);
+    assert!(
+        !state
+            .screen()
+            .cell(row, column)
+            .is_some_and(Cell::is_continuation),
+        "cursor rests on a continuation cell at row {row}, column {column}"
+    );
+}
+
 #[test]
 fn ascii_line_is_unchanged_and_every_cell_keeps_width_one() {
     let mut state = TerminalState::new(3, 5).expect("valid terminal");
@@ -274,4 +285,115 @@ fn resize_cutting_a_continuation_blanks_the_orphaned_lead() {
             .all(|cell| !cell.is_continuation())
     );
     assert_eq!(cell(&state, 0, 2).text(), " ");
+}
+
+/// Coordinator reproduction: the cursor sits on the continuation column of
+/// the row above a wide character, and LF carries that column downward onto
+/// the continuation half.
+fn reproduction_state() -> TerminalState {
+    let mut state = TerminalState::new(4, 6).expect("valid terminal");
+    state.feed_bytes("\x1b[3;3H日".as_bytes());
+    assert_eq!(cursor(&state), (2, 4));
+    state.feed_bytes(b"\x1b[2;4H");
+    assert_eq!(cursor(&state), (1, 3));
+    state
+}
+
+#[test]
+fn line_feed_snaps_the_cursor_off_a_continuation_column() {
+    let mut state = reproduction_state();
+    state.feed_bytes(b"\n");
+    assert_eq!(cursor(&state), (2, 2));
+    assert_cursor_off_continuation(&state);
+}
+
+#[test]
+fn index_nel_and_reverse_index_snap_the_cursor_off_continuations() {
+    // IND (ESC D) keeps the column while moving down onto the continuation.
+    let mut state = reproduction_state();
+    state.feed_bytes(b"\x1bD");
+    assert_eq!(cursor(&state), (2, 2));
+    assert_cursor_off_continuation(&state);
+
+    // NEL (ESC E) homes the column, which is never a continuation.
+    let mut state = reproduction_state();
+    state.feed_bytes(b"\x1bE");
+    assert_eq!(cursor(&state), (2, 0));
+    assert_cursor_off_continuation(&state);
+
+    // RI (ESC M) keeps the column while moving up onto the continuation.
+    let mut state = reproduction_state();
+    state.feed_bytes(b"\x1b[4;4H");
+    state.feed_bytes(b"\x1bM");
+    assert_eq!(cursor(&state), (2, 2));
+    assert_cursor_off_continuation(&state);
+}
+
+#[test]
+fn reverse_index_at_the_top_margin_keeps_wide_rows_intact() {
+    let mut state = TerminalState::new(3, 6).expect("valid terminal");
+    state.feed_bytes("\x1b[2;3H日\x1b[1;4H".as_bytes());
+    assert_eq!(cursor(&state), (0, 3));
+
+    // RI at the top margin scrolls the region down instead of moving the
+    // cursor; the blank row inserted under the cursor has no continuation,
+    // and the wide row keeps both halves.
+    state.feed_bytes(b"\x1bM");
+    assert_eq!(cursor(&state), (0, 3));
+    assert_cursor_off_continuation(&state);
+    assert_eq!(cell(&state, 2, 2).text(), "日");
+    assert_eq!(cell(&state, 2, 2).width(), 2);
+    assert!(cell(&state, 2, 3).is_continuation());
+}
+
+#[test]
+fn printing_after_a_snapped_line_feed_replaces_the_pair_at_the_lead() {
+    let mut state = reproduction_state();
+    state.feed_bytes(b"\nX");
+
+    // The cursor snapped to the lead, so the printable replaces the wide
+    // pair at its lead column instead of blanking the lead from the
+    // continuation side and leaving a hole one column left of the print.
+    assert_eq!(state.snapshot().lines(), ["", "", "  X"]);
+    assert_eq!(cell(&state, 2, 2).text(), "X");
+    assert_eq!(cell(&state, 2, 3).text(), " ");
+    assert!(!cell(&state, 2, 3).is_continuation());
+    assert_cursor_off_continuation(&state);
+}
+
+#[test]
+fn wide_characters_survive_row_moves_and_later_prints() {
+    let mut state = reproduction_state();
+    // LF through the row carrying the continuation column, then print on the
+    // following row: the wide character must remain intact behind the cursor.
+    state.feed_bytes(b"\n\nX");
+
+    assert_eq!(cursor(&state), (3, 3));
+    assert_eq!(cell(&state, 2, 2).text(), "日");
+    assert_eq!(cell(&state, 2, 2).width(), 2);
+    assert!(cell(&state, 2, 3).is_continuation());
+    assert_eq!(state.snapshot().lines(), ["", "", "  日", "  X"]);
+}
+
+#[test]
+fn display_lines_preserve_wide_columns_while_lines_keep_their_meaning() {
+    let mut state = TerminalState::new(1, 6).expect("valid terminal");
+    state.feed_bytes("a日b".as_bytes());
+    let snapshot = state.snapshot();
+
+    // The existing accessor keeps its character-packed meaning.
+    assert_eq!(snapshot.lines(), ["a日b"]);
+
+    // The column-preserving view spans four display columns (a=1, 日=2, b=1)
+    // with b at display column 3.
+    let display = snapshot.display_lines();
+    assert_eq!(display, ["a日 b"]);
+    assert_eq!(display[0].chars().count(), 4);
+    assert_eq!(display[0].chars().nth(3), Some('b'));
+
+    // ASCII rows are byte-identical in both views.
+    let mut ascii = TerminalState::new(1, 6).expect("valid terminal");
+    ascii.feed_bytes(b"a b");
+    let snapshot = ascii.snapshot();
+    assert_eq!(snapshot.display_lines(), snapshot.lines());
 }
