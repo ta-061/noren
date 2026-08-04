@@ -1,11 +1,8 @@
 # Terminal core foundation
 
-- Status: PR [#19](https://github.com/ta-061/noren/pull/19) merged as
-  `c695920`; the scroll-region slice is in progress as Draft PR
-  [#21](https://github.com/ta-061/noren/pull/21); the alternate-screen slice
-  (core commit `84da736`) is stacked on top as Draft PR
-  [#23](https://github.com/ta-061/noren/pull/23) for Issue
-  [#22](https://github.com/ta-061/noren/issues/22)
+- Status: merged. The foundation, the parallel Terminal Core stack (PR
+  [#29](https://github.com/ta-061/noren/pull/29)), and scrollback (PR
+  [#50](https://github.com/ta-061/noren/pull/50)) are all on `main`.
 - Supersedes nothing: the accepted [local-PTY PoC
   architecture](minimal-local-pty-poc.md) still applies
 
@@ -116,10 +113,34 @@ renderer-independent API.
   soft-wrap retained rows; until then renderers must tolerate mixed-width
   scrollback rows (each row's `.len()` is its own width).
 
+## Also merged since this document was first written
+
+The sections above describe the foundation slices in the order they landed. These
+capabilities are now on `main` as well and are no longer deferred:
+
+- Erase/insert/delete (ED, EL, ECH, ICH, DCH, IL, DL), SGR and cell attributes,
+  and application cursor/keypad modes (DECCKM, DECKPAM/DECKPNM) — PR #29.
+- Escape-intermediate sequences (`ESC ( B` and siblings) consumed whole, and
+  horizontal tab honored at 8-column stops — PR #29.
+- String sequences (DCS/SOS/PM/APC) swallowed to ST or BEL, and CSI private
+  markers `<` and `=` poisoning the sequence — PR #43.
+- DECSTBM margin clamping and C0 controls executing inside a CSI — PR #45.
+- A bounded VT compatibility harness (PR #32) and an adversarial hostile-input
+  suite (PR #39).
+
 ## Deferred
 
-SGR/erase/insert/delete, cell attributes, tabs, origin mode, and
-query/reply sequences remain deferred, along with other DEC private modes
-(such as 1047/1048, 25, and 2004), application cursor/keypad modes, OSC
-titles, scrollback reflow on resize, and saved-cursor state beyond
-position. Unicode and IME remain later.
+Origin mode and query/reply sequences remain deferred, along with other DEC
+private modes (1047/1048, 25, 2004), OSC titles, scrollback reflow on resize, and
+saved-cursor state beyond position.
+
+Unicode/CJK character width remains the largest outstanding gap: the parser still
+prints only `0x20..=0x7e`, so wide characters and combining marks are not yet
+modeled even though `Cell` carries a `width` field. Mouse reporting is likewise
+unimplemented, and legacy X10 `CSI M` currently misparses (Issue
+[#46](https://github.com/ta-061/noren/issues/46)). See the [Zellij gap
+analysis](../compatibility/zellij-gap-analysis.md) for the ranked list and cost
+estimates.
+
+None of the above is a VT100/xterm compatibility claim, and none is a
+vim/tmux/zellij compatibility claim.
