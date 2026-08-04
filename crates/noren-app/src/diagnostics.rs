@@ -1,0 +1,265 @@
+//! Bounded, opt-in terminal diagnostics without a debugger.
+//!
+//! One key chord (Super+D, see `main.rs`) asks this module for a single-line
+//! report of the live state: grid geometry, active modes, scrollback length,
+//! and PTY child status. Each trigger emits exactly one bounded line — to the
+//! window title and standard error — so the feature is opt-in and cannot grow
+//! into an unbounded log.
+//!
+//! # Privacy rule
+//!
+//! Diagnostics report counters and flags only: grid dimensions, mode bits,
+//! scrollback length against its hard cap, and the child exit code. They
+//! never include PTY output bytes, screen cell text, scrollback contents,
+//! terminal replies, or input, because that content is user data and may
+//! contain secrets. There is deliberately no opt-in for content: no API in
+//! this module accepts or returns screen text, and [`report`] cannot name it.
+//! Any future feature that would emit content requires a threat-model change
+//! (TM-08) before it is designed.
+
+use noren_terminal::{MAX_SCROLLBACK_LINES, TerminalModes, TerminalSnapshot};
+use std::fmt::{self, Write};
+
+/// PTY child status as observed by the application.
+///
+/// The observation is control-plane only (spawn, reap, exit code); it never
+/// inspects or reports child output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PtyChildStatus {
+    /// No PTY session was started (or it was already torn down).
+    NotLaunched,
+    /// The child process is expected to be running.
+    Running,
+    /// The child stream ended; `code` is `None` when only EOF was observed.
+    Exited { code: Option<u32> },
+}
+
+impl fmt::Display for PtyChildStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotLaunched => f.write_str("not launched"),
+            Self::Running => f.write_str("running"),
+            Self::Exited { code: Some(code) } => write!(f, "exited(code={code})"),
+            Self::Exited { code: None } => f.write_str("exited"),
+        }
+    }
+}
+
+/// Inputs for one diagnostics report: counters and flags only.
+///
+/// Construct via [`from_snapshot`] from live terminal state. The fields
+/// intentionally cannot carry screen text or PTY bytes (see module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiagnosticsInput {
+    grid_rows: Option<u16>,
+    grid_cols: Option<u16>,
+    modes: Option<TerminalModes>,
+    scrollback_len: usize,
+    scrollback_cap: usize,
+    pty: PtyChildStatus,
+}
+
+/// Build diagnostics input from the live terminal snapshot.
+///
+/// Only the snapshot's geometry, mode flags, and scrollback length are read;
+/// its line text is never touched. The reported scrollback ceiling is the
+/// terminal foundation's hard cap [`MAX_SCROLLBACK_LINES`], which
+/// configuration cannot raise.
+#[must_use]
+pub fn from_snapshot(snapshot: Option<&TerminalSnapshot>, pty: PtyChildStatus) -> DiagnosticsInput {
+    match snapshot {
+        Some(snapshot) => DiagnosticsInput {
+            grid_rows: Some(snapshot.rows()),
+            grid_cols: Some(snapshot.cols()),
+            modes: Some(snapshot.modes()),
+            scrollback_len: snapshot.scrollback().len(),
+            scrollback_cap: MAX_SCROLLBACK_LINES,
+            pty,
+        },
+        None => DiagnosticsInput {
+            grid_rows: None,
+            grid_cols: None,
+            modes: None,
+            scrollback_len: 0,
+            scrollback_cap: MAX_SCROLLBACK_LINES,
+            pty,
+        },
+    }
+}
+
+/// Render one bounded diagnostics line.
+///
+/// The output is a fixed field sequence with no free text, so its length is
+/// bounded by its numeric fields; hostile terminal state cannot inject
+/// content into the overlay or log.
+#[must_use]
+pub fn report(input: &DiagnosticsInput) -> String {
+    let mut out = String::with_capacity(128);
+    let _ = write!(out, "noren diagnostics: grid=");
+    match (input.grid_rows, input.grid_cols) {
+        (Some(rows), Some(cols)) => {
+            let _ = write!(out, "{rows}x{cols}");
+        }
+        _ => out.push_str("none"),
+    }
+    match input.modes {
+        Some(modes) => {
+            let _ = write!(
+                out,
+                " modes=alt:{} cursor:{} keypad:{}",
+                bit(modes.is_alternate_screen_active()),
+                bit(modes.is_application_cursor_key_mode()),
+                bit(modes.is_application_keypad_mode())
+            );
+        }
+        None => out.push_str(" modes=none"),
+    }
+    let _ = write!(
+        out,
+        " scrollback={}/{} child={}",
+        input.scrollback_len, input.scrollback_cap, input.pty
+    );
+    out
+}
+
+fn bit(flag: bool) -> u8 {
+    u8::from(flag)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use noren_terminal::TerminalState;
+
+    fn snapshot(rows: u16, cols: u16, bytes: &[u8]) -> TerminalSnapshot {
+        let mut terminal = TerminalState::new(rows, cols).expect("valid test terminal");
+        terminal.feed_bytes(bytes);
+        terminal.snapshot()
+    }
+
+    #[test]
+    fn report_matches_geometry_modes_and_scrollback_exactly() {
+        // DECCKM, application keypad, scrolling lines off the primary screen,
+        // and only then the alternate screen.
+        let mut terminal = TerminalState::new(4, 8).expect("valid test terminal");
+        terminal.feed_bytes(b"\x1b[?1h\x1b=");
+        terminal.feed_bytes(b"1\n2\n3\n4\n5\n6\n");
+        terminal.feed_bytes(b"\x1b[?1049h");
+        let state = terminal.snapshot();
+
+        let input = from_snapshot(Some(&state), PtyChildStatus::Running);
+        assert_eq!(input.grid_rows, Some(4));
+        assert_eq!(input.grid_cols, Some(8));
+        assert_eq!(input.scrollback_len, terminal.scrollback_len());
+        assert_eq!(input.scrollback_len, state.scrollback().len());
+
+        let line = report(&input);
+        assert!(line.contains("grid=4x8"), "{line}");
+        assert!(line.contains("modes=alt:1 cursor:1 keypad:1"), "{line}");
+        assert!(
+            line.contains(&format!(
+                "scrollback={}/{}",
+                terminal.scrollback_len(),
+                MAX_SCROLLBACK_LINES
+            )),
+            "{line}"
+        );
+        assert!(line.contains("child=running"), "{line}");
+        assert!(terminal.scrollback_len() >= 2, "scroll occurred in fixture");
+    }
+
+    #[test]
+    fn report_reflects_cleared_modes_and_no_scrollback() {
+        let state = snapshot(3, 5, b"hello");
+        let line = report(&from_snapshot(Some(&state), PtyChildStatus::NotLaunched));
+        assert!(line.contains("grid=3x5"), "{line}");
+        assert!(line.contains("modes=alt:0 cursor:0 keypad:0"), "{line}");
+        assert!(
+            line.contains(&format!("scrollback=0/{MAX_SCROLLBACK_LINES}")),
+            "{line}"
+        );
+        assert!(line.contains("child=not launched"), "{line}");
+    }
+
+    #[test]
+    fn report_without_terminal_state_never_panics() {
+        let input = from_snapshot(None, PtyChildStatus::Exited { code: Some(2) });
+        let line = report(&input);
+        assert!(line.contains("grid=none"), "{line}");
+        assert!(line.contains("modes=none"), "{line}");
+        assert!(
+            line.contains(&format!("scrollback=0/{MAX_SCROLLBACK_LINES}")),
+            "{line}"
+        );
+        assert!(line.contains("child=exited(code=2)"), "{line}");
+    }
+
+    #[test]
+    fn child_status_displays_every_variant() {
+        assert_eq!(PtyChildStatus::NotLaunched.to_string(), "not launched");
+        assert_eq!(PtyChildStatus::Running.to_string(), "running");
+        assert_eq!(PtyChildStatus::Exited { code: None }.to_string(), "exited");
+        assert_eq!(
+            PtyChildStatus::Exited { code: Some(130) }.to_string(),
+            "exited(code=130)"
+        );
+    }
+
+    /// The privacy rule proven here: screen text fed through the terminal
+    /// never appears in diagnostics, even though the snapshot used as input
+    /// demonstrably contains it.
+    #[test]
+    fn report_excludes_screen_and_scrollback_content() {
+        let secret = "SECRET-MARKER-9f8e7d6c";
+        let mut terminal = TerminalState::new(2, 40).expect("valid test terminal");
+        terminal.feed_bytes(secret.as_bytes());
+        terminal.feed_bytes(b"\n\n\n\n"); // push the secret line into scrollback
+        let state = terminal.snapshot();
+        assert!(
+            state
+                .lines()
+                .iter()
+                .chain(&state.scrollback_lines())
+                .any(|line| line.contains(secret)),
+            "fixture must place the secret into terminal content"
+        );
+
+        let line = report(&from_snapshot(Some(&state), PtyChildStatus::Running));
+        assert!(!line.contains(secret), "{line}");
+        assert!(!line.contains("SECRET"), "{line}");
+        // No screen text at all: only the fixed counters and flags.
+        for token in ["9f8e7d6c", "MARKE"] {
+            assert!(!line.contains(token), "{line}");
+        }
+    }
+
+    #[test]
+    fn report_length_is_bounded_for_extreme_inputs() {
+        // 1024x1024 is exactly MAX_SCREEN_CELLS, the largest valid grid.
+        let mut terminal = TerminalState::new(1024, 1024).expect("within MAX_SCREEN_CELLS");
+        terminal.feed_bytes(b"\x1b[?1h\x1b=\x1b[?1049h");
+        let state = terminal.snapshot();
+        let input = from_snapshot(Some(&state), PtyChildStatus::Exited { code: None });
+        let line = report(&input);
+        assert!(line.len() < 200, "report must stay bounded: {line}");
+        assert!(line.is_ascii(), "no free text can reach the report");
+    }
+
+    /// The scrollback ceiling diagnostics reports is the terminal
+    /// foundation's hard cap. It is a fixed constant, so a configuration can
+    /// neither raise it nor (yet) lower it; the report can never name a
+    /// different ceiling.
+    #[test]
+    fn scrollback_is_always_reported_against_the_hard_cap() {
+        let state = snapshot(2, 2, b"x");
+        let line = report(&from_snapshot(Some(&state), PtyChildStatus::Running));
+        assert!(
+            line.contains(&format!("scrollback=0/{MAX_SCROLLBACK_LINES}")),
+            "{line}"
+        );
+        assert_eq!(
+            from_snapshot(Some(&state), PtyChildStatus::Running).scrollback_cap,
+            MAX_SCROLLBACK_LINES
+        );
+    }
+}

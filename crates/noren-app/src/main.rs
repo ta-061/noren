@@ -6,7 +6,7 @@ use noren_app::{
     Arrow, CursorKeyMode, FunctionKey, GridGeometry, GridSize, InputMode, Key, KeyDropReason,
     KeyEncoder, KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode, MAX_RENDER_ROWS, Modifiers,
     PARSE_BUDGET_BYTES_PER_TURN, POC_CELL_HEIGHT, POC_CELL_WIDTH, PasteReject, Resize,
-    SystemClipboard, encode_paste,
+    SystemClipboard, config::AppConfig, diagnostics::{self, PtyChildStatus}, encode_paste,
 };
 use noren_pty::{PtyEvent, PtySession, PtySize};
 use noren_terminal::{Cell, GridPoint, Selection, SelectionMode, TerminalEngine, TerminalState};
@@ -31,9 +31,12 @@ struct NorenApp {
     pending_grid: Option<GridSize>,
     terminal: Option<TerminalState>,
     pty: Option<PtySession>,
+    pty_child: PtyChildStatus,
     modifiers: Modifiers,
     status: &'static str,
     show_status: bool,
+    diagnostics_visible: bool,
+    diagnostics_line: String,
     redraw_needed: bool,
     // User-initiated selection state. The renderer does not highlight it yet;
     // copy still extracts it. Any PTY output or resize invalidates it because
@@ -46,16 +49,30 @@ struct NorenApp {
 
 impl Default for NorenApp {
     fn default() -> Self {
+        Self::new(AppConfig::default())
+    }
+}
+
+impl NorenApp {
+    fn new(config: AppConfig) -> Self {
+        // Configuration is already range-checked; the fallback only guards
+        // the programmatic constructor path.
+        let geometry =
+            GridGeometry::with_cells(config.font().cell_width(), config.font().cell_height())
+                .unwrap_or_else(GridGeometry::poc);
         Self {
             window: None,
             renderer: None,
-            geometry: GridGeometry::poc(),
+            geometry,
             pending_grid: None,
             terminal: None,
             pty: None,
+            pty_child: PtyChildStatus::NotLaunched,
             modifiers: Modifiers::empty(),
             status: "Noren PoC starting",
             show_status: true,
+            diagnostics_visible: false,
+            diagnostics_line: String::new(),
             redraw_needed: true,
             selection: None,
             drag_origin: None,
@@ -99,11 +116,13 @@ impl NorenApp {
             Ok(session) => {
                 self.status = "Noren PoC ready";
                 self.show_status = false;
+                self.pty_child = PtyChildStatus::Running;
                 Some(session)
             }
             Err(_) => {
                 self.status = "Noren PTY start failed";
                 self.show_status = true;
+                self.pty_child = PtyChildStatus::NotLaunched;
                 None
             }
         };
@@ -139,6 +158,15 @@ impl NorenApp {
 
     fn handle_key(&mut self, event: &KeyEvent) {
         if self.handle_clipboard_shortcut(event) {
+            return;
+        }
+        if diagnostics_chord_pressed(
+            &event.logical_key,
+            event.state,
+            event.repeat,
+            self.modifiers,
+        ) {
+            self.toggle_diagnostics();
             return;
         }
         let input_mode = self.current_input_mode();
@@ -350,6 +378,30 @@ impl NorenApp {
         }
     }
 
+    /// Toggle the opt-in diagnostics overlay.
+    ///
+    /// Each activation emits exactly one bounded report line (window title
+    /// and standard error); no screen or PTY content is ever included. See
+    /// [`noren_app::diagnostics`].
+    fn toggle_diagnostics(&mut self) {
+        self.diagnostics_visible = !self.diagnostics_visible;
+        if !self.diagnostics_visible {
+            self.diagnostics_line.clear();
+            if let Some(window) = &self.window {
+                window.set_title("Noren PoC");
+            }
+            return;
+        }
+        let snapshot = self.terminal.as_ref().map(TerminalEngine::snapshot);
+        let input = diagnostics::from_snapshot(snapshot.as_ref(), self.pty_child);
+        let line = diagnostics::report(&input);
+        eprintln!("{line}");
+        if let Some(window) = &self.window {
+            window.set_title(&line);
+        }
+        self.diagnostics_line = line;
+    }
+
     fn current_input_mode(&self) -> InputMode {
         let Some(modes) = self.terminal.as_ref().map(TerminalState::modes) else {
             return InputMode::normal();
@@ -433,10 +485,12 @@ impl NorenApp {
                     self.redraw_needed = true;
                 }
                 PtyEvent::Eof => {
+                    self.pty_child = PtyChildStatus::Exited { code: None };
                     terminal_status = Some("Noren shell reached EOF");
                     break;
                 }
                 PtyEvent::Exited { code } => {
+                    self.pty_child = PtyChildStatus::Exited { code };
                     terminal_status = Some(if code == Some(0) {
                         "Noren shell exited"
                     } else {
@@ -505,12 +559,28 @@ impl NorenApp {
 
     fn close(&mut self, event_loop: &ActiveEventLoop) {
         if let Some(mut session) = self.pty.take() {
+            self.pty_child = PtyChildStatus::NotLaunched;
             if session.shutdown().is_err() {
                 eprintln!("Noren PTY shutdown reached its failure fallback");
             }
         }
         event_loop.exit();
     }
+}
+
+/// Super+D press toggles diagnostics. Super chords are dropped by the key
+/// encoder anyway, so this intercept consumes no terminal input.
+fn diagnostics_chord_pressed(
+    logical_key: &WinitKey,
+    state: ElementState,
+    repeat: bool,
+    modifiers: Modifiers,
+) -> bool {
+    state == ElementState::Pressed
+        && !repeat
+        && modifiers.is_super()
+        && matches!(logical_key,
+            WinitKey::Character(text) if text.eq_ignore_ascii_case("d"))
 }
 
 impl ApplicationHandler for NorenApp {
@@ -681,12 +751,22 @@ fn translate_logical_key(
 }
 
 fn main() {
+    let config = match AppConfig::load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("Noren configuration is unusable: {error}");
+            eprintln!(
+                "see docs/configuration.md; fix or remove the file (or unset NOREN_CONFIG) to continue"
+            );
+            std::process::exit(1);
+        }
+    };
     let Ok(event_loop) = EventLoop::new() else {
         eprintln!("Noren event loop creation failed");
         return;
     };
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = NorenApp::default();
+    let mut app = NorenApp::new(config);
     if event_loop.run_app(&mut app).is_err() {
         eprintln!("Noren event loop failed");
     }
@@ -899,5 +979,110 @@ mod tests {
         assert_eq!(app.status, "Noren shell reached EOF");
         assert!(app.show_status);
         assert!(app.redraw_needed);
+    }
+
+    #[test]
+    fn diagnostics_chord_is_a_super_d_press_only() {
+        let super_modifiers = Modifiers::empty().super_key();
+        let chord = WinitKey::Character("d".into());
+        for (state, repeat, modifiers, expected) in [
+            (ElementState::Pressed, false, super_modifiers, true),
+            (ElementState::Released, false, super_modifiers, false),
+            (ElementState::Pressed, true, super_modifiers, false),
+            (ElementState::Pressed, false, Modifiers::empty(), false),
+            (
+                ElementState::Pressed,
+                false,
+                Modifiers::empty().shift(),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                diagnostics_chord_pressed(&chord, state, repeat, modifiers),
+                expected,
+                "state={state:?} repeat={repeat}"
+            );
+        }
+        for other in [
+            WinitKey::Character("x".into()),
+            WinitKey::Character("dd".into()),
+            WinitKey::Named(NamedKey::Enter),
+        ] {
+            assert!(
+                !diagnostics_chord_pressed(&other, ElementState::Pressed, false, super_modifiers),
+                "only D toggles diagnostics"
+            );
+        }
+        let shifted = WinitKey::Character("D".into());
+        assert!(diagnostics_chord_pressed(
+            &shifted,
+            ElementState::Pressed,
+            false,
+            super_modifiers
+        ));
+    }
+
+    #[test]
+    fn toggle_diagnostics_reports_live_state_and_clears_on_exit() {
+        let mut app = NorenApp::default();
+        let mut terminal = TerminalState::new(4, 8).expect("valid terminal");
+        terminal.feed_bytes(b"\x1b[?1h");
+        app.terminal = Some(terminal);
+
+        app.toggle_diagnostics();
+        assert!(app.diagnostics_visible);
+        assert!(
+            app.diagnostics_line.contains("grid=4x8"),
+            "diagnostics: {}",
+            app.diagnostics_line
+        );
+        assert!(
+            app.diagnostics_line
+                .contains("modes=alt:0 cursor:1 keypad:0"),
+            "diagnostics: {}",
+            app.diagnostics_line
+        );
+        assert!(
+            app.diagnostics_line.contains("child=not launched"),
+            "diagnostics: {}",
+            app.diagnostics_line
+        );
+
+        app.toggle_diagnostics();
+        assert!(!app.diagnostics_visible);
+        assert!(app.diagnostics_line.is_empty());
+    }
+
+    #[test]
+    fn toggle_diagnostics_never_repeats_terminal_content() {
+        let mut app = NorenApp::default();
+        let mut terminal = TerminalState::new(2, 40).expect("valid terminal");
+        terminal.feed_bytes(b"SECRET-MARKER-9f8e7d6c\n\n\n\n");
+        app.terminal = Some(terminal);
+
+        app.toggle_diagnostics();
+        assert!(app.diagnostics_visible);
+        assert!(
+            !app.diagnostics_line.contains("SECRET"),
+            "diagnostics: {}",
+            app.diagnostics_line
+        );
+        assert!(
+            !app.diagnostics_line.contains("9f8e7d6c"),
+            "diagnostics: {}",
+            app.diagnostics_line
+        );
+    }
+
+    #[test]
+    fn configured_cell_sizes_drive_the_app_geometry() {
+        let config = AppConfig::parse("[font]\ncell_width = 20\ncell_height = 40\n")
+            .expect("valid configuration");
+        let app = NorenApp::new(config);
+        let mut expected = GridGeometry::with_cells(20, 40).expect("valid geometry");
+        let mut actual = app.geometry;
+        let grid = actual.update(Resize::new(900, 600)).expect("grid");
+        assert_eq!(grid, expected.update(Resize::new(900, 600)).expect("grid"));
+        assert_eq!((grid.rows(), grid.cols()), (15, 45));
     }
 }
