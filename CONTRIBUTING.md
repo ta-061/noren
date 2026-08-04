@@ -51,6 +51,30 @@ Changes to `crates/noren-terminal/` additionally keep these conventions:
 - Renderer and PTY concerns stay out of `noren-terminal` tests; the core
   neither reads from a PTY nor renders.
 
+## Parallel development model
+
+Work advances through parallel lanes under these rules:
+
+- Each lane runs in an isolated git worktree branched from the current dependency
+  head — never on `main` and never in a shared checkout.
+- Issues assign non-overlapping file leases. Concurrent lanes do not edit the
+  same file; lanes needing the same central files queue behind whichever
+  checkpoint owns them.
+- Work lands as stacked Draft PRs that name their exact base head. A stacked PR
+  is retargeted to `main` only after its dependency merges.
+- A stacked PR that has fallen behind `main` must be rebased before merge, and
+  its diff checked to confirm it removes nothing already landed. A branch cut
+  before a sibling's tests existed will otherwise propose deleting them.
+- Every lane ends with a checkpoint handoff: signed commits plus lane state
+  recorded in the Issue and in [coordination status](docs/coordination/status.md),
+  so the next lane starts from evidence instead of memory.
+- CI must pass on the exact head before review; documentation lanes run
+  `python3 scripts/check_docs.py`.
+
+Implemented in a Draft PR is not supported behavior and not a compatibility
+claim. Lane ownership and dispatch are described in
+[coordination fleet](docs/coordination/fleet.md).
+
 ## Pull requests and review
 
 Open a Draft PR early. Complete the PR template and link the Issue. The

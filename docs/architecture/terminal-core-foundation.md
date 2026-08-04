@@ -15,6 +15,11 @@ VT100/xterm compatibility claim and not vim/tmux/zellij compatibility.
 
 ## Data flow
 
+The pipeline is PTY -> Parser -> TerminalState -> Renderer: the PTY layer
+delivers bytes, the parser turns them into bounded state changes,
+`TerminalState` owns screens, modes, and cursor state, and the renderer consumes
+only immutable snapshots.
+
 ```text
 PTY bytes -> TerminalState::feed_bytes -> parser -> bounded screen/cursor state
 TerminalState::snapshot -> TerminalSnapshot -> renderer (lines only)

@@ -18,13 +18,23 @@ Only evidence-backed work is marked complete.
 A renderer-independent terminal state core is merged as PR
 [#19](https://github.com/ta-061/noren/pull/19) (`c695920`), described in
 [terminal core foundation](docs/architecture/terminal-core-foundation.md).
-Scrolling regions are in progress as Draft PR
-[#21](https://github.com/ta-061/noren/pull/21): inclusive full-screen-default
-scroll margins, DECSTBM with invalid-range rejection, region-only
-LF/VT/FF/IND/NEL/RI and CSI S/T scrolling, CNL/CPL/VPA, delayed autowrap, and
-resize resetting margins/wrap. Deferred: alternate screen,
-SGR/erase/insert/delete, cell attributes, tabs, origin mode, query/reply;
-Unicode/IME remain later.
+
+The parallel Terminal Core stack is merged as PR
+[#29](https://github.com/ta-061/noren/pull/29) (`22c985e`): scrolling regions
+and margins, alternate screen with DEC private mode 1049, erase/insert/delete
+operations, SGR and cell attributes, and application cursor/keypad modes wired
+into the key encoder. PR [#32](https://github.com/ta-061/noren/pull/32)
+(`aa41530`) adds a bounded VT compatibility harness. Escape-intermediate
+sequences and horizontal tab are handled.
+
+This is not a VT100/xterm or vim/tmux/zellij compatibility claim. Known
+non-conformance is tracked as Issues
+[#35](https://github.com/ta-061/noren/issues/35) (renderer and PTY grids
+disagree above 160x60), [#36](https://github.com/ta-061/noren/issues/36)
+(Delete, navigation, function, and modifier keys are not encoded), and
+[#37](https://github.com/ta-061/noren/issues/37) (DECSTBM clamping, embedded C0
+in CSI). Origin mode and query/reply remain deferred, Unicode/CJK width and IME
+remain later, and no hostile-input robustness claim is made yet.
 
 No milestone date is promised. Implementation advances through scoped Issues,
 Draft PRs, and current-head CI evidence.
