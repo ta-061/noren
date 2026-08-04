@@ -225,38 +225,58 @@ sibling's tests existed proposed deleting roughly 1,800 lines of passing tests,
 and `mergeable=MERGEABLE`/`CLEAN`/green CI does **not** catch it — a clean delete
 is still a clean merge. The check is `git diff --stat origin/main...HEAD`.
 
-The owner has not yet repeated a manual macOS startup/output/resize/exit smoke
-check against the merged work. Automated evidence is green, but no rendered-frame
-or real-window-injection oracle exists, so the smoke check remains the outstanding
-manual gate — nothing in CI can substitute for it.
+The macOS smoke check is **done**. Run on 2026-08-05 against `main` at `c415f54`
+on macOS Apple Silicon, from a release build (`cargo build --release -p
+noren-app`, finished clean):
+
+| Step | Observed evidence |
+| --- | --- |
+| Open a window | Process alive after launch with 7 threads (supervisor and reader present) |
+| Start local zsh PTY | Owned child `zsh` present as a direct child of the app |
+| Window -> grid -> PTY geometry | The child's tty reported `30 90` via `stty size`, exactly the 900x600 window divided by the 10x20 cell, so the whole chain agrees |
+| Exit and clean up | On termination the app exited, the `zsh` child was reaped, and the pty device itself was gone — no orphan process and no leaked descriptor |
+
+What this does **not** establish: there is still no rendered-frame oracle and no
+real key-injection into the window, so glyph correctness and live input remain
+unverified by automation. The byte-level input contract is covered by tests
+instead. Treat the smoke check as evidence the process/PTY/geometry chain works,
+not as evidence the renderer draws correctly.
 
 Full VT/xterm behavior, non-ASCII glyph quality, swash/font trials, production
 IME/accessibility, Linux, SSH, agent integration, tabs, panes, themes, and a
 remote daemon remain deferred behind their existing risk gates.
 
-## Human decisions still required
+## Human decisions — resolved 2026-08-05
 
-No repository access control was changed. The owner still must separately decide
-branch protection/required CI/merge policy, macOS signing/notarization identity,
-and the public support/security contact before Preview publication.
+The owner decided all four outstanding items:
 
-Branch protection is now more valuable than it was: four required checks exist
-(Rust build/lint/test, documentation validator, `cargo deny check`, MSRV
-verification), so protection would enforce them rather than relying on each
-merge being done carefully by hand.
+- **Branch protection: enabled** on `main`, requiring all four checks (Rust
+  build/lint/test, documentation validator, `cargo deny check`, MSRV
+  verification), with force-pushes and branch deletion blocked and
+  `strict` (up-to-date-before-merge) on. `enforce_admins` is deliberately left
+  off so the owner retains an emergency path. Conversation resolution is required.
+- **Branch cleanup: approved.** 27 fully-merged remote branches were deleted
+  after verifying `git rev-list --count origin/main..<branch>` was 0 for each.
+  Three were kept because they carry unmerged commits.
+- **Signing and notarization: deferred** until immediately before Preview
+  binaries are distributed to anyone else. No signing identity is configured, and
+  none is claimed.
+- **Security contact: GitHub private vulnerability reporting** is the official
+  channel. Verified enabled on the repository, so the policy in
+  [`SECURITY.md`](../../SECURITY.md) is backed by a working intake rather than
+  being aspirational.
 
 ## Next steps
 
-1. Repeat the bounded macOS startup/output/resize/exit smoke check against
-   current `main` without changing OS security settings. This is the only gate
-   automated evidence cannot close.
-2. Fix Issue [#46](https://github.com/ta-061/noren/issues/46): legacy X10
+1. Fix Issue [#46](https://github.com/ta-061/noren/issues/46): legacy X10
    `CSI M` corrupts the screen, and Zellij enables mouse mode by default, so
    moving the mouse is enough to trigger it.
-3. Land Issue [#36](https://github.com/ta-061/noren/issues/36) stage 4
+2. Land Issue [#36](https://github.com/ta-061/noren/issues/36) stage 4
    (Shift/modifier parameters), the last input-encoding gap.
-4. Open Issues for Unicode/CJK character width and mouse support, the two
+3. Open Issues for Unicode/CJK character width and mouse support, the two
    remaining blocking gaps in the [Zellij gap
    analysis](../compatibility/zellij-gap-analysis.md). Width work touches the
    cell model, so it needs its own design review before implementation.
-5. Decide branch protection and required checks, now that four checks exist.
+4. Build a rendered-frame oracle so glyph correctness stops depending on a human
+   looking at the window. The smoke check covers the process/PTY/geometry chain
+   but cannot see what is drawn.
