@@ -45,6 +45,17 @@ pub const POC_CELL_WIDTH: u32 = 10;
 /// Fixed PoC cell height in physical pixels.
 pub const POC_CELL_HEIGHT: u32 = 20;
 
+/// Maximum terminal grid rows the PoC renderer can draw.
+///
+/// [`GridGeometry::update`] clamps every grid handed to the terminal state and
+/// the PTY to this cap, so the PTY, terminal, and rendered grids always agree.
+/// The renderer module imports this constant rather than redefining it.
+pub const MAX_RENDER_ROWS: u16 = 60;
+/// Maximum terminal grid columns the PoC renderer can draw.
+///
+/// See [`MAX_RENDER_ROWS`] for the shared-cap invariant.
+pub const MAX_RENDER_COLS: u16 = 160;
+
 /// Physical window size reported by the platform, before pixel-to-cell
 /// conversion.
 ///
@@ -85,7 +96,8 @@ impl Resize {
     }
 }
 
-/// Non-zero terminal grid calculated from physical window pixels.
+/// Non-zero terminal grid calculated from physical window pixels, bounded by
+/// the renderer's drawable grid ([`MAX_RENDER_ROWS`] by [`MAX_RENDER_COLS`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridSize {
     rows: u16,
@@ -93,13 +105,13 @@ pub struct GridSize {
 }
 
 impl GridSize {
-    /// Row count, always non-zero.
+    /// Row count, always non-zero and at most [`MAX_RENDER_ROWS`].
     #[must_use]
     pub const fn rows(self) -> u16 {
         self.rows
     }
 
-    /// Column count, always non-zero.
+    /// Column count, always non-zero and at most [`MAX_RENDER_COLS`].
     #[must_use]
     pub const fn cols(self) -> u16 {
         self.cols
@@ -134,20 +146,23 @@ impl GridGeometry {
     /// Convert a physical resize and return only a changed, non-zero grid.
     ///
     /// A zero physical dimension keeps the previous grid. Pixel sizes smaller
-    /// than one cell still produce a one-by-one PTY. Values are capped to
-    /// `u16::MAX` before crossing the PTY boundary.
+    /// than one cell still produce a one-by-one PTY. Values are capped to the
+    /// renderer's drawable grid ([`MAX_RENDER_ROWS`] by [`MAX_RENDER_COLS`])
+    /// before crossing the PTY boundary, so the PTY, terminal state, and
+    /// rendered grids can never disagree. This is the only place a grid is
+    /// calculated; every consumer observes the same clamp.
     pub fn update(&mut self, resize: Resize) -> Option<GridSize> {
         if resize.is_zero() {
             return None;
         }
         let cols = (resize.width() / self.cell_width)
-            .clamp(1, u32::from(u16::MAX))
+            .clamp(1, u32::from(MAX_RENDER_COLS))
             .try_into()
-            .unwrap_or(u16::MAX);
+            .unwrap_or(MAX_RENDER_COLS);
         let rows = (resize.height() / self.cell_height)
-            .clamp(1, u32::from(u16::MAX))
+            .clamp(1, u32::from(MAX_RENDER_ROWS))
             .try_into()
-            .unwrap_or(u16::MAX);
+            .unwrap_or(MAX_RENDER_ROWS);
         let next = GridSize { rows, cols };
         if self.current == Some(next) {
             None
@@ -501,12 +516,70 @@ mod tests {
     }
 
     #[test]
-    fn geometry_caps_values_before_the_pty_boundary() {
+    fn geometry_clamps_extreme_resizes_without_overflow() {
         let mut geometry = GridGeometry::poc();
         let grid = geometry
             .update(Resize::new(u32::MAX, u32::MAX))
             .expect("new grid");
-        assert_eq!((grid.rows(), grid.cols()), (u16::MAX, u16::MAX));
+        assert_eq!(
+            (grid.rows(), grid.cols()),
+            (MAX_RENDER_ROWS, MAX_RENDER_COLS)
+        );
+    }
+
+    #[test]
+    fn geometry_clamps_oversized_resizes_to_the_render_grid() {
+        let mut geometry = GridGeometry::poc();
+        let beyond = geometry
+            .update(Resize::new(
+                u32::from(MAX_RENDER_COLS + 40) * POC_CELL_WIDTH,
+                u32::from(MAX_RENDER_ROWS + 20) * POC_CELL_HEIGHT,
+            ))
+            .expect("new grid");
+        assert_eq!(
+            (beyond.rows(), beyond.cols()),
+            (MAX_RENDER_ROWS, MAX_RENDER_COLS)
+        );
+
+        let mut fresh = GridGeometry::poc();
+        let one_dimension_over = fresh
+            .update(Resize::new(
+                u32::from(MAX_RENDER_COLS + 1) * POC_CELL_WIDTH,
+                u32::from(MAX_RENDER_ROWS) * POC_CELL_HEIGHT,
+            ))
+            .expect("new grid");
+        assert_eq!(
+            (one_dimension_over.rows(), one_dimension_over.cols()),
+            (MAX_RENDER_ROWS, MAX_RENDER_COLS)
+        );
+    }
+
+    #[test]
+    fn geometry_keeps_resizes_within_the_render_cap_unaffected() {
+        let mut geometry = GridGeometry::poc();
+        let normal = geometry.update(Resize::new(900, 600)).expect("new grid");
+        assert_eq!((normal.rows(), normal.cols()), (30, 90));
+
+        let at_cap = geometry
+            .update(Resize::new(
+                u32::from(MAX_RENDER_COLS) * POC_CELL_WIDTH,
+                u32::from(MAX_RENDER_ROWS) * POC_CELL_HEIGHT,
+            ))
+            .expect("changed grid");
+        assert_eq!(
+            (at_cap.rows(), at_cap.cols()),
+            (MAX_RENDER_ROWS, MAX_RENDER_COLS)
+        );
+    }
+
+    #[test]
+    fn geometry_rejects_zero_resizes_and_keeps_the_last_grid() {
+        let mut geometry = GridGeometry::poc();
+        let valid = geometry.update(Resize::new(900, 600)).expect("new grid");
+        assert_eq!(geometry.update(Resize::new(0, 600)), None);
+        assert_eq!(geometry.update(Resize::new(900, 0)), None);
+        assert_eq!(geometry.update(Resize::new(0, 0)), None);
+        assert_eq!(geometry.current(), Some(valid));
     }
 
     #[test]

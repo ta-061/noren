@@ -10,13 +10,13 @@ use wgpu::CurrentSurfaceTexture;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
-use noren_app::{POC_CELL_HEIGHT as CELL_HEIGHT, POC_CELL_WIDTH as CELL_WIDTH};
+use noren_app::{
+    MAX_RENDER_COLS, MAX_RENDER_ROWS, POC_CELL_HEIGHT as CELL_HEIGHT, POC_CELL_WIDTH as CELL_WIDTH,
+};
 use noren_terminal::TerminalSnapshot;
 const GLYPH_SCALE: u32 = 2;
 const GLYPH_TOP: u32 = 3;
-const MAX_RENDER_ROWS: usize = 60;
-const MAX_RENDER_COLS: usize = 160;
-const MAX_VERTICES: usize = MAX_RENDER_ROWS * MAX_RENDER_COLS * 35 * 6;
+const MAX_VERTICES: usize = (MAX_RENDER_ROWS as usize) * (MAX_RENDER_COLS as usize) * 35 * 6;
 
 const SHADER: &str = r#"
 struct VertexOutput {
@@ -283,10 +283,10 @@ fn glyph_vertices(
     }
     let visible_rows = usize::try_from(height / CELL_HEIGHT)
         .unwrap_or(usize::MAX)
-        .clamp(1, MAX_RENDER_ROWS);
+        .clamp(1, usize::from(MAX_RENDER_ROWS));
     let visible_cols = usize::try_from(width / CELL_WIDTH)
         .unwrap_or(usize::MAX)
-        .clamp(1, MAX_RENDER_COLS);
+        .clamp(1, usize::from(MAX_RENDER_COLS));
     let lines = terminal.map(TerminalSnapshot::lines).unwrap_or_default();
     let total_lines = lines.len() + usize::from(status.is_some());
     let first_line = total_lines.saturating_sub(visible_rows);
