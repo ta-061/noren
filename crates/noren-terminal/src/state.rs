@@ -745,11 +745,22 @@ impl TerminalState {
                 self.active.cursor.row = row.min(last_row);
             }
         }
-        self.active.cursor = if snap_forward {
-            snap_past_continuation(&self.active.screen, self.active.cursor)
+        if snap_forward {
+            self.active.cursor = snap_past_continuation(&self.active.screen, self.active.cursor);
         } else {
-            snap_to_lead(&self.active.screen, self.active.cursor)
-        };
+            self.snap_cursor_to_lead();
+        }
+    }
+
+    /// Re-snap the active cursor onto a lead cell.
+    ///
+    /// Every row-changing control path (LF, IND, NEL, RI) keeps the cursor
+    /// column while the row or the row's content changes, so each of them can
+    /// land the cursor on the continuation half of a wide character. Routing
+    /// all of them through this shared helper keeps the cursor off
+    /// continuations, so a path added later cannot forget the re-snap.
+    fn snap_cursor_to_lead(&mut self) {
+        self.active.cursor = snap_to_lead(&self.active.screen, self.active.cursor);
     }
 
     /// Clone a bounded immutable renderer/test view.
@@ -767,9 +778,8 @@ impl TerminalState {
                 self.active.wrap_pending = false;
             }
             Action::Backspace => {
-                let mut cursor = self.active.cursor;
-                cursor.column = cursor.column.saturating_sub(1);
-                self.active.cursor = snap_to_lead(&self.active.screen, cursor);
+                self.active.cursor.column = self.active.cursor.column.saturating_sub(1);
+                self.snap_cursor_to_lead();
                 self.active.wrap_pending = false;
             }
             Action::Tab => self.tab(),
@@ -898,6 +908,8 @@ impl TerminalState {
         self.active.cursor = snap_past_continuation(&self.active.screen, self.active.cursor);
     }
 
+    /// Move the cursor down one row, scrolling at the bottom margin. Shared
+    /// by LF, IND, and NEL, and ends in the shared lead re-snap.
     fn index(&mut self) {
         self.active.wrap_pending = false;
         if self.active.cursor.row == self.active.scroll_region.bottom {
@@ -905,6 +917,7 @@ impl TerminalState {
         } else if self.active.cursor.row < self.active.screen.rows - 1 {
             self.active.cursor.row += 1;
         }
+        self.snap_cursor_to_lead();
     }
 
     fn next_line(&mut self) {
@@ -912,6 +925,8 @@ impl TerminalState {
         self.index();
     }
 
+    /// Move the cursor up one row, scrolling at the top margin, and end in
+    /// the shared lead re-snap.
     fn reverse_index(&mut self) {
         self.active.wrap_pending = false;
         if self.active.cursor.row == self.active.scroll_region.top {
@@ -919,6 +934,7 @@ impl TerminalState {
         } else if self.active.cursor.row > 0 {
             self.active.cursor.row -= 1;
         }
+        self.snap_cursor_to_lead();
     }
 
     fn scroll_up(&mut self, count: u16) {
@@ -1142,6 +1158,7 @@ pub struct TerminalSnapshot {
     wrap_pending: bool,
     modes: TerminalModes,
     lines: Vec<String>,
+    display_lines: Vec<String>,
     scrollback: Vec<Vec<Cell>>,
 }
 
@@ -1154,6 +1171,7 @@ impl TerminalSnapshot {
             wrap_pending: state.active.wrap_pending,
             modes: state.modes,
             lines: visible_lines(&state.active.screen),
+            display_lines: visible_display_lines(&state.active.screen),
             scrollback: state.scrollback.iter().cloned().collect(),
         }
     }
@@ -1204,6 +1222,19 @@ impl TerminalSnapshot {
     #[must_use]
     pub fn lines(&self) -> &[String] {
         &self.lines
+    }
+
+    /// Column-preserving rendering of the visible screen, parallel to
+    /// [`lines`](Self::lines).
+    ///
+    /// Continuation cells of wide characters keep one placeholder column so a
+    /// consumer that enumerates characters positions every glyph at its
+    /// display column. Row selection, trailing-blank trimming, and ASCII rows
+    /// match [`lines`](Self::lines) exactly; only the wide-character
+    /// continuation columns differ.
+    #[must_use]
+    pub fn display_lines(&self) -> &[String] {
+        &self.display_lines
     }
 
     /// Retained scrollback rows in eviction order (oldest first, newest last).
@@ -1266,6 +1297,37 @@ fn cells_to_line(cells: &[Cell]) -> String {
     let mut line = String::with_capacity(cells.len());
     for cell in cells {
         line.push_str(cell.text());
+    }
+    while line.ends_with(' ') {
+        line.pop();
+    }
+    line
+}
+
+fn visible_display_lines(screen: &ScreenBuffer) -> Vec<String> {
+    let mut lines = Vec::with_capacity(usize::from(screen.rows));
+    for row in 0..screen.rows {
+        let start = usize::from(row) * usize::from(screen.cols);
+        let end = start + usize::from(screen.cols);
+        lines.push(cells_to_display_line(&screen.cells[start..end]));
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines
+}
+
+/// Render a cell row to text preserving display columns: a continuation cell
+/// contributes one placeholder column so character positions equal display
+/// columns. Trailing blanks are trimmed exactly like [`cells_to_line`].
+fn cells_to_display_line(cells: &[Cell]) -> String {
+    let mut line = String::with_capacity(cells.len());
+    for cell in cells {
+        if cell.is_continuation() {
+            line.push(' ');
+        } else {
+            line.push_str(cell.text());
+        }
     }
     while line.ends_with(' ') {
         line.pop();
