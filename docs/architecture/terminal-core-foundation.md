@@ -175,6 +175,44 @@ as their per-character widths; resize blanks a wide pair whose continuation
 would be truncated rather than reflowing it; ambiguous-width and grapheme
 cluster work remain later.
 
+## Color model
+
+SGR colors are modelled in full but left to the renderer to resolve: the
+terminal state records the selection, it never draws it. `Color` carries four
+selections — `Default` (the renderer's contextual default), `Ansi(AnsiColor)`
+(one of the 16-name palette), `Indexed(u8)` (an xterm 256-color slot), and
+`Rgb(u8, u8, u8)` (direct 24-bit) — and `CellAttributes` holds one color per
+target: foreground, background, and underline.
+
+- **SGR codes.** The 16 ANSI colors (`30..=37`, `90..=97` and the `40..=47`,
+  `100..=107` background twins), the `39`/`49`/`59` default resets, and the
+  `38`/`48`/`58` extended selectors are all honored. `58` sets the underline
+  *color*, distinct from the `4` underline *flag*; `59` restores it to default.
+- **Extended forms.** Both ECMA-48 serializations parse: the xterm semicolon
+  form (`38;5;N`, `38;2;R;G;B`) and the ITU-T T.416 colon sub-parameter form
+  (`38:5:N`, `38:2::R:G:B`). The colon RGB form carries an empty colour-space
+  slot after the `2`; a non-empty slot (`38:2:Pi:R:G:B`) is accepted and
+  ignored. The whole run of colon sub-parameters belongs to one selector and is
+  consumed together.
+- **Sub-parameters are SGR-only.** The CSI parser records each parameter's
+  separator (`;` versus `:`) instead of dropping every colon-bearing sequence.
+  Sub-parameters are only meaningful for SGR, so any other CSI final byte that
+  carries a colon is still dropped wholesale — `CSI 1:2 A` does not become a
+  cursor move.
+- **Malformed sequences never corrupt the pen.** A truncated selector
+  (`38;2;1`) or an out-of-range index (`38;5;300`) consumes the slots it
+  claimed and sets no color, so channel values can never leak back into the
+  main loop as independent bold/underline/reverse codes. Direct-color channels
+  are clamped to `u8`, matching xterm. Parameter-count overflow still drops the
+  whole SGR rather than misparsing.
+- **Reset semantics.** `CSI m` / `CSI 0 m` clears extended colors along with
+  everything else; `39`/`49`/`59` restore only their target, leaving other
+  colors and flags intact. The SGR pen is terminal-global, so an extended color
+  survives an alternate-screen switch exactly as ANSI SGR state does.
+
+Wiring the modelled colors to actual drawing is renderer work in `noren-app`
+and is intentionally out of scope for this slice.
+
 ## Deferred
 
 SGR/erase/insert/delete, cell attributes, tabs, origin mode, and
