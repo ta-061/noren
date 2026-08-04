@@ -10,6 +10,7 @@ pub(crate) enum Action {
     LineFeed,
     CarriageReturn,
     Backspace,
+    Tab,
     Index,
     NextLine,
     ReverseIndex,
@@ -44,6 +45,7 @@ pub(crate) enum Action {
     },
     SaveCursor,
     RestoreCursor,
+    SetKeypadApplication(bool),
     SetPrivateMode {
         mode: PrivateMode,
         enabled: bool,
@@ -60,6 +62,7 @@ pub(crate) enum EraseMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrivateMode {
     AlternateScreen,
+    ApplicationCursorKey,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -73,6 +76,14 @@ impl Parser {
         match state {
             ParserState::Ground => self.advance_ground(byte),
             ParserState::Escape => self.advance_escape(byte),
+            ParserState::EscapeIntermediate => {
+                self.state = match byte {
+                    ESC => ParserState::Escape,
+                    0x30..=0x7e => ParserState::Ground,
+                    _ => ParserState::EscapeIntermediate,
+                };
+                None
+            }
             ParserState::Csi(mut csi) => {
                 if byte == ESC {
                     self.state = ParserState::Escape;
@@ -113,6 +124,7 @@ impl Parser {
             }
             b'\n' | 0x0b | 0x0c => Some(Action::LineFeed),
             b'\r' => Some(Action::CarriageReturn),
+            b'\t' => Some(Action::Tab),
             0x08 => Some(Action::Backspace),
             0x20..=0x7e => Some(Action::Print(byte)),
             _ => None,
@@ -124,6 +136,14 @@ impl Parser {
             b'[' => self.state = ParserState::Csi(Csi::default()),
             b']' => self.state = ParserState::Osc,
             ESC => self.state = ParserState::Escape,
+            b'=' => {
+                self.state = ParserState::Ground;
+                return Some(Action::SetKeypadApplication(true));
+            }
+            b'>' => {
+                self.state = ParserState::Ground;
+                return Some(Action::SetKeypadApplication(false));
+            }
             b'D' => {
                 self.state = ParserState::Ground;
                 return Some(Action::Index);
@@ -144,6 +164,11 @@ impl Parser {
                 self.state = ParserState::Ground;
                 return Some(Action::RestoreCursor);
             }
+            // Intermediate bytes (0x20..=0x2f) such as `(`, `)`, `#`, and SP
+            // begin a multi-byte escape (e.g. SCS `ESC ( B`). Collect them and
+            // the following final byte without emitting anything, so the final
+            // never leaks to Ground as printable text.
+            0x20..=0x2f => self.state = ParserState::EscapeIntermediate,
             _ => self.state = ParserState::Ground,
         }
         None
@@ -155,6 +180,7 @@ enum ParserState {
     #[default]
     Ground,
     Escape,
+    EscapeIntermediate,
     Csi(Csi),
     Osc,
     OscEscape,
@@ -286,6 +312,7 @@ impl Csi {
             return None;
         }
         let mode = match self.params[0] {
+            1 => PrivateMode::ApplicationCursorKey,
             1049 => PrivateMode::AlternateScreen,
             _ => return None,
         };
@@ -382,6 +409,49 @@ mod tests {
                 Action::MoveTo { row: 2, col: 3 },
             ]
         );
+    }
+
+    #[test]
+    fn horizontal_tab_emits_a_tab_action() {
+        assert_eq!(
+            actions(b"\ta\tb"),
+            [
+                Action::Tab,
+                Action::Print(b'a'),
+                Action::Tab,
+                Action::Print(b'b'),
+            ]
+        );
+    }
+
+    #[test]
+    fn escape_intermediate_sequences_emit_nothing_and_keep_the_final_byte() {
+        // Regression for the byte-leak: `ESC ( B` previously printed 'B'.
+        for sequence in [
+            b"\x1b(B".as_slice(),
+            b"\x1b)0",
+            b"\x1b#8",
+            b"\x1b F",
+            b"\x1b()B",
+        ] {
+            assert!(actions(sequence).is_empty(), "sequence {sequence:?}");
+        }
+        // An unsupported single-byte escape final is still consumed whole.
+        assert!(actions(b"\x1bc").is_empty());
+
+        // The final byte after an intermediate must not leak when followed by
+        // printable text.
+        let mut parser = Parser::default();
+        let emitted: Vec<Action> = b"\x1b(BX"
+            .iter()
+            .filter_map(|byte| parser.advance(*byte))
+            .collect();
+        assert_eq!(emitted, [Action::Print(b'X')]);
+    }
+
+    #[test]
+    fn escape_intermediate_aborts_on_a_new_escape() {
+        assert_eq!(actions(b"\x1b(\x1b[D"), [Action::MoveLeft(1)]);
     }
 
     #[test]

@@ -3,8 +3,9 @@
 mod renderer;
 
 use noren_app::{
-    Arrow, GridGeometry, GridSize, Key, KeyDropReason, KeyEncoder, KeyInput, KeyPhase, Modifiers,
-    PARSE_BUDGET_BYTES_PER_TURN, Resize,
+    Arrow, CursorKeyMode, GridGeometry, GridSize, InputMode, Key, KeyDropReason, KeyEncoder,
+    KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode, Modifiers, PARSE_BUDGET_BYTES_PER_TURN,
+    Resize,
 };
 use noren_pty::{PtyEvent, PtySession, PtySize};
 use noren_terminal::{TerminalEngine, TerminalState};
@@ -15,7 +16,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey};
+use winit::keyboard::{Key as WinitKey, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 const WINDOW_WIDTH: u32 = 900;
@@ -125,19 +126,46 @@ impl NorenApp {
     }
 
     fn handle_key(&mut self, event: &KeyEvent) {
-        let Ok(input) = translate_key(event, self.modifiers) else {
+        let input_mode = self.current_input_mode();
+        let encoded = if let Some(input) = translate_keypad_key(event) {
+            KeyEncoder::encode_keypad_with(input.with_modifiers(self.modifiers), input_mode)
+        } else {
+            translate_key(event, self.modifiers)
+                .and_then(|input| KeyEncoder::encode_with(input, input_mode))
+        };
+        let Ok(bytes) = encoded else {
             return;
         };
-        let Ok(bytes) = KeyEncoder::encode(input) else {
-            return;
-        };
+        self.send_input(&bytes);
+    }
+
+    fn send_input(&mut self, bytes: &[u8]) {
         if let Some(session) = &self.pty {
-            if session.send_input(&bytes).is_err() {
+            if session.send_input(bytes).is_err() {
                 self.status = "Noren PTY input failed";
                 self.show_status = true;
                 self.redraw_needed = true;
             }
         }
+    }
+
+    fn current_input_mode(&self) -> InputMode {
+        let Some(modes) = self.terminal.as_ref().map(TerminalState::modes) else {
+            return InputMode::normal();
+        };
+        let cursor_mode = if modes.is_application_cursor_key_mode() {
+            CursorKeyMode::Application
+        } else {
+            CursorKeyMode::Normal
+        };
+        let keypad_mode = if modes.is_application_keypad_mode() {
+            KeypadMode::Application
+        } else {
+            KeypadMode::Numeric
+        };
+        InputMode::normal()
+            .with_cursor(cursor_mode)
+            .with_keypad(keypad_mode)
     }
 
     fn handle_resize(&mut self, physical: PhysicalSize<u32>) {
@@ -323,12 +351,41 @@ fn pty_size(grid: GridSize) -> Result<PtySize, noren_pty::PtyError> {
 }
 
 fn translate_key(event: &KeyEvent, modifiers: Modifiers) -> Result<KeyInput, KeyDropReason> {
-    let phase = match event.state {
+    translate_logical_key(&event.logical_key, key_phase(event), modifiers)
+}
+
+fn key_phase(event: &KeyEvent) -> KeyPhase {
+    match event.state {
         ElementState::Released => KeyPhase::Released,
         ElementState::Pressed if event.repeat => KeyPhase::Repeat,
         ElementState::Pressed => KeyPhase::Pressed,
-    };
-    translate_logical_key(&event.logical_key, phase, modifiers)
+    }
+}
+
+fn translate_keypad_key(event: &KeyEvent) -> Option<KeypadInput> {
+    keypad_key(event.physical_key).map(|key| KeypadInput::new(key, key_phase(event)))
+}
+
+fn keypad_key(physical_key: PhysicalKey) -> Option<KeypadKey> {
+    Some(match physical_key {
+        PhysicalKey::Code(KeyCode::Numpad0) => KeypadKey::Zero,
+        PhysicalKey::Code(KeyCode::Numpad1) => KeypadKey::One,
+        PhysicalKey::Code(KeyCode::Numpad2) => KeypadKey::Two,
+        PhysicalKey::Code(KeyCode::Numpad3) => KeypadKey::Three,
+        PhysicalKey::Code(KeyCode::Numpad4) => KeypadKey::Four,
+        PhysicalKey::Code(KeyCode::Numpad5) => KeypadKey::Five,
+        PhysicalKey::Code(KeyCode::Numpad6) => KeypadKey::Six,
+        PhysicalKey::Code(KeyCode::Numpad7) => KeypadKey::Seven,
+        PhysicalKey::Code(KeyCode::Numpad8) => KeypadKey::Eight,
+        PhysicalKey::Code(KeyCode::Numpad9) => KeypadKey::Nine,
+        PhysicalKey::Code(KeyCode::NumpadDecimal) => KeypadKey::Decimal,
+        PhysicalKey::Code(KeyCode::NumpadAdd) => KeypadKey::Plus,
+        PhysicalKey::Code(KeyCode::NumpadSubtract) => KeypadKey::Minus,
+        PhysicalKey::Code(KeyCode::NumpadMultiply) => KeypadKey::Star,
+        PhysicalKey::Code(KeyCode::NumpadDivide) => KeypadKey::Slash,
+        PhysicalKey::Code(KeyCode::NumpadEnter) => KeypadKey::Enter,
+        _ => return None,
+    })
 }
 
 fn translate_logical_key(
@@ -387,6 +444,57 @@ mod tests {
                 .expect("space is supported terminal input");
             assert_eq!(KeyEncoder::encode(input), Ok(vec![0x20]));
         }
+    }
+
+    #[test]
+    fn terminal_modes_drive_cursor_and_keypad_encoding() {
+        let mut app = NorenApp::default();
+        assert_eq!(app.current_input_mode(), InputMode::normal());
+
+        let mut terminal = TerminalState::new(2, 4).expect("valid terminal");
+        terminal.feed_bytes(b"\x1b[?1h\x1b=");
+        app.terminal = Some(terminal);
+        let mode = app.current_input_mode();
+
+        let arrow = KeyInput::new(Key::Arrow(Arrow::Up), KeyPhase::Pressed, Modifiers::empty());
+        assert_eq!(
+            KeyEncoder::encode_with(arrow, mode).as_deref(),
+            Ok(b"\x1bOA".as_slice())
+        );
+        assert_eq!(
+            KeyEncoder::encode_keypad_with(
+                KeypadInput::new(KeypadKey::One, KeyPhase::Pressed),
+                mode
+            )
+            .as_deref(),
+            Ok(b"\x1bOq".as_slice())
+        );
+    }
+
+    #[test]
+    fn physical_keypad_mapping_is_bounded_to_numpad_codes() {
+        let cases = [
+            (KeyCode::Numpad0, KeypadKey::Zero),
+            (KeyCode::Numpad1, KeypadKey::One),
+            (KeyCode::Numpad2, KeypadKey::Two),
+            (KeyCode::Numpad3, KeypadKey::Three),
+            (KeyCode::Numpad4, KeypadKey::Four),
+            (KeyCode::Numpad5, KeypadKey::Five),
+            (KeyCode::Numpad6, KeypadKey::Six),
+            (KeyCode::Numpad7, KeypadKey::Seven),
+            (KeyCode::Numpad8, KeypadKey::Eight),
+            (KeyCode::Numpad9, KeypadKey::Nine),
+            (KeyCode::NumpadDecimal, KeypadKey::Decimal),
+            (KeyCode::NumpadAdd, KeypadKey::Plus),
+            (KeyCode::NumpadSubtract, KeypadKey::Minus),
+            (KeyCode::NumpadMultiply, KeypadKey::Star),
+            (KeyCode::NumpadDivide, KeypadKey::Slash),
+            (KeyCode::NumpadEnter, KeypadKey::Enter),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(keypad_key(PhysicalKey::Code(code)), Some(expected));
+        }
+        assert_eq!(keypad_key(PhysicalKey::Code(KeyCode::Digit1)), None);
     }
 
     #[test]

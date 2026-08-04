@@ -151,10 +151,12 @@ impl ScrollRegion {
     }
 }
 
-/// Renderer-independent terminal modes that affect visible state selection.
+/// Renderer-independent modes that affect screen selection or encoded input.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TerminalModes {
     alternate_screen: bool,
+    application_cursor_key: bool,
+    application_keypad: bool,
 }
 
 impl TerminalModes {
@@ -162,6 +164,18 @@ impl TerminalModes {
     #[must_use]
     pub const fn is_alternate_screen_active(self) -> bool {
         self.alternate_screen
+    }
+
+    /// Whether DECCKM (DEC cursor key mode) is set to application mode.
+    #[must_use]
+    pub const fn is_application_cursor_key_mode(self) -> bool {
+        self.application_cursor_key
+    }
+
+    /// Whether DECKPAM (DEC keypad application mode) is set to application mode.
+    #[must_use]
+    pub const fn is_application_keypad_mode(self) -> bool {
+        self.application_keypad
     }
 }
 
@@ -561,6 +575,7 @@ impl TerminalState {
                 self.active.cursor.column = self.active.cursor.column.saturating_sub(1);
                 self.active.wrap_pending = false;
             }
+            Action::Tab => self.tab(),
             Action::Index => self.index(),
             Action::NextLine => self.next_line(),
             Action::ReverseIndex => self.reverse_index(),
@@ -592,6 +607,9 @@ impl TerminalState {
             }
             Action::SaveCursor => self.save_cursor(),
             Action::RestoreCursor => self.restore_cursor(),
+            Action::SetKeypadApplication(enabled) => {
+                self.modes.application_keypad = enabled;
+            }
             Action::SetPrivateMode { mode, enabled } => self.set_private_mode(mode, enabled),
         }
     }
@@ -616,6 +634,14 @@ impl TerminalState {
     fn line_feed(&mut self) {
         self.active.wrap_pending = false;
         self.index();
+    }
+
+    fn tab(&mut self) {
+        self.active.wrap_pending = false;
+        let last_column = self.active.screen.cols - 1;
+        let next_stop = (usize::from(self.active.cursor.column) / 8 + 1) * 8;
+        self.active.cursor.column =
+            last_column.min(u16::try_from(next_stop).unwrap_or(last_column));
     }
 
     fn index(&mut self) {
@@ -785,6 +811,9 @@ impl TerminalState {
         match (mode, enabled) {
             (PrivateMode::AlternateScreen, true) => self.enter_alternate_screen(),
             (PrivateMode::AlternateScreen, false) => self.leave_alternate_screen(),
+            (PrivateMode::ApplicationCursorKey, enabled) => {
+                self.modes.application_cursor_key = enabled;
+            }
         }
     }
 
