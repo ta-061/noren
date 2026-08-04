@@ -85,6 +85,11 @@ Work advances through parallel lanes under these rules:
   so the next lane starts from evidence instead of memory.
 - CI must pass on the exact head before review; documentation lanes run
   `python3 scripts/check_docs.py`.
+- **Green CI is not review.** Wait for review comments to arrive and be resolved
+  before merging, not merely for checks to pass. Automated reviewers post after
+  the checks finish, so a PR that looks mergeable may still have findings in
+  flight. Two merged changes needed follow-up Issues because they were landed on
+  green CI alone.
 
 Implemented in a Draft PR is not supported behavior and not a compatibility
 claim. Lane ownership and dispatch are described in
