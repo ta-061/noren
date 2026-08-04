@@ -1,6 +1,6 @@
 use crate::{
     attributes::{AnsiColor, CellAttributes, Color},
-    parser::{Action, EraseMode, Parser, PrivateMode},
+    parser::{Action, EraseMode, Parser, PrivateMode, is_sub_parameter},
 };
 use std::collections::VecDeque;
 use std::fmt;
@@ -51,16 +51,17 @@ pub const MAX_COMBINING_MARKS_PER_CELL: usize = 7;
 /// # Memory ceiling
 ///
 /// Each retained line owns `cols` cells (the column count at the moment it
-/// scrolled off). `size_of::<Cell>() == 32` on this target (a 24-byte owned
-/// `String` handle, a width byte, and packed attributes). The owned text is
-/// bounded separately by [`MAX_COMBINING_MARKS_PER_CELL`]: at most one base
-/// `char` plus seven combining marks, i.e. at most `4 * 8 == 32` bytes of text,
-/// so a cell holds **64 bytes worst case** (single-character cells stay near 40).
-/// The retained-line ceiling is therefore
-/// `MAX_SCROLLBACK_LINES * cols * bytes_per_cell`:
+/// scrolled off). `size_of::<Cell>() == 40` on this target (a 24-byte owned
+/// `String` handle, a width byte, and a 13-byte `CellAttributes` made of three
+/// 4-byte `Color` selections plus a flag byte). The owned text is bounded
+/// separately by [`MAX_COMBINING_MARKS_PER_CELL`]: at most one base `char`
+/// plus seven combining marks, i.e. at most `4 * 8 == 32` bytes of text, so a
+/// cell holds **72 bytes worst case** (the 40-byte struct plus 32 bytes of
+/// capped text; single-character cells stay near 48). The retained-line
+/// ceiling is therefore `MAX_SCROLLBACK_LINES * cols * bytes_per_cell`:
 ///
-/// - Typical 80-column, single-character text: `10_000 * 80 * 40 ≈ 32 MiB`.
-/// - Worst-case 256-column, fully capped cells: `10_000 * 256 * 64 ≈ 164 MiB`.
+/// - Typical 80-column, single-character text: `10_000 * 80 * 48 ≈ 38 MiB`.
+/// - Worst-case 256-column, fully capped cells: `10_000 * 256 * 72 ≈ 184 MiB`.
 ///
 /// The line count is the hard bound: a hostile program cannot grow history past
 /// this many lines regardless of volume, and a stream of zero-width combining
@@ -869,9 +870,11 @@ impl TerminalState {
             Action::DeleteCharacters(count) => self.delete_characters(count),
             Action::InsertLines(count) => self.insert_lines(count),
             Action::DeleteLines(count) => self.delete_lines(count),
-            Action::SelectGraphicRendition { params, len } => {
-                self.select_graphic_rendition(&params[..len]);
-            }
+            Action::SelectGraphicRendition {
+                params,
+                separators,
+                len,
+            } => self.select_graphic_rendition(&params[..len], &separators[..len]),
             Action::SaveCursor => self.save_cursor(),
             Action::RestoreCursor => self.restore_cursor(),
             Action::SetKeypadApplication(enabled) => {
@@ -1092,10 +1095,23 @@ impl TerminalState {
         }
     }
 
-    fn select_graphic_rendition(&mut self, params: &[u16]) {
+    fn select_graphic_rendition(&mut self, params: &[u16], separators: &[u8]) {
         let mut index = 0;
         while index < params.len() {
             let param = params[index];
+            // Extent of the current ECMA-48 parameter group: the leading value
+            // plus any trailing colon sub-parameters (`:`-separated). A lone
+            // `;`-separated value is a one-element group.
+            let group_end = sgr_group_end(separators, index);
+            // Outside the extended-color selectors (38/48/58), a multi-element
+            // colon group is an unsupported compound attribute (e.g. `4:0` and
+            // other modern underline styles). It must be skipped whole so its
+            // sub-parameters never touch the pen — `4:0` must not turn underline
+            // on and then let the trailing `0` reset every attribute.
+            if group_end > index + 1 && !matches!(param, 38 | 48 | 58) {
+                index = group_end;
+                continue;
+            }
             match param {
                 0 => self.pen = CellAttributes::default(),
                 1 => self.pen = self.pen.with_bold(true),
@@ -1126,12 +1142,29 @@ impl TerminalState {
                         .pen
                         .with_background(Color::Ansi(AnsiColor::ALL[usize::from(param - 100 + 8)]));
                 }
-                // Indexed, direct, and underline colors are deferred. Consume
-                // their semicolon-form arguments as one unsupported group so
-                // channel values such as 1, 4, or 7 are never reinterpreted as
-                // independent bold/underline/reverse controls.
-                38 | 48 | 58 => {
-                    index += extended_color_parameter_count(&params[index..]);
+                58 => {
+                    let (color, consumed) = parse_extended_color(params, separators, index);
+                    if let Some(color) = color {
+                        self.pen = self.pen.with_underline_color(color);
+                    }
+                    index += consumed;
+                    continue;
+                }
+                59 => self.pen = self.pen.with_underline_color(Color::Default),
+                38 => {
+                    let (color, consumed) = parse_extended_color(params, separators, index);
+                    if let Some(color) = color {
+                        self.pen = self.pen.with_foreground(color);
+                    }
+                    index += consumed;
+                    continue;
+                }
+                48 => {
+                    let (color, consumed) = parse_extended_color(params, separators, index);
+                    if let Some(color) = color {
+                        self.pen = self.pen.with_background(color);
+                    }
+                    index += consumed;
                     continue;
                 }
                 _ => {}
@@ -1189,12 +1222,116 @@ impl TerminalState {
     }
 }
 
-fn extended_color_parameter_count(params: &[u16]) -> usize {
-    match params.get(1) {
-        Some(5) => params.len().min(3),
-        Some(2) => params.len().min(5),
-        _ => 1,
+/// End index (exclusive) of the ECMA-48 parameter group that begins at `start`.
+///
+/// A group is the leading value plus every trailing colon sub-parameter
+/// (separator `SEPARATOR_SUB`). A lone `;`-separated value is a one-element
+/// group, so this returns `start + 1` for it. Used by the SGR walker to treat a
+/// colon-bearing attribute as a single parameter and skip unsupported compound
+/// groups (e.g. `4:0`) whole instead of walking their sub-parameters.
+fn sgr_group_end(separators: &[u8], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < separators.len() && is_sub_parameter(&separators[end]) {
+        end += 1;
     }
+    end
+}
+
+/// Parse an extended SGR color (`38`/`48`/`58`) starting at `start`.
+///
+/// Returns the parsed color (if the sequence is well-formed and in range) and
+/// the number of parameter slots consumed, *including* the selector. The
+/// consume count is chosen so a truncated or out-of-range sequence can never
+/// leak its channel values back into the caller as independent bold/underline/
+/// reverse codes: every channel slot the selector claimed is skipped over
+/// whether or not a color was produced.
+///
+/// Both ECMA-48 forms are handled:
+///
+/// - semicolon form: `38;5;N` and `38;2;R;G;B` (xterm);
+/// - colon sub-parameter form: `38:5:N` and `38:2::R:G:B` (ITU-T T.416). The
+///   RGB colon form carries an empty colour-space slot after the `2`; a
+///   non-empty slot (`38:2:Pi:R:G:B`) is accepted and ignored. The whole run
+///   of sub-parameters belongs to the selector's parameter, so all of it is
+///   consumed.
+fn parse_extended_color(params: &[u16], separators: &[u8], start: usize) -> (Option<Color>, usize) {
+    let Some(mode_index) = start.checked_add(1).filter(|&i| i < params.len()) else {
+        return (None, 1);
+    };
+    let remaining = params.len() - start;
+    let colon_form = separators.get(mode_index).is_some_and(is_sub_parameter);
+    if colon_form {
+        // The whole run of `:`-separated sub-parameters belongs to the
+        // selector's parameter, so all of it is consumed regardless of whether
+        // a color is produced.
+        let run_end = params.len().min(
+            (mode_index..)
+                .take_while(|&i| separators.get(i).is_some_and(is_sub_parameter))
+                .last()
+                .map_or(mode_index, |i| i + 1),
+        );
+        let run = &params[mode_index..run_end];
+        let consumed = 1 + run.len();
+        let body = run.get(1..).unwrap_or(&[]);
+        let color = parse_extended_color_body(*run.first().unwrap_or(&0), body);
+        (color, consumed)
+    } else {
+        let mode = params[mode_index];
+        match mode {
+            5 => {
+                let consumed = remaining.min(3);
+                let color = params
+                    .get(start + 2)
+                    .copied()
+                    .filter(|value| *value <= u16::from(u8::MAX))
+                    .map(|value| Color::Indexed(value as u8));
+                (color, consumed)
+            }
+            2 => {
+                let consumed = remaining.min(5);
+                let body = params.get(start + 2..start + 5).unwrap_or(&[]);
+                let color = parse_extended_color_body(mode, body);
+                (color, consumed)
+            }
+            _ => (None, remaining.min(2)),
+        }
+    }
+}
+
+/// Resolve the body following an extended-color mode (`5` indexed, `2` direct).
+///
+/// `body` excludes the mode slot itself. For the colon RGB form the first body
+/// slot is the colour-space id (often empty) when four slots are present, and
+/// is ignored; the next three are red/green/blue. Indexed values above 255 are
+/// out of range and yield no color; direct channels are clamped to `u8`.
+fn parse_extended_color_body(mode: u16, body: &[u16]) -> Option<Color> {
+    match mode {
+        5 => body
+            .first()
+            .copied()
+            .filter(|value| *value <= u16::from(u8::MAX))
+            .map(|value| Color::Indexed(value as u8)),
+        2 => {
+            let channels = if body.len() >= 4 {
+                body.get(1..4)
+            } else if body.len() == 3 {
+                body.get(0..3)
+            } else {
+                None
+            }?;
+            Some(Color::Rgb(
+                clamp_channel(channels[0]),
+                clamp_channel(channels[1]),
+                clamp_channel(channels[2]),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Clamp a direct-color channel to its eight-bit range, matching xterm.
+fn clamp_channel(value: u16) -> u8 {
+    u8::try_from(value).unwrap_or(u8::MAX)
 }
 
 impl fmt::Debug for TerminalState {

@@ -2,7 +2,41 @@
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
-const MAX_CSI_PARAMS: usize = 8;
+
+/// Maximum number of parameter slots collected for a single CSI sequence.
+///
+/// SGR is the parameter-hungriest supported final: the ordinary way to set
+/// foreground and background truecolor together (`38;2;R;G;B;48;2;R;G;B`)
+/// needs 10 slots, and adding underline truecolor (`58;2;R;G;B`) raises that
+/// to 15. The ITU-T T.416 colon form is wider still (`38:2::R:G:B` is six
+/// slots per color, 18 for all three), and a realistic emission surrounds the
+/// colors with style flags. 32 covers that ceiling with headroom while keeping
+/// the per-sequence `Csi` struct (and the copied SGR action payload) small.
+///
+/// The bound is the hard memory ceiling against a hostile
+/// `\x1b[1;1;…;1m` with thousands of parameters: `Csi::push_current` flips
+/// `overflowed` once `len` reaches it and `Csi::action` then drops the whole
+/// sequence, so the parser never allocates beyond these fixed arrays.
+const MAX_CSI_PARAMS: usize = 32;
+
+// Compile-time check that the cap covers the realistic SGR ceiling described
+// above (combined fg+bg+underline truecolor in colon form plus style flags).
+const _: () = assert!(
+    MAX_CSI_PARAMS >= 20,
+    "MAX_CSI_PARAMS must cover combined fg/bg/underline truecolor plus flags"
+);
+
+/// Separator marker recorded with each collected CSI parameter value.
+/// `0` marks a value that begins a new parameter (`;`-separated or the first
+/// value); `1` marks an ECMA-48 sub-parameter that followed a `:`. SGR is the
+/// only supported final that consumes sub-parameters, so any other CSI carrying
+/// a sub-parameter is dropped wholesale by `Csi::action`.
+pub(crate) const SEPARATOR_SUB: u8 = 1;
+
+/// Whether a recorded separator marks an ECMA-48 sub-parameter (`:` form).
+pub(crate) const fn is_sub_parameter(separator: &u8) -> bool {
+    *separator == SEPARATOR_SUB
+}
 
 /// Map a C0 control byte (0x00..=0x1f) to the same action Ground emits.
 ///
@@ -56,6 +90,7 @@ pub(crate) enum Action {
     DeleteLines(u16),
     SelectGraphicRendition {
         params: [u16; MAX_CSI_PARAMS],
+        separators: [u8; MAX_CSI_PARAMS],
         len: usize,
     },
     SaveCursor,
@@ -296,24 +331,30 @@ enum ParserState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Csi {
     params: [u16; MAX_CSI_PARAMS],
+    separators: [u8; MAX_CSI_PARAMS],
     len: usize,
     current: u16,
     has_current: bool,
     overflowed: bool,
     ignored: bool,
+    has_colon: bool,
     private_marker: Option<u8>,
+    pending_sep: u8,
 }
 
 impl Default for Csi {
     fn default() -> Self {
         Self {
             params: [0; MAX_CSI_PARAMS],
+            separators: [0; MAX_CSI_PARAMS],
             len: 0,
             current: 0,
             has_current: false,
             overflowed: false,
             ignored: false,
+            has_colon: false,
             private_marker: None,
+            pending_sep: 0,
         }
     }
 }
@@ -331,6 +372,18 @@ impl Csi {
             }
             b';' => {
                 self.push_current();
+                self.pending_sep = 0;
+                CsiAdvance::pending()
+            }
+            // ECMA-48 sub-parameter separator. It terminates the current value
+            // like `;` but marks the next value as belonging to the same
+            // parameter. SGR is the only supported final that reads
+            // sub-parameters (for `38:5:N` / `38:2::R:G:B` extended colors);
+            // any other final with a colon present is dropped in `action`.
+            b':' => {
+                self.push_current();
+                self.pending_sep = SEPARATOR_SUB;
+                self.has_colon = true;
                 CsiAdvance::pending()
             }
             // ECMA-48 private markers occupy 0x3c..=0x3f: `<`, `=`, `>`, `?`.
@@ -348,7 +401,7 @@ impl Csi {
                 self.ignored = true;
                 CsiAdvance::pending()
             }
-            b':' | 0x20..=0x2f => {
+            0x20..=0x2f => {
                 self.ignored = true;
                 CsiAdvance::pending()
             }
@@ -373,6 +426,7 @@ impl Csi {
     fn push_current(&mut self) {
         if self.len < MAX_CSI_PARAMS {
             self.params[self.len] = self.current;
+            self.separators[self.len] = self.pending_sep;
             self.len += 1;
         } else {
             self.overflowed = true;
@@ -382,6 +436,12 @@ impl Csi {
     }
 
     fn action(&self, final_byte: u8) -> Option<Action> {
+        // Sub-parameters (`:` colon form) are only meaningful for SGR in this
+        // slice. Any other final byte carrying a colon is dropped so a
+        // sub-parameter-shaped sequence never executes an unrelated command.
+        if self.has_colon && final_byte != b'm' {
+            return None;
+        }
         match self.private_marker {
             None => self.standard_action(final_byte),
             Some(b'?') => self.private_action(final_byte),
@@ -419,6 +479,7 @@ impl Csi {
             }),
             b'm' => Some(Action::SelectGraphicRendition {
                 params: self.params,
+                separators: self.separators,
                 len: self.len,
             }),
             b's' if self.is_default_only() => Some(Action::SaveCursor),
