@@ -2,10 +2,37 @@ use crate::{
     attributes::{AnsiColor, CellAttributes, Color},
     parser::{Action, EraseMode, Parser, PrivateMode},
 };
+use std::collections::VecDeque;
 use std::fmt;
 
 /// Hard allocation bound for a visible Terminal Core screen.
 pub const MAX_SCREEN_CELLS: usize = 1024 * 1024;
+
+/// Maximum number of lines retained in the primary screen's scrollback buffer.
+///
+/// Only lines that scroll off the top of the *primary* screen are retained; the
+/// alternate screen never contributes. The bound is enforced by evicting the
+/// oldest retained line when the cap is reached, so a hostile program emitting
+/// unbounded output cannot grow history without limit.
+///
+/// # Memory ceiling
+///
+/// Each retained line owns `cols` cells (the column count at the moment it
+/// scrolled off). `size_of::<Cell>() == 32` on this target (a 24-byte owned
+/// `String` handle, a width byte, and packed attributes); the single-character
+/// text also owns one small heap allocation per cell, so ~40 bytes/cell is a
+/// safe upper bound. The retained-line ceiling is therefore
+/// `MAX_SCROLLBACK_LINES * cols * sizeof(Cell)`:
+///
+/// - Typical 80-column terminal: `10_000 * 80 * 40 ≈ 32 MiB`.
+/// - Typical 256-column terminal: `10_000 * 256 * 40 ≈ 100 MiB`.
+///
+/// The line count is the hard bound: a hostile program cannot grow history past
+/// this many lines regardless of volume. Per-row width is bounded by the live
+/// grid, which is itself bounded by [`MAX_SCREEN_CELLS`]. Resize does **not**
+/// reflow retained lines (see the terminal-core-foundation design note), so each
+/// line keeps the width it had when it scrolled off.
+pub const MAX_SCROLLBACK_LINES: usize = 10_000;
 
 /// One basic terminal cell.
 ///
@@ -252,14 +279,29 @@ impl ScreenBuffer {
         Ok(())
     }
 
-    fn scroll_up(&mut self, region: ScrollRegion, count: u16) {
+    /// Scroll the region up by `count`, returning the rows that left the top of
+    /// the *visible screen* in top-to-bottom order.
+    ///
+    /// Only rows that leave the physical top of the screen (region top == 0) are
+    /// returned; scrolling within a non-screen-aligned margin returns an empty
+    /// vector because those rows never left the grid. The caller still decides
+    /// whether retained rows belong in scrollback (primary screen only).
+    fn scroll_up(&mut self, region: ScrollRegion, count: u16) -> Vec<Vec<Cell>> {
         let columns = usize::from(self.cols);
         let rows = usize::from(count.min(region.height()));
         let start = usize::from(region.top) * columns;
         let end = (usize::from(region.bottom) + 1) * columns;
         let shift = rows * columns;
+        let evicted = if region.top == 0 && rows > 0 {
+            (0..rows)
+                .map(|r| self.cells[start + r * columns..start + (r + 1) * columns].to_vec())
+                .collect()
+        } else {
+            Vec::new()
+        };
         self.cells[start..end].rotate_left(shift);
         self.cells[end - shift..end].fill(Cell::blank());
+        evicted
     }
 
     fn scroll_down(&mut self, region: ScrollRegion, count: u16) {
@@ -422,6 +464,9 @@ pub struct TerminalState {
     // captured when written, independently of screen-buffer selection.
     pen: CellAttributes,
     parser: Parser,
+    // Bounded history of lines that scrolled off the top of the primary screen.
+    // The alternate screen never contributes; see `push_scrollback_rows`.
+    scrollback: VecDeque<Vec<Cell>>,
 }
 
 impl TerminalState {
@@ -433,6 +478,7 @@ impl TerminalState {
             modes: TerminalModes::default(),
             pen: CellAttributes::default(),
             parser: Parser::default(),
+            scrollback: VecDeque::new(),
         })
     }
 
@@ -499,6 +545,16 @@ impl TerminalState {
     #[must_use]
     pub const fn attributes(&self) -> &CellAttributes {
         &self.pen
+    }
+
+    /// Number of primary-screen lines currently retained in scrollback.
+    ///
+    /// Always bounded by [`MAX_SCROLLBACK_LINES`]. Use
+    /// [`TerminalSnapshot::scrollback`] for the full ordered cell view and
+    /// [`TerminalSnapshot::scrollback_lines`] for renderer-ready text.
+    #[must_use]
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
     }
 
     /// Save the active screen's cursor position.
@@ -653,7 +709,7 @@ impl TerminalState {
     fn index(&mut self) {
         self.active.wrap_pending = false;
         if self.active.cursor.row == self.active.scroll_region.bottom {
-            self.active.screen.scroll_up(self.active.scroll_region, 1);
+            self.scroll_up_capturing(self.active.scroll_region, 1);
         } else if self.active.cursor.row < self.active.screen.rows - 1 {
             self.active.cursor.row += 1;
         }
@@ -675,9 +731,27 @@ impl TerminalState {
 
     fn scroll_up(&mut self, count: u16) {
         self.active.wrap_pending = false;
-        self.active
-            .screen
-            .scroll_up(self.active.scroll_region, count);
+        self.scroll_up_capturing(self.active.scroll_region, count);
+    }
+
+    /// Scroll the active screen's region up and, when rows actually leave the
+    /// visible primary screen, retain them in scrollback.
+    ///
+    /// Retention requires both: (1) the primary screen is active (the alternate
+    /// screen never contributes, matching `less`/`vim` behavior), and (2) the
+    /// region starts at row 0 so the evicted rows left the top of the screen
+    /// rather than just the top of a non-screen-aligned margin.
+    fn scroll_up_capturing(&mut self, region: ScrollRegion, count: u16) {
+        let evicted = self.active.screen.scroll_up(region, count);
+        if self.modes.alternate_screen || region.top != 0 || evicted.is_empty() {
+            return;
+        }
+        for row in evicted {
+            if self.scrollback.len() >= MAX_SCROLLBACK_LINES {
+                self.scrollback.pop_front();
+            }
+            self.scrollback.push_back(row);
+        }
     }
 
     fn scroll_down(&mut self, count: u16) {
@@ -740,7 +814,7 @@ impl TerminalState {
         let cursor_row = self.active.cursor.row;
         let region = self.active.scroll_region;
         if (region.top..=region.bottom).contains(&cursor_row) {
-            self.active.screen.scroll_up(
+            self.scroll_up_capturing(
                 ScrollRegion {
                     top: cursor_row,
                     bottom: region.bottom,
@@ -876,6 +950,7 @@ pub struct TerminalSnapshot {
     wrap_pending: bool,
     modes: TerminalModes,
     lines: Vec<String>,
+    scrollback: Vec<Vec<Cell>>,
 }
 
 impl TerminalSnapshot {
@@ -887,6 +962,7 @@ impl TerminalSnapshot {
             wrap_pending: state.active.wrap_pending,
             modes: state.modes,
             lines: visible_lines(&state.active.screen),
+            scrollback: state.scrollback.iter().cloned().collect(),
         }
     }
 
@@ -937,6 +1013,27 @@ impl TerminalSnapshot {
     pub fn lines(&self) -> &[String] {
         &self.lines
     }
+
+    /// Retained scrollback rows in eviction order (oldest first, newest last).
+    ///
+    /// Each row is the full cell content of a primary-screen line that scrolled
+    /// off the top of the visible grid, captured at the width it had when it
+    /// left. The alternate screen never contributes. The slice length is bounded
+    /// by [`MAX_SCROLLBACK_LINES`].
+    #[must_use]
+    pub fn scrollback(&self) -> &[Vec<Cell>] {
+        &self.scrollback
+    }
+
+    /// Renderer-ready text rendering of [`scrollback`](Self::scrollback) with
+    /// trailing blanks trimmed per line, parallel to [`lines`](Self::lines).
+    #[must_use]
+    pub fn scrollback_lines(&self) -> Vec<String> {
+        self.scrollback
+            .iter()
+            .map(|row| cells_to_line(row))
+            .collect()
+    }
 }
 
 fn checked_cell_count(rows: u16, cols: u16) -> Result<usize, TerminalError> {
@@ -961,21 +1058,27 @@ fn clamp_cursor(cursor: Cursor, rows: u16, cols: u16) -> Cursor {
 fn visible_lines(screen: &ScreenBuffer) -> Vec<String> {
     let mut lines = Vec::with_capacity(usize::from(screen.rows));
     for row in 0..screen.rows {
-        let mut line = String::new();
-        for column in 0..screen.cols {
-            if let Some(cell) = screen.cell(row, column) {
-                line.push_str(cell.text());
-            }
-        }
-        while line.ends_with(' ') {
-            line.pop();
-        }
-        lines.push(line);
+        let start = usize::from(row) * usize::from(screen.cols);
+        let end = start + usize::from(screen.cols);
+        lines.push(cells_to_line(&screen.cells[start..end]));
     }
     while lines.last().is_some_and(String::is_empty) {
         lines.pop();
     }
     lines
+}
+
+/// Render a cell row to text with trailing blanks removed. Shared by the
+/// visible-screen snapshot and scrollback so the trimming policy is identical.
+fn cells_to_line(cells: &[Cell]) -> String {
+    let mut line = String::with_capacity(cells.len());
+    for cell in cells {
+        line.push_str(cell.text());
+    }
+    while line.ends_with(' ') {
+        line.pop();
+    }
+    line
 }
 
 #[cfg(test)]
