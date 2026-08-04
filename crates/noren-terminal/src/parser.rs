@@ -10,12 +10,59 @@ pub(crate) enum Action {
     LineFeed,
     CarriageReturn,
     Backspace,
+    Tab,
+    Index,
+    NextLine,
+    ReverseIndex,
     MoveUp(u16),
     MoveDown(u16),
     MoveRight(u16),
     MoveLeft(u16),
-    MoveTo { row: u16, col: u16 },
+    MoveNextLine(u16),
+    MovePreviousLine(u16),
+    MoveTo {
+        row: u16,
+        col: u16,
+    },
     MoveToColumn(u16),
+    MoveToRow(u16),
+    SetScrollRegion {
+        top: u16,
+        bottom: Option<u16>,
+    },
+    ScrollUp(u16),
+    ScrollDown(u16),
+    EraseInDisplay(EraseMode),
+    EraseInLine(EraseMode),
+    EraseCharacters(u16),
+    InsertCharacters(u16),
+    DeleteCharacters(u16),
+    InsertLines(u16),
+    DeleteLines(u16),
+    SelectGraphicRendition {
+        params: [u16; MAX_CSI_PARAMS],
+        len: usize,
+    },
+    SaveCursor,
+    RestoreCursor,
+    SetKeypadApplication(bool),
+    SetPrivateMode {
+        mode: PrivateMode,
+        enabled: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EraseMode {
+    ToEnd,
+    ToBeginning,
+    All,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrivateMode {
+    AlternateScreen,
+    ApplicationCursorKey,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -25,10 +72,18 @@ pub(crate) struct Parser {
 
 impl Parser {
     pub(crate) fn advance(&mut self, byte: u8) -> Option<Action> {
-        let state = std::mem::take(&mut self.state);
+        let state = self.state;
         match state {
             ParserState::Ground => self.advance_ground(byte),
             ParserState::Escape => self.advance_escape(byte),
+            ParserState::EscapeIntermediate => {
+                self.state = match byte {
+                    ESC => ParserState::Escape,
+                    0x30..=0x7e => ParserState::Ground,
+                    _ => ParserState::EscapeIntermediate,
+                };
+                None
+            }
             ParserState::Csi(mut csi) => {
                 if byte == ESC {
                     self.state = ParserState::Escape;
@@ -67,8 +122,9 @@ impl Parser {
                 self.state = ParserState::Escape;
                 None
             }
-            b'\n' => Some(Action::LineFeed),
+            b'\n' | 0x0b | 0x0c => Some(Action::LineFeed),
             b'\r' => Some(Action::CarriageReturn),
+            b'\t' => Some(Action::Tab),
             0x08 => Some(Action::Backspace),
             0x20..=0x7e => Some(Action::Print(byte)),
             _ => None,
@@ -76,12 +132,45 @@ impl Parser {
     }
 
     fn advance_escape(&mut self, byte: u8) -> Option<Action> {
-        self.state = match byte {
-            b'[' => ParserState::Csi(Csi::default()),
-            b']' => ParserState::Osc,
-            ESC => ParserState::Escape,
-            _ => ParserState::Ground,
-        };
+        match byte {
+            b'[' => self.state = ParserState::Csi(Csi::default()),
+            b']' => self.state = ParserState::Osc,
+            ESC => self.state = ParserState::Escape,
+            b'=' => {
+                self.state = ParserState::Ground;
+                return Some(Action::SetKeypadApplication(true));
+            }
+            b'>' => {
+                self.state = ParserState::Ground;
+                return Some(Action::SetKeypadApplication(false));
+            }
+            b'D' => {
+                self.state = ParserState::Ground;
+                return Some(Action::Index);
+            }
+            b'E' => {
+                self.state = ParserState::Ground;
+                return Some(Action::NextLine);
+            }
+            b'M' => {
+                self.state = ParserState::Ground;
+                return Some(Action::ReverseIndex);
+            }
+            b'7' => {
+                self.state = ParserState::Ground;
+                return Some(Action::SaveCursor);
+            }
+            b'8' => {
+                self.state = ParserState::Ground;
+                return Some(Action::RestoreCursor);
+            }
+            // Intermediate bytes (0x20..=0x2f) such as `(`, `)`, `#`, and SP
+            // begin a multi-byte escape (e.g. SCS `ESC ( B`). Collect them and
+            // the following final byte without emitting anything, so the final
+            // never leaks to Ground as printable text.
+            0x20..=0x2f => self.state = ParserState::EscapeIntermediate,
+            _ => self.state = ParserState::Ground,
+        }
         None
     }
 }
@@ -91,6 +180,7 @@ enum ParserState {
     #[default]
     Ground,
     Escape,
+    EscapeIntermediate,
     Csi(Csi),
     Osc,
     OscEscape,
@@ -104,6 +194,7 @@ struct Csi {
     has_current: bool,
     overflowed: bool,
     ignored: bool,
+    private_marker: Option<u8>,
 }
 
 impl Default for Csi {
@@ -115,6 +206,7 @@ impl Default for Csi {
             has_current: false,
             overflowed: false,
             ignored: false,
+            private_marker: None,
         }
     }
 }
@@ -134,7 +226,11 @@ impl Csi {
                 self.push_current();
                 CsiAdvance::pending()
             }
-            b'?' | b'>' if self.len == 0 && !self.has_current => {
+            b'?' | b'>' if self.len == 0 && !self.has_current && self.private_marker.is_none() => {
+                self.private_marker = Some(byte);
+                CsiAdvance::pending()
+            }
+            b'?' | b'>' => {
                 self.ignored = true;
                 CsiAdvance::pending()
             }
@@ -166,17 +262,85 @@ impl Csi {
     }
 
     fn action(&self, final_byte: u8) -> Option<Action> {
+        match self.private_marker {
+            None => self.standard_action(final_byte),
+            Some(b'?') => self.private_action(final_byte),
+            Some(_) => None,
+        }
+    }
+
+    fn standard_action(&self, final_byte: u8) -> Option<Action> {
         let count = self.param_or(0, 1);
         match final_byte {
+            b'@' if self.len == 1 => Some(Action::InsertCharacters(count)),
             b'A' => Some(Action::MoveUp(count)),
             b'B' => Some(Action::MoveDown(count)),
             b'C' => Some(Action::MoveRight(count)),
             b'D' => Some(Action::MoveLeft(count)),
+            b'E' => Some(Action::MoveNextLine(count)),
+            b'F' => Some(Action::MovePreviousLine(count)),
             b'G' => Some(Action::MoveToColumn(count.saturating_sub(1))),
             b'H' | b'f' => Some(Action::MoveTo {
                 row: self.param_or(0, 1).saturating_sub(1),
                 col: self.param_or(1, 1).saturating_sub(1),
             }),
+            b'J' => self.erase_mode().map(Action::EraseInDisplay),
+            b'K' => self.erase_mode().map(Action::EraseInLine),
+            b'L' if self.len == 1 => Some(Action::InsertLines(count)),
+            b'P' if self.len == 1 => Some(Action::DeleteCharacters(count)),
+            b'S' if self.len <= 1 => Some(Action::ScrollUp(count)),
+            b'T' if self.len <= 1 => Some(Action::ScrollDown(count)),
+            b'X' if self.len == 1 => Some(Action::EraseCharacters(count)),
+            b'd' => Some(Action::MoveToRow(count.saturating_sub(1))),
+            b'M' if self.len == 1 => Some(Action::DeleteLines(count)),
+            b'r' if self.len <= 2 => Some(Action::SetScrollRegion {
+                top: self.param_or(0, 1).saturating_sub(1),
+                bottom: self.zero_based_param(1),
+            }),
+            b'm' => Some(Action::SelectGraphicRendition {
+                params: self.params,
+                len: self.len,
+            }),
+            b's' if self.is_default_only() => Some(Action::SaveCursor),
+            b'u' if self.is_default_only() => Some(Action::RestoreCursor),
+            _ => None,
+        }
+    }
+
+    fn private_action(&self, final_byte: u8) -> Option<Action> {
+        if self.len != 1 {
+            return None;
+        }
+        let mode = match self.params[0] {
+            1 => PrivateMode::ApplicationCursorKey,
+            1049 => PrivateMode::AlternateScreen,
+            _ => return None,
+        };
+        match final_byte {
+            b'h' => Some(Action::SetPrivateMode {
+                mode,
+                enabled: true,
+            }),
+            b'l' => Some(Action::SetPrivateMode {
+                mode,
+                enabled: false,
+            }),
+            _ => None,
+        }
+    }
+
+    fn is_default_only(&self) -> bool {
+        self.len == 1 && self.params[0] == 0
+    }
+
+    fn erase_mode(&self) -> Option<EraseMode> {
+        if self.len != 1 {
+            return None;
+        }
+        match self.params[0] {
+            0 => Some(EraseMode::ToEnd),
+            1 => Some(EraseMode::ToBeginning),
+            2 => Some(EraseMode::All),
             _ => None,
         }
     }
@@ -187,6 +351,13 @@ impl Csi {
             .copied()
             .filter(|value| *value != 0)
             .unwrap_or(default)
+    }
+
+    fn zero_based_param(&self, index: usize) -> Option<u16> {
+        if index >= self.len {
+            return None;
+        }
+        self.params[index].checked_sub(1)
     }
 }
 
@@ -226,9 +397,11 @@ mod tests {
     #[test]
     fn parses_basic_text_controls_and_cursor_sequences() {
         assert_eq!(
-            actions(b"A\n\r\x08\x1b[2A\x1b[3;4H"),
+            actions(b"A\n\x0b\x0c\r\x08\x1b[2A\x1b[3;4H"),
             [
                 Action::Print(b'A'),
+                Action::LineFeed,
+                Action::LineFeed,
                 Action::LineFeed,
                 Action::CarriageReturn,
                 Action::Backspace,
@@ -236,6 +409,49 @@ mod tests {
                 Action::MoveTo { row: 2, col: 3 },
             ]
         );
+    }
+
+    #[test]
+    fn horizontal_tab_emits_a_tab_action() {
+        assert_eq!(
+            actions(b"\ta\tb"),
+            [
+                Action::Tab,
+                Action::Print(b'a'),
+                Action::Tab,
+                Action::Print(b'b'),
+            ]
+        );
+    }
+
+    #[test]
+    fn escape_intermediate_sequences_emit_nothing_and_keep_the_final_byte() {
+        // Regression for the byte-leak: `ESC ( B` previously printed 'B'.
+        for sequence in [
+            b"\x1b(B".as_slice(),
+            b"\x1b)0",
+            b"\x1b#8",
+            b"\x1b F",
+            b"\x1b()B",
+        ] {
+            assert!(actions(sequence).is_empty(), "sequence {sequence:?}");
+        }
+        // An unsupported single-byte escape final is still consumed whole.
+        assert!(actions(b"\x1bc").is_empty());
+
+        // The final byte after an intermediate must not leak when followed by
+        // printable text.
+        let mut parser = Parser::default();
+        let emitted: Vec<Action> = b"\x1b(BX"
+            .iter()
+            .filter_map(|byte| parser.advance(*byte))
+            .collect();
+        assert_eq!(emitted, [Action::Print(b'X')]);
+    }
+
+    #[test]
+    fn escape_intermediate_aborts_on_a_new_escape() {
+        assert_eq!(actions(b"\x1b(\x1b[D"), [Action::MoveLeft(1)]);
     }
 
     #[test]
@@ -247,5 +463,61 @@ mod tests {
     #[test]
     fn escape_restarts_an_incomplete_csi_sequence() {
         assert_eq!(actions(b"\x1b[9\x1b[2A"), [Action::MoveUp(2)]);
+    }
+
+    #[test]
+    fn parses_index_scroll_region_and_extended_cursor_actions() {
+        assert_eq!(
+            actions(b"\x1bD\x1bE\x1bM\x1b[2;4r\x1b[3S\x1b[T\x1b[2E\x1b[F\x1b[4d"),
+            [
+                Action::Index,
+                Action::NextLine,
+                Action::ReverseIndex,
+                Action::SetScrollRegion {
+                    top: 1,
+                    bottom: Some(3),
+                },
+                Action::ScrollUp(3),
+                Action::ScrollDown(1),
+                Action::MoveNextLine(2),
+                Action::MovePreviousLine(1),
+                Action::MoveToRow(3),
+            ]
+        );
+        assert_eq!(
+            actions(b"\x1b[r\x1b[2r"),
+            [
+                Action::SetScrollRegion {
+                    top: 0,
+                    bottom: None,
+                },
+                Action::SetScrollRegion {
+                    top: 1,
+                    bottom: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_cursor_save_restore_and_alternate_screen_mode() {
+        assert_eq!(
+            actions(b"\x1b7\x1b8\x1b[s\x1b[u\x1b[?1049h\x1b[?1049l"),
+            [
+                Action::SaveCursor,
+                Action::RestoreCursor,
+                Action::SaveCursor,
+                Action::RestoreCursor,
+                Action::SetPrivateMode {
+                    mode: PrivateMode::AlternateScreen,
+                    enabled: true,
+                },
+                Action::SetPrivateMode {
+                    mode: PrivateMode::AlternateScreen,
+                    enabled: false,
+                },
+            ]
+        );
+        assert!(actions(b"\x1b[?2004h\x1b[?1049;1h\x1b[>1049h").is_empty());
     }
 }

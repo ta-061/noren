@@ -15,11 +15,16 @@ Only evidence-backed work is marked complete.
 | 7 — Quality | Unit/integration/compatibility/fault/security/visual tests, fuzzing, soak tests and benchmarks | Not started |
 | 8 — Public Preview | Honest docs/site, binaries, checksums, release review, known limitations and `0.1.0-preview` | Not started |
 
-A renderer-independent terminal state core is in progress as Draft PR
-[#19](https://github.com/ta-061/noren/pull/19) (not merged), described in
+A renderer-independent terminal state core is merged as PR
+[#19](https://github.com/ta-061/noren/pull/19) (`c695920`), described in
 [terminal core foundation](docs/architecture/terminal-core-foundation.md).
-Deferred order: scroll regions, alternate screen, SGR/erase plus cell
-attributes, mode state; Unicode/IME remain later.
+Scrolling regions are in progress as Draft PR
+[#21](https://github.com/ta-061/noren/pull/21): inclusive full-screen-default
+scroll margins, DECSTBM with invalid-range rejection, region-only
+LF/VT/FF/IND/NEL/RI and CSI S/T scrolling, CNL/CPL/VPA, delayed autowrap, and
+resize resetting margins/wrap. Deferred: alternate screen,
+SGR/erase/insert/delete, cell attributes, tabs, origin mode, query/reply;
+Unicode/IME remain later.
 
 No milestone date is promised. Implementation advances through scoped Issues,
 Draft PRs, and current-head CI evidence.

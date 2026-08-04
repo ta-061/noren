@@ -1,32 +1,38 @@
 # Coordination status
 
 Last updated: 2026-08-03 (Asia/Tokyo). PR
-[#17](https://github.com/ta-061/noren/pull/17) is merged into `main` as
-`b2bb87c20365dec5d1ab6b0122b2a987ec768744`. The only open PR is Draft
-[#19](https://github.com/ta-061/noren/pull/19), branch
-`agent/terminal-core-foundation`. The sections below preserve the PR #17
-record at implementation/test head
+[#19](https://github.com/ta-061/noren/pull/19) is merged into `main` as
+`c695920d8bc99990447d0b451754ea96c91181fc`. Draft PR
+[#21](https://github.com/ta-061/noren/pull/21) remains in review for Issue
+[#20](https://github.com/ta-061/noren/issues/20). Draft PR
+[#23](https://github.com/ta-061/noren/pull/23), branch
+`agent/terminal-alternate-screen`, is stacked on #21 for Issue
+[#22](https://github.com/ta-061/noren/issues/22). Historical sections below
+preserve the PR #17 record at implementation/test head
 `c1f66dc27ddce37a60665d319a7ca061c300947e`, corrected only where an active
 claim went stale; coordination head `ac410a82` also passed both GitHub checks.
 
 ## Current phase
 
-Terminal foundation. The first macOS local-zsh PTY PoC (PR #17) is merged.
-Draft PR #19, not merged, replaces the `avt` dependency with a
-renderer-independent Noren `TerminalState`: bounded screen cells, cursor,
-resize, printable ASCII/LF/CR/backspace, and minimal CSI cursor movement. The
-renderer consumes `TerminalSnapshot`; see
+Terminal foundation, alternate-screen slice. PR #19 merged the Noren-owned,
+renderer-independent `TerminalState`; Draft PR #21 adds scrolling regions.
+Stacked Draft PR #23 adds primary/alternate screen ownership, DEC private mode
+1049, cursor save/restore, mode snapshots, and both-buffer resize behavior. See
 [terminal core foundation](../architecture/terminal-core-foundation.md). This
-is not VT100/xterm compatibility. Deferred order: scroll regions, alternate
-screen, SGR/erase plus cell attributes, mode state; Unicode/IME remain later.
+is not a VT100/xterm or vim/tmux/zellij compatibility claim.
 
 ## GitHub state
 
 Verified on 2026-08-03:
 
-- The only open Issue is [#18](https://github.com/ta-061/noren/issues/18), the
-  Terminal Core foundation. The only open PR is its Draft
-  [#19](https://github.com/ta-061/noren/pull/19).
+- The open Issues are [#20](https://github.com/ta-061/noren/issues/20), the
+  scrolling-region behavior slice, and stacked alternate-screen Issue
+  [#22](https://github.com/ta-061/noren/issues/22). Their open Draft PRs are
+  [#21](https://github.com/ta-061/noren/pull/21) and
+  [#23](https://github.com/ta-061/noren/pull/23), respectively.
+- PR [#19](https://github.com/ta-061/noren/pull/19) and Issue
+  [#18](https://github.com/ta-061/noren/issues/18) are complete after owner
+  acceptance of the renderer-independent Terminal Core foundation.
 - PR [#17](https://github.com/ta-061/noren/pull/17) and its Issue
   [#16](https://github.com/ta-061/noren/issues/16) are complete after the owner
   accepted the macOS local-PTY PoC.
@@ -35,11 +41,11 @@ Verified on 2026-08-03:
   [#14](https://github.com/ta-061/noren/pull/14) merged the bounded Discovery
   integration and PR [#15](https://github.com/ta-061/noren/pull/15) merged the
   lean Design Council.
-- `main` is at `b2bb87c20365dec5d1ab6b0122b2a987ec768744`, the merge commit
-  for PR #17. No Discovery PR remains open and no repeated large research or
+- `main` is at `c695920d8bc99990447d0b451754ea96c91181fc`, the merge commit
+  for PR #19. No Discovery PR remains open and no repeated large research or
   review is planned.
 
-## Terminal Core handoff
+## Merged PR #19 Terminal Core handoff
 
 | Lane | Saved evidence | State |
 | --- | --- | --- |
@@ -48,6 +54,28 @@ Verified on 2026-08-03:
 | GLM boundaries | PR #19 review: module, error, and crate boundaries pass without changes | Complete |
 | Claude Code architecture | PR #19 review: ACCEPT, no VT-evolution blocker | Complete |
 | Qwen documentation | Signed `b390531`: architecture, roadmap, contributor, and status updates | Complete |
+
+## Draft PR #21 scrolling-region handoff
+
+| Lane | Saved evidence | State |
+| --- | --- | --- |
+| Codex core | Signed `9ffe79c`: margins, region scrolling, cursor/index behavior, delayed autowrap | Complete |
+| codex-lab tests | Signed `6bbac87`: eight public-API scroll/cursor/resize regression tests | Complete |
+| GLM helper | Signed `32ca7da`: behavior-preserving parser-state idiom cleanup | Complete |
+| Claude Code review | PR #21 review: `BLOCKER: NONE` | Complete |
+| Qwen documentation | Signed `328c013`: architecture, roadmap, and contributor guidance | Complete |
+| Codex integration | Exact-head local checks, CI, and bounded local-zsh launch smoke | Complete |
+
+## Draft PR #23 alternate-screen handoff
+
+| Lane | Saved evidence | State |
+| --- | --- | --- |
+| Codex core | Signed `84da736`: screen ownership, mode 1049, cursor save/restore, and resize behavior | Complete |
+| codex-lab tests | Signed `454d995`: seven public-API alternate/mode/cursor/resize tests | Complete |
+| GLM helper | PR #23 review: parser/enum/module organization is clean; no change needed | Complete |
+| Claude Code review | PR #23 review: `BLOCKER: NONE` | Complete |
+| Qwen documentation | Signed `29f7362`: focused terminal-core architecture update | Complete |
+| Codex integration | Exact-head local checks, CI, and bounded local-zsh launch smoke | Complete |
 
 ## PR #17 historical implementation checkpoints
 
@@ -99,10 +127,11 @@ then passed both GitHub checks: runs `30783618745` (Rust) and `30783618743`
 
 ## Current Draft gate
 
-PR #19 remains Draft until current-head CI is green and the owner can repeat a
-local macOS startup/output/resize/exit smoke check. PR #17 has no remaining
-gate; its manual verification was accepted before merge. This does not
-authorize deferred terminal features in the foundation PR.
+PR #21 remains Draft for owner review and acceptance. Stacked PR #23 has passed
+local checks and CI, and the existing local-zsh application launch was
+rechecked; it remains Draft and based on `agent/terminal-scroll-regions` until
+#21 is accepted and merged. PR #19 has no remaining gate. This does not
+authorize deferred terminal features in either Draft PR.
 
 Full VT/xterm behavior, non-ASCII glyph quality, swash/font trials, production
 IME/accessibility, Linux, SSH, agent integration, tabs, panes, themes, and a
@@ -116,7 +145,8 @@ identity, and the public support/security contact before Preview publication.
 
 ## Next steps
 
-1. Save exact-head local checks and GitHub CI on Draft PR #19.
-2. Repeat the bounded macOS smoke check without changing OS security settings.
-3. Keep scroll regions and later VT work in a separate Issue/PR after this
-   foundation is accepted.
+1. Review and accept Draft PR #21, then promote and merge its exact tested head.
+2. Retarget Draft PR #23 to `main` only after #21 merges, then review its exact
+   tested head.
+3. Keep SGR/erase, attributes, remaining modes, and later VT work in separate
+   Issues and PRs.
