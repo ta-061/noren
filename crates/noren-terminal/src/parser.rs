@@ -74,10 +74,23 @@ pub(crate) enum EraseMode {
     All,
 }
 
+/// DEC private modes (`CSI ? ... h/l`) recognised by the parser.
+///
+/// Mouse modes are tracked as state so the disambiguation between
+/// `DeleteLines` and an X10 mouse report can happen at the `CSI M` final byte;
+/// see [`Parser::advance`]. The encoding-only modes (1005/1006/1015) do not
+/// trigger report consumption on their own — a tracking mode must also be on —
+/// but are recorded so a future input path can read the active encoding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PrivateMode {
     AlternateScreen,
     ApplicationCursorKey,
+    MouseNormalTracking,
+    MouseButtonEvent,
+    MouseAnyEvent,
+    MouseUtf8,
+    MouseSgr,
+    MouseUrxvt,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -86,7 +99,17 @@ pub(crate) struct Parser {
 }
 
 impl Parser {
-    pub(crate) fn advance(&mut self, byte: u8) -> Option<Action> {
+    /// Advance the machine by one byte.
+    ///
+    /// `mouse_tracking` reports whether any mouse *tracking* mode (DEC 1000,
+    /// 1002, or 1003) is currently enabled. It is the sole disambiguator for
+    /// the genuinely ambiguous `CSI M`: with tracking on, a parameter-less
+    /// `CSI M` is the X10 mouse-report introducer and the next three bytes are
+    /// consumed as its binary payload; with tracking off, `CSI M` keeps its
+    /// ECMA-48 `DeleteLines(1)` meaning. The flag is supplied per byte by the
+    /// caller so a mode change inside one `feed_bytes` call takes effect at the
+    /// next byte.
+    pub(crate) fn advance(&mut self, byte: u8, mouse_tracking: bool) -> Option<Action> {
         let state = self.state;
         match state {
             ParserState::Ground => self.advance_ground(byte),
@@ -104,13 +127,31 @@ impl Parser {
                     self.state = ParserState::Escape;
                     return None;
                 }
-                let action = csi.advance(byte);
-                self.state = if action.finished {
-                    ParserState::Ground
+                let advance = csi.advance(byte, mouse_tracking);
+                self.state = if advance.finished {
+                    if advance.enter_mouse_report {
+                        ParserState::MouseReport { remaining: 3 }
+                    } else {
+                        ParserState::Ground
+                    }
                 } else {
                     ParserState::Csi(csi)
                 };
-                action.action
+                advance.action
+            }
+            // Fixed-length X10 mouse-report payload (Cb, Cx, Cy) introduced by a
+            // tracking-mode `CSI M`. Every byte is swallowed unconditionally —
+            // including ESC, BEL, and C0 controls — because the payload is raw
+            // binary coordinates, not text or control codes. Letting an ESC
+            // here restart the escape machine would desync the parser for the
+            // rest of the stream; treating it as data keeps the consumption
+            // count exact so the parser resynchronises on the byte after Cy.
+            ParserState::MouseReport { remaining } => {
+                match remaining.checked_sub(1) {
+                    Some(0) | None => self.state = ParserState::Ground,
+                    Some(next) => self.state = ParserState::MouseReport { remaining: next },
+                }
+                None
             }
             // Control-string payload swallowing. Entered by OSC (`ESC ]`),
             // DCS (`ESC P`), SOS (`ESC X`), PM (`ESC ^`), and APC (`ESC _`).
@@ -207,6 +248,11 @@ enum ParserState {
     Escape,
     EscapeIntermediate,
     Csi(Csi),
+    // Swallows the fixed-length three-byte payload of an X10 mouse report
+    // (`CSI M` + Cb/Cx/Cy) introduced while a mouse tracking mode is enabled.
+    MouseReport {
+        remaining: u8,
+    },
     ControlString,
     ControlStringEscape,
 }
@@ -237,7 +283,7 @@ impl Default for Csi {
 }
 
 impl Csi {
-    fn advance(&mut self, byte: u8) -> CsiAdvance {
+    fn advance(&mut self, byte: u8, mouse_tracking: bool) -> CsiAdvance {
         match byte {
             b'0'..=b'9' => {
                 self.has_current = true;
@@ -271,12 +317,27 @@ impl Csi {
                 CsiAdvance::pending()
             }
             0x40..=0x7e => {
+                // `CSI M` is ambiguous between DeleteLines (ECMA-48) and the X10
+                // mouse-report introducer. Only the *parameter-less* form is a
+                // report shape — real reports are bare `CSI M`; an explicit
+                // parameter such as `CSI 2 M` is DL. The disambiguator is mode
+                // state: with a mouse tracking mode on, bare `CSI M` becomes a
+                // report and the parser consumes the next three bytes as data
+                // instead of executing DL. Capture the bare shape before
+                // push_current commits the implicit zero parameter.
+                let bare_csi_m = mouse_tracking
+                    && byte == b'M'
+                    && self.private_marker.is_none()
+                    && self.len == 0
+                    && !self.has_current;
                 self.push_current();
-                CsiAdvance::finished(if self.overflowed || self.ignored {
-                    None
-                } else {
-                    self.action(byte)
-                })
+                if self.overflowed || self.ignored {
+                    return CsiAdvance::finished(None);
+                }
+                if bare_csi_m {
+                    return CsiAdvance::mouse_report();
+                }
+                CsiAdvance::finished(self.action(byte))
             }
             // C0 controls embedded in a control sequence execute immediately
             // via the Ground action WITHOUT aborting the sequence (DEC VT and
@@ -352,6 +413,16 @@ impl Csi {
         let mode = match self.params[0] {
             1 => PrivateMode::ApplicationCursorKey,
             1049 => PrivateMode::AlternateScreen,
+            // Mouse tracking modes: their presence flips `CSI M` from
+            // DeleteLines into the X10 report introducer.
+            1000 => PrivateMode::MouseNormalTracking,
+            1002 => PrivateMode::MouseButtonEvent,
+            1003 => PrivateMode::MouseAnyEvent,
+            // Mouse coordinate-encoding modes: recorded for a future input
+            // path but they do not, on their own, make `CSI M` a report.
+            1005 => PrivateMode::MouseUtf8,
+            1006 => PrivateMode::MouseSgr,
+            1015 => PrivateMode::MouseUrxvt,
             _ => return None,
         };
         match final_byte {
@@ -402,6 +473,7 @@ impl Csi {
 struct CsiAdvance {
     action: Option<Action>,
     finished: bool,
+    enter_mouse_report: bool,
 }
 
 impl CsiAdvance {
@@ -409,6 +481,7 @@ impl CsiAdvance {
         Self {
             action: None,
             finished: false,
+            enter_mouse_report: false,
         }
     }
 
@@ -416,6 +489,7 @@ impl CsiAdvance {
         Self {
             action,
             finished: true,
+            enter_mouse_report: false,
         }
     }
 
@@ -423,6 +497,18 @@ impl CsiAdvance {
         Self {
             action,
             finished: false,
+            enter_mouse_report: false,
+        }
+    }
+
+    /// Signals that a tracking-mode `CSI M` was seen and the parser must enter
+    /// the fixed-length mouse-report swallow state instead of returning to
+    /// Ground. No action is emitted: a report introduces no screen mutation.
+    const fn mouse_report() -> Self {
+        Self {
+            action: None,
+            finished: true,
+            enter_mouse_report: true,
         }
     }
 }
@@ -432,10 +518,14 @@ mod tests {
     use super::*;
 
     fn actions(bytes: &[u8]) -> Vec<Action> {
+        actions_with(bytes, false)
+    }
+
+    fn actions_with(bytes: &[u8], mouse_tracking: bool) -> Vec<Action> {
         let mut parser = Parser::default();
         bytes
             .iter()
-            .filter_map(|byte| parser.advance(*byte))
+            .filter_map(|byte| parser.advance(*byte, mouse_tracking))
             .collect()
     }
 
@@ -489,7 +579,7 @@ mod tests {
         let mut parser = Parser::default();
         let emitted: Vec<Action> = b"\x1b(BX"
             .iter()
-            .filter_map(|byte| parser.advance(*byte))
+            .filter_map(|byte| parser.advance(*byte, false))
             .collect();
         assert_eq!(emitted, [Action::Print(b'X')]);
     }
@@ -599,5 +689,103 @@ mod tests {
             ]
         );
         assert!(actions(b"\x1b[?2004h\x1b[?1049;1h\x1b[>1049h").is_empty());
+    }
+
+    #[test]
+    fn csi_m_is_delete_lines_without_a_mouse_mode() {
+        // With no mouse tracking mode enabled, the ECMA-48 reading of `CSI M`
+        // wins: it is DeleteLines(1). An explicit parameter stays DL too.
+        assert_eq!(actions(b"\x1b[M"), [Action::DeleteLines(1)]);
+        assert_eq!(actions(b"\x1b[2M"), [Action::DeleteLines(2)]);
+    }
+
+    #[test]
+    fn csi_m_with_mouse_tracking_consumes_three_payload_bytes() {
+        // The issue #46 repro: with tracking on, `CSI M` introduces the X10
+        // report and the three coordinate bytes are swallowed as data, never
+        // printed and never executed. No action leaves the parser at all.
+        assert!(actions_with(b"\x1b[M\x20\x25\x27", true).is_empty());
+        // A bare `CSI M` with tracking on emits nothing (no DL) and the
+        // following printable text resumes normally after the three bytes.
+        assert_eq!(
+            actions_with(b"\x1b[M\x20\x25\x27X", true),
+            [Action::Print(b'X')]
+        );
+    }
+
+    #[test]
+    fn csi_m_with_explicit_param_is_still_delete_lines_under_tracking() {
+        // Real reports are bare `CSI M`; a parameterised form is DL even while
+        // a mouse mode is on, so it cannot be used to smuggle a payload swallow.
+        assert_eq!(actions_with(b"\x1b[2M", true), [Action::DeleteLines(2)]);
+        assert_eq!(actions_with(b"\x1b[0M", true), [Action::DeleteLines(1)]);
+    }
+
+    #[test]
+    fn csi_m_mouse_report_swallows_esc_and_controls_without_desync() {
+        // Rule: the three report bytes are raw binary coordinates, so they are
+        // consumed unconditionally. ESC, BEL, and LF inside the payload must
+        // NOT restart the escape machine or execute their C0 actions — that
+        // would desync the parser for the rest of the stream. After three
+        // bytes the parser is back in Ground and printable text prints.
+        assert!(actions_with(b"\x1b[M\x1b\n\x07", true).is_empty());
+        assert_eq!(
+            actions_with(b"\x1b[M\x1b\n\x07X", true),
+            [Action::Print(b'X')]
+        );
+    }
+
+    #[test]
+    fn csi_m_mouse_report_survives_byte_at_a_time_feeds() {
+        // The parser state persists between advance calls, so a report split
+        // one byte at a time across feed boundaries behaves the same as a
+        // single feed.
+        let mut parser = Parser::default();
+        let mut emitted = Vec::new();
+        for byte in b"\x1b[M\x20\x25\x27X" {
+            emitted.extend(parser.advance(*byte, true));
+        }
+        assert_eq!(emitted, [Action::Print(b'X')]);
+    }
+
+    #[test]
+    fn private_mouse_modes_round_trip_at_the_action_level() {
+        let expected = [
+            (1000, PrivateMode::MouseNormalTracking),
+            (1002, PrivateMode::MouseButtonEvent),
+            (1003, PrivateMode::MouseAnyEvent),
+            (1005, PrivateMode::MouseUtf8),
+            (1006, PrivateMode::MouseSgr),
+            (1015, PrivateMode::MouseUrxvt),
+        ];
+        for (num, mode) in expected {
+            let enable = format!("\x1b[?{num}h");
+            let disable = format!("\x1b[?{num}l");
+            assert_eq!(
+                actions(enable.as_bytes()),
+                [Action::SetPrivateMode {
+                    mode,
+                    enabled: true,
+                }]
+            );
+            assert_eq!(
+                actions(disable.as_bytes()),
+                [Action::SetPrivateMode {
+                    mode,
+                    enabled: false,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn sgr_mouse_report_marker_stays_poisoned() {
+        // Regression for issue #41: the `<` private marker poisons the CSI so a
+        // SGR-form mouse report (`CSI < Cb ; Cx ; Cy M/m`) is never executed as
+        // DeleteLines or printed as text — under mouse tracking or not.
+        assert!(actions(b"\x1b[<0;5;7M").is_empty());
+        assert!(actions(b"\x1b[<0;5;7m").is_empty());
+        assert!(actions_with(b"\x1b[<0;5;7M", true).is_empty());
+        assert!(actions_with(b"\x1b[<0;5;7m", true).is_empty());
     }
 }

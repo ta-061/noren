@@ -184,12 +184,78 @@ impl ScrollRegion {
     }
 }
 
+/// DEC private mouse reporting modes (DECSET/DECRST 1000-1015).
+///
+/// These track the six modes Zellij's client enables on attach. The tracking
+/// modes (1000/1002/1003) decide whether a click produces a report at all and
+/// select the bare `CSI M` report introducer. The encoding modes (1005/1006/
+/// 1015) only change how a report is *formatted* by a future input path; they
+/// are recorded here so enabling/disabling them round-trips in the snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MouseModes {
+    normal_click_tracking: bool,
+    button_event_tracking: bool,
+    any_event_tracking: bool,
+    utf8_coordinate_encoding: bool,
+    sgr_encoding: bool,
+    urxvt_encoding: bool,
+}
+
+impl MouseModes {
+    /// Whether any mouse *tracking* mode (1000/1002/1003) is currently enabled.
+    ///
+    /// Only a tracking mode causes the terminal to emit a report, and a bare
+    /// `CSI M` is the X10-form introducer for that report. The encoding modes
+    /// alone never produce a report, so they do not flip this flag.
+    #[must_use]
+    pub const fn is_tracking_enabled(self) -> bool {
+        self.normal_click_tracking || self.button_event_tracking || self.any_event_tracking
+    }
+
+    /// DECSET/DECRST 1000: normal (X10/VT200 click) mouse tracking.
+    #[must_use]
+    pub const fn is_normal_click_tracking(self) -> bool {
+        self.normal_click_tracking
+    }
+
+    /// DECSET/DECRST 1002: button-event mouse tracking (press/release/drag).
+    #[must_use]
+    pub const fn is_button_event_tracking(self) -> bool {
+        self.button_event_tracking
+    }
+
+    /// DECSET/DECRST 1003: any-event mouse tracking (including motion).
+    #[must_use]
+    pub const fn is_any_event_tracking(self) -> bool {
+        self.any_event_tracking
+    }
+
+    /// DECSET/DECRST 1005: UTF-8 coordinate encoding.
+    #[must_use]
+    pub const fn is_utf8_coordinate_encoding(self) -> bool {
+        self.utf8_coordinate_encoding
+    }
+
+    /// DECSET/DECRST 1006: SGR mouse encoding (`CSI < Cb ; Cx ; Cy M`).
+    #[must_use]
+    pub const fn is_sgr_encoding(self) -> bool {
+        self.sgr_encoding
+    }
+
+    /// DECSET/DECRST 1015: urxvt mouse encoding.
+    #[must_use]
+    pub const fn is_urxvt_encoding(self) -> bool {
+        self.urxvt_encoding
+    }
+}
+
 /// Renderer-independent modes that affect screen selection or encoded input.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TerminalModes {
     alternate_screen: bool,
     application_cursor_key: bool,
     application_keypad: bool,
+    mouse: MouseModes,
 }
 
 impl TerminalModes {
@@ -209,6 +275,19 @@ impl TerminalModes {
     #[must_use]
     pub const fn is_application_keypad_mode(self) -> bool {
         self.application_keypad
+    }
+
+    /// Mouse reporting mode state (DECSET/DECRST 1000-1015).
+    #[must_use]
+    pub const fn mouse(self) -> MouseModes {
+        self.mouse
+    }
+
+    /// Whether any mouse tracking mode is enabled, i.e. whether a bare `CSI M`
+    /// must be read as the X10 mouse-report introducer rather than DeleteLines.
+    #[must_use]
+    pub const fn is_mouse_tracking_enabled(self) -> bool {
+        self.mouse.is_tracking_enabled()
     }
 }
 
@@ -489,7 +568,11 @@ impl TerminalState {
     /// escape-sequence payload.
     pub fn feed_bytes(&mut self, bytes: &[u8]) {
         for byte in bytes {
-            if let Some(action) = self.parser.advance(*byte) {
+            // The mouse-tracking flag is read fresh on every byte so a DECSET
+            // that enables tracking mid-feed takes effect before the following
+            // `CSI M` report in the same feed_bytes call.
+            let mouse_tracking = self.modes.is_mouse_tracking_enabled();
+            if let Some(action) = self.parser.advance(*byte, mouse_tracking) {
                 self.apply(action);
             }
         }
@@ -893,6 +976,24 @@ impl TerminalState {
             (PrivateMode::AlternateScreen, false) => self.leave_alternate_screen(),
             (PrivateMode::ApplicationCursorKey, enabled) => {
                 self.modes.application_cursor_key = enabled;
+            }
+            (PrivateMode::MouseNormalTracking, enabled) => {
+                self.modes.mouse.normal_click_tracking = enabled;
+            }
+            (PrivateMode::MouseButtonEvent, enabled) => {
+                self.modes.mouse.button_event_tracking = enabled;
+            }
+            (PrivateMode::MouseAnyEvent, enabled) => {
+                self.modes.mouse.any_event_tracking = enabled;
+            }
+            (PrivateMode::MouseUtf8, enabled) => {
+                self.modes.mouse.utf8_coordinate_encoding = enabled;
+            }
+            (PrivateMode::MouseSgr, enabled) => {
+                self.modes.mouse.sgr_encoding = enabled;
+            }
+            (PrivateMode::MouseUrxvt, enabled) => {
+                self.modes.mouse.urxvt_encoding = enabled;
             }
         }
     }
