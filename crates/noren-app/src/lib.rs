@@ -175,9 +175,10 @@ impl GridGeometry {
 
 /// Active modifier keys on an app-owned key event.
 ///
-/// The PoC key encoder consumes `ctrl` for control bytes and treats Cmd/Option/
-/// IME/dead-key combinations as unsupported drops. The full policy is wired
-/// later; this baseline only carries the typed shape.
+/// The key encoder consumes `ctrl` for control bytes and `alt` as the xterm
+/// `ESC` prefix, and drops Super/Cmd combinations. IME and dead-key input is
+/// dropped at translation. This baseline cannot distinguish Option-as-Alt
+/// from Option-as-compose on macOS; every Option event is treated as Alt.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Modifiers {
     shift: bool,
@@ -263,9 +264,10 @@ pub enum Arrow {
 /// Supported app-owned key identities.
 ///
 /// The PoC encodes printable UTF-8, Enter, Backspace, Tab, Escape, arrows,
-/// Delete, Insert, Home, End, PageUp, PageDown, F1-F12, and Ctrl control
-/// bytes. Releases and unsupported combinations emit zero bytes; they are not
-/// part of this baseline's encoding step.
+/// Delete, Insert, Home, End, PageUp, PageDown, F1-F12, Ctrl control bytes,
+/// Ctrl with the base bytes of Enter/Backspace/Tab/Escape, and Alt as an
+/// `ESC` prefix over any of those encodings. Releases and still-unsupported
+/// combinations emit zero bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
     /// A printable UTF-8 character.
@@ -354,9 +356,9 @@ impl KeyEncoder {
     /// Encode one pressed or repeated key event in the PoC default
     /// ([`InputMode::normal`]) mode.
     ///
-    /// This entry point preserves the original byte contract and stays
-    /// source-compatible with PoC callers that do not yet track terminal
-    /// modes. Mode-aware callers use [`KeyEncoder::encode_with`].
+    /// This entry point keeps a mode-free signature for callers that do not
+    /// yet track terminal modes. Mode-aware callers use
+    /// [`KeyEncoder::encode_with`].
     pub fn encode(input: KeyInput) -> Result<Vec<u8>, KeyDropReason> {
         Self::encode_with(input, InputMode::normal())
     }
@@ -364,46 +366,66 @@ impl KeyEncoder {
     /// Encode one pressed or repeated key event for the active application
     /// input mode.
     ///
-    /// Bare arrow keys, Home, and End observe [`CursorKeyMode`]; Delete,
-    /// Insert, PageUp, PageDown, and F1-F12 are mode-independent. Release,
-    /// modifier, control-byte, and printable handling is identical to
-    /// [`KeyEncoder::encode`], so the normal mode is byte-for-byte compatible.
+    /// Arrow keys, Home, and End observe [`CursorKeyMode`]; Delete, Insert,
+    /// PageUp, PageDown, and F1-F12 are mode-independent. Ctrl converts
+    /// printable characters to control bytes while Enter, Backspace, Tab, and
+    /// Escape keep their base bytes, like xterm. Alt prefixes `ESC` to the
+    /// bytes the key would otherwise emit, matching xterm's meta behavior.
+    /// Release, Super, and still-unsupported combinations are drops.
+    /// [`KeyEncoder::encode`] applies the same rules in the normal mode.
     pub fn encode_with(input: KeyInput, mode: InputMode) -> Result<Vec<u8>, KeyDropReason> {
         if input.phase() == KeyPhase::Released {
             return Err(KeyDropReason::Released);
         }
         let modifiers = input.modifiers();
-        if modifiers.is_alt() || modifiers.is_super() {
+        if modifiers.is_super() {
             return Err(KeyDropReason::UnsupportedModifier);
         }
-        if modifiers.is_ctrl() {
-            return match input.key() {
-                Key::Character(character) => control_byte(character)
-                    .map(|byte| vec![byte])
-                    .ok_or(KeyDropReason::UnsupportedControl),
-                _ => Err(KeyDropReason::UnsupportedControl),
-            };
-        }
+        let alt = modifiers.is_alt();
+        let key = if modifiers.is_ctrl() {
+            match input.key() {
+                Key::Character(character) => {
+                    let Some(byte) = control_byte(character) else {
+                        return Err(KeyDropReason::UnsupportedControl);
+                    };
+                    return Ok(Self::alt_prefixed(alt, vec![byte]));
+                }
+                // xterm keeps the base bytes of these named keys under Ctrl.
+                key @ (Key::Enter | Key::Backspace | Key::Tab | Key::Escape) => key,
+                _ => return Err(KeyDropReason::UnsupportedControl),
+            }
+        } else {
+            input.key()
+        };
 
-        match input.key() {
+        let bytes = match key {
             Key::Character(character) if !character.is_control() => {
                 let mut buffer = [0_u8; 4];
-                Ok(character.encode_utf8(&mut buffer).as_bytes().to_vec())
+                character.encode_utf8(&mut buffer).as_bytes().to_vec()
             }
-            Key::Character(_) => Err(KeyDropReason::UnsupportedKey),
-            Key::Enter => Ok(vec![0x0d]),
-            Key::Backspace => Ok(vec![0x7f]),
-            Key::Tab => Ok(vec![0x09]),
-            Key::Escape => Ok(vec![0x1b]),
-            Key::Arrow(arrow) => Ok(input::cursor_bytes(arrow, mode.cursor()).to_vec()),
-            Key::Delete => Ok(b"\x1b[3~".to_vec()),
-            Key::Insert => Ok(b"\x1b[2~".to_vec()),
-            Key::Home => Ok(input::home_bytes(mode.cursor()).to_vec()),
-            Key::End => Ok(input::end_bytes(mode.cursor()).to_vec()),
-            Key::PageUp => Ok(b"\x1b[5~".to_vec()),
-            Key::PageDown => Ok(b"\x1b[6~".to_vec()),
-            Key::Function(function_key) => Ok(input::function_key_bytes(function_key).to_vec()),
+            Key::Character(_) => return Err(KeyDropReason::UnsupportedKey),
+            Key::Enter => vec![0x0d],
+            Key::Backspace => vec![0x7f],
+            Key::Tab => vec![0x09],
+            Key::Escape => vec![0x1b],
+            Key::Arrow(arrow) => input::cursor_bytes(arrow, mode.cursor()).to_vec(),
+            Key::Delete => b"\x1b[3~".to_vec(),
+            Key::Insert => b"\x1b[2~".to_vec(),
+            Key::Home => input::home_bytes(mode.cursor()).to_vec(),
+            Key::End => input::end_bytes(mode.cursor()).to_vec(),
+            Key::PageUp => b"\x1b[5~".to_vec(),
+            Key::PageDown => b"\x1b[6~".to_vec(),
+            Key::Function(function_key) => input::function_key_bytes(function_key).to_vec(),
+        };
+        Ok(Self::alt_prefixed(alt, bytes))
+    }
+
+    /// Prepend the `ESC` byte that Alt adds in front of a key's base bytes.
+    fn alt_prefixed(alt: bool, mut bytes: Vec<u8>) -> Vec<u8> {
+        if alt {
+            bytes.insert(0, 0x1b);
         }
+        bytes
     }
 
     /// Encode one pressed or repeated keypad key event in the PoC default
@@ -702,7 +724,10 @@ mod tests {
         let released = KeyInput::new(Key::Character('x'), KeyPhase::Released, Modifiers::empty());
         assert_eq!(KeyEncoder::encode(released), Err(KeyDropReason::Released));
 
-        for modifiers in [Modifiers::empty().alt(), Modifiers::empty().super_key()] {
+        for modifiers in [
+            Modifiers::empty().super_key(),
+            Modifiers::empty().alt().super_key(),
+        ] {
             let input = KeyInput::new(Key::Character('x'), KeyPhase::Pressed, modifiers);
             assert_eq!(
                 KeyEncoder::encode(input),
@@ -788,15 +813,26 @@ mod tests {
     }
 
     #[test]
-    fn application_cursor_mode_leaves_modifier_and_control_paths_unchanged() {
+    fn application_cursor_mode_prefixes_alt_and_keeps_super_control_drops() {
         let application = InputMode::normal().with_cursor(CursorKeyMode::Application);
-        for modifiers in [Modifiers::empty().alt(), Modifiers::empty().super_key()] {
-            let input = KeyInput::new(Key::Arrow(Arrow::Up), KeyPhase::Pressed, modifiers);
-            assert_eq!(
-                KeyEncoder::encode_with(input, application),
-                Err(KeyDropReason::UnsupportedModifier)
-            );
-        }
+        let alt_arrow = KeyInput::new(
+            Key::Arrow(Arrow::Up),
+            KeyPhase::Pressed,
+            Modifiers::empty().alt(),
+        );
+        assert_eq!(
+            KeyEncoder::encode_with(alt_arrow, application).as_deref(),
+            Ok(b"\x1b\x1bOA".as_slice())
+        );
+        let super_arrow = KeyInput::new(
+            Key::Arrow(Arrow::Up),
+            KeyPhase::Pressed,
+            Modifiers::empty().super_key(),
+        );
+        assert_eq!(
+            KeyEncoder::encode_with(super_arrow, application),
+            Err(KeyDropReason::UnsupportedModifier)
+        );
         let ctrl_arrow = KeyInput::new(
             Key::Arrow(Arrow::Up),
             KeyPhase::Pressed,
@@ -1095,6 +1131,184 @@ mod tests {
                 KeyEncoder::encode(input),
                 Err(KeyDropReason::UnsupportedControl)
             );
+        }
+    }
+
+    #[test]
+    fn alt_characters_emit_esc_followed_by_utf8() {
+        for (character, expected) in [
+            ('f', b"\x1bf".as_slice()),
+            ('a', b"\x1ba"),
+            ('Z', b"\x1bZ"),
+            ('x', b"\x1bx"),
+            ('q', b"\x1bq"),
+        ] {
+            let input = KeyInput::new(
+                Key::Character(character),
+                KeyPhase::Pressed,
+                Modifiers::empty().alt(),
+            );
+            assert_eq!(KeyEncoder::encode(input).as_deref(), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn alt_non_ascii_characters_emit_esc_followed_by_the_full_utf8() {
+        for (character, expected) in [
+            ('é', b"\x1b\xc3\xa9".as_slice()),
+            ('界', b"\x1b\xe7\x95\x8c"),
+        ] {
+            let input = KeyInput::new(
+                Key::Character(character),
+                KeyPhase::Pressed,
+                Modifiers::empty().alt(),
+            );
+            assert_eq!(KeyEncoder::encode(input).as_deref(), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn alt_ctrl_characters_emit_esc_then_the_control_byte() {
+        for (character, byte) in [
+            ('c', 0x03),
+            ('d', 0x04),
+            ('@', 0x00),
+            (' ', 0x00),
+            ('z', 0x1a),
+        ] {
+            let input = KeyInput::new(
+                Key::Character(character),
+                KeyPhase::Pressed,
+                Modifiers::empty().alt().ctrl(),
+            );
+            assert_eq!(
+                KeyEncoder::encode(input),
+                Ok(vec![0x1b, byte]),
+                "Alt+Ctrl+{character}"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_named_keys_keep_their_base_bytes() {
+        let cases = [
+            (Key::Enter, b"\x0d".as_slice()),
+            (Key::Backspace, b"\x7f"),
+            (Key::Tab, b"\x09"),
+            (Key::Escape, b"\x1b"),
+        ];
+        for (key, expected) in cases {
+            let input = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty().ctrl());
+            assert_eq!(KeyEncoder::encode(input).as_deref(), Ok(expected));
+            let repeated = KeyInput::new(key, KeyPhase::Repeat, Modifiers::empty().ctrl());
+            assert_eq!(KeyEncoder::encode(repeated).as_deref(), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn alt_ctrl_named_keys_prefix_esc_to_the_ctrl_bytes() {
+        let cases = [
+            (Key::Enter, b"\x1b\x0d".as_slice()),
+            (Key::Backspace, b"\x1b\x7f"),
+            (Key::Tab, b"\x1b\x09"),
+            (Key::Escape, b"\x1b\x1b"),
+        ];
+        for (key, expected) in cases {
+            let input = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty().alt().ctrl());
+            assert_eq!(KeyEncoder::encode(input).as_deref(), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn alt_named_and_navigation_keys_prefix_esc_to_base_sequences() {
+        let application = InputMode::normal().with_cursor(CursorKeyMode::Application);
+        let cases = [
+            (Key::Enter, b"\x1b\x0d".as_slice()),
+            (Key::Backspace, b"\x1b\x7f"),
+            (Key::Tab, b"\x1b\x09"),
+            (Key::Escape, b"\x1b\x1b"),
+            (Key::Arrow(Arrow::Up), b"\x1b\x1b[A"),
+            (Key::Arrow(Arrow::Left), b"\x1b\x1b[D"),
+            (Key::Delete, b"\x1b\x1b[3~"),
+            (Key::PageDown, b"\x1b\x1b[6~"),
+            (Key::Function(FunctionKey::F5), b"\x1b\x1b[15~"),
+        ];
+        for (key, expected) in cases {
+            let input = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty().alt());
+            assert_eq!(KeyEncoder::encode(input).as_deref(), Ok(expected));
+        }
+        let alt_home = KeyInput::new(Key::Home, KeyPhase::Pressed, Modifiers::empty().alt());
+        assert_eq!(
+            KeyEncoder::encode_with(alt_home, application).as_deref(),
+            Ok(b"\x1b\x1bOH".as_slice())
+        );
+        let alt_up = KeyInput::new(
+            Key::Arrow(Arrow::Up),
+            KeyPhase::Pressed,
+            Modifiers::empty().alt(),
+        );
+        assert_eq!(
+            KeyEncoder::encode_with(alt_up, application).as_deref(),
+            Ok(b"\x1b\x1bOA".as_slice())
+        );
+    }
+
+    #[test]
+    fn unsupported_modifier_combinations_still_drop() {
+        for key in [Key::Delete, Key::Home, Key::Arrow(Arrow::Up)] {
+            let ctrl = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty().ctrl());
+            assert_eq!(
+                KeyEncoder::encode(ctrl),
+                Err(KeyDropReason::UnsupportedControl)
+            );
+            let alt_ctrl = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty().alt().ctrl());
+            assert_eq!(
+                KeyEncoder::encode(alt_ctrl),
+                Err(KeyDropReason::UnsupportedControl)
+            );
+        }
+        let control_character = KeyInput::new(
+            Key::Character('\x03'),
+            KeyPhase::Pressed,
+            Modifiers::empty().alt(),
+        );
+        assert_eq!(
+            KeyEncoder::encode(control_character),
+            Err(KeyDropReason::UnsupportedKey)
+        );
+        let ctrl_digit = KeyInput::new(
+            Key::Character('1'),
+            KeyPhase::Pressed,
+            Modifiers::empty().alt().ctrl(),
+        );
+        assert_eq!(
+            KeyEncoder::encode(ctrl_digit),
+            Err(KeyDropReason::UnsupportedControl)
+        );
+    }
+
+    #[test]
+    fn alt_and_ctrl_combination_releases_emit_nothing() {
+        let releases = [
+            KeyInput::new(
+                Key::Character('f'),
+                KeyPhase::Released,
+                Modifiers::empty().alt(),
+            ),
+            KeyInput::new(Key::Enter, KeyPhase::Released, Modifiers::empty().ctrl()),
+            KeyInput::new(
+                Key::Character('c'),
+                KeyPhase::Released,
+                Modifiers::empty().alt().ctrl(),
+            ),
+            KeyInput::new(
+                Key::Backspace,
+                KeyPhase::Released,
+                Modifiers::empty().ctrl(),
+            ),
+        ];
+        for released in releases {
+            assert_eq!(KeyEncoder::encode(released), Err(KeyDropReason::Released));
         }
     }
 }
