@@ -1,21 +1,26 @@
 # Coordination status
 
-Last updated: 2026-08-05 (Asia/Tokyo). `main` is at
-`22c985e`, the merge commit for PR
-[#29](https://github.com/ta-061/noren/pull/29), which landed the whole parallel
-Terminal Core stack. Historical sections below preserve the earlier PR #17/#19
+Last updated: 2026-08-05 (Asia/Tokyo). `main` is at `c415f54` and passes **177
+workspace tests**. Historical sections below preserve the earlier PR #17/#19
 records at their own heads, corrected only where an active claim went stale.
 
 ## Current phase
 
-Terminal foundation. The parallel Terminal Core stack is merged: scrolling
-regions, alternate screen and mode state, erase/edit operations, SGR and cell
-attributes, and application cursor/keypad modes are all on `main`, wired into
-the key encoder. See
+Terminal foundation. On `main`: scrolling regions, alternate screen and mode
+state, erase/edit operations, SGR and cell attributes, application cursor/keypad
+modes, escape-intermediate and string-sequence handling, DECSTBM clamping,
+bounded scrollback, and key encoding through stage 3 (Delete, navigation,
+function keys, Alt-as-ESC, Ctrl+named). See
 [terminal core foundation](../architecture/terminal-core-foundation.md).
 
-This is **not** a VT100/xterm or vim/tmux/zellij compatibility claim. Known
-non-conformance is recorded in [reviews](reviews/) and summarized under
+Quality gates: 177 workspace tests, a VT compatibility harness, an adversarial
+hostile-input suite, plus `cargo deny` and MSRV verification in CI.
+
+This is **not** a VT100/xterm or vim/tmux/zellij compatibility claim. The largest
+outstanding gaps are Unicode/CJK character width and mouse support; the ranked,
+evidence-based list is the [Zellij gap
+analysis](../compatibility/zellij-gap-analysis.md). Known non-conformance is
+recorded in [reviews](reviews/) and under
 [accepted follow-ups](#accepted-follow-ups) below.
 
 Development now runs as an agent fleet; see [fleet](fleet.md) for lane
@@ -36,14 +41,45 @@ Verified on 2026-08-05 with `gh pr list` and `gh issue list`:
   [#24](https://github.com/ta-061/noren/issues/24), and
   [#26](https://github.com/ta-061/noren/issues/26) are closed as delivered on
   `main`.
-- The open PRs are [#32](https://github.com/ta-061/noren/pull/32) (bounded VT
-  compatibility harness, Issue
-  [#27](https://github.com/ta-061/noren/issues/27)) and
-  [#33](https://github.com/ta-061/noren/pull/33) (parallel-delivery
-  documentation, Issue [#28](https://github.com/ta-061/noren/issues/28)). Both
-  predate the stack landing and **must be rebased onto `main` before merge**:
-  their current diffs would delete the erase-ops, SGR, and application-mode
-  test files that are now on `main`.
+- PR [#32](https://github.com/ta-061/noren/pull/32) (VT compatibility harness,
+  Issue [#27](https://github.com/ta-061/noren/issues/27)) is merged as
+  `aa41530` after being rebased. PR
+  [#33](https://github.com/ta-061/noren/pull/33) was **closed rather than
+  merged**: its text described every stack PR as an unmerged Draft that is "not
+  yet supported", which became false when the stack landed. Its durable content
+  was carried into PR [#34](https://github.com/ta-061/noren/pull/34) instead.
+  Both branches predated the stack landing, and their unrebased diffs would have
+  deleted the erase-ops, SGR, and application-mode test files.
+- Subsequent merges on `main`. The audit workflow did not exist until PR
+  #44 introduced it, so only #45 onward could have run `cargo deny` and MSRV;
+  earlier entries passed the two checks that existed at the time:
+  [#34](https://github.com/ta-061/noren/pull/34) fleet contract and status
+  correction; [#38](https://github.com/ta-061/noren/pull/38) renderer/PTY grid
+  agreement (Issue #35); [#39](https://github.com/ta-061/noren/pull/39)
+  adversarial hostile-input suite;
+  [#40](https://github.com/ta-061/noren/pull/40) and
+  [#48](https://github.com/ta-061/noren/pull/48) key encoding stages 1-3 of
+  Issue [#36](https://github.com/ta-061/noren/issues/36);
+  [#42](https://github.com/ta-061/noren/pull/42) fleet scaling and the Kimi
+  sweep; [#43](https://github.com/ta-061/noren/pull/43) string sequences and
+  private CSI markers (Issue #41);
+  [#44](https://github.com/ta-061/noren/pull/44) dependency audit, license
+  policy, and MSRV verification; [#45](https://github.com/ta-061/noren/pull/45)
+  DECSTBM clamping and C0 inside CSI (Issue #37);
+  [#47](https://github.com/ta-061/noren/pull/47) Zellij gap analysis;
+  [#49](https://github.com/ta-061/noren/pull/49) lane stall diagnosis;
+  [#50](https://github.com/ta-061/noren/pull/50) bounded scrollback.
+- Issues #22, #24, #26, #27, #28, #35, #37, and #41 are closed as delivered.
+  Issue [#36](https://github.com/ta-061/noren/issues/36) stays open for stage 4
+  (Shift/modifier parameters). Issue
+  [#46](https://github.com/ta-061/noren/issues/46) is open: legacy X10 `CSI M`
+  deletes a line and prints its coordinate bytes, found by the Zellij gap
+  analysis after #41 had fixed only the `<`/`=` markers.
+- CI runs four checks per PR: the Rust build/lint/test job, the documentation
+  validator, `cargo deny check`, and MSRV verification. These became *required*
+  when branch protection was enabled on 2026-08-05 (see [resolved
+  decisions](#human-decisions--resolved-2026-08-05)); before that they ran
+  automatically but did not block a merge.
 - PR [#19](https://github.com/ta-061/noren/pull/19) and Issue
   [#18](https://github.com/ta-061/noren/issues/18) are complete after owner
   acceptance of the renderer-independent Terminal Core foundation.
@@ -82,19 +118,39 @@ Recorded as decision D-0011 in [decisions](decisions.md).
 
 ## Accepted follow-ups
 
-Reviewed, reproduced where noted, and accepted as **not** blocking the stack.
-None is closed; each needs its own Issue and evidence.
+Every finding from the stack reviews, with its current disposition. Findings are
+tracked to closure rather than left implicit.
 
-| Finding | Severity | Source |
-| --- | --- | --- |
-| Renderer clamps the drawn grid to 160x60 while the PTY/terminal grid is capped only at `u16::MAX`, so on a Retina display the PTY is told a geometry that is never drawn (confirmed by code reading) | MAJOR | [Qwen](reviews/terminal-stack-qwen.md) |
-| Delete/Home/End/PageUp/PageDown/Insert/F1-F12, Alt+char, Ctrl+named keys, and Shift combinations are silently dropped instead of sending xterm bytes | MAJOR | [Qwen](reviews/terminal-stack-qwen.md) |
-| DECSTBM rejects an out-of-range bottom margin instead of clamping it as xterm does | MINOR | [GLM](reviews/terminal-stack-glm.md) |
-| C0 controls embedded inside a CSI are swallowed rather than executed | MINOR | [GLM](reviews/terminal-stack-glm.md) |
+| Finding | Severity | Source | State |
+| --- | --- | --- | --- |
+| Renderer clamped the drawn grid to 160x60 while the PTY/terminal grid was capped only at `u16::MAX` | MAJOR | [Qwen](reviews/terminal-stack-qwen.md) | Fixed, PR #38 (Issue #35) |
+| Delete/navigation/function keys, Alt+char, and Ctrl+named keys were silently dropped | MAJOR | [Qwen](reviews/terminal-stack-qwen.md) | Fixed, PRs #40 and #48 |
+| Shift and general modifier parameters are still not encoded, so Shift+Arrow is indistinguishable from a bare arrow | MAJOR | [Qwen](reviews/terminal-stack-qwen.md) | **Open** — Issue #36 stage 4 |
+| DECSTBM rejected an out-of-range bottom margin instead of clamping | MINOR | [GLM](reviews/terminal-stack-glm.md) | Fixed, PR #45 (Issue #37) |
+| C0 controls embedded inside a CSI were swallowed rather than executed | MINOR | [GLM](reviews/terminal-stack-glm.md) | Fixed, PR #45 (Issue #37) |
+| DCS/SOS/PM/APC payloads rendered as screen text, allowing a program to spoof screen content | MAJOR | [Kimi](reviews/terminal-stack-kimi.md) | Fixed, PR #43 (Issue #41) |
+| CSI private markers `<` and `=` executed as destructive plain CSI | MAJOR | [Kimi](reviews/terminal-stack-kimi.md) | Fixed, PR #43 (Issue #41) |
+| Legacy X10 `CSI M` "misparse" on the output channel | — | [Zellij gap analysis](../compatibility/zellij-gap-analysis.md) | **Not a bug** — Issue #46 and PR #52 closed; see below |
+| Unicode/CJK character width is not modeled, so wide characters misalign the grid | MAJOR | [Zellij gap analysis](../compatibility/zellij-gap-analysis.md) | **Open** — no Issue yet |
+| No mouse support: modes untracked and no pointer events reach the PTY | MAJOR | [Zellij gap analysis](../compatibility/zellij-gap-analysis.md) | **Open** — no Issue yet |
 
-Unicode/CJK width, IME, non-ASCII glyph quality, and the adversarial
-hostile-input sweep remain outstanding: the Kimi robustness lane was rate-limited
-before it produced evidence, so no hostile-input claim is made.
+The X10 `CSI M` item was withdrawn after review. `TerminalState::feed_bytes`
+parses PTY **output**, where parameterless `CSI M` is the valid Delete Line
+command; an X10 mouse report shares the prefix but travels the other way
+(terminal to PTY **input**), and no mouse input path exists at all. The
+coordinator's original reproduction was a misreading: the deleted line was DL
+working correctly, and the following bytes printed as text because on that
+channel they *are* text. PR #52 would have made a legitimate DL discard itself
+plus three output bytes; it was closed before merge. Mouse-mode tracking remains
+useful for a future mouse *input* encoder and will be re-proposed on that basis.
+
+An adversarial hostile-input sweep now exists (PR #39, 23 tests) and was
+mutation-tested to confirm it detects breakage rather than passing vacuously. An
+independent second sweep from the Kimi lane (PR #43's provenance) found two real
+parser defects the first sweep had reported clean, which is why both are kept.
+
+IME, non-ASCII glyph quality, and truecolor rendering remain outstanding, and no
+compatibility claim is made for any of them.
 
 ## Merged PR #19 Terminal Core handoff
 
@@ -176,35 +232,66 @@ then passed both GitHub checks: runs `30783618745` (Rust) and `30783618743`
 - No async runtime, SSH, agent-state UI, tabs, panes, themes, persistence, or
   remote daemon was added.
 
-## Current Draft gate
+## Outstanding gate
 
-Open PRs #32 and #33 remain Draft. Neither may merge until it is rebased onto
-`main` and its diff is confirmed to delete no landed test file; both branched
-before the erase-ops, SGR, and application-mode tests existed.
+Every branch must be rebased onto `main` before merge, with its diff confirmed to
+delete no landed test file. This is not a formality: two branches cut before a
+sibling's tests existed proposed deleting roughly 1,800 lines of passing tests,
+and `mergeable=MERGEABLE`/`CLEAN`/green CI does **not** catch it — a clean delete
+is still a clean merge. The check is `git diff --stat origin/main...HEAD`.
 
-The owner has not yet repeated a manual macOS startup/output/resize/exit smoke
-check against the merged stack. The stack's automated evidence is green, but no
-rendered-frame or real-window-injection oracle exists, so the smoke check remains
-the outstanding manual gate.
+The macOS smoke check is **done**. Run on 2026-08-05 against `main` at `c415f54`
+on macOS Apple Silicon, from a release build (`cargo build --release -p
+noren-app`, finished clean):
+
+| Step | Observed evidence |
+| --- | --- |
+| Open a window | Process alive after launch with 7 threads (supervisor and reader present) |
+| Start local zsh PTY | Owned child `zsh` present as a direct child of the app |
+| Window -> grid -> PTY geometry | The child's tty reported `30 90` via `stty size`, exactly the 900x600 window divided by the 10x20 cell, so the whole chain agrees |
+| Exit and clean up | On termination the app exited, the `zsh` child was reaped, and the pty device itself was gone — no orphan process and no leaked descriptor |
+
+What this does **not** establish: there is still no rendered-frame oracle and no
+real key-injection into the window, so glyph correctness and live input remain
+unverified by automation. The byte-level input contract is covered by tests
+instead. Treat the smoke check as evidence the process/PTY/geometry chain works,
+not as evidence the renderer draws correctly.
 
 Full VT/xterm behavior, non-ASCII glyph quality, swash/font trials, production
 IME/accessibility, Linux, SSH, agent integration, tabs, panes, themes, and a
 remote daemon remain deferred behind their existing risk gates.
 
-## Human decisions still required
+## Human decisions — resolved 2026-08-05
 
-No repository access control was changed. The owner still must separately
-decide branch protection/required CI/merge policy, macOS signing/notarization
-identity, and the public support/security contact before Preview publication.
+The owner decided all four outstanding items:
+
+- **Branch protection: enabled** on `main`, requiring all four checks (Rust
+  build/lint/test, documentation validator, `cargo deny check`, MSRV
+  verification), with force-pushes and branch deletion blocked and
+  `strict` (up-to-date-before-merge) on. `enforce_admins` is deliberately left
+  off so the owner retains an emergency path. Conversation resolution is required.
+- **Branch cleanup: approved.** 27 fully-merged remote branches were deleted
+  after verifying `git rev-list --count origin/main..<branch>` was 0 for each.
+  Three were kept because they carry unmerged commits.
+- **Signing and notarization: deferred** until immediately before Preview
+  binaries are distributed to anyone else. No signing identity is configured, and
+  none is claimed.
+- **Security contact: GitHub private vulnerability reporting** is the official
+  channel. Verified enabled on the repository, so the policy in
+  [`SECURITY.md`](../../SECURITY.md) is backed by a working intake rather than
+  being aspirational.
 
 ## Next steps
 
-1. Rebase PR #32 onto `main` so its only contribution is the VT compatibility
-   harness, and confirm the diff deletes no landed test file.
-2. Rebase PR #33 onto `main` and reconcile its documentation with this file.
-3. Repeat the bounded macOS startup/output/resize/exit smoke check against the
-   merged stack without changing OS security settings.
-4. Open an Issue per accepted follow-up above; land the renderer/PTY geometry
-   agreement and the missing key encodings as separate scoped PRs.
-5. Re-run the adversarial hostile-input sweep once the Kimi lane's quota resets,
-   since that evidence is still missing.
+1. Fix Issue [#46](https://github.com/ta-061/noren/issues/46): legacy X10
+   `CSI M` corrupts the screen, and Zellij enables mouse mode by default, so
+   moving the mouse is enough to trigger it.
+2. Land Issue [#36](https://github.com/ta-061/noren/issues/36) stage 4
+   (Shift/modifier parameters), the last input-encoding gap.
+3. Open Issues for Unicode/CJK character width and mouse support, the two
+   remaining blocking gaps in the [Zellij gap
+   analysis](../compatibility/zellij-gap-analysis.md). Width work touches the
+   cell model, so it needs its own design review before implementation.
+4. Build a rendered-frame oracle so glyph correctness stops depending on a human
+   looking at the window. The smoke check covers the process/PTY/geometry chain
+   but cannot see what is drawn.
