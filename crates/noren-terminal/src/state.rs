@@ -575,6 +575,7 @@ impl TerminalState {
                 self.active.cursor.column = self.active.cursor.column.saturating_sub(1);
                 self.active.wrap_pending = false;
             }
+            Action::Tab => self.tab(),
             Action::Index => self.index(),
             Action::NextLine => self.next_line(),
             Action::ReverseIndex => self.reverse_index(),
@@ -633,6 +634,14 @@ impl TerminalState {
     fn line_feed(&mut self) {
         self.active.wrap_pending = false;
         self.index();
+    }
+
+    fn tab(&mut self) {
+        self.active.wrap_pending = false;
+        let last_column = self.active.screen.cols - 1;
+        let next_stop = (usize::from(self.active.cursor.column) / 8 + 1) * 8;
+        self.active.cursor.column =
+            last_column.min(u16::try_from(next_stop).unwrap_or(last_column));
     }
 
     fn index(&mut self) {
