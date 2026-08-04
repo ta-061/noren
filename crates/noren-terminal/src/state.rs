@@ -37,8 +37,11 @@ pub const MAX_SCROLLBACK_LINES: usize = 10_000;
 /// One basic terminal cell.
 ///
 /// Text remains an owned string so later grapheme work does not require a
-/// renderer-facing shape change. Terminal Core v1 writes one ASCII character
-/// with width one into each cell.
+/// renderer-facing shape change. Printing honors display width: a two-column
+/// character occupies a lead cell (`width == 2`, holding the character) and a
+/// zero-width continuation cell that renders as nothing and is never an
+/// independent character; zero-width combining characters are appended to the
+/// preceding cell's text without changing its width.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cell {
     text: String,
@@ -87,12 +90,33 @@ impl Cell {
         self.text == " "
     }
 
-    fn from_ascii(byte: u8, attributes: CellAttributes) -> Self {
+    /// Whether this is the second column placeholder of a wide character.
+    ///
+    /// A continuation cell renders as nothing and must always be preceded in
+    /// its row by its width-two lead cell.
+    #[must_use]
+    pub fn is_continuation(&self) -> bool {
+        self.text.is_empty() && self.width == 0
+    }
+
+    fn from_char(ch: char, width: u8, attributes: CellAttributes) -> Self {
         Self {
-            text: char::from(byte).to_string(),
-            width: 1,
+            text: ch.to_string(),
+            width,
             attributes,
         }
+    }
+
+    fn continuation(attributes: CellAttributes) -> Self {
+        Self {
+            text: String::new(),
+            width: 0,
+            attributes,
+        }
+    }
+
+    fn push_text(&mut self, ch: char) {
+        self.text.push(ch);
     }
 }
 
@@ -261,6 +285,66 @@ impl ScreenBuffer {
         }
     }
 
+    fn is_continuation(&self, row: u16, column: u16) -> bool {
+        self.cell(row, column).is_some_and(Cell::is_continuation)
+    }
+
+    fn push_text(&mut self, row: u16, column: u16, ch: char) {
+        if let Some(index) = self.index(row, column) {
+            self.cells[index].push_text(ch);
+        }
+    }
+
+    /// Enforce the wide-character invariant on one row: every continuation
+    /// cell directly follows its width-two lead, and every lead is directly
+    /// followed by its continuation. A half that lost its partner is blanked,
+    /// i.e. clearing either half of a wide character clears both.
+    fn repair_row(&mut self, row: u16) {
+        let Some(start) = self.index(row, 0) else {
+            return;
+        };
+        let end = start + usize::from(self.cols);
+        let mut index = start;
+        while index < end {
+            if self.cells[index].is_continuation() {
+                self.cells[index] = Cell::blank();
+                index += 1;
+            } else if self.cells[index].width() == 2 {
+                let paired = index + 1 < end && self.cells[index + 1].is_continuation();
+                if paired {
+                    index += 2;
+                } else {
+                    self.cells[index] = Cell::blank();
+                    index += 1;
+                }
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    /// Whether every wide-character pair in the buffer is intact.
+    pub(crate) fn wide_cells_intact(&self) -> bool {
+        (0..self.rows).all(|row| {
+            let start = usize::from(row) * usize::from(self.cols);
+            let end = start + usize::from(self.cols);
+            let mut index = start;
+            while index < end {
+                if self.cells[index].width() == 2 {
+                    if index + 1 >= end || !self.cells[index + 1].is_continuation() {
+                        return false;
+                    }
+                    index += 2;
+                } else if self.cells[index].is_continuation() {
+                    return false;
+                } else {
+                    index += 1;
+                }
+            }
+            true
+        })
+    }
+
     fn resize(&mut self, rows: u16, cols: u16) -> Result<(), TerminalError> {
         let count = checked_cell_count(rows, cols)?;
         let mut next = vec![Cell::blank(); count];
@@ -276,6 +360,12 @@ impl ScreenBuffer {
         self.rows = rows;
         self.cols = cols;
         self.cells = next;
+        // Shrinking a row can truncate the continuation half of a wide
+        // character; blank the orphaned lead rather than leaving a pair
+        // split across the right edge.
+        for row in 0..retained_rows {
+            self.repair_row(row);
+        }
         Ok(())
     }
 
@@ -318,10 +408,19 @@ impl ScreenBuffer {
         let Some(cursor_index) = self.index(cursor.row, cursor.column) else {
             return;
         };
+        let repaired_rows = match mode {
+            EraseMode::ToEnd => cursor.row..self.rows,
+            EraseMode::ToBeginning => 0..cursor.row + 1,
+            EraseMode::All => 0..self.rows,
+        };
         match mode {
             EraseMode::ToEnd => self.cells[cursor_index..].fill(Cell::default()),
             EraseMode::ToBeginning => self.cells[..cursor_index + 1].fill(Cell::default()),
             EraseMode::All => self.cells.fill(Cell::default()),
+        }
+        // An erase boundary may cut a wide character; blank the orphaned half.
+        for row in repaired_rows {
+            self.repair_row(row);
         }
     }
 
@@ -338,6 +437,7 @@ impl ScreenBuffer {
             }
             EraseMode::All => self.cells[row_start..row_end].fill(Cell::default()),
         }
+        self.repair_row(cursor.row);
     }
 
     fn erase_characters(&mut self, cursor: Cursor, count: u16) {
@@ -347,6 +447,7 @@ impl ScreenBuffer {
         let row_end = (usize::from(cursor.row) + 1) * usize::from(self.cols);
         let count = usize::from(count).min(row_end - start);
         self.cells[start..start + count].fill(Cell::default());
+        self.repair_row(cursor.row);
     }
 
     fn insert_characters(&mut self, cursor: Cursor, count: u16) {
@@ -357,6 +458,7 @@ impl ScreenBuffer {
         let count = usize::from(count).min(row_end - start);
         self.cells[start..row_end].rotate_right(count);
         self.cells[start..start + count].fill(Cell::default());
+        self.repair_row(cursor.row);
     }
 
     fn delete_characters(&mut self, cursor: Cursor, count: u16) {
@@ -367,6 +469,7 @@ impl ScreenBuffer {
         let count = usize::from(count).min(row_end - start);
         self.cells[start..row_end].rotate_left(count);
         self.cells[row_end - count..row_end].fill(Cell::default());
+        self.repair_row(cursor.row);
     }
 
     fn index(&self, row: u16, column: u16) -> Option<usize> {
@@ -434,10 +537,10 @@ impl ScreenState {
 
     fn resize(&mut self, rows: u16, cols: u16) -> Result<(), TerminalError> {
         self.screen.resize(rows, cols)?;
-        self.cursor = clamp_cursor(self.cursor, rows, cols);
+        self.cursor = snap_to_lead(&self.screen, clamp_cursor(self.cursor, rows, cols));
         self.saved_cursor = self
             .saved_cursor
-            .map(|cursor| clamp_cursor(cursor, rows, cols));
+            .map(|cursor| snap_to_lead(&self.screen, clamp_cursor(cursor, rows, cols)));
         self.scroll_region = ScrollRegion::full_screen(rows);
         self.wrap_pending = false;
         Ok(())
@@ -449,10 +552,29 @@ impl ScreenState {
 
     fn restore_cursor(&mut self) {
         if let Some(cursor) = self.saved_cursor {
-            self.cursor = clamp_cursor(cursor, self.screen.rows, self.screen.cols);
+            let cursor = clamp_cursor(cursor, self.screen.rows, self.screen.cols);
+            self.cursor = snap_to_lead(&self.screen, cursor);
         }
         self.wrap_pending = false;
     }
+}
+
+/// Move a cursor off continuation cells onto the lead of its wide character.
+fn snap_to_lead(screen: &ScreenBuffer, mut cursor: Cursor) -> Cursor {
+    while cursor.column > 0 && screen.is_continuation(cursor.row, cursor.column) {
+        cursor.column -= 1;
+    }
+    cursor
+}
+
+/// Move a cursor forward past any continuation cell, resolving to the cell
+/// after the wide character when there is room and otherwise to its lead.
+fn snap_past_continuation(screen: &ScreenBuffer, mut cursor: Cursor) -> Cursor {
+    let last_column = screen.cols.saturating_sub(1);
+    while cursor.column < last_column && screen.is_continuation(cursor.row, cursor.column) {
+        cursor.column += 1;
+    }
+    snap_to_lead(screen, cursor)
 }
 
 /// Noren-owned mutable terminal state.
@@ -484,8 +606,9 @@ impl TerminalState {
 
     /// Apply PTY bytes in order.
     ///
-    /// Non-ASCII bytes and unsupported control sequences are ignored in this
-    /// foundation. They are never interpreted as authority or rendered as raw
+    /// Bytes are decoded as UTF-8; printable characters are placed by display
+    /// width, and invalid or unsupported bytes and sequences are ignored.
+    /// They are never interpreted as authority or rendered as raw
     /// escape-sequence payload.
     pub fn feed_bytes(&mut self, bytes: &[u8]) {
         for byte in bytes {
@@ -576,10 +699,15 @@ impl TerminalState {
     }
 
     /// Apply a clamped renderer-independent cursor operation.
+    ///
+    /// The result never rests on a continuation cell: relative forward motion
+    /// resolves past the wide character, and all other motion resolves onto
+    /// its lead cell.
     pub fn move_cursor(&mut self, movement: CursorMove) {
         self.active.wrap_pending = false;
         let last_row = self.active.screen.rows - 1;
         let last_column = self.active.screen.cols - 1;
+        let snap_forward = matches!(movement, CursorMove::Right(_));
         match movement {
             CursorMove::Up(count) => {
                 self.active.cursor.row = self.active.cursor.row.saturating_sub(count);
@@ -617,6 +745,11 @@ impl TerminalState {
                 self.active.cursor.row = row.min(last_row);
             }
         }
+        self.active.cursor = if snap_forward {
+            snap_past_continuation(&self.active.screen, self.active.cursor)
+        } else {
+            snap_to_lead(&self.active.screen, self.active.cursor)
+        };
     }
 
     /// Clone a bounded immutable renderer/test view.
@@ -627,14 +760,16 @@ impl TerminalState {
 
     fn apply(&mut self, action: Action) {
         match action {
-            Action::Print(byte) => self.print_ascii(byte),
+            Action::Print(ch) => self.print_char(ch),
             Action::LineFeed => self.line_feed(),
             Action::CarriageReturn => {
                 self.active.cursor.column = 0;
                 self.active.wrap_pending = false;
             }
             Action::Backspace => {
-                self.active.cursor.column = self.active.cursor.column.saturating_sub(1);
+                let mut cursor = self.active.cursor;
+                cursor.column = cursor.column.saturating_sub(1);
+                self.active.cursor = snap_to_lead(&self.active.screen, cursor);
                 self.active.wrap_pending = false;
             }
             Action::Tab => self.tab(),
@@ -674,23 +809,79 @@ impl TerminalState {
             }
             Action::SetPrivateMode { mode, enabled } => self.set_private_mode(mode, enabled),
         }
+        debug_assert!(self.active.screen.wide_cells_intact());
+        if let Some(primary) = &self.primary_screen {
+            debug_assert!(primary.screen.wide_cells_intact());
+        }
     }
 
-    fn print_ascii(&mut self, byte: u8) {
+    /// Print one decoded character honoring its display width.
+    ///
+    /// A two-column character occupies a lead cell plus a zero-width
+    /// continuation cell; it wraps to the next line when the remaining
+    /// columns cannot fit both. Zero-width combining characters attach to the
+    /// preceding cell and never move the cursor. The cursor never lands on a
+    /// continuation cell: after writing a wide character flush against the
+    /// right edge it waits on the lead cell with autowrap pending, and a
+    /// character wider than the whole grid is dropped.
+    fn print_char(&mut self, ch: char) {
+        let width = match crate::cell_width(ch) {
+            0 => {
+                self.attach_zero_width(ch);
+                return;
+            }
+            width => u16::try_from(width).unwrap_or(1),
+        };
+        if width > self.active.screen.cols {
+            return;
+        }
         if self.active.wrap_pending {
             self.active.cursor.column = 0;
             self.index();
         }
-        self.active.screen.put(
-            self.active.cursor.row,
-            self.active.cursor.column,
-            Cell::from_ascii(byte, self.pen),
-        );
-        if self.active.cursor.column == self.active.screen.cols - 1 {
+        if self.active.cursor.column > self.active.screen.cols - width {
+            self.active.cursor.column = 0;
+            self.index();
+        }
+        let row = self.active.cursor.row;
+        let column = self.active.cursor.column;
+        self.active
+            .screen
+            .put(row, column, Cell::from_char(ch, width as u8, self.pen));
+        if width == 2 {
+            self.active
+                .screen
+                .put(row, column + 1, Cell::continuation(self.pen));
+        }
+        // Overwritten halves of pre-existing wide characters must not dangle.
+        self.active.screen.repair_row(row);
+        if column + width >= self.active.screen.cols {
             self.active.wrap_pending = true;
         } else {
-            self.active.cursor.column += 1;
+            self.active.cursor.column = column + width;
         }
+    }
+
+    /// Append a zero-width (combining) character to the preceding cell.
+    ///
+    /// Combining characters are attached rather than dropped: they extend the
+    /// preceding cell's text without changing its width, never advance the
+    /// cursor, and do not clear pending autowrap. With no preceding cell the
+    /// character is dropped.
+    fn attach_zero_width(&mut self, ch: char) {
+        let cursor = self.active.cursor;
+        let column = if self.active.wrap_pending {
+            Some(cursor.column)
+        } else {
+            cursor.column.checked_sub(1)
+        };
+        let Some(mut column) = column else {
+            return;
+        };
+        if self.active.screen.is_continuation(cursor.row, column) {
+            column = column.saturating_sub(1);
+        }
+        self.active.screen.push_text(cursor.row, column, ch);
     }
 
     fn line_feed(&mut self) {
@@ -704,6 +895,7 @@ impl TerminalState {
         let next_stop = (usize::from(self.active.cursor.column) / 8 + 1) * 8;
         self.active.cursor.column =
             last_column.min(u16::try_from(next_stop).unwrap_or(last_column));
+        self.active.cursor = snap_past_continuation(&self.active.screen, self.active.cursor);
     }
 
     fn index(&mut self) {
@@ -1128,6 +1320,207 @@ mod tests {
         state.feed_bytes(b"\rZ");
         assert_eq!(state.snapshot().lines(), ["Zbc"]);
         assert_eq!(state.cursor(), Cursor { row: 0, column: 1 });
+        assert!(!state.is_wrap_pending());
+    }
+
+    fn row_widths(state: &TerminalState, row: u16) -> Vec<u8> {
+        (0..state.screen().cols())
+            .map(|column| state.screen().cell(row, column).map_or(0, Cell::width))
+            .collect()
+    }
+
+    #[test]
+    fn ascii_lines_are_unchanged_by_the_width_model() {
+        let mut state = TerminalState::new(2, 8).expect("valid terminal");
+        state.feed_bytes(b"hello");
+
+        assert_eq!(state.snapshot().lines(), ["hello"]);
+        assert_eq!(row_widths(&state, 0), vec![1, 1, 1, 1, 1, 1, 1, 1]);
+        assert_eq!(state.cursor(), Cursor { row: 0, column: 5 });
+        assert!(!state.is_wrap_pending());
+    }
+
+    #[test]
+    fn cjk_characters_occupy_two_cells_each() {
+        let mut state = TerminalState::new(2, 8).expect("valid terminal");
+        state.feed_bytes("日本語".as_bytes());
+
+        let screen = state.screen();
+        assert_eq!(
+            screen.cell(0, 0).map(|c| (c.text(), c.width())),
+            Some(("日", 2))
+        );
+        assert!(screen.cell(0, 1).is_some_and(Cell::is_continuation));
+        assert_eq!(
+            screen.cell(0, 2).map(|c| (c.text(), c.width())),
+            Some(("本", 2))
+        );
+        assert!(screen.cell(0, 3).is_some_and(Cell::is_continuation));
+        assert_eq!(
+            screen.cell(0, 4).map(|c| (c.text(), c.width())),
+            Some(("語", 2))
+        );
+        assert!(screen.cell(0, 5).is_some_and(Cell::is_continuation));
+        assert_eq!(state.snapshot().lines(), ["日本語"]);
+        assert_eq!(state.cursor(), Cursor { row: 0, column: 6 });
+    }
+
+    #[test]
+    fn wide_character_at_the_last_column_wraps_instead_of_splitting() {
+        let mut state = TerminalState::new(3, 4).expect("valid terminal");
+        state.feed_bytes("abc日".as_bytes());
+
+        assert_eq!(state.snapshot().lines(), ["abc", "日"]);
+        // The lead never lands in the final column without its continuation.
+        assert_eq!(state.screen().cell(0, 3).map(Cell::text), Some(" "));
+        assert_eq!(
+            state.screen().cell(1, 0).map(|c| (c.text(), c.width())),
+            Some(("日", 2))
+        );
+        assert!(state.screen().cell(1, 1).is_some_and(Cell::is_continuation));
+        assert_eq!(state.cursor(), Cursor { row: 1, column: 2 });
+    }
+
+    #[test]
+    fn wide_character_fitting_at_the_right_edge_keeps_cursor_on_its_lead() {
+        let mut state = TerminalState::new(2, 5).expect("valid terminal");
+        state.feed_bytes("abc日".as_bytes());
+
+        assert_eq!(state.snapshot().lines(), ["abc日"]);
+        assert!(state.is_wrap_pending());
+        // Pending wrap parks the cursor on the lead, never the continuation.
+        assert_eq!(state.cursor(), Cursor { row: 0, column: 3 });
+        assert!(!state.screen().cell(0, 3).is_some_and(Cell::is_continuation));
+    }
+
+    #[test]
+    fn overwriting_or_erasing_half_of_a_wide_character_leaves_no_continuation() {
+        // Overwrite the lead of a wide character with a narrow one.
+        let mut state = TerminalState::new(2, 6).expect("valid terminal");
+        state.feed_bytes("日a".as_bytes());
+        state.feed_bytes(b"\x1b[1;1HX");
+        assert_eq!(state.screen().cell(0, 0).map(Cell::text), Some("X"));
+        assert_eq!(state.screen().cell(0, 1).map(Cell::text), Some(" "));
+        assert!(!state.screen().cell(0, 1).is_some_and(Cell::is_continuation));
+        assert_eq!(state.snapshot().lines(), ["X a"]);
+
+        // ECH over only the lead clears the orphaned continuation too.
+        let mut state = TerminalState::new(2, 6).expect("valid terminal");
+        state.feed_bytes("a日b".as_bytes());
+        state.feed_bytes(b"\x1b[1;2H\x1b[X");
+        assert_eq!(state.snapshot().lines(), ["a  b"]);
+
+        // EL to the beginning up to the lead clears the continuation after it.
+        let mut state = TerminalState::new(2, 6).expect("valid terminal");
+        state.feed_bytes("a日b".as_bytes());
+        state.feed_bytes(b"\x1b[1;2H\x1b[1K");
+        assert_eq!(state.snapshot().lines(), ["   b"]);
+
+        // DCH deleting the lead shifts the row and clears the continuation.
+        let mut state = TerminalState::new(2, 6).expect("valid terminal");
+        state.feed_bytes("a日b".as_bytes());
+        state.feed_bytes(b"\x1b[1;2H\x1b[P");
+        assert_eq!(state.snapshot().lines(), ["a b"]);
+        assert!(state.screen().wide_cells_intact());
+    }
+
+    #[test]
+    fn combining_mark_attaches_to_the_preceding_cell_and_does_not_advance() {
+        let mut state = TerminalState::new(2, 8).expect("valid terminal");
+        state.feed_bytes("e\u{0301}".as_bytes());
+
+        assert_eq!(state.screen().cell(0, 0).map(Cell::text), Some("e\u{0301}"));
+        assert_eq!(state.screen().cell(0, 0).map(Cell::width), Some(1));
+        assert_eq!(state.cursor(), Cursor { row: 0, column: 1 });
+        assert_eq!(state.snapshot().lines(), ["e\u{0301}"]);
+    }
+
+    #[test]
+    fn combining_mark_without_a_preceding_cell_is_dropped() {
+        let mut state = TerminalState::new(2, 8).expect("valid terminal");
+        state.feed_bytes("\u{0301}x".as_bytes());
+
+        assert_eq!(state.screen().cell(0, 0).map(Cell::text), Some("x"));
+        assert_eq!(state.cursor(), Cursor { row: 0, column: 1 });
+    }
+
+    #[test]
+    fn cursor_motion_never_rests_on_a_continuation_cell() {
+        let mut state = TerminalState::new(3, 8).expect("valid terminal");
+        state.feed_bytes("日a".as_bytes());
+        assert_eq!(state.cursor(), Cursor { row: 0, column: 3 });
+
+        // Left onto the continuation snaps onto the lead, Right skips the pair.
+        state.move_cursor(CursorMove::Left(2));
+        assert_eq!(state.cursor(), Cursor { row: 0, column: 0 });
+        state.move_cursor(CursorMove::Right(1));
+        assert_eq!(state.cursor(), Cursor { row: 0, column: 2 });
+
+        // Absolute addressing onto the continuation column snaps to the lead.
+        state.move_cursor(CursorMove::To { row: 0, column: 1 });
+        assert_eq!(state.cursor(), Cursor { row: 0, column: 0 });
+
+        // Backspace from just past the pair lands on the lead.
+        state.move_cursor(CursorMove::To { row: 0, column: 2 });
+        state.feed_bytes(b"\x08");
+        assert_eq!(state.cursor(), Cursor { row: 0, column: 0 });
+
+        // Vertical/absolute motion into a row whose target column is a
+        // continuation resolves onto that row's lead.
+        state.feed_bytes(b"\r\n \xe6\x97\xa5");
+        state.move_cursor(CursorMove::To { row: 1, column: 2 });
+        assert_eq!(state.cursor(), Cursor { row: 1, column: 1 });
+        assert!(
+            !state
+                .screen()
+                .cell(state.cursor().row(), state.cursor().column())
+                .is_some_and(Cell::is_continuation)
+        );
+    }
+
+    #[test]
+    fn mixed_ascii_cjk_and_emoji_render_at_the_expected_columns() {
+        let mut state = TerminalState::new(2, 10).expect("valid terminal");
+        state.feed_bytes("a日😀b".as_bytes());
+
+        let texts: Vec<&str> = (0..6)
+            .map(|column| state.screen().cell(0, column).map_or("", Cell::text))
+            .collect();
+        assert_eq!(texts, ["a", "日", "", "\u{1F600}", "", "b"]);
+        assert_eq!(row_widths(&state, 0), vec![1, 2, 0, 2, 0, 1, 1, 1, 1, 1]);
+        assert_eq!(state.snapshot().lines(), ["a日😀b"]);
+        assert_eq!(state.cursor(), Cursor { row: 0, column: 6 });
+    }
+
+    #[test]
+    fn utf8_split_across_feeds_still_decodes_and_invalid_bytes_are_dropped() {
+        let mut state = TerminalState::new(2, 8).expect("valid terminal");
+        state.feed_bytes(&[0xe6]);
+        state.feed_bytes(&[0x97, 0xa5]);
+        assert_eq!(state.screen().cell(0, 0).map(Cell::text), Some("日"));
+
+        state.feed_bytes(&[0xff]);
+        assert_eq!(state.cursor(), Cursor { row: 0, column: 2 });
+    }
+
+    #[test]
+    fn resize_truncating_a_wide_character_blanks_the_orphaned_lead() {
+        let mut state = TerminalState::new(2, 4).expect("valid terminal");
+        state.feed_bytes("日".as_bytes());
+        state.resize(2, 1).expect("valid resize");
+
+        assert_eq!(state.screen().cell(0, 0).map(Cell::text), Some(" "));
+        assert_eq!(state.snapshot().lines(), [] as [String; 0]);
+        assert!(state.screen().wide_cells_intact());
+    }
+
+    #[test]
+    fn a_character_wider_than_the_grid_is_dropped() {
+        let mut state = TerminalState::new(2, 1).expect("valid terminal");
+        state.feed_bytes("日".as_bytes());
+
+        assert_eq!(state.screen().cell(0, 0).map(Cell::text), Some(" "));
+        assert_eq!(state.cursor(), Cursor { row: 0, column: 0 });
         assert!(!state.is_wrap_pending());
     }
 }

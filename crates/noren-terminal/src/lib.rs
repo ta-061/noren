@@ -4,9 +4,10 @@
 //! PTY bytes enter through [`TerminalEngine::feed_bytes`]; renderers receive an
 //! immutable [`TerminalSnapshot`] and never depend on PTY or parser types.
 //!
-//! This foundation supports a bounded ASCII/CSI subset, basic SGR attributes,
-//! scrolling regions, cursor save/restore, and DEC private mode 1049 screen
-//! switching. It is not a VT100/xterm compatibility claim.
+//! This foundation supports a bounded printable-text subset (ASCII plus
+//! decoded UTF-8, placed by display width), a bounded CSI subset, basic SGR
+//! attributes, scrolling regions, cursor save/restore, and DEC private mode
+//! 1049 screen switching. It is not a VT100/xterm compatibility claim.
 
 mod attributes;
 mod parser;
@@ -56,10 +57,14 @@ impl TerminalEngine for TerminalState {
     }
 }
 
-/// Current Unicode column-width seed for future non-ASCII cell handling.
+/// Display column width used when placing a character into cells.
 ///
-/// Terminal Core v1 writes printable ASCII only. This policy remains public so
-/// later grapheme/ambiguous-width work can evolve behind the same boundary.
+/// Printable characters are one or two columns wide; combining and other
+/// zero-width characters are zero. Widths come from
+/// [`UnicodeWidthChar`](unicode_width::UnicodeWidthChar) — no hand-rolled
+/// tables — so ambiguous-width characters follow that crate's defaults. This
+/// policy remains public so later grapheme work can evolve behind the same
+/// boundary.
 #[must_use]
 pub fn cell_width(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(0)

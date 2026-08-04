@@ -113,6 +113,61 @@ renderer-independent API.
   soft-wrap retained rows; until then renderers must tolerate mixed-width
   scrollback rows (each row's `.len()` is its own width).
 
+## Character width model
+
+Printing honors display width, so CJK output, wide emoji, and combining marks
+keep the cell grid aligned instead of drifting it one cell per wide character.
+
+- **Decoding.** The parser's Ground state decodes UTF-8 incrementally and emits
+  one `Action::Print(char)` per complete character; the decoder keeps no other
+  allocation, so split feeds across `feed_bytes` calls are fine. Overlong,
+  surrogate, and out-of-range sequences are rejected as a unit; a byte that
+  interrupts a pending sequence is re-examined as a new lead; and a pending
+  sequence never straddles an escape sequence or control-string payload.
+  Invalid bytes never print.
+- **Width policy.** `cell_width` delegates to `UnicodeWidthChar` from the pinned
+  `unicode-width` crate; no hand-rolled width tables. Characters are zero, one,
+  or two columns wide (ambiguous-width characters follow the crate's non-CJK
+  default of one).
+- **Wide characters.** A two-column character occupies a lead cell
+  (`width == 2`, holding the text) and a continuation cell (`width == 0`, empty
+  text) that renders as nothing and is never treated as an independent
+  character. The grid invariant is: every continuation directly follows its
+  lead, and every lead is directly followed by its continuation.
+- **Wrap rule.** Delayed autowrap is preserved. A wide character that does not
+  fit in the remaining columns wraps whole to the next line instead of being
+  split across the right edge. A wide character written flush against the right
+  edge leaves the cursor on the lead cell with autowrap pending. A character
+  wider than the entire grid is dropped.
+- **No dangling halves.** Erase (ED/EL/ECH), insert/delete characters (ICH/DCH),
+  overwriting, and resize all enforce the invariant: clearing either half of a
+  wide character clears both. `ScreenBuffer::repair_row` blanks any half that
+  lost its partner, runs after every grid edit, and `apply` debug-asserts the
+  invariant on both screens after every action.
+- **Cursor rule.** The cursor never rests on a continuation cell. Forward
+  relative motion moves past the whole wide character; absolute positioning,
+  backward motion, backspace, restore-cursor, and resize clamping snap onto the
+  lead cell.
+- **Zero-width characters.** Combining marks are *attached* to the preceding
+  cell in the row (skipping continuation cells): they extend that cell's text
+  without changing its width, never advance the cursor, and do not clear
+  pending autowrap. With no preceding cell (cursor at column zero with no
+  pending wrap) the mark is dropped. This is a documented simplification: the
+  grid stores per-cell text, not grapheme clusters.
+
+Known limitations of this slice: emoji ZWJ/variation sequences are only as wide
+as their per-character widths; resize blanks a wide pair whose continuation
+would be truncated rather than reflowing it; ambiguous-width and grapheme
+cluster work remain later.
+
+## Deferred
+
+SGR/erase/insert/delete, cell attributes, tabs, origin mode, and
+query/reply sequences remain deferred, along with other DEC private modes
+(such as 1047/1048, 25, and 2004), application cursor/keypad modes, OSC
+titles, scrollback reflow on resize, and saved-cursor state beyond
+position. IME, grapheme clusters, and ambiguous-width policy remain later.
+
 ## Also merged since this document was first written
 
 The sections above describe the foundation slices in the order they landed. These
@@ -133,10 +188,6 @@ capabilities are now on `main` as well and are no longer deferred:
 Origin mode and query/reply sequences remain deferred, along with other DEC
 private modes (1047/1048, 25, 2004), OSC titles, scrollback reflow on resize, and
 saved-cursor state beyond position.
-
-Unicode/CJK character width remains the largest outstanding gap: the parser still
-prints only `0x20..=0x7e`, so wide characters and combining marks are not yet
-modeled even though `Cell` carries a `width` field.
 
 Mouse support is unimplemented, but note the channel direction before treating any
 `CSI M` handling as a parser defect. `feed_bytes` parses PTY **output**, where
