@@ -11,12 +11,16 @@
 
 mod attributes;
 mod parser;
+mod search;
 mod state;
 
 pub use attributes::{AnsiColor, CellAttributes, Color};
+pub use search::{
+    CaseSensitivity, Search, SearchDirection, SearchIter, SearchMatch, SearchPosition,
+};
 pub use state::{
-    Cell, Cursor, CursorMove, MAX_SCREEN_CELLS, MAX_SCROLLBACK_LINES, ScreenBuffer, ScrollRegion,
-    TerminalError, TerminalModes, TerminalSnapshot, TerminalState,
+    Cell, Cursor, CursorMove, MAX_COMBINING_MARKS_PER_CELL, MAX_SCREEN_CELLS, MAX_SCROLLBACK_LINES,
+    ScreenBuffer, ScrollRegion, TerminalError, TerminalModes, TerminalSnapshot, TerminalState,
 };
 
 use unicode_width::UnicodeWidthChar;

@@ -175,10 +175,13 @@ impl GridGeometry {
 
 /// Active modifier keys on an app-owned key event.
 ///
-/// The key encoder consumes `ctrl` for control bytes and `alt` as the xterm
-/// `ESC` prefix, and drops Super/Cmd combinations. IME and dead-key input is
-/// dropped at translation. This baseline cannot distinguish Option-as-Alt
-/// from Option-as-compose on macOS; every Option event is treated as Alt.
+/// The key encoder consumes `ctrl` for control bytes, encodes Shift, Alt,
+/// and Ctrl as the xterm modifier parameter on the navigation keys, and
+/// treats Alt as the `ESC` prefix on plain characters and the named keys
+/// without a parameter form. Super/Cmd combinations drop; IME and dead-key
+/// input is dropped at translation. This baseline cannot distinguish
+/// Option-as-Alt from Option-as-compose on macOS; every Option event is
+/// treated as Alt.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Modifiers {
     shift: bool,
@@ -265,9 +268,10 @@ pub enum Arrow {
 ///
 /// The PoC encodes printable UTF-8, Enter, Backspace, Tab, Escape, arrows,
 /// Delete, Insert, Home, End, PageUp, PageDown, F1-F12, Ctrl control bytes,
-/// Ctrl with the base bytes of Enter/Backspace/Tab/Escape, and Alt as an
-/// `ESC` prefix over any of those encodings. Releases and still-unsupported
-/// combinations emit zero bytes.
+/// Ctrl with the base bytes of Enter/Backspace/Tab/Escape, Alt as an `ESC`
+/// prefix over those encodings, and the xterm modifier parameter for
+/// Shift/Alt/Ctrl combinations of the navigation keys. Releases and
+/// still-unsupported combinations emit zero bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
     /// A printable UTF-8 character.
@@ -367,11 +371,18 @@ impl KeyEncoder {
     /// input mode.
     ///
     /// Arrow keys, Home, and End observe [`CursorKeyMode`]; Delete, Insert,
-    /// PageUp, PageDown, and F1-F12 are mode-independent. Ctrl converts
-    /// printable characters to control bytes while Enter, Backspace, Tab, and
-    /// Escape keep their base bytes, like xterm. Alt prefixes `ESC` to the
-    /// bytes the key would otherwise emit, matching xterm's meta behavior.
-    /// Release, Super, and still-unsupported combinations are drops.
+    /// PageUp, PageDown, and F1-F12 are mode-independent. Shift, Alt, and
+    /// Ctrl combinations of the navigation keys (arrows, Home, End, Delete,
+    /// Insert, PageUp, PageDown, F1-F12) carry the xterm modifier parameter:
+    /// `CSI 1 ; <mod> <final>` for arrows, Home, End, and F1-F4 and
+    /// `CSI <n> ; <mod> ~` for the tilde-style keys, where
+    /// `mod = 1 + shift + 2 * alt + 4 * ctrl`; there Alt counts in the
+    /// parameter instead of prefixing `ESC`, and the modified form always
+    /// uses `CSI`, even under DECCKM. Shift+Tab emits the backtab `CSI Z`.
+    /// The remaining keys follow xterm: Ctrl converts printable characters to
+    /// control bytes while Enter, Backspace, Tab, and Escape keep their base
+    /// bytes, and Alt prefixes `ESC` to the bytes the key would otherwise
+    /// emit. Release, Super, and still-unsupported combinations are drops.
     /// [`KeyEncoder::encode`] applies the same rules in the normal mode.
     pub fn encode_with(input: KeyInput, mode: InputMode) -> Result<Vec<u8>, KeyDropReason> {
         if input.phase() == KeyPhase::Released {
@@ -381,6 +392,14 @@ impl KeyEncoder {
         if modifiers.is_super() {
             return Err(KeyDropReason::UnsupportedModifier);
         }
+
+        // Navigation-class keys carry the xterm modifier parameter (Alt is
+        // bit 2 of the parameter there) before the Alt-as-ESC-prefix rule
+        // that applies to the remaining keys.
+        if let Some(bytes) = encode_modified_navigation(input.key(), modifiers) {
+            return Ok(bytes);
+        }
+
         let alt = modifiers.is_alt();
         let key = if modifiers.is_ctrl() {
             match input.key() {
@@ -406,6 +425,9 @@ impl KeyEncoder {
             Key::Character(_) => return Err(KeyDropReason::UnsupportedKey),
             Key::Enter => vec![0x0d],
             Key::Backspace => vec![0x7f],
+            // Ctrl keeps Tab's base byte even with Shift; only a bare Shift
+            // produces the backtab.
+            Key::Tab if modifiers.is_shift() && !modifiers.is_ctrl() => b"\x1b[Z".to_vec(),
             Key::Tab => vec![0x09],
             Key::Escape => vec![0x1b],
             Key::Arrow(arrow) => input::cursor_bytes(arrow, mode.cursor()).to_vec(),
@@ -455,6 +477,36 @@ impl KeyEncoder {
             return Err(KeyDropReason::UnsupportedControl);
         }
         Ok(input::keypad_bytes(input.key(), mode.keypad()).to_vec())
+    }
+}
+
+/// Encode a navigation-class key carrying the xterm modifier parameter.
+///
+/// Returns `None` when no Shift/Alt/Ctrl modifier is held or the key is
+/// outside the navigation class (arrows, Home, End, Delete, Insert, PageUp,
+/// PageDown, F1-F12), leaving the key to the bare byte contract and the
+/// remaining modifier policy. The modified form always uses `CSI`, even
+/// under DECCKM.
+fn encode_modified_navigation(key: Key, modifiers: Modifiers) -> Option<Vec<u8>> {
+    let parameter = input::modifier_parameter(modifiers);
+    if parameter == 1 {
+        return None;
+    }
+    match key {
+        Key::Arrow(arrow) => Some(input::modified_final_bytes(
+            input::cursor_final_byte(arrow),
+            parameter,
+        )),
+        Key::Home => Some(input::modified_final_bytes(b'H', parameter)),
+        Key::End => Some(input::modified_final_bytes(b'F', parameter)),
+        Key::Delete => Some(input::modified_tilde_bytes(3, parameter)),
+        Key::Insert => Some(input::modified_tilde_bytes(2, parameter)),
+        Key::PageUp => Some(input::modified_tilde_bytes(5, parameter)),
+        Key::PageDown => Some(input::modified_tilde_bytes(6, parameter)),
+        Key::Function(function_key) => {
+            Some(input::modified_function_key_bytes(function_key, parameter))
+        }
+        _ => None,
     }
 }
 
@@ -812,8 +864,62 @@ mod tests {
         }
     }
 
+    /// The stage-1 test at this site asserted that Alt/Ctrl cursor keys stay
+    /// dropped under DECCKM; stage 4 encodes their modifier parameter instead.
+    /// Super/Command still drops and printables stay byte-identical.
     #[test]
-    fn application_cursor_mode_prefixes_alt_and_keeps_super_control_drops() {
+    fn stage_four_modified_cursor_keys_use_csi_even_under_decckm() {
+        let application = InputMode::normal().with_cursor(CursorKeyMode::Application);
+        let cases = [
+            (Key::Arrow(Arrow::Up), b"\x1bOA".as_slice(), b'A'),
+            (Key::Arrow(Arrow::Down), b"\x1bOB", b'B'),
+            (Key::Arrow(Arrow::Right), b"\x1bOC", b'C'),
+            (Key::Arrow(Arrow::Left), b"\x1bOD", b'D'),
+            (Key::Home, b"\x1bOH", b'H'),
+            (Key::End, b"\x1bOF", b'F'),
+        ];
+        for (key, unmodified_bytes, final_byte) in cases {
+            // Unmodified cursor keys keep the SS3 form under DECCKM.
+            let unmodified = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty());
+            assert_eq!(
+                KeyEncoder::encode_with(unmodified, application).as_deref(),
+                Ok(unmodified_bytes)
+            );
+            // Modified cursor keys keep the CSI form under DECCKM; the
+            // modifier parameter suppresses the SS3 application form.
+            for (modifiers, parameter) in stage_four_modifier_parameters() {
+                let modified = KeyInput::new(key, KeyPhase::Pressed, modifiers);
+                let expected = format!("\x1b[1;{parameter}{}", char::from(final_byte));
+                assert_eq!(
+                    KeyEncoder::encode_with(modified, application).as_deref(),
+                    Ok(expected.as_bytes())
+                );
+            }
+        }
+        let super_arrow = KeyInput::new(
+            Key::Arrow(Arrow::Up),
+            KeyPhase::Pressed,
+            Modifiers::empty().super_key(),
+        );
+        assert_eq!(
+            KeyEncoder::encode_with(super_arrow, application),
+            Err(KeyDropReason::UnsupportedModifier)
+        );
+        let printable = KeyInput::new(Key::Character('a'), KeyPhase::Pressed, Modifiers::empty());
+        assert_eq!(
+            KeyEncoder::encode_with(printable, application).as_deref(),
+            Ok(b"a".as_slice())
+        );
+    }
+
+    /// The stage-2 test at this site asserted Alt prefixes `ESC` to the SS3
+    /// sequence under DECCKM and Ctrl arrows drop; stage 4 supersedes both:
+    /// Alt is bit 2 and Ctrl bit 4 of the modifier parameter on the
+    /// navigation class, and modified cursor keys keep the `CSI` form even
+    /// under DECCKM. Super/Command still drops and printables stay
+    /// byte-identical.
+    #[test]
+    fn application_cursor_mode_encodes_alt_and_ctrl_arrows_with_modifier_parameters() {
         let application = InputMode::normal().with_cursor(CursorKeyMode::Application);
         let alt_arrow = KeyInput::new(
             Key::Arrow(Arrow::Up),
@@ -822,7 +928,7 @@ mod tests {
         );
         assert_eq!(
             KeyEncoder::encode_with(alt_arrow, application).as_deref(),
-            Ok(b"\x1b\x1bOA".as_slice())
+            Ok(b"\x1b[1;3A".as_slice())
         );
         let super_arrow = KeyInput::new(
             Key::Arrow(Arrow::Up),
@@ -839,8 +945,8 @@ mod tests {
             Modifiers::empty().ctrl(),
         );
         assert_eq!(
-            KeyEncoder::encode_with(ctrl_arrow, application),
-            Err(KeyDropReason::UnsupportedControl)
+            KeyEncoder::encode_with(ctrl_arrow, application).as_deref(),
+            Ok(b"\x1b[1;5A".as_slice())
         );
         let printable = KeyInput::new(Key::Character('a'), KeyPhase::Pressed, Modifiers::empty());
         assert_eq!(
@@ -1117,20 +1223,141 @@ mod tests {
         }
     }
 
+    /// The stage-1 test at this site asserted these Ctrl combinations stay
+    /// dropped; stage 4 encodes the xterm Ctrl modifier parameter (1 + 4 = 5).
     #[test]
-    fn stage_one_ctrl_combinations_remain_dropped() {
-        for key in [
-            Key::Delete,
-            Key::Home,
-            Key::PageUp,
-            Key::Function(FunctionKey::F1),
-            Key::Function(FunctionKey::F12),
-        ] {
+    fn stage_four_ctrl_combinations_encode_modifier_parameters() {
+        let cases = [
+            (Key::Delete, b"\x1b[3;5~".as_slice()),
+            (Key::Home, b"\x1b[1;5H"),
+            (Key::PageUp, b"\x1b[5;5~"),
+            (Key::Function(FunctionKey::F1), b"\x1b[1;5P"),
+            (Key::Function(FunctionKey::F12), b"\x1b[24;5~"),
+        ];
+        for (key, expected) in cases {
             let input = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty().ctrl());
+            assert_eq!(KeyEncoder::encode(input).as_deref(), Ok(expected));
+        }
+    }
+
+    /// The xterm modifier parameter table: `1 + shift + 2 * alt + 4 * ctrl`.
+    fn stage_four_modifier_parameters() -> [(Modifiers, u8); 7] {
+        [
+            (Modifiers::empty().shift(), 2),
+            (Modifiers::empty().alt(), 3),
+            (Modifiers::empty().shift().alt(), 4),
+            (Modifiers::empty().ctrl(), 5),
+            (Modifiers::empty().shift().ctrl(), 6),
+            (Modifiers::empty().alt().ctrl(), 7),
+            (Modifiers::empty().shift().alt().ctrl(), 8),
+        ]
+    }
+
+    #[test]
+    fn stage_four_arrow_keys_encode_the_full_modifier_table() {
+        let arrows = [
+            (Arrow::Up, 'A'),
+            (Arrow::Down, 'B'),
+            (Arrow::Right, 'C'),
+            (Arrow::Left, 'D'),
+        ];
+        for (arrow, final_char) in arrows {
+            for (modifiers, parameter) in stage_four_modifier_parameters() {
+                let input = KeyInput::new(Key::Arrow(arrow), KeyPhase::Pressed, modifiers);
+                let expected = format!("\x1b[1;{parameter}{final_char}");
+                assert_eq!(
+                    KeyEncoder::encode(input).as_deref(),
+                    Ok(expected.as_bytes())
+                );
+            }
+        }
+
+        // Autorepeat of a modified arrow emits exactly one sequence.
+        let repeated = KeyInput::new(
+            Key::Arrow(Arrow::Up),
+            KeyPhase::Repeat,
+            Modifiers::empty().shift(),
+        );
+        assert_eq!(
+            KeyEncoder::encode(repeated).as_deref(),
+            Ok(b"\x1b[1;2A".as_slice())
+        );
+    }
+
+    #[test]
+    fn stage_four_shift_tab_is_the_backtab_sequence() {
+        let shifted = KeyInput::new(Key::Tab, KeyPhase::Pressed, Modifiers::empty().shift());
+        assert_eq!(
+            KeyEncoder::encode(shifted).as_deref(),
+            Ok(b"\x1b[Z".as_slice())
+        );
+        let unmodified = KeyInput::new(Key::Tab, KeyPhase::Pressed, Modifiers::empty());
+        assert_eq!(
+            KeyEncoder::encode(unmodified).as_deref(),
+            Ok(b"\t".as_slice())
+        );
+
+        // Stage 3 encodes the Ctrl and Alt combinations of Tab: Ctrl keeps
+        // the base HT byte even with Shift, and Alt prefixes ESC to the
+        // bytes Tab would otherwise emit. Super/Command still drops, and no
+        // combination degrades to the bare backtab.
+        let ctrl_tab = KeyInput::new(Key::Tab, KeyPhase::Pressed, Modifiers::empty().ctrl());
+        assert_eq!(
+            KeyEncoder::encode(ctrl_tab).as_deref(),
+            Ok(b"\x09".as_slice())
+        );
+        let ctrl_shift_tab = KeyInput::new(
+            Key::Tab,
+            KeyPhase::Pressed,
+            Modifiers::empty().ctrl().shift(),
+        );
+        assert_eq!(
+            KeyEncoder::encode(ctrl_shift_tab).as_deref(),
+            Ok(b"\x09".as_slice())
+        );
+        let alt_tab = KeyInput::new(Key::Tab, KeyPhase::Pressed, Modifiers::empty().alt());
+        assert_eq!(
+            KeyEncoder::encode(alt_tab).as_deref(),
+            Ok(b"\x1b\x09".as_slice())
+        );
+        let alt_shift_tab = KeyInput::new(
+            Key::Tab,
+            KeyPhase::Pressed,
+            Modifiers::empty().alt().shift(),
+        );
+        assert_eq!(
+            KeyEncoder::encode(alt_shift_tab).as_deref(),
+            Ok(b"\x1b\x1b[Z".as_slice())
+        );
+        for modifiers in [
+            Modifiers::empty().super_key(),
+            Modifiers::empty().super_key().shift(),
+        ] {
+            let input = KeyInput::new(Key::Tab, KeyPhase::Pressed, modifiers);
             assert_eq!(
                 KeyEncoder::encode(input),
-                Err(KeyDropReason::UnsupportedControl)
+                Err(KeyDropReason::UnsupportedModifier)
             );
+        }
+    }
+
+    #[test]
+    fn stage_four_tilde_keys_carry_the_modifier_as_second_parameter() {
+        let cases = [
+            (Key::Delete, 3_u8),
+            (Key::Insert, 2),
+            (Key::PageUp, 5),
+            (Key::PageDown, 6),
+        ];
+        for (key, parameter) in cases {
+            for (modifiers, modifier_parameter) in stage_four_modifier_parameters() {
+                let input = KeyInput::new(key, KeyPhase::Pressed, modifiers);
+                let expected = format!("\x1b[{parameter};{modifier_parameter}~");
+                assert_eq!(
+                    KeyEncoder::encode(input).as_deref(),
+                    Ok(expected.as_bytes())
+                );
+            }
         }
     }
 
@@ -1219,19 +1446,24 @@ mod tests {
         }
     }
 
+    /// Stage 2 prefixed `ESC` to every Alt combination; stage 4 keeps the
+    /// `ESC` prefix for the named keys without a parameter form (Enter,
+    /// Backspace, Tab, Escape) and moves the navigation class onto the
+    /// modifier parameter with Alt as bit 2, in the `CSI` form even under
+    /// DECCKM.
     #[test]
-    fn alt_named_and_navigation_keys_prefix_esc_to_base_sequences() {
+    fn alt_named_and_navigation_keys_use_esc_prefix_or_modifier_parameter() {
         let application = InputMode::normal().with_cursor(CursorKeyMode::Application);
         let cases = [
             (Key::Enter, b"\x1b\x0d".as_slice()),
             (Key::Backspace, b"\x1b\x7f"),
             (Key::Tab, b"\x1b\x09"),
             (Key::Escape, b"\x1b\x1b"),
-            (Key::Arrow(Arrow::Up), b"\x1b\x1b[A"),
-            (Key::Arrow(Arrow::Left), b"\x1b\x1b[D"),
-            (Key::Delete, b"\x1b\x1b[3~"),
-            (Key::PageDown, b"\x1b\x1b[6~"),
-            (Key::Function(FunctionKey::F5), b"\x1b\x1b[15~"),
+            (Key::Arrow(Arrow::Up), b"\x1b[1;3A"),
+            (Key::Arrow(Arrow::Left), b"\x1b[1;3D"),
+            (Key::Delete, b"\x1b[3;3~"),
+            (Key::PageDown, b"\x1b[6;3~"),
+            (Key::Function(FunctionKey::F5), b"\x1b[15;3~"),
         ];
         for (key, expected) in cases {
             let input = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty().alt());
@@ -1240,7 +1472,7 @@ mod tests {
         let alt_home = KeyInput::new(Key::Home, KeyPhase::Pressed, Modifiers::empty().alt());
         assert_eq!(
             KeyEncoder::encode_with(alt_home, application).as_deref(),
-            Ok(b"\x1b\x1bOH".as_slice())
+            Ok(b"\x1b[1;3H".as_slice())
         );
         let alt_up = KeyInput::new(
             Key::Arrow(Arrow::Up),
@@ -1249,23 +1481,30 @@ mod tests {
         );
         assert_eq!(
             KeyEncoder::encode_with(alt_up, application).as_deref(),
-            Ok(b"\x1b\x1bOA".as_slice())
+            Ok(b"\x1b[1;3A".as_slice())
         );
     }
 
+    /// Stage 2 dropped Ctrl and Alt+Ctrl on the navigation class; stage 4
+    /// encodes the xterm modifier parameter instead (Ctrl is bit 4, Alt+Ctrl
+    /// is 7). The character-class drops survive: a control character still
+    /// has no encoding, and a digit still has no control byte.
     #[test]
-    fn unsupported_modifier_combinations_still_drop() {
-        for key in [Key::Delete, Key::Home, Key::Arrow(Arrow::Up)] {
+    fn ctrl_and_alt_ctrl_navigation_keys_encode_modifier_parameters() {
+        let cases = [
+            (
+                Key::Delete,
+                b"\x1b[3;5~".as_slice(),
+                b"\x1b[3;7~".as_slice(),
+            ),
+            (Key::Home, b"\x1b[1;5H", b"\x1b[1;7H"),
+            (Key::Arrow(Arrow::Up), b"\x1b[1;5A", b"\x1b[1;7A"),
+        ];
+        for (key, ctrl_bytes, alt_ctrl_bytes) in cases {
             let ctrl = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty().ctrl());
-            assert_eq!(
-                KeyEncoder::encode(ctrl),
-                Err(KeyDropReason::UnsupportedControl)
-            );
+            assert_eq!(KeyEncoder::encode(ctrl).as_deref(), Ok(ctrl_bytes));
             let alt_ctrl = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty().alt().ctrl());
-            assert_eq!(
-                KeyEncoder::encode(alt_ctrl),
-                Err(KeyDropReason::UnsupportedControl)
-            );
+            assert_eq!(KeyEncoder::encode(alt_ctrl).as_deref(), Ok(alt_ctrl_bytes));
         }
         let control_character = KeyInput::new(
             Key::Character('\x03'),
@@ -1309,6 +1548,203 @@ mod tests {
         ];
         for released in releases {
             assert_eq!(KeyEncoder::encode(released), Err(KeyDropReason::Released));
+        }
+    }
+
+    #[test]
+    fn stage_four_modified_function_keys_use_modifier_parameters() {
+        // F1-F4 switch from SS3 to CSI 1;<mod> <final> when modified.
+        let ss3_cases = [
+            (FunctionKey::F1, b"\x1bOP".as_slice(), 'P'),
+            (FunctionKey::F2, b"\x1bOQ", 'Q'),
+            (FunctionKey::F3, b"\x1bOR", 'R'),
+            (FunctionKey::F4, b"\x1bOS", 'S'),
+        ];
+        for (function_key, unmodified_bytes, final_char) in ss3_cases {
+            let unmodified = KeyInput::new(
+                Key::Function(function_key),
+                KeyPhase::Pressed,
+                Modifiers::empty(),
+            );
+            assert_eq!(
+                KeyEncoder::encode(unmodified).as_deref(),
+                Ok(unmodified_bytes)
+            );
+            for (modifiers, parameter) in stage_four_modifier_parameters() {
+                let modified =
+                    KeyInput::new(Key::Function(function_key), KeyPhase::Pressed, modifiers);
+                let expected = format!("\x1b[1;{parameter}{final_char}");
+                assert_eq!(
+                    KeyEncoder::encode(modified).as_deref(),
+                    Ok(expected.as_bytes())
+                );
+            }
+        }
+        // F5-F12 keep their xterm parameter and append the modifier.
+        let tilde_cases = [
+            (FunctionKey::F5, 15_u8),
+            (FunctionKey::F6, 17),
+            (FunctionKey::F7, 18),
+            (FunctionKey::F8, 19),
+            (FunctionKey::F9, 20),
+            (FunctionKey::F10, 21),
+            (FunctionKey::F11, 23),
+            (FunctionKey::F12, 24),
+        ];
+        for (function_key, parameter) in tilde_cases {
+            for (modifiers, modifier_parameter) in stage_four_modifier_parameters() {
+                let modified =
+                    KeyInput::new(Key::Function(function_key), KeyPhase::Pressed, modifiers);
+                let expected = format!("\x1b[{parameter};{modifier_parameter}~");
+                assert_eq!(
+                    KeyEncoder::encode(modified).as_deref(),
+                    Ok(expected.as_bytes())
+                );
+            }
+        }
+    }
+
+    /// Every unmodified stage-1 encoding stays byte-identical after the
+    /// modifier-parameter stage, in both cursor key modes. Ctrl characters
+    /// keep their control bytes, and Alt characters take the stage-2 `ESC`
+    /// prefix instead of dropping.
+    #[test]
+    fn stage_four_unmodified_stage_one_bytes_are_unchanged() {
+        let application = InputMode::normal().with_cursor(CursorKeyMode::Application);
+        let cases = [
+            (Key::Character(' '), b" ".as_slice(), b" ".as_slice()),
+            (Key::Enter, b"\r", b"\r"),
+            (Key::Backspace, b"\x7f", b"\x7f"),
+            (Key::Tab, b"\t", b"\t"),
+            (Key::Escape, b"\x1b", b"\x1b"),
+            (Key::Arrow(Arrow::Up), b"\x1b[A", b"\x1bOA"),
+            (Key::Arrow(Arrow::Down), b"\x1b[B", b"\x1bOB"),
+            (Key::Arrow(Arrow::Right), b"\x1b[C", b"\x1bOC"),
+            (Key::Arrow(Arrow::Left), b"\x1b[D", b"\x1bOD"),
+            (Key::Delete, b"\x1b[3~", b"\x1b[3~"),
+            (Key::Insert, b"\x1b[2~", b"\x1b[2~"),
+            (Key::Home, b"\x1b[H", b"\x1bOH"),
+            (Key::End, b"\x1b[F", b"\x1bOF"),
+            (Key::PageUp, b"\x1b[5~", b"\x1b[5~"),
+            (Key::PageDown, b"\x1b[6~", b"\x1b[6~"),
+        ];
+        for (key, normal_bytes, application_bytes) in cases {
+            let input = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty());
+            assert_eq!(KeyEncoder::encode(input).as_deref(), Ok(normal_bytes));
+            assert_eq!(
+                KeyEncoder::encode_with(input, application).as_deref(),
+                Ok(application_bytes)
+            );
+        }
+        let function_cases = [
+            (FunctionKey::F1, b"\x1bOP".as_slice()),
+            (FunctionKey::F2, b"\x1bOQ"),
+            (FunctionKey::F3, b"\x1bOR"),
+            (FunctionKey::F4, b"\x1bOS"),
+            (FunctionKey::F5, b"\x1b[15~"),
+            (FunctionKey::F6, b"\x1b[17~"),
+            (FunctionKey::F7, b"\x1b[18~"),
+            (FunctionKey::F8, b"\x1b[19~"),
+            (FunctionKey::F9, b"\x1b[20~"),
+            (FunctionKey::F10, b"\x1b[21~"),
+            (FunctionKey::F11, b"\x1b[23~"),
+            (FunctionKey::F12, b"\x1b[24~"),
+        ];
+        for (function_key, expected) in function_cases {
+            let input = KeyInput::new(
+                Key::Function(function_key),
+                KeyPhase::Pressed,
+                Modifiers::empty(),
+            );
+            assert_eq!(KeyEncoder::encode(input).as_deref(), Ok(expected));
+            assert_eq!(
+                KeyEncoder::encode_with(input, application).as_deref(),
+                Ok(expected)
+            );
+        }
+        let ctrl_character = KeyInput::new(
+            Key::Character('c'),
+            KeyPhase::Pressed,
+            Modifiers::empty().ctrl(),
+        );
+        assert_eq!(KeyEncoder::encode(ctrl_character), Ok(vec![0x03]));
+        let alt_character = KeyInput::new(
+            Key::Character('f'),
+            KeyPhase::Pressed,
+            Modifiers::empty().alt(),
+        );
+        assert_eq!(
+            KeyEncoder::encode(alt_character).as_deref(),
+            Ok(b"\x1bf".as_slice())
+        );
+    }
+
+    #[test]
+    fn stage_four_releases_still_emit_nothing() {
+        let application = InputMode::normal().with_cursor(CursorKeyMode::Application);
+        let cases = [
+            Key::Arrow(Arrow::Up),
+            Key::Arrow(Arrow::Left),
+            Key::Tab,
+            Key::Delete,
+            Key::Insert,
+            Key::Home,
+            Key::End,
+            Key::PageUp,
+            Key::PageDown,
+            Key::Function(FunctionKey::F1),
+            Key::Function(FunctionKey::F12),
+        ];
+        for key in cases {
+            for modifiers in [
+                Modifiers::empty().shift(),
+                Modifiers::empty().ctrl(),
+                Modifiers::empty().alt(),
+                Modifiers::empty().shift().alt().ctrl(),
+            ] {
+                let released = KeyInput::new(key, KeyPhase::Released, modifiers);
+                assert_eq!(KeyEncoder::encode(released), Err(KeyDropReason::Released));
+                assert_eq!(
+                    KeyEncoder::encode_with(released, application),
+                    Err(KeyDropReason::Released)
+                );
+            }
+        }
+    }
+
+    /// The combined Alt rule, matching xterm: keys that own a modifier
+    /// parameter form (arrows, Home, End, Delete, Insert, PageUp, PageDown,
+    /// F1-F12) take Alt as bit 2 of the parameter, while plain characters
+    /// and the named keys without a parameter form keep Alt as the `ESC`
+    /// prefix.
+    #[test]
+    fn stage_four_alt_splits_between_modifier_parameter_and_esc_prefix() {
+        let parameter_form = [
+            (Key::Arrow(Arrow::Up), b"\x1b[1;3A".as_slice()),
+            (Key::Home, b"\x1b[1;3H"),
+            (Key::End, b"\x1b[1;3F"),
+            (Key::Delete, b"\x1b[3;3~"),
+            (Key::Insert, b"\x1b[2;3~"),
+            (Key::PageUp, b"\x1b[5;3~"),
+            (Key::PageDown, b"\x1b[6;3~"),
+            (Key::Function(FunctionKey::F1), b"\x1b[1;3P"),
+            (Key::Function(FunctionKey::F12), b"\x1b[24;3~"),
+        ];
+        for (key, expected) in parameter_form {
+            let input = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty().alt());
+            assert_eq!(KeyEncoder::encode(input).as_deref(), Ok(expected));
+        }
+        let esc_prefix = [
+            (Key::Character('f'), b"\x1bf".as_slice()),
+            (Key::Character('é'), b"\x1b\xc3\xa9"),
+            (Key::Enter, b"\x1b\x0d"),
+            (Key::Backspace, b"\x1b\x7f"),
+            (Key::Tab, b"\x1b\x09"),
+            (Key::Escape, b"\x1b\x1b"),
+        ];
+        for (key, expected) in esc_prefix {
+            let input = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty().alt());
+            assert_eq!(KeyEncoder::encode(input).as_deref(), Ok(expected));
         }
     }
 }

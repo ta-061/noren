@@ -1,12 +1,45 @@
 use crate::{
     attributes::{AnsiColor, CellAttributes, Color},
-    parser::{Action, EraseMode, Parser, PrivateMode},
+    parser::{Action, EraseMode, Parser, PrivateMode, is_sub_parameter},
 };
 use std::collections::VecDeque;
 use std::fmt;
 
 /// Hard allocation bound for a visible Terminal Core screen.
 pub const MAX_SCREEN_CELLS: usize = 1024 * 1024;
+
+/// Maximum number of zero-width combining characters that may be attached to a
+/// single cell's base character.
+///
+/// `attach_zero_width` previously appended every combining mark to the target
+/// cell's owned `String` with no cap, so a hostile PTY stream of `a` followed
+/// by arbitrarily many `U+0301` marks grew one cell linearly in the input
+/// volume while every other documented ceiling — cell count (`rows * cols` ≤
+/// [`MAX_SCREEN_CELLS`]), scrollback lines (≤ [`MAX_SCROLLBACK_LINES`]) — still
+/// held. The inflated cells are also copied verbatim into scrollback and every
+/// snapshot, multiplying the cost. Marks beyond this budget are now dropped
+/// instead of appended (KBUG-01).
+///
+/// # Why this value
+///
+/// Real text rarely stacks more than three or four combining marks on one base:
+/// fully pointed Hebrew carries up to three (dagesh + vowel point + cantillation),
+/// decomposed Vietnamese two, and Devanagari/Thai conjuncts two to three. A
+/// budget of **seven** leaves roughly 2× headroom over the heaviest real script
+/// while keeping the per-cell text bound small and exact. Legitimate accented
+/// and Indic text (base + two to three marks) renders unchanged.
+///
+/// # Resulting per-cell bound
+///
+/// A cell holds at most one base character plus [`MAX_COMBINING_MARKS_PER_CELL`]
+/// marks, i.e. at most eight `char`s. The longest UTF-8 encoding of any `char`
+/// is four bytes, so a cell's owned text is bounded by
+/// `4 * (MAX_COMBINING_MARKS_PER_CELL + 1) == 32` bytes. Adding
+/// `size_of::<Cell>() == 32` gives a hard **64 bytes per cell** in the inflated
+/// worst case (single-character cells stay near 40 bytes). That bound propagates
+/// for free to every retained scrollback row and every snapshot, which simply
+/// borrow the already-capped cells.
+pub const MAX_COMBINING_MARKS_PER_CELL: usize = 7;
 
 /// Maximum number of lines retained in the primary screen's scrollback buffer.
 ///
@@ -18,20 +51,24 @@ pub const MAX_SCREEN_CELLS: usize = 1024 * 1024;
 /// # Memory ceiling
 ///
 /// Each retained line owns `cols` cells (the column count at the moment it
-/// scrolled off). `size_of::<Cell>() == 32` on this target (a 24-byte owned
-/// `String` handle, a width byte, and packed attributes); the single-character
-/// text also owns one small heap allocation per cell, so ~40 bytes/cell is a
-/// safe upper bound. The retained-line ceiling is therefore
-/// `MAX_SCROLLBACK_LINES * cols * sizeof(Cell)`:
+/// scrolled off). `size_of::<Cell>() == 40` on this target (a 24-byte owned
+/// `String` handle, a width byte, and a 13-byte `CellAttributes` made of three
+/// 4-byte `Color` selections plus a flag byte). The owned text is bounded
+/// separately by [`MAX_COMBINING_MARKS_PER_CELL`]: at most one base `char`
+/// plus seven combining marks, i.e. at most `4 * 8 == 32` bytes of text, so a
+/// cell holds **72 bytes worst case** (the 40-byte struct plus 32 bytes of
+/// capped text; single-character cells stay near 48). The retained-line
+/// ceiling is therefore `MAX_SCROLLBACK_LINES * cols * bytes_per_cell`:
 ///
-/// - Typical 80-column terminal: `10_000 * 80 * 40 ≈ 32 MiB`.
-/// - Typical 256-column terminal: `10_000 * 256 * 40 ≈ 100 MiB`.
+/// - Typical 80-column, single-character text: `10_000 * 80 * 48 ≈ 38 MiB`.
+/// - Worst-case 256-column, fully capped cells: `10_000 * 256 * 72 ≈ 184 MiB`.
 ///
 /// The line count is the hard bound: a hostile program cannot grow history past
-/// this many lines regardless of volume. Per-row width is bounded by the live
-/// grid, which is itself bounded by [`MAX_SCREEN_CELLS`]. Resize does **not**
-/// reflow retained lines (see the terminal-core-foundation design note), so each
-/// line keeps the width it had when it scrolled off.
+/// this many lines regardless of volume, and a stream of zero-width combining
+/// marks cannot grow one cell past the per-cell cap. Per-row width is bounded by
+/// the live grid, which is itself bounded by [`MAX_SCREEN_CELLS`]. Resize does
+/// **not** reflow retained lines (see the terminal-core-foundation design note),
+/// so each line keeps the width it had when it scrolled off.
 pub const MAX_SCROLLBACK_LINES: usize = 10_000;
 
 /// One basic terminal cell.
@@ -116,7 +153,16 @@ impl Cell {
     }
 
     fn push_text(&mut self, ch: char) {
-        self.text.push(ch);
+        if self.combining_marks() < MAX_COMBINING_MARKS_PER_CELL {
+            self.text.push(ch);
+        }
+    }
+
+    /// Number of zero-width combining marks attached to the base character
+    /// (every `char` past the first). Bounded by
+    /// [`MAX_COMBINING_MARKS_PER_CELL`]: `push_text` drops the excess.
+    fn combining_marks(&self) -> usize {
+        self.text.chars().count().saturating_sub(1)
     }
 }
 
@@ -270,6 +316,21 @@ impl ScreenBuffer {
     #[must_use]
     pub fn cells(&self) -> &[Cell] {
         &self.cells
+    }
+
+    /// The cells of one zero-based row, as a contiguous slice.
+    ///
+    /// Narrow accessor shared by the screen and scrollback search so neither
+    /// needs to recompute row offsets from the flat [`cells`](Self::cells)
+    /// array. Returns an empty slice for an out-of-range row.
+    #[must_use]
+    pub fn row(&self, row: u16) -> &[Cell] {
+        if row >= self.rows {
+            return &[];
+        }
+        let start = usize::from(row) * usize::from(self.cols);
+        let end = start + usize::from(self.cols);
+        &self.cells[start..end]
     }
 
     /// Cell at a zero-based visible position.
@@ -745,11 +806,22 @@ impl TerminalState {
                 self.active.cursor.row = row.min(last_row);
             }
         }
-        self.active.cursor = if snap_forward {
-            snap_past_continuation(&self.active.screen, self.active.cursor)
+        if snap_forward {
+            self.active.cursor = snap_past_continuation(&self.active.screen, self.active.cursor);
         } else {
-            snap_to_lead(&self.active.screen, self.active.cursor)
-        };
+            self.snap_cursor_to_lead();
+        }
+    }
+
+    /// Re-snap the active cursor onto a lead cell.
+    ///
+    /// Every row-changing control path (LF, IND, NEL, RI) keeps the cursor
+    /// column while the row or the row's content changes, so each of them can
+    /// land the cursor on the continuation half of a wide character. Routing
+    /// all of them through this shared helper keeps the cursor off
+    /// continuations, so a path added later cannot forget the re-snap.
+    fn snap_cursor_to_lead(&mut self) {
+        self.active.cursor = snap_to_lead(&self.active.screen, self.active.cursor);
     }
 
     /// Clone a bounded immutable renderer/test view.
@@ -767,9 +839,8 @@ impl TerminalState {
                 self.active.wrap_pending = false;
             }
             Action::Backspace => {
-                let mut cursor = self.active.cursor;
-                cursor.column = cursor.column.saturating_sub(1);
-                self.active.cursor = snap_to_lead(&self.active.screen, cursor);
+                self.active.cursor.column = self.active.cursor.column.saturating_sub(1);
+                self.snap_cursor_to_lead();
                 self.active.wrap_pending = false;
             }
             Action::Tab => self.tab(),
@@ -799,9 +870,11 @@ impl TerminalState {
             Action::DeleteCharacters(count) => self.delete_characters(count),
             Action::InsertLines(count) => self.insert_lines(count),
             Action::DeleteLines(count) => self.delete_lines(count),
-            Action::SelectGraphicRendition { params, len } => {
-                self.select_graphic_rendition(&params[..len]);
-            }
+            Action::SelectGraphicRendition {
+                params,
+                separators,
+                len,
+            } => self.select_graphic_rendition(&params[..len], &separators[..len]),
             Action::SaveCursor => self.save_cursor(),
             Action::RestoreCursor => self.restore_cursor(),
             Action::SetKeypadApplication(enabled) => {
@@ -898,6 +971,8 @@ impl TerminalState {
         self.active.cursor = snap_past_continuation(&self.active.screen, self.active.cursor);
     }
 
+    /// Move the cursor down one row, scrolling at the bottom margin. Shared
+    /// by LF, IND, and NEL, and ends in the shared lead re-snap.
     fn index(&mut self) {
         self.active.wrap_pending = false;
         if self.active.cursor.row == self.active.scroll_region.bottom {
@@ -905,6 +980,7 @@ impl TerminalState {
         } else if self.active.cursor.row < self.active.screen.rows - 1 {
             self.active.cursor.row += 1;
         }
+        self.snap_cursor_to_lead();
     }
 
     fn next_line(&mut self) {
@@ -912,6 +988,8 @@ impl TerminalState {
         self.index();
     }
 
+    /// Move the cursor up one row, scrolling at the top margin, and end in
+    /// the shared lead re-snap.
     fn reverse_index(&mut self) {
         self.active.wrap_pending = false;
         if self.active.cursor.row == self.active.scroll_region.top {
@@ -919,6 +997,7 @@ impl TerminalState {
         } else if self.active.cursor.row > 0 {
             self.active.cursor.row -= 1;
         }
+        self.snap_cursor_to_lead();
     }
 
     fn scroll_up(&mut self, count: u16) {
@@ -1016,10 +1095,23 @@ impl TerminalState {
         }
     }
 
-    fn select_graphic_rendition(&mut self, params: &[u16]) {
+    fn select_graphic_rendition(&mut self, params: &[u16], separators: &[u8]) {
         let mut index = 0;
         while index < params.len() {
             let param = params[index];
+            // Extent of the current ECMA-48 parameter group: the leading value
+            // plus any trailing colon sub-parameters (`:`-separated). A lone
+            // `;`-separated value is a one-element group.
+            let group_end = sgr_group_end(separators, index);
+            // Outside the extended-color selectors (38/48/58), a multi-element
+            // colon group is an unsupported compound attribute (e.g. `4:0` and
+            // other modern underline styles). It must be skipped whole so its
+            // sub-parameters never touch the pen — `4:0` must not turn underline
+            // on and then let the trailing `0` reset every attribute.
+            if group_end > index + 1 && !matches!(param, 38 | 48 | 58) {
+                index = group_end;
+                continue;
+            }
             match param {
                 0 => self.pen = CellAttributes::default(),
                 1 => self.pen = self.pen.with_bold(true),
@@ -1050,12 +1142,29 @@ impl TerminalState {
                         .pen
                         .with_background(Color::Ansi(AnsiColor::ALL[usize::from(param - 100 + 8)]));
                 }
-                // Indexed, direct, and underline colors are deferred. Consume
-                // their semicolon-form arguments as one unsupported group so
-                // channel values such as 1, 4, or 7 are never reinterpreted as
-                // independent bold/underline/reverse controls.
-                38 | 48 | 58 => {
-                    index += extended_color_parameter_count(&params[index..]);
+                58 => {
+                    let (color, consumed) = parse_extended_color(params, separators, index);
+                    if let Some(color) = color {
+                        self.pen = self.pen.with_underline_color(color);
+                    }
+                    index += consumed;
+                    continue;
+                }
+                59 => self.pen = self.pen.with_underline_color(Color::Default),
+                38 => {
+                    let (color, consumed) = parse_extended_color(params, separators, index);
+                    if let Some(color) = color {
+                        self.pen = self.pen.with_foreground(color);
+                    }
+                    index += consumed;
+                    continue;
+                }
+                48 => {
+                    let (color, consumed) = parse_extended_color(params, separators, index);
+                    if let Some(color) = color {
+                        self.pen = self.pen.with_background(color);
+                    }
+                    index += consumed;
                     continue;
                 }
                 _ => {}
@@ -1113,12 +1222,116 @@ impl TerminalState {
     }
 }
 
-fn extended_color_parameter_count(params: &[u16]) -> usize {
-    match params.get(1) {
-        Some(5) => params.len().min(3),
-        Some(2) => params.len().min(5),
-        _ => 1,
+/// End index (exclusive) of the ECMA-48 parameter group that begins at `start`.
+///
+/// A group is the leading value plus every trailing colon sub-parameter
+/// (separator `SEPARATOR_SUB`). A lone `;`-separated value is a one-element
+/// group, so this returns `start + 1` for it. Used by the SGR walker to treat a
+/// colon-bearing attribute as a single parameter and skip unsupported compound
+/// groups (e.g. `4:0`) whole instead of walking their sub-parameters.
+fn sgr_group_end(separators: &[u8], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < separators.len() && is_sub_parameter(&separators[end]) {
+        end += 1;
     }
+    end
+}
+
+/// Parse an extended SGR color (`38`/`48`/`58`) starting at `start`.
+///
+/// Returns the parsed color (if the sequence is well-formed and in range) and
+/// the number of parameter slots consumed, *including* the selector. The
+/// consume count is chosen so a truncated or out-of-range sequence can never
+/// leak its channel values back into the caller as independent bold/underline/
+/// reverse codes: every channel slot the selector claimed is skipped over
+/// whether or not a color was produced.
+///
+/// Both ECMA-48 forms are handled:
+///
+/// - semicolon form: `38;5;N` and `38;2;R;G;B` (xterm);
+/// - colon sub-parameter form: `38:5:N` and `38:2::R:G:B` (ITU-T T.416). The
+///   RGB colon form carries an empty colour-space slot after the `2`; a
+///   non-empty slot (`38:2:Pi:R:G:B`) is accepted and ignored. The whole run
+///   of sub-parameters belongs to the selector's parameter, so all of it is
+///   consumed.
+fn parse_extended_color(params: &[u16], separators: &[u8], start: usize) -> (Option<Color>, usize) {
+    let Some(mode_index) = start.checked_add(1).filter(|&i| i < params.len()) else {
+        return (None, 1);
+    };
+    let remaining = params.len() - start;
+    let colon_form = separators.get(mode_index).is_some_and(is_sub_parameter);
+    if colon_form {
+        // The whole run of `:`-separated sub-parameters belongs to the
+        // selector's parameter, so all of it is consumed regardless of whether
+        // a color is produced.
+        let run_end = params.len().min(
+            (mode_index..)
+                .take_while(|&i| separators.get(i).is_some_and(is_sub_parameter))
+                .last()
+                .map_or(mode_index, |i| i + 1),
+        );
+        let run = &params[mode_index..run_end];
+        let consumed = 1 + run.len();
+        let body = run.get(1..).unwrap_or(&[]);
+        let color = parse_extended_color_body(*run.first().unwrap_or(&0), body);
+        (color, consumed)
+    } else {
+        let mode = params[mode_index];
+        match mode {
+            5 => {
+                let consumed = remaining.min(3);
+                let color = params
+                    .get(start + 2)
+                    .copied()
+                    .filter(|value| *value <= u16::from(u8::MAX))
+                    .map(|value| Color::Indexed(value as u8));
+                (color, consumed)
+            }
+            2 => {
+                let consumed = remaining.min(5);
+                let body = params.get(start + 2..start + 5).unwrap_or(&[]);
+                let color = parse_extended_color_body(mode, body);
+                (color, consumed)
+            }
+            _ => (None, remaining.min(2)),
+        }
+    }
+}
+
+/// Resolve the body following an extended-color mode (`5` indexed, `2` direct).
+///
+/// `body` excludes the mode slot itself. For the colon RGB form the first body
+/// slot is the colour-space id (often empty) when four slots are present, and
+/// is ignored; the next three are red/green/blue. Indexed values above 255 are
+/// out of range and yield no color; direct channels are clamped to `u8`.
+fn parse_extended_color_body(mode: u16, body: &[u16]) -> Option<Color> {
+    match mode {
+        5 => body
+            .first()
+            .copied()
+            .filter(|value| *value <= u16::from(u8::MAX))
+            .map(|value| Color::Indexed(value as u8)),
+        2 => {
+            let channels = if body.len() >= 4 {
+                body.get(1..4)
+            } else if body.len() == 3 {
+                body.get(0..3)
+            } else {
+                None
+            }?;
+            Some(Color::Rgb(
+                clamp_channel(channels[0]),
+                clamp_channel(channels[1]),
+                clamp_channel(channels[2]),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Clamp a direct-color channel to its eight-bit range, matching xterm.
+fn clamp_channel(value: u16) -> u8 {
+    u8::try_from(value).unwrap_or(u8::MAX)
 }
 
 impl fmt::Debug for TerminalState {
@@ -1142,6 +1355,7 @@ pub struct TerminalSnapshot {
     wrap_pending: bool,
     modes: TerminalModes,
     lines: Vec<String>,
+    display_lines: Vec<String>,
     scrollback: Vec<Vec<Cell>>,
 }
 
@@ -1154,6 +1368,7 @@ impl TerminalSnapshot {
             wrap_pending: state.active.wrap_pending,
             modes: state.modes,
             lines: visible_lines(&state.active.screen),
+            display_lines: visible_display_lines(&state.active.screen),
             scrollback: state.scrollback.iter().cloned().collect(),
         }
     }
@@ -1206,6 +1421,19 @@ impl TerminalSnapshot {
         &self.lines
     }
 
+    /// Column-preserving rendering of the visible screen, parallel to
+    /// [`lines`](Self::lines).
+    ///
+    /// Continuation cells of wide characters keep one placeholder column so a
+    /// consumer that enumerates characters positions every glyph at its
+    /// display column. Row selection, trailing-blank trimming, and ASCII rows
+    /// match [`lines`](Self::lines) exactly; only the wide-character
+    /// continuation columns differ.
+    #[must_use]
+    pub fn display_lines(&self) -> &[String] {
+        &self.display_lines
+    }
+
     /// Retained scrollback rows in eviction order (oldest first, newest last).
     ///
     /// Each row is the full cell content of a primary-screen line that scrolled
@@ -1225,6 +1453,42 @@ impl TerminalSnapshot {
             .iter()
             .map(|row| cells_to_line(row))
             .collect()
+    }
+
+    /// Total logical rows spanning scrollback followed by the visible screen.
+    ///
+    /// Scrollback rows are indexed oldest-first (the order returned by
+    /// [`scrollback`](Self::scrollback)); the visible rows follow in
+    /// top-to-bottom order. The value fits a `u32` because both contributors
+    /// are bounded ([`MAX_SCROLLBACK_LINES`] plus a `u16` visible row count).
+    #[must_use]
+    pub fn logical_row_count(&self) -> u32 {
+        u32::try_from(self.scrollback.len() + usize::from(self.screen.rows)).unwrap_or(u32::MAX)
+    }
+
+    /// Borrow one logical row as a cell slice, scrollback-first then visible.
+    ///
+    /// Indexing matches [`logical_row_count`](Self::logical_row_count): rows
+    /// `0..scrollback_len()` borrow scrollback rows in oldest-first order, and
+    /// rows `scrollback_len()..` borrow visible rows in top-to-bottom order.
+    /// Returns `None` for out-of-range indices. Used by
+    /// [`Search`](crate::search::Search) so the renderer-independent search
+    /// never copies history into a rectangle.
+    #[must_use]
+    pub fn logical_row(&self, index: u32) -> Option<&[Cell]> {
+        let i = usize::try_from(index).ok()?;
+        let sb = self.scrollback.len();
+        if i < sb {
+            Some(self.scrollback[i].as_slice())
+        } else {
+            let v = i - sb;
+            let cols = usize::from(self.screen.cols);
+            if v < usize::from(self.screen.rows) {
+                Some(&self.screen.cells[v * cols..(v + 1) * cols])
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -1266,6 +1530,37 @@ fn cells_to_line(cells: &[Cell]) -> String {
     let mut line = String::with_capacity(cells.len());
     for cell in cells {
         line.push_str(cell.text());
+    }
+    while line.ends_with(' ') {
+        line.pop();
+    }
+    line
+}
+
+fn visible_display_lines(screen: &ScreenBuffer) -> Vec<String> {
+    let mut lines = Vec::with_capacity(usize::from(screen.rows));
+    for row in 0..screen.rows {
+        let start = usize::from(row) * usize::from(screen.cols);
+        let end = start + usize::from(screen.cols);
+        lines.push(cells_to_display_line(&screen.cells[start..end]));
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines
+}
+
+/// Render a cell row to text preserving display columns: a continuation cell
+/// contributes one placeholder column so character positions equal display
+/// columns. Trailing blanks are trimmed exactly like [`cells_to_line`].
+fn cells_to_display_line(cells: &[Cell]) -> String {
+    let mut line = String::with_capacity(cells.len());
+    for cell in cells {
+        if cell.is_continuation() {
+            line.push(' ');
+        } else {
+            line.push_str(cell.text());
+        }
     }
     while line.ends_with(' ') {
         line.pop();

@@ -87,10 +87,19 @@ renderer-independent API.
 - **Bounded.** `MAX_SCROLLBACK_LINES` (10,000) sits next to `MAX_SCREEN_CELLS`
   and is the hard line-count cap. Each retained row owns `cols` cells (the column
   count when it left), so the memory ceiling is
-  `MAX_SCROLLBACK_LINES * cols * sizeof(Cell)`. At ~40 bytes/cell that is ~32 MiB
-  for an 80-column terminal and ~100 MiB for 256 columns; the line count is the
-  hard bound so hostile unbounded output cannot grow history past it. The oldest
-  retained line is evicted when the cap is reached.
+  `MAX_SCROLLBACK_LINES * cols * bytes_per_cell`. `sizeof(Cell) == 32` (a 24-byte
+  owned `String` handle, a width byte, and packed attributes) plus the owned text:
+  combining marks attached to one cell are capped at
+  `MAX_COMBINING_MARKS_PER_CELL` (7), so the text is at most
+  `4 * (7 + 1) == 32` bytes (one base `char` plus seven marks, four bytes each in
+  the worst UTF-8 case). The inflated worst case is therefore **64 bytes/cell**
+  (single-character cells stay near 40). That is ~51 MiB for an 80-column
+  terminal and ~164 MiB for 256 columns at the cap; typical single-character text
+  is ~32 MiB and ~100 MiB respectively. The line count is the hard bound so
+  hostile unbounded output — including a stream of zero-width combining marks,
+  which used to grow one cell without bound and now stops at the cap — cannot
+  grow history past it. The oldest retained line is evicted when the cap is
+  reached.
 - **Primary screen only.** Retention is gated on the primary screen being active
   and on the scrolling region starting at row 0. The alternate screen never
   contributes (so `less`/`vim` do not pollute history), and scrolling inside a
@@ -152,13 +161,57 @@ keep the cell grid aligned instead of drifting it one cell per wide character.
   cell in the row (skipping continuation cells): they extend that cell's text
   without changing its width, never advance the cursor, and do not clear
   pending autowrap. With no preceding cell (cursor at column zero with no
-  pending wrap) the mark is dropped. This is a documented simplification: the
-  grid stores per-cell text, not grapheme clusters.
+  pending wrap) the mark is dropped. A hostile stream of marks is bounded by
+  `MAX_COMBINING_MARKS_PER_CELL` (7): once a cell carries that many, further
+  marks are dropped instead of appended, so the per-cell text cannot be grown
+  without bound (KBUG-01). This covers both attach paths — the normal cursor
+  path and the wrap-pending path — and the cap propagates to scrollback rows
+  and snapshots, which simply observe the already-capped cells. This is a
+  documented simplification: the grid stores capped per-cell text, not
+  grapheme clusters.
 
 Known limitations of this slice: emoji ZWJ/variation sequences are only as wide
 as their per-character widths; resize blanks a wide pair whose continuation
 would be truncated rather than reflowing it; ambiguous-width and grapheme
 cluster work remain later.
+
+## Color model
+
+SGR colors are modelled in full but left to the renderer to resolve: the
+terminal state records the selection, it never draws it. `Color` carries four
+selections — `Default` (the renderer's contextual default), `Ansi(AnsiColor)`
+(one of the 16-name palette), `Indexed(u8)` (an xterm 256-color slot), and
+`Rgb(u8, u8, u8)` (direct 24-bit) — and `CellAttributes` holds one color per
+target: foreground, background, and underline.
+
+- **SGR codes.** The 16 ANSI colors (`30..=37`, `90..=97` and the `40..=47`,
+  `100..=107` background twins), the `39`/`49`/`59` default resets, and the
+  `38`/`48`/`58` extended selectors are all honored. `58` sets the underline
+  *color*, distinct from the `4` underline *flag*; `59` restores it to default.
+- **Extended forms.** Both ECMA-48 serializations parse: the xterm semicolon
+  form (`38;5;N`, `38;2;R;G;B`) and the ITU-T T.416 colon sub-parameter form
+  (`38:5:N`, `38:2::R:G:B`). The colon RGB form carries an empty colour-space
+  slot after the `2`; a non-empty slot (`38:2:Pi:R:G:B`) is accepted and
+  ignored. The whole run of colon sub-parameters belongs to one selector and is
+  consumed together.
+- **Sub-parameters are SGR-only.** The CSI parser records each parameter's
+  separator (`;` versus `:`) instead of dropping every colon-bearing sequence.
+  Sub-parameters are only meaningful for SGR, so any other CSI final byte that
+  carries a colon is still dropped wholesale — `CSI 1:2 A` does not become a
+  cursor move.
+- **Malformed sequences never corrupt the pen.** A truncated selector
+  (`38;2;1`) or an out-of-range index (`38;5;300`) consumes the slots it
+  claimed and sets no color, so channel values can never leak back into the
+  main loop as independent bold/underline/reverse codes. Direct-color channels
+  are clamped to `u8`, matching xterm. Parameter-count overflow still drops the
+  whole SGR rather than misparsing.
+- **Reset semantics.** `CSI m` / `CSI 0 m` clears extended colors along with
+  everything else; `39`/`49`/`59` restore only their target, leaving other
+  colors and flags intact. The SGR pen is terminal-global, so an extended color
+  survives an alternate-screen switch exactly as ANSI SGR state does.
+
+Wiring the modelled colors to actual drawing is renderer work in `noren-app`
+and is intentionally out of scope for this slice.
 
 ## Deferred
 
