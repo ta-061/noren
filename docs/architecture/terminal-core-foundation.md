@@ -81,10 +81,45 @@ Added by Draft PR #23 / Issue #22 (alternate screen, stacked on #21):
 This slice makes `?1049` round-trips reliable; it is not full xterm, vim,
 tmux, or zellij compatibility.
 
+## Scrollback
+
+Lines that scroll off the top of the *primary* screen are retained in a bounded
+scrollback buffer instead of being discarded, and are readable through the public
+renderer-independent API.
+
+- **Bounded.** `MAX_SCROLLBACK_LINES` (10,000) sits next to `MAX_SCREEN_CELLS`
+  and is the hard line-count cap. Each retained row owns `cols` cells (the column
+  count when it left), so the memory ceiling is
+  `MAX_SCROLLBACK_LINES * cols * sizeof(Cell)`. At ~40 bytes/cell that is ~32 MiB
+  for an 80-column terminal and ~100 MiB for 256 columns; the line count is the
+  hard bound so hostile unbounded output cannot grow history past it. The oldest
+  retained line is evicted when the cap is reached.
+- **Primary screen only.** Retention is gated on the primary screen being active
+  and on the scrolling region starting at row 0. The alternate screen never
+  contributes (so `less`/`vim` do not pollute history), and scrolling inside a
+  non-screen-aligned margin never reaches scrollback. Entering/leaving the
+  alternate screen leaves primary scrollback intact.
+- **Capture point.** `ScreenBuffer::scroll_up` returns the rows that left the top
+  of the region; `TerminalState::scroll_up_capturing` pushes them to the
+  `VecDeque` scrollback only when both gates hold. All three scroll-up paths
+  (explicit `CSI SU`, `LF`/`IND`/`NEL` at the bottom margin, and `CSI DL`) route
+  through this capture, so wrap-driven and explicit scrolling behave identically.
+- **Renderer-independent exposure.** `TerminalSnapshot::scrollback()` returns the
+  retained rows as `&[Vec<Cell>]` (oldest first) and `scrollback_lines()` gives a
+  trimmed text rendering parallel to `lines()`. `TerminalState::scrollback_len()`
+  reports the count cheaply. The renderer never reaches past the snapshot.
+- **Resize does not reflow (known limitation).** Reflowing retained history on a
+  column change is deliberately out of scope for this slice. Retained rows keep
+  the width they had when they scrolled off: growing the grid does not pad them,
+  shrinking it does not truncate them, and each row's cell count is the original
+  `cols`. This is asserted in the test suite. A future slice may reflow or
+  soft-wrap retained rows; until then renderers must tolerate mixed-width
+  scrollback rows (each row's `.len()` is its own width).
+
 ## Deferred
 
 SGR/erase/insert/delete, cell attributes, tabs, origin mode, and
 query/reply sequences remain deferred, along with other DEC private modes
 (such as 1047/1048, 25, and 2004), application cursor/keypad modes, OSC
-titles, alternate-screen scrollback, and saved-cursor state beyond
+titles, scrollback reflow on resize, and saved-cursor state beyond
 position. Unicode and IME remain later.
