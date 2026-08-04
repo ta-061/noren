@@ -318,6 +318,21 @@ impl ScreenBuffer {
         &self.cells
     }
 
+    /// The cells of one zero-based row, as a contiguous slice.
+    ///
+    /// Narrow accessor shared by the screen and scrollback search so neither
+    /// needs to recompute row offsets from the flat [`cells`](Self::cells)
+    /// array. Returns an empty slice for an out-of-range row.
+    #[must_use]
+    pub fn row(&self, row: u16) -> &[Cell] {
+        if row >= self.rows {
+            return &[];
+        }
+        let start = usize::from(row) * usize::from(self.cols);
+        let end = start + usize::from(self.cols);
+        &self.cells[start..end]
+    }
+
     /// Cell at a zero-based visible position.
     #[must_use]
     pub fn cell(&self, row: u16, column: u16) -> Option<&Cell> {
@@ -1438,6 +1453,42 @@ impl TerminalSnapshot {
             .iter()
             .map(|row| cells_to_line(row))
             .collect()
+    }
+
+    /// Total logical rows spanning scrollback followed by the visible screen.
+    ///
+    /// Scrollback rows are indexed oldest-first (the order returned by
+    /// [`scrollback`](Self::scrollback)); the visible rows follow in
+    /// top-to-bottom order. The value fits a `u32` because both contributors
+    /// are bounded ([`MAX_SCROLLBACK_LINES`] plus a `u16` visible row count).
+    #[must_use]
+    pub fn logical_row_count(&self) -> u32 {
+        u32::try_from(self.scrollback.len() + usize::from(self.screen.rows)).unwrap_or(u32::MAX)
+    }
+
+    /// Borrow one logical row as a cell slice, scrollback-first then visible.
+    ///
+    /// Indexing matches [`logical_row_count`](Self::logical_row_count): rows
+    /// `0..scrollback_len()` borrow scrollback rows in oldest-first order, and
+    /// rows `scrollback_len()..` borrow visible rows in top-to-bottom order.
+    /// Returns `None` for out-of-range indices. Used by
+    /// [`Search`](crate::search::Search) so the renderer-independent search
+    /// never copies history into a rectangle.
+    #[must_use]
+    pub fn logical_row(&self, index: u32) -> Option<&[Cell]> {
+        let i = usize::try_from(index).ok()?;
+        let sb = self.scrollback.len();
+        if i < sb {
+            Some(self.scrollback[i].as_slice())
+        } else {
+            let v = i - sb;
+            let cols = usize::from(self.screen.cols);
+            if v < usize::from(self.screen.rows) {
+                Some(&self.screen.cells[v * cols..(v + 1) * cols])
+            } else {
+                None
+            }
+        }
     }
 }
 
