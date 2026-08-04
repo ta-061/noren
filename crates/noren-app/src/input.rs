@@ -1,4 +1,4 @@
-//! Application input modes and bounded keypad key model.
+//! Application input modes and bounded keypad/function key model.
 //!
 //! This is the input-side mirror of DECCKM (`CSI ?1 h/l`, DEC cursor key mode)
 //! and DECKPAM / DECKPNM (`ESC =` / `ESC >`, keypad application / numeric
@@ -77,9 +77,9 @@ impl InputMode {
 
 /// Bounded set of numeric-keypad keys the input encoder explicitly supports.
 ///
-/// The set is deliberately bounded to a standard numeric keypad; function,
-/// editing, and PF keys remain a later integration concern and are not modeled
-/// by this checkpoint.
+/// The set is deliberately bounded to a standard numeric keypad; PF keys
+/// remain a later integration concern and are not modeled by this checkpoint.
+/// Function keys are modeled separately as [`FunctionKey`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeypadKey {
     /// `0`.
@@ -198,5 +198,81 @@ pub(crate) fn keypad_bytes(key: KeypadKey, mode: KeypadMode) -> &'static [u8] {
     match mode {
         KeypadMode::Numeric => numeric,
         KeypadMode::Application => application,
+    }
+}
+
+/// Bounded set of function keys the input encoder explicitly supports.
+///
+/// F1 through F4 emit `SS3` sequences while F5 through F12 emit `CSI <n> ~`
+/// sequences, matching xterm's asymmetry. Function keys ignore both
+/// application cursor and application keypad modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FunctionKey {
+    /// `F1`.
+    F1,
+    /// `F2`.
+    F2,
+    /// `F3`.
+    F3,
+    /// `F4`.
+    F4,
+    /// `F5`.
+    F5,
+    /// `F6`.
+    F6,
+    /// `F7`.
+    F7,
+    /// `F8`.
+    F8,
+    /// `F9`.
+    F9,
+    /// `F10`.
+    F10,
+    /// `F11`.
+    F11,
+    /// `F12`.
+    F12,
+}
+
+/// Select the function key byte sequence.
+///
+/// F1-F4 use the `SS3` finals `P`-`S`; F5-F12 use `CSI <n> ~` with xterm's
+/// parameter gaps at 16 and 22. DECCKM does not change any of these.
+pub(crate) fn function_key_bytes(key: FunctionKey) -> &'static [u8] {
+    match key {
+        FunctionKey::F1 => b"\x1bOP",
+        FunctionKey::F2 => b"\x1bOQ",
+        FunctionKey::F3 => b"\x1bOR",
+        FunctionKey::F4 => b"\x1bOS",
+        FunctionKey::F5 => b"\x1b[15~",
+        FunctionKey::F6 => b"\x1b[17~",
+        FunctionKey::F7 => b"\x1b[18~",
+        FunctionKey::F8 => b"\x1b[19~",
+        FunctionKey::F9 => b"\x1b[20~",
+        FunctionKey::F10 => b"\x1b[21~",
+        FunctionKey::F11 => b"\x1b[23~",
+        FunctionKey::F12 => b"\x1b[24~",
+    }
+}
+
+/// Select the Home byte sequence for the active cursor key mode.
+///
+/// xterm sends `CSI H` in normal mode and `SS3 H` under DECCKM, matching the
+/// terminfo `khome=\EOH` capability that applies between `smkx` and `rmkx`.
+pub(crate) fn home_bytes(mode: CursorKeyMode) -> &'static [u8] {
+    match mode {
+        CursorKeyMode::Normal => b"\x1b[H",
+        CursorKeyMode::Application => b"\x1bOH",
+    }
+}
+
+/// Select the End byte sequence for the active cursor key mode.
+///
+/// xterm sends `CSI F` in normal mode and `SS3 F` under DECCKM
+/// (`kend=\EOF` between `smkx` and `rmkx`).
+pub(crate) fn end_bytes(mode: CursorKeyMode) -> &'static [u8] {
+    match mode {
+        CursorKeyMode::Normal => b"\x1b[F",
+        CursorKeyMode::Application => b"\x1bOF",
     }
 }

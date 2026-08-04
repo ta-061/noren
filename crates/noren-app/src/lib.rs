@@ -10,7 +10,7 @@
 
 mod input;
 
-pub use input::{CursorKeyMode, InputMode, KeypadInput, KeypadKey, KeypadMode};
+pub use input::{CursorKeyMode, FunctionKey, InputMode, KeypadInput, KeypadKey, KeypadMode};
 
 use std::fmt;
 use std::time::Duration;
@@ -262,9 +262,10 @@ pub enum Arrow {
 
 /// Supported app-owned key identities.
 ///
-/// The PoC encodes printable UTF-8, Enter, Backspace, Tab, Escape, arrows, and
-/// Ctrl control bytes. Releases and unsupported combinations emit zero bytes;
-/// they are not part of this baseline's encoding step.
+/// The PoC encodes printable UTF-8, Enter, Backspace, Tab, Escape, arrows,
+/// Delete, Insert, Home, End, PageUp, PageDown, F1-F12, and Ctrl control
+/// bytes. Releases and unsupported combinations emit zero bytes; they are not
+/// part of this baseline's encoding step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Key {
     /// A printable UTF-8 character.
@@ -274,6 +275,20 @@ pub enum Key {
     Tab,
     Escape,
     Arrow(Arrow),
+    /// Forward delete (xterm `CSI 3 ~`), distinct from [`Key::Backspace`].
+    Delete,
+    /// Insert / toggle key (xterm `CSI 2 ~`).
+    Insert,
+    /// Home (xterm `CSI H`, or `SS3 H` under DECCKM).
+    Home,
+    /// End (xterm `CSI F`, or `SS3 F` under DECCKM).
+    End,
+    /// Page up (xterm `CSI 5 ~`).
+    PageUp,
+    /// Page down (xterm `CSI 6 ~`).
+    PageDown,
+    /// Function key F1 through F12.
+    Function(FunctionKey),
 }
 
 /// Whether a key event is a press, an autorepeat, or a release.
@@ -349,8 +364,9 @@ impl KeyEncoder {
     /// Encode one pressed or repeated key event for the active application
     /// input mode.
     ///
-    /// Only bare arrow keys observe [`CursorKeyMode`]; release, modifier,
-    /// control-byte, and printable handling is identical to
+    /// Bare arrow keys, Home, and End observe [`CursorKeyMode`]; Delete,
+    /// Insert, PageUp, PageDown, and F1-F12 are mode-independent. Release,
+    /// modifier, control-byte, and printable handling is identical to
     /// [`KeyEncoder::encode`], so the normal mode is byte-for-byte compatible.
     pub fn encode_with(input: KeyInput, mode: InputMode) -> Result<Vec<u8>, KeyDropReason> {
         if input.phase() == KeyPhase::Released {
@@ -380,6 +396,13 @@ impl KeyEncoder {
             Key::Tab => Ok(vec![0x09]),
             Key::Escape => Ok(vec![0x1b]),
             Key::Arrow(arrow) => Ok(input::cursor_bytes(arrow, mode.cursor()).to_vec()),
+            Key::Delete => Ok(b"\x1b[3~".to_vec()),
+            Key::Insert => Ok(b"\x1b[2~".to_vec()),
+            Key::Home => Ok(input::home_bytes(mode.cursor()).to_vec()),
+            Key::End => Ok(input::end_bytes(mode.cursor()).to_vec()),
+            Key::PageUp => Ok(b"\x1b[5~".to_vec()),
+            Key::PageDown => Ok(b"\x1b[6~".to_vec()),
+            Key::Function(function_key) => Ok(input::function_key_bytes(function_key).to_vec()),
         }
     }
 
@@ -906,5 +929,172 @@ mod tests {
             KeyEncoder::encode_keypad_with(keypad, once),
             KeyEncoder::encode_keypad_with(keypad, twice)
         );
+    }
+
+    fn all_function_keys() -> [FunctionKey; 12] {
+        [
+            FunctionKey::F1,
+            FunctionKey::F2,
+            FunctionKey::F3,
+            FunctionKey::F4,
+            FunctionKey::F5,
+            FunctionKey::F6,
+            FunctionKey::F7,
+            FunctionKey::F8,
+            FunctionKey::F9,
+            FunctionKey::F10,
+            FunctionKey::F11,
+            FunctionKey::F12,
+        ]
+    }
+
+    #[test]
+    fn navigation_keys_emit_their_xterm_bytes() {
+        let cases = [
+            (Key::Delete, b"\x1b[3~".as_slice()),
+            (Key::Insert, b"\x1b[2~"),
+            (Key::Home, b"\x1b[H"),
+            (Key::End, b"\x1b[F"),
+            (Key::PageUp, b"\x1b[5~"),
+            (Key::PageDown, b"\x1b[6~"),
+        ];
+        for (key, expected) in cases {
+            let input = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty());
+            assert_eq!(KeyEncoder::encode(input).as_deref(), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn function_keys_emit_the_xterm_ss3_and_csi_bytes() {
+        let cases = [
+            (FunctionKey::F1, b"\x1bOP".as_slice()),
+            (FunctionKey::F2, b"\x1bOQ"),
+            (FunctionKey::F3, b"\x1bOR"),
+            (FunctionKey::F4, b"\x1bOS"),
+            (FunctionKey::F5, b"\x1b[15~"),
+            (FunctionKey::F6, b"\x1b[17~"),
+            (FunctionKey::F7, b"\x1b[18~"),
+            (FunctionKey::F8, b"\x1b[19~"),
+            (FunctionKey::F9, b"\x1b[20~"),
+            (FunctionKey::F10, b"\x1b[21~"),
+            (FunctionKey::F11, b"\x1b[23~"),
+            (FunctionKey::F12, b"\x1b[24~"),
+        ];
+        for (function_key, expected) in cases {
+            let input = KeyInput::new(
+                Key::Function(function_key),
+                KeyPhase::Pressed,
+                Modifiers::empty(),
+            );
+            assert_eq!(KeyEncoder::encode(input).as_deref(), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn home_and_end_switch_to_ss3_under_application_cursor_mode() {
+        let application = InputMode::normal().with_cursor(CursorKeyMode::Application);
+        let cases = [
+            (Key::Home, b"\x1b[H".as_slice(), b"\x1bOH".as_slice()),
+            (Key::End, b"\x1b[F".as_slice(), b"\x1bOF".as_slice()),
+        ];
+        for (key, normal_bytes, application_bytes) in cases {
+            let input = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty());
+            assert_eq!(
+                KeyEncoder::encode_with(input, InputMode::normal()).as_deref(),
+                Ok(normal_bytes)
+            );
+            assert_eq!(
+                KeyEncoder::encode_with(input, application).as_deref(),
+                Ok(application_bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn mode_independent_keys_ignore_application_cursor_mode() {
+        let application = InputMode::normal().with_cursor(CursorKeyMode::Application);
+        for key in [Key::Delete, Key::Insert, Key::PageUp, Key::PageDown] {
+            let input = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty());
+            let expected = KeyEncoder::encode(input);
+            assert_eq!(KeyEncoder::encode_with(input, application), expected);
+        }
+        for function_key in all_function_keys() {
+            let input = KeyInput::new(
+                Key::Function(function_key),
+                KeyPhase::Pressed,
+                Modifiers::empty(),
+            );
+            let expected = KeyEncoder::encode(input);
+            assert_eq!(KeyEncoder::encode_with(input, application), expected);
+        }
+    }
+
+    #[test]
+    fn stage_one_key_releases_emit_nothing() {
+        let application = InputMode::normal().with_cursor(CursorKeyMode::Application);
+        for key in [
+            Key::Delete,
+            Key::Insert,
+            Key::Home,
+            Key::End,
+            Key::PageUp,
+            Key::PageDown,
+        ] {
+            let released = KeyInput::new(key, KeyPhase::Released, Modifiers::empty());
+            assert_eq!(KeyEncoder::encode(released), Err(KeyDropReason::Released));
+            assert_eq!(
+                KeyEncoder::encode_with(released, application),
+                Err(KeyDropReason::Released)
+            );
+        }
+        for function_key in all_function_keys() {
+            let released = KeyInput::new(
+                Key::Function(function_key),
+                KeyPhase::Released,
+                Modifiers::empty(),
+            );
+            assert_eq!(KeyEncoder::encode(released), Err(KeyDropReason::Released));
+            assert_eq!(
+                KeyEncoder::encode_with(released, application),
+                Err(KeyDropReason::Released)
+            );
+        }
+    }
+
+    #[test]
+    fn stage_one_key_repeats_emit_exactly_one_sequence() {
+        let cases = [
+            (Key::Delete, b"\x1b[3~".as_slice()),
+            (Key::Insert, b"\x1b[2~"),
+            (Key::Home, b"\x1b[H"),
+            (Key::End, b"\x1b[F"),
+            (Key::PageUp, b"\x1b[5~"),
+            (Key::PageDown, b"\x1b[6~"),
+            (Key::Function(FunctionKey::F1), b"\x1bOP"),
+            (Key::Function(FunctionKey::F12), b"\x1b[24~"),
+        ];
+        for (key, expected) in cases {
+            let repeated = KeyInput::new(key, KeyPhase::Repeat, Modifiers::empty());
+            assert_eq!(KeyEncoder::encode(repeated).as_deref(), Ok(expected));
+            let pressed = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty());
+            assert_eq!(KeyEncoder::encode(repeated), KeyEncoder::encode(pressed));
+        }
+    }
+
+    #[test]
+    fn stage_one_ctrl_combinations_remain_dropped() {
+        for key in [
+            Key::Delete,
+            Key::Home,
+            Key::PageUp,
+            Key::Function(FunctionKey::F1),
+            Key::Function(FunctionKey::F12),
+        ] {
+            let input = KeyInput::new(key, KeyPhase::Pressed, Modifiers::empty().ctrl());
+            assert_eq!(
+                KeyEncoder::encode(input),
+                Err(KeyDropReason::UnsupportedControl)
+            );
+        }
     }
 }

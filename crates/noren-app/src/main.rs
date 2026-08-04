@@ -3,9 +3,9 @@
 mod renderer;
 
 use noren_app::{
-    Arrow, CursorKeyMode, GridGeometry, GridSize, InputMode, Key, KeyDropReason, KeyEncoder,
-    KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode, Modifiers, PARSE_BUDGET_BYTES_PER_TURN,
-    Resize,
+    Arrow, CursorKeyMode, FunctionKey, GridGeometry, GridSize, InputMode, Key, KeyDropReason,
+    KeyEncoder, KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode, Modifiers,
+    PARSE_BUDGET_BYTES_PER_TURN, Resize,
 };
 use noren_pty::{PtyEvent, PtySession, PtySize};
 use noren_terminal::{TerminalEngine, TerminalState};
@@ -411,6 +411,24 @@ fn translate_logical_key(
         WinitKey::Named(NamedKey::ArrowDown) => Key::Arrow(Arrow::Down),
         WinitKey::Named(NamedKey::ArrowLeft) => Key::Arrow(Arrow::Left),
         WinitKey::Named(NamedKey::ArrowRight) => Key::Arrow(Arrow::Right),
+        WinitKey::Named(NamedKey::Delete) => Key::Delete,
+        WinitKey::Named(NamedKey::Insert) => Key::Insert,
+        WinitKey::Named(NamedKey::Home) => Key::Home,
+        WinitKey::Named(NamedKey::End) => Key::End,
+        WinitKey::Named(NamedKey::PageUp) => Key::PageUp,
+        WinitKey::Named(NamedKey::PageDown) => Key::PageDown,
+        WinitKey::Named(NamedKey::F1) => Key::Function(FunctionKey::F1),
+        WinitKey::Named(NamedKey::F2) => Key::Function(FunctionKey::F2),
+        WinitKey::Named(NamedKey::F3) => Key::Function(FunctionKey::F3),
+        WinitKey::Named(NamedKey::F4) => Key::Function(FunctionKey::F4),
+        WinitKey::Named(NamedKey::F5) => Key::Function(FunctionKey::F5),
+        WinitKey::Named(NamedKey::F6) => Key::Function(FunctionKey::F6),
+        WinitKey::Named(NamedKey::F7) => Key::Function(FunctionKey::F7),
+        WinitKey::Named(NamedKey::F8) => Key::Function(FunctionKey::F8),
+        WinitKey::Named(NamedKey::F9) => Key::Function(FunctionKey::F9),
+        WinitKey::Named(NamedKey::F10) => Key::Function(FunctionKey::F10),
+        WinitKey::Named(NamedKey::F11) => Key::Function(FunctionKey::F11),
+        WinitKey::Named(NamedKey::F12) => Key::Function(FunctionKey::F12),
         WinitKey::Dead(_) => return Err(KeyDropReason::ImeOrDeadKey),
         _ => return Err(KeyDropReason::UnsupportedKey),
     };
@@ -495,6 +513,48 @@ mod tests {
             assert_eq!(keypad_key(PhysicalKey::Code(code)), Some(expected));
         }
         assert_eq!(keypad_key(PhysicalKey::Code(KeyCode::Digit1)), None);
+    }
+
+    #[test]
+    fn navigation_and_function_named_keys_translate_to_app_keys() {
+        let cases = [
+            (NamedKey::Delete, Key::Delete),
+            (NamedKey::Insert, Key::Insert),
+            (NamedKey::Home, Key::Home),
+            (NamedKey::End, Key::End),
+            (NamedKey::PageUp, Key::PageUp),
+            (NamedKey::PageDown, Key::PageDown),
+            (NamedKey::F1, Key::Function(FunctionKey::F1)),
+            (NamedKey::F2, Key::Function(FunctionKey::F2)),
+            (NamedKey::F3, Key::Function(FunctionKey::F3)),
+            (NamedKey::F4, Key::Function(FunctionKey::F4)),
+            (NamedKey::F5, Key::Function(FunctionKey::F5)),
+            (NamedKey::F6, Key::Function(FunctionKey::F6)),
+            (NamedKey::F7, Key::Function(FunctionKey::F7)),
+            (NamedKey::F8, Key::Function(FunctionKey::F8)),
+            (NamedKey::F9, Key::Function(FunctionKey::F9)),
+            (NamedKey::F10, Key::Function(FunctionKey::F10)),
+            (NamedKey::F11, Key::Function(FunctionKey::F11)),
+            (NamedKey::F12, Key::Function(FunctionKey::F12)),
+        ];
+        for (named, expected) in cases {
+            let logical_key = WinitKey::Named(named);
+            let input = translate_logical_key(&logical_key, KeyPhase::Pressed, Modifiers::empty())
+                .expect("stage one key is supported terminal input");
+            assert_eq!(input.key(), expected);
+            assert_eq!(input.phase(), KeyPhase::Pressed);
+        }
+    }
+
+    #[test]
+    fn untranslated_named_keys_still_report_a_drop() {
+        for named in [NamedKey::F13, NamedKey::ScrollLock, NamedKey::Pause] {
+            let logical_key = WinitKey::Named(named);
+            assert_eq!(
+                translate_logical_key(&logical_key, KeyPhase::Pressed, Modifiers::empty()),
+                Err(KeyDropReason::UnsupportedKey)
+            );
+        }
     }
 
     #[test]
