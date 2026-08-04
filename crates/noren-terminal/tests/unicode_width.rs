@@ -1,6 +1,6 @@
 //! Display-width behavior for wide, zero-width, and mixed-width printing.
 
-use noren_terminal::{Cell, CursorMove, TerminalState};
+use noren_terminal::{Cell, CursorMove, MAX_COMBINING_MARKS_PER_CELL, TerminalState};
 
 fn cursor(state: &TerminalState) -> (u16, u16) {
     (state.cursor().row(), state.cursor().column())
@@ -396,4 +396,116 @@ fn display_lines_preserve_wide_columns_while_lines_keep_their_meaning() {
     ascii.feed_bytes(b"a b");
     let snapshot = ascii.snapshot();
     assert_eq!(snapshot.display_lines(), snapshot.lines());
+}
+
+// ===== KBUG-01 fix: combining-mark budget must not break legitimate text =====
+
+/// The grapheme-cluster cap must leave realistic combining sequences — the
+/// regression risk for this fix — exactly intact. Every script that stacks
+/// marks in real text stays well under [`MAX_COMBINING_MARKS_PER_CELL`], so the
+/// cell's text round-trips byte-for-byte.
+#[test]
+fn realistic_combining_sequences_render_exactly_within_the_cap() {
+    // Latin: 'e' with macron and acute (e + U+0304 + U+0301).
+    let mut state = TerminalState::new(1, 8).expect("valid terminal");
+    state.feed_bytes("e\u{0304}\u{0301}".as_bytes());
+    assert_eq!(cell(&state, 0, 0).text(), "e\u{0304}\u{0301}");
+    assert_eq!(cell(&state, 0, 0).width(), 1);
+
+    // Devanagari: consonant + nukta + candrabindu (क + U+093C + U+0901).
+    let mut state = TerminalState::new(1, 8).expect("valid terminal");
+    state.feed_bytes("\u{0915}\u{093C}\u{0901}".as_bytes());
+    assert_eq!(cell(&state, 0, 0).text(), "\u{0915}\u{093C}\u{0901}");
+
+    // Thai: consonant + below vowel + above tone mark (ก + U+0E38 + U+0E48).
+    let mut state = TerminalState::new(1, 8).expect("valid terminal");
+    state.feed_bytes("\u{0E01}\u{0E38}\u{0E48}".as_bytes());
+    assert_eq!(cell(&state, 0, 0).text(), "\u{0E01}\u{0E38}\u{0E48}");
+
+    // Fully pointed Hebrew: bet + dagesh + qamats + etnahta (3 marks).
+    let pointed = "\u{05D1}\u{05BC}\u{05B8}\u{05A0}";
+    let mut state = TerminalState::new(1, 8).expect("valid terminal");
+    state.feed_bytes(pointed.as_bytes());
+    assert_eq!(cell(&state, 0, 0).text(), pointed);
+
+    // The renderer-facing line keeps every mark of the Hebrew cluster.
+    assert_eq!(state.snapshot().lines(), [pointed]);
+}
+
+/// A hostile flood of combining marks is capped to exactly
+/// [`MAX_COMBINING_MARKS_PER_CELL`] on both attach paths: the normal cursor
+/// path (preceding cell one column left) and the wrap-pending path (cursor
+/// resting on the armed right-edge cell). Kimi demonstrated the same flood
+/// reaches both.
+#[test]
+fn a_combining_mark_flood_is_capped_on_both_attach_paths() {
+    let flood = "\u{0301}".repeat(2_000);
+
+    // Normal cursor path.
+    let mut state = TerminalState::new(1, 4).expect("valid terminal");
+    state.feed_bytes(b"a");
+    state.feed_bytes(flood.as_bytes());
+    let normal_marks = cell(&state, 0, 0).text().chars().count().saturating_sub(1);
+    assert_eq!(
+        normal_marks, MAX_COMBINING_MARKS_PER_CELL,
+        "normal cursor path did not stop at the cap"
+    );
+
+    // Wrap-pending path: filling the last column arms autowrap, so attach
+    // targets that right-edge cell.
+    let mut state = TerminalState::new(1, 2).expect("valid terminal");
+    state.feed_bytes(b"ab");
+    assert!(state.is_wrap_pending());
+    state.feed_bytes(flood.as_bytes());
+    let wrap_marks = cell(&state, 0, 1).text().chars().count().saturating_sub(1);
+    assert_eq!(
+        wrap_marks, MAX_COMBINING_MARKS_PER_CELL,
+        "wrap-pending attach path did not stop at the cap"
+    );
+}
+
+/// Once a cell is capped the bound propagates for free to retained scrollback
+/// rows and to every snapshot, since both simply observe the already-capped
+/// cells. The documented per-cell text ceiling is `4 * (cap + 1)` bytes.
+#[test]
+fn a_capped_cell_stays_capped_through_scrollback_and_snapshots() {
+    let bytes_per_cell = 4 * (MAX_COMBINING_MARKS_PER_CELL + 1);
+    let flood = "\u{0301}".repeat(5_000);
+
+    // One-row grid: the capped row is the one that will scroll off.
+    let mut state = TerminalState::new(1, 4).expect("valid terminal");
+    state.feed_bytes(b"a");
+    state.feed_bytes(flood.as_bytes());
+    let live_text = cell(&state, 0, 0).text().to_owned();
+    assert!(
+        live_text.len() <= bytes_per_cell,
+        "live cell text {} exceeds the {}-byte per-cell ceiling",
+        live_text.len(),
+        bytes_per_cell
+    );
+
+    // Scroll the capped row off into scrollback.
+    state.feed_bytes(b"\r\nb");
+    assert_eq!(state.scrollback_len(), 1);
+
+    // The retained scrollback cell (via the snapshot) is the same capped cell.
+    let snapshot = state.snapshot();
+    let retained = &snapshot.scrollback()[0][0];
+    assert_eq!(
+        retained.text(),
+        live_text,
+        "scrollback inherited a different cell"
+    );
+    assert!(
+        retained.text().len() <= bytes_per_cell,
+        "scrollback cell exceeds the per-cell ceiling"
+    );
+
+    // The renderer-facing rendering of that retained row is bounded too.
+    let scrollback_lines = snapshot.scrollback_lines();
+    let row_text = scrollback_lines[0].as_str();
+    assert!(
+        row_text.len() <= bytes_per_cell,
+        "scrollback line {row_text:?} exceeds the per-cell ceiling"
+    );
 }
