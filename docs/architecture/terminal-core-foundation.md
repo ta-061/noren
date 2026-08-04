@@ -87,10 +87,19 @@ renderer-independent API.
 - **Bounded.** `MAX_SCROLLBACK_LINES` (10,000) sits next to `MAX_SCREEN_CELLS`
   and is the hard line-count cap. Each retained row owns `cols` cells (the column
   count when it left), so the memory ceiling is
-  `MAX_SCROLLBACK_LINES * cols * sizeof(Cell)`. At ~40 bytes/cell that is ~32 MiB
-  for an 80-column terminal and ~100 MiB for 256 columns; the line count is the
-  hard bound so hostile unbounded output cannot grow history past it. The oldest
-  retained line is evicted when the cap is reached.
+  `MAX_SCROLLBACK_LINES * cols * bytes_per_cell`. `sizeof(Cell) == 32` (a 24-byte
+  owned `String` handle, a width byte, and packed attributes) plus the owned text:
+  combining marks attached to one cell are capped at
+  `MAX_COMBINING_MARKS_PER_CELL` (7), so the text is at most
+  `4 * (7 + 1) == 32` bytes (one base `char` plus seven marks, four bytes each in
+  the worst UTF-8 case). The inflated worst case is therefore **64 bytes/cell**
+  (single-character cells stay near 40). That is ~51 MiB for an 80-column
+  terminal and ~164 MiB for 256 columns at the cap; typical single-character text
+  is ~32 MiB and ~100 MiB respectively. The line count is the hard bound so
+  hostile unbounded output — including a stream of zero-width combining marks,
+  which used to grow one cell without bound and now stops at the cap — cannot
+  grow history past it. The oldest retained line is evicted when the cap is
+  reached.
 - **Primary screen only.** Retention is gated on the primary screen being active
   and on the scrolling region starting at row 0. The alternate screen never
   contributes (so `less`/`vim` do not pollute history), and scrolling inside a
@@ -152,8 +161,14 @@ keep the cell grid aligned instead of drifting it one cell per wide character.
   cell in the row (skipping continuation cells): they extend that cell's text
   without changing its width, never advance the cursor, and do not clear
   pending autowrap. With no preceding cell (cursor at column zero with no
-  pending wrap) the mark is dropped. This is a documented simplification: the
-  grid stores per-cell text, not grapheme clusters.
+  pending wrap) the mark is dropped. A hostile stream of marks is bounded by
+  `MAX_COMBINING_MARKS_PER_CELL` (7): once a cell carries that many, further
+  marks are dropped instead of appended, so the per-cell text cannot be grown
+  without bound (KBUG-01). This covers both attach paths — the normal cursor
+  path and the wrap-pending path — and the cap propagates to scrollback rows
+  and snapshots, which simply observe the already-capped cells. This is a
+  documented simplification: the grid stores capped per-cell text, not
+  grapheme clusters.
 
 Known limitations of this slice: emoji ZWJ/variation sequences are only as wide
 as their per-character widths; resize blanks a wide pair whose continuation

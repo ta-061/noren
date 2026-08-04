@@ -539,7 +539,6 @@ fn public_api_edge_inputs_are_rejected_or_clamped() {
 /// cells, not the text inside them). The wrap-pending path (`attach` targets
 /// the last column while a wrap is armed) has the same hole.
 #[test]
-#[ignore = "reproduces KBUG-01"]
 fn combining_marks_grow_a_single_cell_without_bound() {
     const REASONABLE_GRAPHEME_CAP: usize = 32;
 

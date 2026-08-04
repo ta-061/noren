@@ -8,6 +8,39 @@ use std::fmt;
 /// Hard allocation bound for a visible Terminal Core screen.
 pub const MAX_SCREEN_CELLS: usize = 1024 * 1024;
 
+/// Maximum number of zero-width combining characters that may be attached to a
+/// single cell's base character.
+///
+/// `attach_zero_width` previously appended every combining mark to the target
+/// cell's owned `String` with no cap, so a hostile PTY stream of `a` followed
+/// by arbitrarily many `U+0301` marks grew one cell linearly in the input
+/// volume while every other documented ceiling — cell count (`rows * cols` ≤
+/// [`MAX_SCREEN_CELLS`]), scrollback lines (≤ [`MAX_SCROLLBACK_LINES`]) — still
+/// held. The inflated cells are also copied verbatim into scrollback and every
+/// snapshot, multiplying the cost. Marks beyond this budget are now dropped
+/// instead of appended (KBUG-01).
+///
+/// # Why this value
+///
+/// Real text rarely stacks more than three or four combining marks on one base:
+/// fully pointed Hebrew carries up to three (dagesh + vowel point + cantillation),
+/// decomposed Vietnamese two, and Devanagari/Thai conjuncts two to three. A
+/// budget of **seven** leaves roughly 2× headroom over the heaviest real script
+/// while keeping the per-cell text bound small and exact. Legitimate accented
+/// and Indic text (base + two to three marks) renders unchanged.
+///
+/// # Resulting per-cell bound
+///
+/// A cell holds at most one base character plus [`MAX_COMBINING_MARKS_PER_CELL`]
+/// marks, i.e. at most eight `char`s. The longest UTF-8 encoding of any `char`
+/// is four bytes, so a cell's owned text is bounded by
+/// `4 * (MAX_COMBINING_MARKS_PER_CELL + 1) == 32` bytes. Adding
+/// `size_of::<Cell>() == 32` gives a hard **64 bytes per cell** in the inflated
+/// worst case (single-character cells stay near 40 bytes). That bound propagates
+/// for free to every retained scrollback row and every snapshot, which simply
+/// borrow the already-capped cells.
+pub const MAX_COMBINING_MARKS_PER_CELL: usize = 7;
+
 /// Maximum number of lines retained in the primary screen's scrollback buffer.
 ///
 /// Only lines that scroll off the top of the *primary* screen are retained; the
@@ -19,19 +52,22 @@ pub const MAX_SCREEN_CELLS: usize = 1024 * 1024;
 ///
 /// Each retained line owns `cols` cells (the column count at the moment it
 /// scrolled off). `size_of::<Cell>() == 32` on this target (a 24-byte owned
-/// `String` handle, a width byte, and packed attributes); the single-character
-/// text also owns one small heap allocation per cell, so ~40 bytes/cell is a
-/// safe upper bound. The retained-line ceiling is therefore
-/// `MAX_SCROLLBACK_LINES * cols * sizeof(Cell)`:
+/// `String` handle, a width byte, and packed attributes). The owned text is
+/// bounded separately by [`MAX_COMBINING_MARKS_PER_CELL`]: at most one base
+/// `char` plus seven combining marks, i.e. at most `4 * 8 == 32` bytes of text,
+/// so a cell holds **64 bytes worst case** (single-character cells stay near 40).
+/// The retained-line ceiling is therefore
+/// `MAX_SCROLLBACK_LINES * cols * bytes_per_cell`:
 ///
-/// - Typical 80-column terminal: `10_000 * 80 * 40 ≈ 32 MiB`.
-/// - Typical 256-column terminal: `10_000 * 256 * 40 ≈ 100 MiB`.
+/// - Typical 80-column, single-character text: `10_000 * 80 * 40 ≈ 32 MiB`.
+/// - Worst-case 256-column, fully capped cells: `10_000 * 256 * 64 ≈ 164 MiB`.
 ///
 /// The line count is the hard bound: a hostile program cannot grow history past
-/// this many lines regardless of volume. Per-row width is bounded by the live
-/// grid, which is itself bounded by [`MAX_SCREEN_CELLS`]. Resize does **not**
-/// reflow retained lines (see the terminal-core-foundation design note), so each
-/// line keeps the width it had when it scrolled off.
+/// this many lines regardless of volume, and a stream of zero-width combining
+/// marks cannot grow one cell past the per-cell cap. Per-row width is bounded by
+/// the live grid, which is itself bounded by [`MAX_SCREEN_CELLS`]. Resize does
+/// **not** reflow retained lines (see the terminal-core-foundation design note),
+/// so each line keeps the width it had when it scrolled off.
 pub const MAX_SCROLLBACK_LINES: usize = 10_000;
 
 /// One basic terminal cell.
@@ -116,7 +152,16 @@ impl Cell {
     }
 
     fn push_text(&mut self, ch: char) {
-        self.text.push(ch);
+        if self.combining_marks() < MAX_COMBINING_MARKS_PER_CELL {
+            self.text.push(ch);
+        }
+    }
+
+    /// Number of zero-width combining marks attached to the base character
+    /// (every `char` past the first). Bounded by
+    /// [`MAX_COMBINING_MARKS_PER_CELL`]: `push_text` drops the excess.
+    fn combining_marks(&self) -> usize {
+        self.text.chars().count().saturating_sub(1)
     }
 }
 
