@@ -276,3 +276,91 @@ pub(crate) fn end_bytes(mode: CursorKeyMode) -> &'static [u8] {
         CursorKeyMode::Application => b"\x1bOF",
     }
 }
+
+/// Final byte of the bare cursor key sequence for an arrow.
+pub(crate) fn cursor_final_byte(arrow: Arrow) -> u8 {
+    match arrow {
+        Arrow::Up => b'A',
+        Arrow::Down => b'B',
+        Arrow::Right => b'C',
+        Arrow::Left => b'D',
+    }
+}
+
+/// The xterm modifier parameter for the active modifiers.
+///
+/// xterm encodes modifiers on function and cursor keys as
+/// `1 + shift + 2 * alt + 4 * ctrl + 8 * meta`, so a bare Shift gives 2,
+/// Alt gives 3, Ctrl gives 5, and Shift+Alt+Ctrl gives 8. The app drops
+/// Super/Command before consulting this value, and Meta is not tracked in
+/// the PoC, so the result is bounded to `1..=8`; `1` means no modifier is
+/// active and the key keeps its bare stage-1 sequence.
+pub(crate) fn modifier_parameter(modifiers: Modifiers) -> u8 {
+    let mut parameter = 1;
+    if modifiers.is_shift() {
+        parameter += 1;
+    }
+    if modifiers.is_alt() {
+        parameter += 2;
+    }
+    if modifiers.is_ctrl() {
+        parameter += 4;
+    }
+    parameter
+}
+
+/// Encode the modified `CSI 1 ; <mod> <final>` form shared by cursor-class
+/// keys (arrows, Home, End, F1-F4) when any modifier is held.
+///
+/// xterm emits this `CSI` form even under DECCKM: the modifier parameter
+/// suppresses the `SS3` application cursor form.
+pub(crate) fn modified_final_bytes(final_byte: u8, modifier_parameter: u8) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(6);
+    bytes.extend_from_slice(b"\x1b[1;");
+    append_decimal(&mut bytes, modifier_parameter);
+    bytes.push(final_byte);
+    bytes
+}
+
+/// Encode the modified `CSI <n> ; <mod> ~` form used by the tilde-style
+/// keys (Delete, Insert, PageUp, PageDown, F5-F12) when any modifier is
+/// held; `parameter` is the key's bare `CSI <n> ~` parameter.
+pub(crate) fn modified_tilde_bytes(parameter: u8, modifier_parameter: u8) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(7);
+    bytes.push(0x1b);
+    bytes.push(b'[');
+    append_decimal(&mut bytes, parameter);
+    bytes.push(b';');
+    append_decimal(&mut bytes, modifier_parameter);
+    bytes.push(b'~');
+    bytes
+}
+
+/// Select the modified byte sequence for a function key.
+///
+/// F1-F4 switch from `SS3 P`-`SS3 S` to `CSI 1 ; <mod> P`-`CSI 1 ; <mod> S`
+/// when a modifier is held; F5-F12 keep their xterm parameters
+/// (15, 17-21, 23-24) and append the modifier as the second parameter.
+pub(crate) fn modified_function_key_bytes(key: FunctionKey, modifier_parameter: u8) -> Vec<u8> {
+    match key {
+        FunctionKey::F1 => modified_final_bytes(b'P', modifier_parameter),
+        FunctionKey::F2 => modified_final_bytes(b'Q', modifier_parameter),
+        FunctionKey::F3 => modified_final_bytes(b'R', modifier_parameter),
+        FunctionKey::F4 => modified_final_bytes(b'S', modifier_parameter),
+        FunctionKey::F5 => modified_tilde_bytes(15, modifier_parameter),
+        FunctionKey::F6 => modified_tilde_bytes(17, modifier_parameter),
+        FunctionKey::F7 => modified_tilde_bytes(18, modifier_parameter),
+        FunctionKey::F8 => modified_tilde_bytes(19, modifier_parameter),
+        FunctionKey::F9 => modified_tilde_bytes(20, modifier_parameter),
+        FunctionKey::F10 => modified_tilde_bytes(21, modifier_parameter),
+        FunctionKey::F11 => modified_tilde_bytes(23, modifier_parameter),
+        FunctionKey::F12 => modified_tilde_bytes(24, modifier_parameter),
+    }
+}
+
+fn append_decimal(bytes: &mut Vec<u8>, value: u8) {
+    if value >= 10 {
+        bytes.push(b'0' + value / 10);
+    }
+    bytes.push(b'0' + value % 10);
+}
