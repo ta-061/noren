@@ -21,6 +21,26 @@ feature code while a lane can do it.
 Lanes are scoped so two engines never review the same code. That keeps findings
 independent and makes disagreement meaningful rather than duplicated.
 
+### Running several lanes per engine
+
+A lane name is a prefix plus a suffix (`glm-core`, `glm-b`, `qwen-c`), and each
+suffix gets its own persistent session, so one engine can run several concurrent
+lanes. GLM and Qwen recover their 5-hour windows in minutes and hold ~93% and
+~99% weekly, so they are the engines to scale — running review, implementation,
+tests, and analysis at the same time rather than in sequence.
+
+Concurrent lanes take a worktree each from the pool at
+`../noren-worktrees/pool-p*`, all branched from `main`. **Assign file ownership
+per lane before dispatching** — two lanes editing one file is the failure this
+pool exists to prevent. When overlap is genuinely unavoidable (two input-encoding
+stages, say), accept it deliberately and resolve by merge order, landing one and
+rebasing the other.
+
+Kimi is the opposite case: it works, but its 5-hour window empties after roughly
+one substantial task and takes hours to return. Spend it on independent
+verification bursts rather than standing work — its one sweep found two real
+parser bugs that the GLM sweep had missed.
+
 Only Kimi works over SSH, against the clone at
 `/home/matsulab/tatuya/apps/noren` on `kali`. Every other lane runs locally in a
 git worktree under `../noren-worktrees/`.
