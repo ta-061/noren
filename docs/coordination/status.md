@@ -1,35 +1,49 @@
 # Coordination status
 
-Last updated: 2026-08-03 (Asia/Tokyo). PR
-[#19](https://github.com/ta-061/noren/pull/19) is merged into `main` as
-`c695920d8bc99990447d0b451754ea96c91181fc`. Draft PR
-[#21](https://github.com/ta-061/noren/pull/21) remains in review for Issue
-[#20](https://github.com/ta-061/noren/issues/20). Draft PR
-[#23](https://github.com/ta-061/noren/pull/23), branch
-`agent/terminal-alternate-screen`, is stacked on #21 for Issue
-[#22](https://github.com/ta-061/noren/issues/22). Historical sections below
-preserve the PR #17 record at implementation/test head
-`c1f66dc27ddce37a60665d319a7ca061c300947e`, corrected only where an active
-claim went stale; coordination head `ac410a82` also passed both GitHub checks.
+Last updated: 2026-08-05 (Asia/Tokyo). `main` is at
+`22c985e`, the merge commit for PR
+[#29](https://github.com/ta-061/noren/pull/29), which landed the whole parallel
+Terminal Core stack. Historical sections below preserve the earlier PR #17/#19
+records at their own heads, corrected only where an active claim went stale.
 
 ## Current phase
 
-Terminal foundation, alternate-screen slice. PR #19 merged the Noren-owned,
-renderer-independent `TerminalState`; Draft PR #21 adds scrolling regions.
-Stacked Draft PR #23 adds primary/alternate screen ownership, DEC private mode
-1049, cursor save/restore, mode snapshots, and both-buffer resize behavior. See
-[terminal core foundation](../architecture/terminal-core-foundation.md). This
-is not a VT100/xterm or vim/tmux/zellij compatibility claim.
+Terminal foundation. The parallel Terminal Core stack is merged: scrolling
+regions, alternate screen and mode state, erase/edit operations, SGR and cell
+attributes, and application cursor/keypad modes are all on `main`, wired into
+the key encoder. See
+[terminal core foundation](../architecture/terminal-core-foundation.md).
+
+This is **not** a VT100/xterm or vim/tmux/zellij compatibility claim. Known
+non-conformance is recorded in [reviews](reviews/) and summarized under
+[accepted follow-ups](#accepted-follow-ups) below.
+
+Development now runs as an agent fleet; see [fleet](fleet.md) for lane
+ownership, quota-gated dispatch, and failover.
 
 ## GitHub state
 
-Verified on 2026-08-03:
+Verified on 2026-08-05 with `gh pr list` and `gh issue list`:
 
-- The open Issues are [#20](https://github.com/ta-061/noren/issues/20), the
-  scrolling-region behavior slice, and stacked alternate-screen Issue
-  [#22](https://github.com/ta-061/noren/issues/22). Their open Draft PRs are
-  [#21](https://github.com/ta-061/noren/pull/21) and
-  [#23](https://github.com/ta-061/noren/pull/23), respectively.
+- PR [#29](https://github.com/ta-061/noren/pull/29) is merged as `22c985e` and
+  subsumes PRs [#21](https://github.com/ta-061/noren/pull/21),
+  [#23](https://github.com/ta-061/noren/pull/23),
+  [#30](https://github.com/ta-061/noren/pull/30), and
+  [#31](https://github.com/ta-061/noren/pull/31). #21 and #30 report merged;
+  #23 and #31 were closed after verifying `git log origin/main..<branch>` was
+  empty for each, so neither had unlanded commits.
+- Issues [#22](https://github.com/ta-061/noren/issues/22),
+  [#24](https://github.com/ta-061/noren/issues/24), and
+  [#26](https://github.com/ta-061/noren/issues/26) are closed as delivered on
+  `main`.
+- The open PRs are [#32](https://github.com/ta-061/noren/pull/32) (bounded VT
+  compatibility harness, Issue
+  [#27](https://github.com/ta-061/noren/issues/27)) and
+  [#33](https://github.com/ta-061/noren/pull/33) (parallel-delivery
+  documentation, Issue [#28](https://github.com/ta-061/noren/issues/28)). Both
+  predate the stack landing and **must be rebased onto `main` before merge**:
+  their current diffs would delete the erase-ops, SGR, and application-mode
+  test files that are now on `main`.
 - PR [#19](https://github.com/ta-061/noren/pull/19) and Issue
   [#18](https://github.com/ta-061/noren/issues/18) are complete after owner
   acceptance of the renderer-independent Terminal Core foundation.
@@ -41,9 +55,46 @@ Verified on 2026-08-03:
   [#14](https://github.com/ta-061/noren/pull/14) merged the bounded Discovery
   integration and PR [#15](https://github.com/ta-061/noren/pull/15) merged the
   lean Design Council.
-- `main` is at `c695920d8bc99990447d0b451754ea96c91181fc`, the merge commit
-  for PR #19. No Discovery PR remains open and no repeated large research or
-  review is planned.
+- No Discovery PR remains open and no repeated large research or review is
+  planned.
+
+## Merged Terminal Core stack evidence
+
+Landed by PR #29 as `22c985e`. Verified at the merged head `c21a5a2`:
+`cargo fmt --all --check` clean, `cargo clippy --workspace --all-targets
+-- -D warnings` clean, and **108 workspace tests pass** (previously 96). Both
+GitHub checks reported SUCCESS against `main` before merge.
+
+| Lane | Saved evidence | State |
+| --- | --- | --- |
+| GLM core review | Found a BLOCKER in the escape state machine plus one MAJOR, two MINOR; [review](reviews/terminal-stack-glm.md) | Complete |
+| GLM core fix | Signed `5e266d4`: `EscapeIntermediate` parser state and HT tab stops, with 12 regression tests | Complete |
+| Qwen application review | 0 BLOCKER, 2 MAJOR, 2 MINOR on the window/renderer/input layer; [review](reviews/terminal-stack-qwen.md) | Complete |
+| codex-lab merge mechanics | Simulated all merge steps in a disposable clone and compared tree OIDs; [plan](reviews/terminal-stack-merge-plan.md) | Complete |
+| Coordinator verification | Independently reproduced the BLOCKER (`ESC ( B -> "B"`) and MAJOR (`a TAB b -> "ab"`), then re-verified the fix | Complete |
+
+The BLOCKER is why the stack landed as one merge rather than seven bottom-up
+merges: `ESC ( B` — the SCS charset sequence emitted by essentially every
+terminfo-driven program — leaked a printable `B` onto the screen, and Horizontal
+Tab was silently dropped. The fix exists only at the stack tip, so merging
+bottom-up would have placed four knowingly output-corrupting commits on `main`.
+Recorded as decision D-0011 in [decisions](decisions.md).
+
+## Accepted follow-ups
+
+Reviewed, reproduced where noted, and accepted as **not** blocking the stack.
+None is closed; each needs its own Issue and evidence.
+
+| Finding | Severity | Source |
+| --- | --- | --- |
+| Renderer clamps the drawn grid to 160x60 while the PTY/terminal grid is capped only at `u16::MAX`, so on a Retina display the PTY is told a geometry that is never drawn (confirmed by code reading) | MAJOR | [Qwen](reviews/terminal-stack-qwen.md) |
+| Delete/Home/End/PageUp/PageDown/Insert/F1-F12, Alt+char, Ctrl+named keys, and Shift combinations are silently dropped instead of sending xterm bytes | MAJOR | [Qwen](reviews/terminal-stack-qwen.md) |
+| DECSTBM rejects an out-of-range bottom margin instead of clamping it as xterm does | MINOR | [GLM](reviews/terminal-stack-glm.md) |
+| C0 controls embedded inside a CSI are swallowed rather than executed | MINOR | [GLM](reviews/terminal-stack-glm.md) |
+
+Unicode/CJK width, IME, non-ASCII glyph quality, and the adversarial
+hostile-input sweep remain outstanding: the Kimi robustness lane was rate-limited
+before it produced evidence, so no hostile-input claim is made.
 
 ## Merged PR #19 Terminal Core handoff
 
@@ -127,11 +178,14 @@ then passed both GitHub checks: runs `30783618745` (Rust) and `30783618743`
 
 ## Current Draft gate
 
-PR #21 remains Draft for owner review and acceptance. Stacked PR #23 has passed
-local checks and CI, and the existing local-zsh application launch was
-rechecked; it remains Draft and based on `agent/terminal-scroll-regions` until
-#21 is accepted and merged. PR #19 has no remaining gate. This does not
-authorize deferred terminal features in either Draft PR.
+Open PRs #32 and #33 remain Draft. Neither may merge until it is rebased onto
+`main` and its diff is confirmed to delete no landed test file; both branched
+before the erase-ops, SGR, and application-mode tests existed.
+
+The owner has not yet repeated a manual macOS startup/output/resize/exit smoke
+check against the merged stack. The stack's automated evidence is green, but no
+rendered-frame or real-window-injection oracle exists, so the smoke check remains
+the outstanding manual gate.
 
 Full VT/xterm behavior, non-ASCII glyph quality, swash/font trials, production
 IME/accessibility, Linux, SSH, agent integration, tabs, panes, themes, and a
@@ -145,8 +199,12 @@ identity, and the public support/security contact before Preview publication.
 
 ## Next steps
 
-1. Review and accept Draft PR #21, then promote and merge its exact tested head.
-2. Retarget Draft PR #23 to `main` only after #21 merges, then review its exact
-   tested head.
-3. Keep SGR/erase, attributes, remaining modes, and later VT work in separate
-   Issues and PRs.
+1. Rebase PR #32 onto `main` so its only contribution is the VT compatibility
+   harness, and confirm the diff deletes no landed test file.
+2. Rebase PR #33 onto `main` and reconcile its documentation with this file.
+3. Repeat the bounded macOS startup/output/resize/exit smoke check against the
+   merged stack without changing OS security settings.
+4. Open an Issue per accepted follow-up above; land the renderer/PTY geometry
+   agreement and the missing key encodings as separate scoped PRs.
+5. Re-run the adversarial hostile-input sweep once the Kimi lane's quota resets,
+   since that evidence is still missing.
