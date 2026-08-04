@@ -1,0 +1,72 @@
+name: Audit
+
+# Supply-chain and toolchain-pin gates. This workflow is intentionally separate
+# from `rust.yml`: `rust.yml` owns build/lint/test, while this file owns the
+# dependency audit (advisories, licenses, bans, sources) and the Minimum
+# Supported Rust Version claim. Neither job duplicates a step in `rust.yml`.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deny:
+    name: Dependency audit (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No floating Rust setup action is used (matches rust.yml). rustup is
+      # preinstalled on the runner; rust-toolchain.toml pins the exact
+      # toolchain. cargo-deny only reads metadata and the lockfile, so it does
+      # not compile the workspace.
+      - name: Install cargo-deny (pinned)
+        run: cargo install cargo-deny --locked --version 0.20.2
+      - name: cargo-deny version
+        run: cargo deny --version
+      # Runs all four checks: advisories, bans, licenses, sources. Advisories,
+      # licenses, and sources fail the job; duplicate versions are surfaced as
+      # warnings (see deny.toml for the written policy).
+      - name: cargo deny check
+        run: cargo deny check
+
+  msrv:
+    name: Verify MSRV build (rust-version)
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The MSRV is declared once in the workspace `rust-version`. Read it from
+      # the manifest rather than hard-coding it here, so a bump in Cargo.toml is
+      # what drives this gate. `cargo +<msrv>` overrides rust-toolchain.toml, so
+      # the declared MSRV is what is actually tested even if the toolchain pin
+      # moves.
+      - name: Resolve declared MSRV
+        id: msrv
+        run: |
+          msrv="$(python3 -c 'import tomllib;print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["rust-version"])')"
+          echo "msrv=${msrv}" >> "$GITHUB_OUTPUT"
+          echo "Declared MSRV: ${msrv}"
+      - name: Install the declared MSRV toolchain
+        run: rustup toolchain install "${MSRV}" --profile minimal
+        env:
+          MSRV: ${{ steps.msrv.outputs.msrv }}
+      - name: Build the workspace on the MSRV
+        run: cargo +"${MSRV}" check --workspace --all-targets
+        env:
+          MSRV: ${{ steps.msrv.outputs.msrv }}
