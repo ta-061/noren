@@ -21,7 +21,7 @@ fn c0_action(byte: u8) -> Option<Action> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
-    Print(u8),
+    Print(char),
     LineFeed,
     CarriageReturn,
     Backspace,
@@ -80,13 +80,87 @@ pub(crate) enum PrivateMode {
     ApplicationCursorKey,
 }
 
+/// Incremental UTF-8 decoder for printable text in the Ground state.
+///
+/// Rejects overlong forms, surrogates, and out-of-range code points so only
+/// well-formed characters reach [`Action::Print`]. Invalid lead bytes are
+/// dropped; an invalid continuation abandons the pending sequence and is
+/// re-examined as a new lead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Utf8 {
+    value: u32,
+    remaining: u8,
+    min: u32,
+}
+
+impl Utf8 {
+    const fn idle() -> Self {
+        Self {
+            value: 0,
+            remaining: 0,
+            min: 0,
+        }
+    }
+
+    fn feed(&mut self, byte: u8) -> Option<char> {
+        if self.remaining > 0 {
+            if (0x80..=0xbf).contains(&byte) {
+                self.value = (self.value << 6) | u32::from(byte & 0x3f);
+                self.remaining -= 1;
+                if self.remaining > 0 {
+                    return None;
+                }
+                let (value, min) = (self.value, self.min);
+                *self = Self::idle();
+                return if value >= min {
+                    char::from_u32(value)
+                } else {
+                    None
+                };
+            }
+            self.value = 0;
+            self.remaining = 0;
+            self.min = 0;
+        }
+        *self = match byte {
+            // 0xc0/0xc1 leads can only encode overlong forms, so they are
+            // rejected outright; the `min` bounds reject overlong 3- and
+            // 4-byte forms, and `char::from_u32` rejects surrogates and
+            // values above U+10FFFF.
+            0xc2..=0xdf => Self {
+                value: u32::from(byte & 0x1f),
+                remaining: 1,
+                min: 0x80,
+            },
+            0xe0..=0xef => Self {
+                value: u32::from(byte & 0x0f),
+                remaining: 2,
+                min: 0x800,
+            },
+            0xf0..=0xf4 => Self {
+                value: u32::from(byte & 0x07),
+                remaining: 3,
+                min: 0x10_000,
+            },
+            _ => Self::idle(),
+        };
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Parser {
     state: ParserState,
+    utf8: Utf8,
 }
 
 impl Parser {
     pub(crate) fn advance(&mut self, byte: u8) -> Option<Action> {
+        if self.state != ParserState::Ground {
+            // A pending multi-byte character never straddles an escape
+            // sequence or control-string payload.
+            self.utf8 = Utf8::idle();
+        }
         let state = self.state;
         match state {
             ParserState::Ground => self.advance_ground(byte),
@@ -146,10 +220,18 @@ impl Parser {
         match byte {
             ESC => {
                 self.state = ParserState::Escape;
+                self.utf8 = Utf8::idle();
                 None
             }
-            0x20..=0x7e => Some(Action::Print(byte)),
-            _ => c0_action(byte),
+            0x20..=0x7e => {
+                self.utf8 = Utf8::idle();
+                Some(Action::Print(char::from(byte)))
+            }
+            0x80..=0xff => self.utf8.feed(byte).map(Action::Print),
+            _ => {
+                self.utf8 = Utf8::idle();
+                c0_action(byte)
+            }
         }
     }
 
@@ -444,7 +526,7 @@ mod tests {
         assert_eq!(
             actions(b"A\n\x0b\x0c\r\x08\x1b[2A\x1b[3;4H"),
             [
-                Action::Print(b'A'),
+                Action::Print('A'),
                 Action::LineFeed,
                 Action::LineFeed,
                 Action::LineFeed,
@@ -457,14 +539,53 @@ mod tests {
     }
 
     #[test]
+    fn decodes_multibyte_utf8_into_print_actions() {
+        assert_eq!(actions("日".as_bytes()), [Action::Print('日')]);
+        assert_eq!(
+            actions("aé😀".as_bytes()),
+            [Action::Print('a'), Action::Print('é'), Action::Print('😀')]
+        );
+        // Zero-width combining characters decode like any other printable.
+        assert_eq!(actions("\u{0301}".as_bytes()), [Action::Print('\u{0301}')]);
+    }
+
+    #[test]
+    fn utf8_state_survives_chunk_boundaries_but_not_escapes() {
+        let bytes = "日".as_bytes();
+        let mut parser = Parser::default();
+        assert_eq!(parser.advance(bytes[0]), None);
+        assert_eq!(parser.advance(bytes[1]), None);
+        assert_eq!(parser.advance(bytes[2]), Some(Action::Print('日')));
+
+        // An escape sequence mid-character abandons the pending bytes.
+        let mut parser = Parser::default();
+        assert_eq!(parser.advance(bytes[0]), None);
+        assert_eq!(parser.advance(ESC), None);
+        assert_eq!(parser.advance(b'['), None);
+        assert_eq!(parser.advance(b'A'), Some(Action::MoveUp(1)));
+    }
+
+    #[test]
+    fn invalid_utf8_bytes_are_dropped_without_printing() {
+        assert!(actions(&[0xff, 0xfe]).is_empty());
+        assert!(actions(&[0xc0, 0x80]).is_empty()); // overlong NUL
+        assert!(actions(&[0xe0, 0x80, 0x80]).is_empty()); // overlong
+        // Truncated multi-byte sequences at end of input are dropped.
+        assert!(actions(&"日".as_bytes()[..2]).is_empty());
+        // An invalid continuation abandons the pending sequence; the ASCII
+        // byte that broke it still prints.
+        assert_eq!(actions(&[0xc3, b'a']), [Action::Print('a')]);
+    }
+
+    #[test]
     fn horizontal_tab_emits_a_tab_action() {
         assert_eq!(
             actions(b"\ta\tb"),
             [
                 Action::Tab,
-                Action::Print(b'a'),
+                Action::Print('a'),
                 Action::Tab,
-                Action::Print(b'b'),
+                Action::Print('b'),
             ]
         );
     }
@@ -491,7 +612,7 @@ mod tests {
             .iter()
             .filter_map(|byte| parser.advance(*byte))
             .collect();
-        assert_eq!(emitted, [Action::Print(b'X')]);
+        assert_eq!(emitted, [Action::Print('X')]);
     }
 
     #[test]

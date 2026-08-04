@@ -103,7 +103,9 @@ fn split_sequences_are_retained_and_unsupported_bytes_do_not_leak() {
 
     state.feed_bytes(b"\x1b[31m\xff\xc3\xa9");
     state.feed_bytes(b"Q");
-    assert_eq!(state.snapshot().lines(), ["", "  Q"]);
+    // 0xff is invalid UTF-8 and is dropped; é decodes and prints as a
+    // one-column character.
+    assert_eq!(state.snapshot().lines(), ["", "  éQ"]);
 }
 
 #[test]
