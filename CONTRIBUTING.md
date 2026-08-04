@@ -38,8 +38,23 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Dependency audit and license policy checks remain intended additions; the
-repository will not claim these pass before CI actually runs them.
+Dependency audit, license policy, and MSRV verification run in CI via the
+`Audit` workflow (`.github/workflows/audit.yml`):
+
+- `cargo deny check` enforces advisories (security, yanked), license policy
+  (the allow-list in `deny.toml`, derived from the actual dependency tree and
+  limited to permissive licenses), and source policy (crates.io only).
+- A dedicated job builds the workspace with the toolchain named by the
+  workspace `rust-version` (currently `1.88`), so the MSRV claim is tested
+  rather than asserted.
+
+Reproduce locally before opening a supply-chain or MSRV change:
+
+```text
+cargo install cargo-deny --locked --version 0.20.2
+cargo deny check
+cargo +<rust-version> check --workspace --all-targets
+```
 
 Changes to `crates/noren-terminal/` additionally keep these conventions:
 
