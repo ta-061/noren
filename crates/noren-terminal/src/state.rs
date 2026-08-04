@@ -1084,6 +1084,19 @@ impl TerminalState {
         let mut index = 0;
         while index < params.len() {
             let param = params[index];
+            // Extent of the current ECMA-48 parameter group: the leading value
+            // plus any trailing colon sub-parameters (`:`-separated). A lone
+            // `;`-separated value is a one-element group.
+            let group_end = sgr_group_end(separators, index);
+            // Outside the extended-color selectors (38/48/58), a multi-element
+            // colon group is an unsupported compound attribute (e.g. `4:0` and
+            // other modern underline styles). It must be skipped whole so its
+            // sub-parameters never touch the pen — `4:0` must not turn underline
+            // on and then let the trailing `0` reset every attribute.
+            if group_end > index + 1 && !matches!(param, 38 | 48 | 58) {
+                index = group_end;
+                continue;
+            }
             match param {
                 0 => self.pen = CellAttributes::default(),
                 1 => self.pen = self.pen.with_bold(true),
@@ -1192,6 +1205,21 @@ impl TerminalState {
         }
         self.modes.alternate_screen = false;
     }
+}
+
+/// End index (exclusive) of the ECMA-48 parameter group that begins at `start`.
+///
+/// A group is the leading value plus every trailing colon sub-parameter
+/// (separator `SEPARATOR_SUB`). A lone `;`-separated value is a one-element
+/// group, so this returns `start + 1` for it. Used by the SGR walker to treat a
+/// colon-bearing attribute as a single parameter and skip unsupported compound
+/// groups (e.g. `4:0`) whole instead of walking their sub-parameters.
+fn sgr_group_end(separators: &[u8], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < separators.len() && is_sub_parameter(&separators[end]) {
+        end += 1;
+    }
+    end
 }
 
 /// Parse an extended SGR color (`38`/`48`/`58`) starting at `start`.

@@ -73,8 +73,12 @@ fn degenerate_parameter_lists_do_not_panic() {
     assert_eq!((state.cursor().row(), state.cursor().column()), (0, 0));
     assert_invariants(&state, "many semicolons CUP");
 
-    // SGR with >8 params is dropped entirely (overflow), pen unchanged.
-    state.feed_bytes(b"\x1b[1;2;3;4;5;6;7;8;9m");
+    // SGR beyond the parameter cap is dropped entirely (overflow), pen
+    // unchanged. The cap is 32, so 40 bold-codes overflows and is discarded.
+    let mut hostile = b"\x1b[".to_vec();
+    hostile.extend(b"1;".repeat(40));
+    hostile.extend(b"m");
+    state.feed_bytes(&hostile);
     assert_eq!(*state.attributes(), CellAttributes::default());
 
     // Lone/default params resolve to defaults.

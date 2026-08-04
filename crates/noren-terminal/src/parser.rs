@@ -2,7 +2,29 @@
 
 const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
-const MAX_CSI_PARAMS: usize = 8;
+
+/// Maximum number of parameter slots collected for a single CSI sequence.
+///
+/// SGR is the parameter-hungriest supported final: the ordinary way to set
+/// foreground and background truecolor together (`38;2;R;G;B;48;2;R;G;B`)
+/// needs 10 slots, and adding underline truecolor (`58;2;R;G;B`) raises that
+/// to 15. The ITU-T T.416 colon form is wider still (`38:2::R:G:B` is six
+/// slots per color, 18 for all three), and a realistic emission surrounds the
+/// colors with style flags. 32 covers that ceiling with headroom while keeping
+/// the per-sequence `Csi` struct (and the copied SGR action payload) small.
+///
+/// The bound is the hard memory ceiling against a hostile
+/// `\x1b[1;1;…;1m` with thousands of parameters: `Csi::push_current` flips
+/// `overflowed` once `len` reaches it and `Csi::action` then drops the whole
+/// sequence, so the parser never allocates beyond these fixed arrays.
+const MAX_CSI_PARAMS: usize = 32;
+
+// Compile-time check that the cap covers the realistic SGR ceiling described
+// above (combined fg+bg+underline truecolor in colon form plus style flags).
+const _: () = assert!(
+    MAX_CSI_PARAMS >= 20,
+    "MAX_CSI_PARAMS must cover combined fg/bg/underline truecolor plus flags"
+);
 
 /// Separator marker recorded with each collected CSI parameter value.
 /// `0` marks a value that begins a new parameter (`;`-separated or the first
