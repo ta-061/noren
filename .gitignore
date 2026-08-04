@@ -31,3 +31,4 @@ __pycache__/
 # Local test/runtime state
 /.noren/
 /tmp/
+.fleet/
