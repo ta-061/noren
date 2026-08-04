@@ -4,6 +4,21 @@ const ESC: u8 = 0x1b;
 const BEL: u8 = 0x07;
 const MAX_CSI_PARAMS: usize = 8;
 
+/// Map a C0 control byte (0x00..=0x1f) to the same action Ground emits.
+///
+/// Most C0 controls (NUL, CAN, SUB, ...) produce no action; the actionable
+/// ones are shared between Ground and an in-progress CSI so that a control
+/// embedded in a sequence executes without aborting it.
+fn c0_action(byte: u8) -> Option<Action> {
+    match byte {
+        b'\n' | 0x0b | 0x0c => Some(Action::LineFeed),
+        b'\r' => Some(Action::CarriageReturn),
+        b'\t' => Some(Action::Tab),
+        0x08 => Some(Action::Backspace),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
     Print(u8),
@@ -133,12 +148,8 @@ impl Parser {
                 self.state = ParserState::Escape;
                 None
             }
-            b'\n' | 0x0b | 0x0c => Some(Action::LineFeed),
-            b'\r' => Some(Action::CarriageReturn),
-            b'\t' => Some(Action::Tab),
-            0x08 => Some(Action::Backspace),
             0x20..=0x7e => Some(Action::Print(byte)),
-            _ => None,
+            _ => c0_action(byte),
         }
     }
 
@@ -267,6 +278,12 @@ impl Csi {
                     self.action(byte)
                 })
             }
+            // C0 controls embedded in a control sequence execute immediately
+            // via the Ground action WITHOUT aborting the sequence (DEC VT and
+            // xterm). ESC never reaches here: Parser::advance intercepts it
+            // first and restarts the escape. CAN/SUB yield no action via
+            // c0_action, preserving the prior swallow-and-continue behavior.
+            0x00..=0x1f => CsiAdvance::embedded(c0_action(byte)),
             _ => CsiAdvance::pending(),
         }
     }
@@ -401,6 +418,13 @@ impl CsiAdvance {
             finished: true,
         }
     }
+
+    const fn embedded(action: Option<Action>) -> Self {
+        Self {
+            action,
+            finished: false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -484,6 +508,41 @@ mod tests {
     #[test]
     fn escape_restarts_an_incomplete_csi_sequence() {
         assert_eq!(actions(b"\x1b[9\x1b[2A"), [Action::MoveUp(2)]);
+    }
+
+    #[test]
+    fn embedded_c0_in_csi_executes_without_aborting() {
+        // A C0 control inside a CSI executes its Ground action immediately and
+        // the sequence keeps collecting parameters (DEC VT / xterm). The LF
+        // is no longer swallowed mid-sequence.
+        assert_eq!(actions(b"\x1b[\n2A"), [Action::LineFeed, Action::MoveUp(2)]);
+        // CR and BS likewise execute mid-sequence without aborting.
+        assert_eq!(
+            actions(b"\x1b[2\rA"),
+            [Action::CarriageReturn, Action::MoveUp(2)]
+        );
+        // Digits on both sides of an embedded C0 concatenate into one
+        // parameter: the execute action does not commit the current param.
+        assert_eq!(
+            actions(b"\x1b[1\n2A"),
+            [Action::LineFeed, Action::MoveUp(12)]
+        );
+    }
+
+    #[test]
+    fn embedded_esc_still_aborts_the_csi() {
+        // ESC inside a CSI restarts the escape; the partial sequence is
+        // dropped. (ESC is intercepted by Parser::advance before Csi::advance.)
+        assert_eq!(actions(b"\x1b[1\x1b[2A"), [Action::MoveUp(2)]);
+    }
+
+    #[test]
+    fn embedded_can_and_sub_are_unchanged() {
+        // CAN (0x18) and SUB (0x1a) emit no action and do not abort the CSI;
+        // the sequence runs to completion with its parameters intact, exactly
+        // as before the embedded-C0 fix.
+        assert_eq!(actions(b"\x1b[2\x18A"), [Action::MoveUp(2)]);
+        assert_eq!(actions(b"\x1b[2\x1aA"), [Action::MoveUp(2)]);
     }
 
     #[test]

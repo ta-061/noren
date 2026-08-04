@@ -200,40 +200,44 @@ fn high_bytes_interleaved_with_ascii_are_individually_dropped() {
 // ===== Degenerate scroll regions =====
 
 #[test]
-fn inverted_and_degenerate_scroll_regions_are_rejected_and_preserve_state() {
+fn degenerate_scroll_regions_reject_and_out_of_range_clamps() {
     let mut state = TerminalState::new(5, 3).expect("valid terminal");
     let (top0, bottom0) = (state.scroll_region().top(), state.scroll_region().bottom());
 
-    // inverted (top > bottom)
-    state.feed_bytes(b"\x1b[4;2r");
-    assert_eq!(
-        (state.scroll_region().top(), state.scroll_region().bottom()),
-        (top0, bottom0)
-    );
-    // single-row (top == bottom)
-    state.feed_bytes(b"\x1b[3;3r");
-    assert_eq!(
-        (state.scroll_region().top(), state.scroll_region().bottom()),
-        (top0, bottom0)
-    );
-    // bottom past the last screen line
-    state.feed_bytes(b"\x1b[1;99r");
+    // Ranges that stay inverted or degenerate after clamping are rejected and
+    // leave the current region untouched (DECSTBM clamps before validating).
+    state.feed_bytes(b"\x1b[4;2r"); // top=3, bottom=1 -> inverted after clamping
+    state.feed_bytes(b"\x1b[3;3r"); // top==bottom==2 after clamping
     assert_eq!(
         (state.scroll_region().top(), state.scroll_region().bottom()),
         (top0, bottom0)
     );
 
-    // The public API must agree and return Err without mutating.
+    // Out-of-range bottom CLAMPS to the last screen line and is accepted, not
+    // rejected. On this 5-row terminal ESC[2;99r clamps bottom 98 -> 4.
+    state.feed_bytes(b"\x1b[2;99r");
+    assert_eq!(
+        (state.scroll_region().top(), state.scroll_region().bottom()),
+        (1, 4)
+    );
+
+    // The public API agrees with the CSI path on both rejection and clamping.
     assert_eq!(
         state.set_scroll_region(3, 1),
-        Err(TerminalError::InvalidScrollRegion)
+        Err(TerminalError::InvalidScrollRegion),
+        "inverted range rejected by the public API"
+    );
+    assert_eq!(
+        state.set_scroll_region(0, 99),
+        Ok(()),
+        "out-of-range bottom clamped by the public API"
     );
     assert_eq!(
         (state.scroll_region().top(), state.scroll_region().bottom()),
-        (top0, bottom0)
+        (0, 4)
     );
 
-    assert_invariants(&state, "degenerate regions rejected");
+    assert_invariants(&state, "degenerate regions reject, out-of-range clamps");
 }
 
 #[test]

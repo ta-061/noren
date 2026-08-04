@@ -126,7 +126,13 @@ impl ScrollRegion {
     }
 
     fn checked(rows: u16, top: u16, bottom: u16) -> Result<Self, TerminalError> {
-        if top >= bottom || bottom >= rows {
+        // xterm clamps both margins to the screen before the validity check,
+        // so ESC[1;6r on a 5-row terminal yields (0, 4) instead of being
+        // dropped. DECSTBM is ignored only when top >= bottom AFTER clamping.
+        let last_row = rows - 1;
+        let top = top.min(last_row);
+        let bottom = bottom.min(last_row);
+        if top >= bottom {
             return Err(TerminalError::InvalidScrollRegion);
         }
         Ok(Self { top, bottom })

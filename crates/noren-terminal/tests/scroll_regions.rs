@@ -31,7 +31,7 @@ fn labeled_rows() -> TerminalState {
 }
 
 #[test]
-fn decstbm_defaults_reset_invalid_ranges_and_preserves_outside_rows() {
+fn decstbm_clamps_out_of_range_and_rejects_inverted_regions() {
     let mut state = labeled_rows();
 
     state.feed_bytes(b"\x1b[;4r");
@@ -42,16 +42,38 @@ fn decstbm_defaults_reset_invalid_ranges_and_preserves_outside_rows() {
     assert_eq!(region(&state), (1, 4));
     assert_eq!(cursor(&state), (0, 0));
 
-    state.feed_bytes(b"\x1b[3;3r\x1b[5;2r\x1b[2;99r");
+    // Genuine rejections: top >= bottom (even after clamping) leave the
+    // current region and cursor untouched. ESC[3;3r, ESC[5;2r, and ESC[4;2r
+    // all collapse to top >= bottom and are dropped, so the cursor stays.
+    state.feed_bytes(b"\x1b[4;1H");
+    assert_eq!(cursor(&state), (3, 0));
+    state.feed_bytes(b"\x1b[3;3r\x1b[5;2r\x1b[4;2r");
     assert_eq!(region(&state), (1, 4));
-    assert_eq!(cursor(&state), (0, 0));
+    assert_eq!(cursor(&state), (3, 0));
     assert_eq!(rows(&state), ["AAA", "BBB", "CCC", "DDD", "EEE"]);
 
+    // Out-of-range margins now clamp to the last row instead of rejecting.
+    // ESC[1;6r on a 5-row terminal clamps bottom 5 -> 4, accepting (0, 4).
+    state.feed_bytes(b"\x1b[1;6r");
+    assert_eq!(region(&state), (0, 4));
+    assert_eq!(cursor(&state), (0, 0));
+
+    // ESC[2;99r clamps bottom 98 -> 4 and accepts (1, 4).
+    state.feed_bytes(b"\x1b[2;99r");
+    assert_eq!(region(&state), (1, 4));
+    assert_eq!(cursor(&state), (0, 0));
+
+    // The public set_scroll_region API rejects top >= bottom just like CSI.
     assert_eq!(
         state.set_scroll_region(3, 3),
         Err(TerminalError::InvalidScrollRegion)
     );
     assert_eq!(region(&state), (1, 4));
+
+    // The public API clamps identically to the CSI path: out-of-range bottom
+    // is accepted after clamping rather than erroring.
+    assert_eq!(state.set_scroll_region(0, 99), Ok(()));
+    assert_eq!(region(&state), (0, 4));
 
     state.feed_bytes(b"\x1b[r");
     assert_eq!(region(&state), (0, 4));
@@ -191,4 +213,36 @@ fn printable_ascii_and_ignored_controls_remain_stable() {
     assert_eq!(rows(&state), ["ABCD ", "     "]);
     assert_eq!(cursor(&state), (0, 4));
     assert!(!state.is_wrap_pending());
+}
+
+/// DECSTBM clamping must hold when the sequence is split across feed
+/// boundaries, where this parser has historically been fragile. Feeding the
+/// whole script one byte at a time must match feeding it as a single chunk.
+#[test]
+fn decstbm_clamp_survives_byte_at_a_time_feeding() {
+    let script: &[&[u8]] = &[
+        // Out-of-range bottom clamps to the last row.
+        b"\x1b[1;6r",
+        // Region valid only after clamping is accepted.
+        b"\x1b[2;99r",
+        // top >= bottom after clamping is rejected; prior region preserved.
+        b"\x1b[4;2r",
+    ];
+
+    let mut chunked = labeled_rows();
+    for bytes in script {
+        chunked.feed_bytes(bytes);
+    }
+
+    let mut bytewise = labeled_rows();
+    for bytes in script {
+        for byte in *bytes {
+            bytewise.feed_bytes(std::slice::from_ref(byte));
+        }
+    }
+
+    assert_eq!(region(&chunked), (1, 4));
+    assert_eq!(region(&bytewise), (1, 4));
+    assert_eq!(cursor(&chunked), cursor(&bytewise));
+    assert_eq!(chunked.snapshot(), bytewise.snapshot());
 }
