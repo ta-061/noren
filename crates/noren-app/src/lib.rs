@@ -9,6 +9,8 @@
 //! crates.
 
 mod clipboard;
+pub mod config;
+pub mod diagnostics;
 mod input;
 
 pub use clipboard::{
@@ -146,6 +148,23 @@ impl GridGeometry {
             cell_height: POC_CELL_HEIGHT,
             current: None,
         }
+    }
+
+    /// Geometry with configuration-chosen cell dimensions.
+    ///
+    /// A zero edge is rejected because grid division would fault; the
+    /// configuration loader ([`crate::config`]) range-checks values before
+    /// they reach here.
+    #[must_use]
+    pub fn with_cells(cell_width: u32, cell_height: u32) -> Option<Self> {
+        if cell_width == 0 || cell_height == 0 {
+            return None;
+        }
+        Some(Self {
+            cell_width,
+            cell_height,
+            current: None,
+        })
     }
 
     /// Current last valid grid.

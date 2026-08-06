@@ -685,6 +685,7 @@ version = "0.1.0"
 dependencies = [
  "noren-pty",
  "noren-terminal",
+ "toml_edit",
  "wgpu",
  "winit",
 ]
