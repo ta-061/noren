@@ -351,9 +351,15 @@ fn observe_emits_status_changed_only_when_it_differs() {
     let mut registry = SessionRegistry::new();
     let id = registry.create(SessionKind::Local);
 
-    // A real change yields the unit StatusChanged event.
+    // A real change yields the contract StatusChanged { id, status } event.
     let changed = registry.observe(id, SessionStatus::Running).unwrap();
-    assert_eq!(changed, Some(SessionEvent::StatusChanged));
+    assert_eq!(
+        changed,
+        Some(SessionEvent::StatusChanged {
+            id,
+            status: SessionStatus::Running,
+        })
+    );
 
     // Re-observing the same status yields nothing.
     let unchanged = registry.observe(id, SessionStatus::Running).unwrap();
@@ -406,7 +412,10 @@ fn session_event_matches_the_contract_variants() {
     let _ = [
         SessionEvent::Created(id),
         SessionEvent::Selected(Some(id)),
-        SessionEvent::StatusChanged,
+        SessionEvent::StatusChanged {
+            id,
+            status: SessionStatus::Running,
+        },
         SessionEvent::Closed(id),
     ];
 }

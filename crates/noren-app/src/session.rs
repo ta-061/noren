@@ -208,12 +208,10 @@ pub enum SessionAction {
 
 /// The result of reducing a [`SessionAction`] or an observation.
 ///
-/// Conforms to D-M3-001: tuple-variant shape. Events describe what actually
-/// changed; a no-op (selecting the already-selected session) emits nothing.
-/// [`StatusChanged`] is intentionally payload-free — a consumer that needs the
-/// new value queries the registry.
-///
-/// [`StatusChanged`]: SessionEvent::StatusChanged
+/// Conforms to D-M3-001: `Created`, `Selected`, and `Closed` are tuple
+/// variants; `StatusChanged` carries the id and new status as named fields.
+/// Events describe what actually changed; a no-op (selecting the
+/// already-selected session, observing the current status) emits nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionEvent {
     /// A new session entry was recorded.
@@ -221,7 +219,12 @@ pub enum SessionEvent {
     /// The selection changed: set, replaced, or cleared.
     Selected(Option<SessionId>),
     /// A session's observed status changed.
-    StatusChanged,
+    StatusChanged {
+        /// The session whose status changed.
+        id: SessionId,
+        /// The newly observed status.
+        status: SessionStatus,
+    },
     /// A session entry was removed.
     Closed(SessionId),
 }
@@ -371,7 +374,10 @@ impl SessionRegistry {
             return Ok(None);
         }
         descriptor.status = status;
-        Ok(Some(SessionEvent::StatusChanged))
+        Ok(Some(SessionEvent::StatusChanged {
+            id,
+            status: descriptor.status.clone(),
+        }))
     }
 
     /// The descriptor for `id`, if it is live.
