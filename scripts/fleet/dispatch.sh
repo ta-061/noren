@@ -28,6 +28,10 @@ case "$lane" in
   glm-*)   engine=glm;   account=glm-main;   model="zai-coding-plan/glm-5.2" ;;
   qwen-*)  engine=qwen;  account=qwen-main;  model="qwencloud/qwen3.8-max-preview" ;;
   kimi-*)  engine=kimi;  account=kimi-main;  model="" ;;
+  # Fugu owns Zellij, OpenSSH, and remote process-boundary work. It runs through
+  # the same opencode binary as GLM/Qwen, so it is gated on the GLM account.
+  # Adding this lane does NOT mean SSH implementation has started.
+  fugu-*)  engine=glm;   account=glm-main;   model="sakana/fugu-ultra" ;;
   # Codex work goes through the codex-lab wrapper only (portal `codex-main`).
   # The plain `codex` binary maps to `codex-tatu`, which is nearly exhausted and
   # is deliberately not reachable from this script.
