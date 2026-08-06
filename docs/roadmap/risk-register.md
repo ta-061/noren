@@ -30,7 +30,7 @@ tables below): [terminal-landscape.md](../research/terminal-landscape.md)
 [project-principles.md](../project-principles.md) (`PP`),
 [design-process.md](../coordination/design-process.md) (`DP`),
 [open-questions.md](../coordination/open-questions.md) (`OQ`),
-[agent-calibration.md](../coordination/agent-calibration.md) (`AC`),
+agent-calibration.md (`AC`),
 [status.md](../coordination/status.md) (`ST`).
 
 ## Independent reviews (assigned, not performed)
