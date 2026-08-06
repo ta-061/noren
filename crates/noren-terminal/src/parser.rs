@@ -113,6 +113,7 @@ pub(crate) enum EraseMode {
 pub(crate) enum PrivateMode {
     AlternateScreen,
     ApplicationCursorKey,
+    BracketedPaste,
 }
 
 /// Incremental UTF-8 decoder for printable text in the Ground state.
@@ -495,6 +496,7 @@ impl Csi {
         let mode = match self.params[0] {
             1 => PrivateMode::ApplicationCursorKey,
             1049 => PrivateMode::AlternateScreen,
+            2004 => PrivateMode::BracketedPaste,
             _ => return None,
         };
         match final_byte {
@@ -683,8 +685,25 @@ mod tests {
 
     #[test]
     fn swallows_unsupported_csi_and_osc_payloads() {
-        assert_eq!(actions(b"a\x1b[?2004hb\x1b]0;secret\x07c"), actions(b"abc"));
+        assert_eq!(actions(b"a\x1b[?9999hb\x1b]0;secret\x07c"), actions(b"abc"));
         assert!(actions(b"\x1b[?2A\x1b[1:2A").is_empty());
+    }
+
+    #[test]
+    fn bracketed_paste_mode_2004_is_tracked_as_a_private_mode() {
+        assert_eq!(
+            actions(b"\x1b[?2004h\x1b[?2004l"),
+            [
+                Action::SetPrivateMode {
+                    mode: PrivateMode::BracketedPaste,
+                    enabled: true,
+                },
+                Action::SetPrivateMode {
+                    mode: PrivateMode::BracketedPaste,
+                    enabled: false,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -780,6 +799,6 @@ mod tests {
                 },
             ]
         );
-        assert!(actions(b"\x1b[?2004h\x1b[?1049;1h\x1b[>1049h").is_empty());
+        assert!(actions(b"\x1b[?9999h\x1b[?1049;1h\x1b[>1049h").is_empty());
     }
 }

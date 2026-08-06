@@ -4,17 +4,18 @@ mod renderer;
 
 use noren_app::{
     Arrow, CursorKeyMode, FunctionKey, GridGeometry, GridSize, InputMode, Key, KeyDropReason,
-    KeyEncoder, KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode, Modifiers,
-    PARSE_BUDGET_BYTES_PER_TURN, Resize,
+    KeyEncoder, KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode, MAX_RENDER_ROWS, Modifiers,
+    PARSE_BUDGET_BYTES_PER_TURN, POC_CELL_HEIGHT, POC_CELL_WIDTH, PasteReject, Resize,
+    SystemClipboard, encode_paste,
 };
 use noren_pty::{PtyEvent, PtySession, PtySize};
-use noren_terminal::{TerminalEngine, TerminalState};
+use noren_terminal::{Cell, GridPoint, Selection, SelectionMode, TerminalEngine, TerminalState};
 use renderer::{RenderOutcome, Renderer};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key as WinitKey, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -34,6 +35,13 @@ struct NorenApp {
     status: &'static str,
     show_status: bool,
     redraw_needed: bool,
+    // User-initiated selection state. The renderer does not highlight it yet;
+    // copy still extracts it. Any PTY output or resize invalidates it because
+    // grid coordinates only address the content they were captured on.
+    selection: Option<Selection>,
+    drag_origin: Option<GridPoint>,
+    drag_mode: SelectionMode,
+    cursor_position: Option<PhysicalPosition<f64>>,
 }
 
 impl Default for NorenApp {
@@ -49,6 +57,10 @@ impl Default for NorenApp {
             status: "Noren PoC starting",
             show_status: true,
             redraw_needed: true,
+            selection: None,
+            drag_origin: None,
+            drag_mode: SelectionMode::Char,
+            cursor_position: None,
         }
     }
 }
@@ -126,6 +138,9 @@ impl NorenApp {
     }
 
     fn handle_key(&mut self, event: &KeyEvent) {
+        if self.handle_clipboard_shortcut(event) {
+            return;
+        }
         let input_mode = self.current_input_mode();
         let encoded = if let Some(input) = translate_keypad_key(event) {
             KeyEncoder::encode_keypad_with(input.with_modifiers(self.modifiers), input_mode)
@@ -137,6 +152,192 @@ impl NorenApp {
             return;
         };
         self.send_input(&bytes);
+    }
+
+    /// User-initiated selection and clipboard shortcuts.
+    ///
+    /// Cmd+A selects the whole grid, Cmd+C copies the selection to the system
+    /// clipboard, and Cmd+V pastes the clipboard into the PTY — but only as a
+    /// bracketed paste when the application enabled DEC private mode 2004;
+    /// otherwise the paste is gated and reported, never sent unbracketed.
+    fn handle_clipboard_shortcut(&mut self, event: &KeyEvent) -> bool {
+        if event.state != ElementState::Pressed || event.repeat || !self.modifiers.is_super() {
+            return false;
+        }
+        let WinitKey::Character(text) = &event.logical_key else {
+            return false;
+        };
+        let mut characters = text.chars();
+        let Some(character) = characters.next() else {
+            return false;
+        };
+        if characters.next().is_some() {
+            return false;
+        }
+        match character {
+            'a' | 'A' => self.select_entire_grid(),
+            'c' | 'C' => self.copy_selection(),
+            'v' | 'V' => self.paste_clipboard(),
+            _ => return false,
+        }
+        true
+    }
+
+    fn select_entire_grid(&mut self) {
+        if let Some(terminal) = &self.terminal {
+            self.selection = Some(Selection::entire_grid(terminal));
+        }
+    }
+
+    fn copy_selection(&mut self) {
+        let Some(terminal) = &self.terminal else {
+            return;
+        };
+        let Some(selection) = &self.selection else {
+            return;
+        };
+        if !selection.is_valid(terminal) {
+            self.selection = None;
+            return;
+        }
+        let text = selection.extract(terminal);
+        if text.is_empty() {
+            return;
+        }
+        if SystemClipboard::new().write(&text).is_err() {
+            self.status = "Noren clipboard copy failed";
+            self.show_status = true;
+            self.redraw_needed = true;
+        }
+    }
+
+    fn paste_clipboard(&mut self) {
+        let text = match SystemClipboard::new().read() {
+            Ok(text) => text,
+            Err(_) => {
+                self.status = "Noren clipboard paste failed";
+                self.show_status = true;
+                self.redraw_needed = true;
+                return;
+            }
+        };
+        match self.paste_bytes(&text) {
+            Ok(bytes) => self.send_input(&bytes),
+            Err(reject @ (PasteReject::Unbracketed | PasteReject::Oversized)) => {
+                self.show_paste_gate(reject);
+            }
+            Err(PasteReject::Empty) => {}
+        }
+    }
+
+    /// Encode a user-initiated paste against the live terminal mode.
+    ///
+    /// Returns the bracketed bytes when DEC private mode 2004 is enabled, and a
+    /// typed [`PasteReject`] otherwise. Never yields unbracketed bytes: when the
+    /// mode is off, or the terminal state is unavailable, the paste is gated.
+    fn paste_bytes(&self, text: &str) -> Result<Vec<u8>, PasteReject> {
+        let bracketed = self
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.modes().is_bracketed_paste_enabled());
+        encode_paste(text, bracketed)
+    }
+
+    /// Surface a gated paste visibly instead of sending nothing silently.
+    fn show_paste_gate(&mut self, reject: PasteReject) {
+        // Status is a &'static str, so map the typed reason to fixed text.
+        self.status = match reject {
+            PasteReject::Unbracketed => {
+                "Noren paste gated: application did not enable bracketed paste (mode 2004)"
+            }
+            PasteReject::Oversized => "Noren paste gated: clipboard text exceeds the paste bound",
+            PasteReject::Empty => "Noren paste gated: clipboard text is empty",
+        };
+        self.show_status = true;
+        self.redraw_needed = true;
+    }
+
+    fn handle_mouse_move(&mut self, position: PhysicalPosition<f64>) {
+        self.cursor_position = Some(position);
+        let Some(origin) = self.drag_origin else {
+            return;
+        };
+        let Some(point) = self.grid_point_at(position) else {
+            return;
+        };
+        if let Some(terminal) = &self.terminal {
+            self.selection = Some(Selection::new(terminal, self.drag_mode, origin, point));
+        }
+    }
+
+    fn handle_mouse_button(&mut self, state: ElementState, button: MouseButton) {
+        if button != MouseButton::Left {
+            return;
+        }
+        match state {
+            ElementState::Pressed => {
+                let Some(position) = self.cursor_position else {
+                    return;
+                };
+                let Some(point) = self.grid_point_at(position) else {
+                    return;
+                };
+                let Some(terminal) = &self.terminal else {
+                    return;
+                };
+                // Option-drag selects word-wise, Cmd-drag line-wise.
+                let mode = if self.modifiers.is_alt() {
+                    SelectionMode::Word
+                } else if self.modifiers.is_super() {
+                    SelectionMode::Line
+                } else {
+                    SelectionMode::Char
+                };
+                self.drag_mode = mode;
+                self.drag_origin = Some(point);
+                self.selection = Some(Selection::new(terminal, mode, point, point));
+            }
+            ElementState::Released => {
+                self.drag_origin = None;
+            }
+        }
+    }
+
+    /// Map a window pixel position to grid coordinates, mirroring the
+    /// renderer's bottom-aligned layout of the trimmed visible lines and the
+    /// optional status row. Returns `None` outside the rendered content.
+    fn grid_point_at(&self, position: PhysicalPosition<f64>) -> Option<GridPoint> {
+        if position.x < 0.0 || position.y < 0.0 {
+            return None;
+        }
+        let terminal = self.terminal.as_ref()?;
+        let window = self.window.as_ref()?;
+        let physical = window.inner_size();
+        let visible_rows = usize::try_from(physical.height / POC_CELL_HEIGHT)
+            .unwrap_or(0)
+            .clamp(1, usize::from(MAX_RENDER_ROWS));
+        let content_rows = visible_content_rows(terminal);
+        let total_lines = content_rows + usize::from(self.show_status);
+        let displayed = total_lines.min(visible_rows);
+        let top_blank_rows = visible_rows - displayed;
+        let first_line = total_lines - displayed;
+        let row = pixel_row_index(position.y, POC_CELL_HEIGHT)?;
+        if row < top_blank_rows {
+            return None;
+        }
+        let line_index = first_line + (row - top_blank_rows);
+        if line_index >= content_rows {
+            return None;
+        }
+        let (rows, cols) = terminal.size();
+        if line_index >= usize::from(rows) {
+            return None;
+        }
+        let column = pixel_row_index(position.x, POC_CELL_WIDTH)?.min(usize::from(cols) - 1);
+        Some(GridPoint::new(
+            terminal.scrollback_len() + line_index,
+            column,
+        ))
     }
 
     fn send_input(&mut self, bytes: &[u8]) {
@@ -185,6 +386,9 @@ impl NorenApp {
         let Some(grid) = self.pending_grid.take() else {
             return;
         };
+        // Resize re-addresses the grid, so captured coordinates expire.
+        self.selection = None;
+        self.drag_origin = None;
         if let Some(terminal) = &mut self.terminal {
             if terminal.resize(grid.rows(), grid.cols()).is_err() {
                 self.status = "Noren terminal resize failed";
@@ -203,6 +407,7 @@ impl NorenApp {
     fn drain_pty(&mut self) {
         let mut remaining = PARSE_BUDGET_BYTES_PER_TURN;
         let mut terminal_status = None;
+        let mut output_consumed = false;
         while remaining >= noren_pty::READ_CHUNK_BYTES {
             let event = match self.pty.as_ref().map(PtySession::try_recv) {
                 Some(Ok(Some(event))) => event,
@@ -224,6 +429,7 @@ impl NorenApp {
                     if let Some(terminal) = &mut self.terminal {
                         terminal.feed_bytes(&bytes);
                     }
+                    output_consumed = true;
                     self.redraw_needed = true;
                 }
                 PtyEvent::Eof => {
@@ -243,6 +449,13 @@ impl NorenApp {
                     break;
                 }
             }
+        }
+        // Any output may have moved or overwritten the selected content; the
+        // selection model treats every state change as expiration, so the app
+        // drops captured coordinates rather than risk stale text.
+        if output_consumed {
+            self.selection = None;
+            self.drag_origin = None;
         }
         if let Some(status) = terminal_status {
             self.finish_pty(status);
@@ -318,6 +531,10 @@ impl ApplicationHandler for NorenApp {
             WindowEvent::CloseRequested => self.close(event_loop),
             WindowEvent::Resized(physical) => self.handle_resize(physical),
             WindowEvent::ModifiersChanged(modifiers) => self.update_modifiers(modifiers.state()),
+            WindowEvent::CursorMoved { position, .. } => self.handle_mouse_move(position),
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.handle_mouse_button(state, button)
+            }
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(&event),
             WindowEvent::Ime(_) => {
                 let _ = KeyDropReason::ImeOrDeadKey;
@@ -348,6 +565,34 @@ impl ApplicationHandler for NorenApp {
 
 fn pty_size(grid: GridSize) -> Result<PtySize, noren_pty::PtyError> {
     PtySize::from_raw(grid.rows(), grid.cols()).ok_or(noren_pty::PtyError::InvalidSize)
+}
+
+/// Index of the cell row containing a non-negative pixel coordinate, or
+/// `None` when the coordinate is not finite. The cast saturates on overflow,
+/// and downstream clamping keeps any saturated index inside the grid.
+fn pixel_row_index(pixel: f64, cell_size: u32) -> Option<usize> {
+    if !pixel.is_finite() {
+        return None;
+    }
+    Some((pixel / f64::from(cell_size)) as usize)
+}
+
+/// Number of visible grid rows the renderer will draw: rows up to and
+/// including the last row with non-blank content. Mirrors the snapshot
+/// `lines` trimming without cloning the grid (or the scrollback), so mouse
+/// mapping never pays for an immutable snapshot per event.
+fn visible_content_rows(terminal: &TerminalState) -> usize {
+    let screen = terminal.screen();
+    let cols = usize::from(screen.cols());
+    let cells = screen.cells();
+    (0..usize::from(screen.rows()))
+        .filter(|row| {
+            !cells[row * cols..(row + 1) * cols]
+                .iter()
+                .all(Cell::is_blank)
+        })
+        .next_back()
+        .map_or(0, |row| row + 1)
 }
 
 fn translate_key(event: &KeyEvent, modifiers: Modifiers) -> Result<KeyInput, KeyDropReason> {
@@ -555,6 +800,94 @@ mod tests {
                 Err(KeyDropReason::UnsupportedKey)
             );
         }
+    }
+
+    #[test]
+    fn pixel_row_index_truncates_and_rejects_non_finite() {
+        assert_eq!(pixel_row_index(0.0, 20), Some(0));
+        assert_eq!(pixel_row_index(39.0, 20), Some(1));
+        assert_eq!(pixel_row_index(40.0, 20), Some(2));
+        assert_eq!(pixel_row_index(f64::NAN, 20), None);
+        assert_eq!(pixel_row_index(f64::INFINITY, 20), None);
+    }
+
+    #[test]
+    fn visible_content_rows_counts_through_the_last_non_blank_row() {
+        let mut terminal = TerminalState::new(4, 8).expect("valid terminal");
+        terminal.feed_bytes(b"ab\r\ncd");
+        assert_eq!(visible_content_rows(&terminal), 2);
+
+        terminal.feed_bytes(b"\r\n\r\nef");
+        assert_eq!(visible_content_rows(&terminal), 4);
+    }
+
+    #[test]
+    fn paste_is_gated_in_the_app_without_a_terminal() {
+        // With no terminal state, mode 2004 is unavailable, so encode_paste
+        // gates rather than emitting an unbracketed paste.
+        assert_eq!(encode_paste("hello", false), Err(PasteReject::Unbracketed));
+    }
+
+    #[test]
+    fn paste_is_bracketed_when_mode_2004_is_enabled() {
+        let mut app = NorenApp::default();
+        let mut terminal = TerminalState::new(2, 4).expect("valid terminal");
+        terminal.feed_bytes(b"\x1b[?2004h");
+        app.terminal = Some(terminal);
+
+        assert_eq!(
+            app.paste_bytes("ls -la"),
+            Ok(b"\x1b[200~ls -la\x1b[201~".to_vec())
+        );
+    }
+
+    #[test]
+    fn paste_is_gated_when_mode_2004_is_off_or_terminal_unavailable() {
+        let mut app = NorenApp::default();
+        // No terminal state at all: bracketed paste cannot be enabled.
+        assert_eq!(app.paste_bytes("ls"), Err(PasteReject::Unbracketed));
+
+        // Terminal state present but the application never enabled 2004.
+        let terminal = TerminalState::new(2, 4).expect("valid terminal");
+        app.terminal = Some(terminal);
+        assert_eq!(app.paste_bytes("ls"), Err(PasteReject::Unbracketed));
+    }
+
+    #[test]
+    fn copy_selection_drops_an_expired_selection_without_copying() {
+        let mut app = NorenApp::default();
+        let mut terminal = TerminalState::new(2, 6).expect("valid terminal");
+        terminal.feed_bytes(b"hello");
+        app.selection = Some(Selection::new(
+            &terminal,
+            SelectionMode::Char,
+            GridPoint::new(0, 0),
+            GridPoint::new(0, 4),
+        ));
+        terminal.resize(3, 8).expect("valid resize");
+        app.terminal = Some(terminal);
+
+        // The resize expired the selection's stamp; copy clears the selection
+        // and returns before any system clipboard access.
+        app.copy_selection();
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn select_entire_grid_captures_all_visible_content() {
+        let mut app = NorenApp::default();
+        let mut terminal = TerminalState::new(3, 6).expect("valid terminal");
+        terminal.feed_bytes(b"abc\r\ndef");
+        app.terminal = Some(terminal);
+
+        app.select_entire_grid();
+        let terminal = app.terminal.as_ref().expect("terminal present");
+        assert_eq!(
+            app.selection
+                .as_ref()
+                .map(|selection| selection.extract(terminal)),
+            Some("abc\ndef".to_owned())
+        );
     }
 
     #[test]

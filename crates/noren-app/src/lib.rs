@@ -8,9 +8,20 @@
 //! types stay inside `noren-app` and never cross into the PTY or terminal
 //! crates.
 
+mod clipboard;
 mod input;
 
+pub use clipboard::{
+    BRACKET_PASTE_BEGIN, BRACKET_PASTE_END, ClipboardError, PasteReject, SystemClipboard,
+};
 pub use input::{CursorKeyMode, FunctionKey, InputMode, KeypadInput, KeypadKey, KeypadMode};
+
+/// Encode a user-initiated paste for the PTY, gated on DEC private mode 2004.
+///
+/// Re-exported so both the library tests and the binary share one policy:
+/// bracketed when the application enabled mode 2004, refused (never sent
+/// unbracketed) when it is off or unavailable.
+pub use clipboard::encode_paste;
 
 use std::fmt;
 use std::time::Duration;
