@@ -10,14 +10,18 @@
 - **Branch:** `agent/m3-session-domain`, branched from `origin/main` @
   `1d329a5` (353 workspace tests passing at branch point).
 - **Initial code commit:** `d31e3ac75a9a8f5cf16b6b4ac9d7dcb4e33ff27e`
-- **Conformance-fix commit (current authoritative code):**
-  `df3afcc65b3487a3cfe6627520acb0b3fd3544e7`
-- **Independent review:** `docs/coordination/reviews/M3-1a-review.md` (commit
-  `b0f61c3`), one MAJOR (contract fork), no BLOCKER.
+- **First conformance fix:** `df3afcc65b3487a3cfe6627520acb0b3fd3544e7`
+  (conformed 5 of 6 deviations; silently forked the 6th — see revision
+  history).
+- **StatusChanged conformance fix (current authoritative code):**
+  `65ebc453499130ba69db4384fc834e956f145a08`
+- **Independent reviews:** `docs/coordination/reviews/M3-1a-review.md` —
+  first review `b0f61c3` (one MAJOR, contract fork in 6/8 places, void after
+  the first fix); re-review `6fc1e39` (found 5/6 resolved, one fork remained).
 - **Base SHA:** `1d329a5`.
-- **Diff vs main:** only the two leased files plus this handoff and the review;
-  **no deletions, no edits to `lib.rs`, `Cargo.toml`, `Cargo.lock`, or
-  `status.md`** (verified: their combined diff vs main is empty).
+- **Diff vs main:** only the two leased files plus this handoff and the
+  reviews; **no deletions, no edits to `lib.rs`, `Cargo.toml`, `Cargo.lock`,
+  or `status.md`** (verified: their combined diff vs main is empty).
 
 ## Revision history
 
@@ -25,29 +29,49 @@
    spec files (`M3-1a.md`, `D-M3-001-session-api.md`, ADR 0003) were **absent**
    from `origin/main`. The handoff explicitly flagged this and asked a reviewer
    to diff against the real contract when it landed.
-2. `b0f61c3` — independent Qwen review. Found one MAJOR: the public types fork
-   the D-M3-001 contract in 6 of 8 places (the contract lives in the fleet repo
-   at `state/D-M3-001-session-api.md`; the review quotes it side-by-side). The
-   coordinator judged the finding real.
-3. **`df3afcc` — conformance fix (current).** All six deviations conformed to
-   the contract as written; none were kept. Details below.
+2. `b0f61c3` — first independent Qwen review. Found one MAJOR: the public types
+   fork the D-M3-001 contract in 6 of 8 places (the contract lives in the fleet
+   repo at `state/D-M3-001-session-api.md`; the review quotes it side-by-side).
+   The coordinator judged the finding real. (This review is void after the fix
+   below; its `SessionEvent` row misquoted the contract.)
+3. `df3afcc` — first conformance fix. Conformed **5 of 6** deviations
+   (`SessionKind`, `SessionStatus`, `SessionDescriptor`, `SessionAction`,
+   `SelectedSession`). The 6th, `SessionEvent::StatusChanged`, was **not**
+   conformed: it was kept as a unit variant. The fix worked from the first
+   review's quoted contract, which misquoted `StatusChanged` as unit, instead
+   of the canonical D-M3-001 struct variant. It then documented the unit shape
+   as "intentionally payload-free" and the handoff certified **all six** as
+   conformant. That certification was wrong, and a handoff that claims
+   conformance while the type differs is worse than an openly-declared
+   deviation. Corrected below.
+4. `6fc1e39` — independent re-review. Re-diffed every contract type against the
+   canonical D-M3-001 (not the handoff's table). Confirmed 5/6 resolved; found
+   the `StatusChanged` unit fork remaining, frozen by an inverted guard test,
+   and shown to break the M3-ADV lane which already constructs the contract
+   struct shape.
+5. **`65ebc45` — `StatusChanged` conformance fix (current).** Conformed the
+   last deviation to the contract exactly. With this, all six deviations are
+   genuinely conformed; the table below now states what the code actually does.
 
-## The conformance fix (`df3afcc`) — all 6 deviations conformed, 0 kept
+## Contract conformance — current state (all 6 conformed)
 
-For each deviation I chose to **conform** rather than argue a better shape: the
+For each deviation the branch now **conforms** to the contract as written; the
 contract was written to be imported by four other lanes, not to be optimal.
+`StatusChanged` took two passes (see revision history) and is the one to
+re-check on review.
 
-| Type | Deviation | Resolution |
+| Type | Deviation (original) | Resolution (current) |
 | --- | --- | --- |
-| `SessionKind` | missing `Project`/`Worktree`; `Ssh`/`Agent` were unit | **Conformed:** `Local`, `Project{root:PathBuf}`, `Worktree{path:PathBuf}`, `Ssh{target:String}`, `Agent{name:String}` |
-| `SessionStatus` | `Created` vs `Starting`; dropped `Exited.code`/`Failed.reason` | **Conformed:** `Starting`, `Running`, `Exited{code:Option<i32>}`, `Failed{reason:String}` |
-| `SessionDescriptor` | `label:Option<String>` vs `title:String` | **Conformed:** `title:String`, registry-generated at create (the contract `Create` carries no title) |
-| `SessionAction` | added `Observe` and `Create.label` | **Conformed:** reduced to `{Create{kind}, Select{id}, Close{id}}` |
-| `SessionEvent` | `Created{id,descriptor}`, `SelectionChanged`, `StatusChanged{id,status}` | **Conformed:** tuple `Created(SessionId)`, `Selected(Option<SessionId>)`, `StatusChanged` (unit), `Closed(SessionId)` |
-| `SelectedSession` | `struct{id,descriptor}` | **Conformed:** `pub type SelectedSession = Option<SessionId>;` |
+| `SessionKind` | missing `Project`/`Worktree`; `Ssh`/`Agent` were unit | `Local`, `Project{root:PathBuf}`, `Worktree{path:PathBuf}`, `Ssh{target:String}`, `Agent{name:String}` |
+| `SessionStatus` | `Created` vs `Starting`; dropped `Exited.code`/`Failed.reason` | `Starting`, `Running`, `Exited{code:Option<i32>}`, `Failed{reason:String}` |
+| `SessionDescriptor` | `label:Option<String>` vs `title:String` | `title:String`, registry-generated at create (the contract `Create` carries no title) |
+| `SessionAction` | added `Observe` and `Create.label` | `{Create{kind}, Select{id}, Close{id}}` |
+| `SessionEvent` | `Created{id,descriptor}`, `SelectionChanged`, payload mismatch | `Created(SessionId)`, `Selected(Option<SessionId>)`, **`StatusChanged{id:SessionId,status:SessionStatus}`** (struct variant), `Closed(SessionId)` |
+| `SelectedSession` | `struct{id,descriptor}` | `pub type SelectedSession = Option<SessionId>;` |
 
-`SessionId` and `SessionRegistry` already conformed (per the review); `SessionError`
-is a local addition the review accepted (D-M3-001 defines no error type).
+`SessionId` and `SessionRegistry` already conformed (per the reviews);
+`SessionError` is a local addition both reviews accepted (D-M3-001 defines no
+error type).
 
 ### What this required beyond renaming
 
@@ -60,8 +84,10 @@ is a local addition the review accepted (D-M3-001 defines no error type).
   override it once a rename/observation path exists.
 - **`observe` moved off the action enum.** It is now a registry **method**
   `observe(id, status) -> Result<Option<SessionEvent>, SessionError>` returning
-  `Some(StatusChanged)` on change. This preserves invariant 3 (status is only set
-  from a reported observation) without re-forking `SessionAction`.
+  `Some(StatusChanged { id, status })` on change (the new status is cloned,
+  since `SessionStatus` is non-Copy via `Failed{reason}`). This preserves
+  invariant 3 (status is only set from a reported observation) without
+  re-forking `SessionAction`.
 
 ### Escalation item for the coordinator (do not let this stay implicit)
 
@@ -89,7 +115,8 @@ dropping it or smuggling it back into `SessionAction`.
   `title()->&str`.
 - `SessionAction` — `Create{kind}`, `Select{id}`, `Close{id}`.
 - `SessionEvent` — `Created(SessionId)`, `Selected(Option<SessionId>)`,
-  `StatusChanged`, `Closed(SessionId)`.
+  `StatusChanged { id: SessionId, status: SessionStatus }` (struct variant),
+  `Closed(SessionId)`.
 - `SelectedSession` — `pub type SelectedSession = Option<SessionId>;`.
 - `SessionError` — `UnknownSession` (`Display + std::error::Error`).
 - `SessionRegistry` — `new()`/`Default`; `apply(SessionAction) ->
@@ -112,8 +139,14 @@ dropping it or smuggling it back into `SessionAction`.
 7. No persistence format; no `serde`; in-memory only.
 8. No pane/tab/layout/split type (ADR 0003 respected).
 9. Two **compile-shape guard tests** (`session_action_has_exactly_the_three_contract_variants`,
-   `session_event_matches_the_contract_variants`) fail to build if anyone
-   re-forks the contract enum shapes.
+   `session_event_matches_the_contract_variants`) construct the contract enum
+   shapes, so they fail to build if anyone re-forks them. Caveat: a guard that
+   compiles only proves the test matches the implementation; it does not prove
+   either matches the contract. In the first fix this guard was **inverted** —
+   it pinned the forked unit `StatusChanged` and so passed against the wrong
+   shape; `65ebc45` repoints it at the contract struct variant. Treat these
+   guards as a tripwire, not as conformance evidence; the contract file is the
+   authority.
 
 ## How the unwired module is tested
 
@@ -132,7 +165,8 @@ mod session;
 
 ## Commands actually run (gate), with real results
 
-On `agent/m3-session-domain` at fix commit `df3afcc`, macOS arm64, rustc 1.88.0.
+On `agent/m3-session-domain` at `StatusChanged` fix commit `65ebc45`, macOS
+arm64, rustc 1.88.0.
 
 ```
 $ cargo fmt --all && cargo fmt --all --check   → exit 0 (clean)
@@ -142,10 +176,11 @@ $ cargo test --workspace                       → exit 0
     PASSED=387 FAILED=0 IGNORED=1
 ```
 
-Two compile errors were hit and fixed during the fix run: a borrow of a
-temporary `Descriptor` (`.title()` on an unnamed `get().unwrap()`) and a
-mutable-then-immutable borrow of `registry` in one expression. Both fixed by
-binding intermediates; the clean clippy output above is post-fix.
+This fix run was clean on the first clippy/test pass: the change is small
+(restore the struct variant, emit it from `observe`, repoint two test sites).
+The earlier `df3afcc` run had hit two borrow-check compile errors (a borrow of
+a temporary `Descriptor`, and a mutable-then-immutable borrow of `registry`),
+both fixed by binding intermediates.
 
 ### Test totals (`cargo test --workspace`)
 
@@ -170,27 +205,40 @@ tests). Reconciles: 353 + 34 = 387.
   intends an action variant is not knowable from this repo.
 - **`title` generation policy is unspecified by the contract.** I generate the
   display id; the contract only requires `title: String`.
-- D-M3-001, `M3-1a.md`, and ADR 0003 are still absent from `origin/main`; I
-  worked from the review's quoted contract.
+- D-M3-001, `M3-1a.md`, and ADR 0003 are still absent from `origin/main`. The
+  contract shapes in this handoff and code are transcribed from the two reviews
+  (`b0f61c3`, `6fc1e39`), which the reviewers read against the canonical fleet
+  file. The first review misquoted `StatusChanged` as unit; the re-review quoted
+  the canonical struct variant, which `65ebc45` matches. **Any further contract
+  detail should be read from the fleet file directly, not from this handoff.**
 
 ## Authorship / conflict of interest
 
 - **I (GLM `glm-a`) authored all the code** (`session.rs`, `session_domain.rs`)
-  and this handoff, across both the initial commit and the conformance fix. I
-  did **not** author the review (`b0f61c3` is an independent Qwen lane). Per
-  fleet policy an independent lane should review the fix, not this one.
+  and this handoff, across the initial commit (`d31e3ac`), the first
+  conformance fix (`df3afcc`), and the `StatusChanged` conformance fix
+  (`65ebc45`). I did **not** author either review (`b0f61c3`, `6fc1e39` are an
+  independent Qwen lane). Per fleet policy an independent lane should review
+  this fix, not this one. I also cannot self-certify conformance against a
+  contract file that is not in this repo — the re-review's transcription is the
+  evidence, and a third check against the fleet file is warranted.
 
 ## Resume instructions
 
-1. `git checkout agent/m3-session-domain`; confirm fix commit `df3afcc`.
+1. `git checkout agent/m3-session-domain`; confirm current code commit
+   `65ebc45`.
 2. Re-run the gate: `cargo fmt --all --check`,
    `cargo clippy --workspace --all-targets -- -D warnings`,
    `cargo test --workspace` (expect 387 passed / 1 ignored).
-3. **Reconcile `SessionKind` field names** against canonical D-M3-001 before any
-   downstream lane codes against them.
-4. Decide the `observe` escalation (ratify as a contract action vs. keep as a
+3. **Re-verify `SessionEvent::StatusChanged` against the canonical fleet
+   `state/D-M3-001-session-api.md`** — it is the variant that forked twice and
+   whose guard test was inverted; do not take the handoff's word for it.
+4. **Reconcile `SessionKind` struct-variant field names** (`root`/`path`/
+   `target`/`name`) against canonical D-M3-001 before any downstream lane codes
+   against them.
+5. Decide the `observe` escalation (ratify as a contract action vs. keep as a
    registry method).
-5. To wire into the crate (serial integration commit, **not** this branch): add
+6. To wire into the crate (serial integration commit, **not** this branch): add
    `pub mod session;` to `crates/noren-app/src/lib.rs`, then change the first
    non-comment line of `tests/session_domain.rs` from
    `#[path = "../src/session.rs"] mod session;` to `use noren_app::session;`.
