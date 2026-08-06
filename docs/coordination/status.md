@@ -1,8 +1,35 @@
 # Coordination status
 
-Last updated: 2026-08-05 (Asia/Tokyo). `main` is at `c415f54` and passes **177
-workspace tests**. Historical sections below preserve the earlier PR #17/#19
-records at their own heads, corrected only where an active claim went stale.
+Last updated: 2026-08-07 (Asia/Tokyo). `main` is at `1d329a5` and passes **353
+workspace tests**. **Milestone 2 is complete**; Milestone 3 is in progress under the
+Noren/Zellij responsibility boundary. Historical sections below preserve the earlier
+PR #17/#19 records at their own heads, corrected only where an active claim went stale.
+
+## How coordination works now
+
+Development is **repo-backed and event-driven**, not conversation-backed. The
+conversation session is no longer the source of truth for work state.
+
+- **Tracked state** — `docs/coordination/tasks/<id>.md` (goal, base SHA,
+  dependencies, exact file lease, forbidden files, API contract, acceptance criteria,
+  required tests, assigned lane, independent verifier, stop conditions) and
+  `docs/coordination/handoffs/<lane>.md` (branch, exact commit SHA, commands actually
+  executed, real test results, unresolved findings, assumptions, self-review
+  limitations, and whether the lane also authored the code under review). Acceptance
+  criterion: another model can resume from these files plus Git history alone.
+- **Runtime state** — the gitignored `.fleet/`: queue, events, locks, logs, sessions,
+  decision packets.
+- **Orchestrator** — `scripts/fleet/orchestrator.py`, a plain Python process run
+  detached by `scripts/fleet/orchestratord.sh`. It dispatches lanes, holds file
+  leases, distinguishes an init stall from a permission stall, and runs the merge
+  gate. It escalates for decisions only, never for waiting, and cannot merge without
+  review, ignore a BLOCKER, push to `main`, or assign two writers to one file.
+- **Coordinator role** — Issue decomposition, API boundaries, file-lease assignment,
+  review integration, conflict policy, BLOCKER calls, final merges, and adjudicating
+  evidence-backed disagreement between models. Not routine implementation, not CI
+  waiting, not quota polling.
+
+Lane ownership and the budget policy are in [fleet](fleet.md).
 
 ## Current phase
 
