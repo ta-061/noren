@@ -1,231 +1,196 @@
 # Handoff — M3 session domain lane (GLM, `glm-a`)
 
 > **Note on the handoff template:** `docs/coordination/handoffs/TEMPLATE.md`
-> and `docs/coordination/tasks/M3-1a.md` /
-> `docs/coordination/decisions/D-M3-001-session-api.md` did **not** exist on
-> `origin/main` at the time this lane ran (`1d329a5`). This file is therefore
-> structured from the lane prompt's required fields rather than from the
-> missing template. A reviewer resuming from here should treat the lane prompt
-> (reproduced in spirit below) as the authority and create the missing template
-> if one is wanted for later lanes.
+> did **not** exist on `origin/main` at the time this lane ran. This file is
+> structured from the lane prompt's required fields rather than from a template.
 
 ## Identity
 
 - **Lane:** `glm-a` (session domain model), engine GLM 5.2 via opencode.
 - **Branch:** `agent/m3-session-domain`, branched from `origin/main` @
   `1d329a5` (353 workspace tests passing at branch point).
-- **Code commit (authoritative):** `d31e3ac75a9a8f5cf16b6b4ac9d7dcb4e33ff27e`
-- **Handoff commit:** the commit that adds this file (separate, so this file can
-  record the stable code SHA above).
+- **Initial code commit:** `d31e3ac75a9a8f5cf16b6b4ac9d7dcb4e33ff27e`
+- **Conformance-fix commit (current authoritative code):**
+  `df3afcc65b3487a3cfe6627520acb0b3fd3544e7`
+- **Independent review:** `docs/coordination/reviews/M3-1a-review.md` (commit
+  `b0f61c3`), one MAJOR (contract fork), no BLOCKER.
 - **Base SHA:** `1d329a5`.
-- **Diff vs main:** `git diff --stat origin/main...HEAD` shows the two leased
-  files added only; **no deletions, no edits to `lib.rs`, `Cargo.toml`,
-  `Cargo.lock`, or `status.md`.**
+- **Diff vs main:** only the two leased files plus this handoff and the review;
+  **no deletions, no edits to `lib.rs`, `Cargo.toml`, `Cargo.lock`, or
+  `status.md`** (verified: their combined diff vs main is empty).
 
-## Files touched (within the lease)
+## Revision history
 
-| File | Status | Purpose |
+1. `d31e3ac` — initial model. Implemented to the lane prompt because the named
+   spec files (`M3-1a.md`, `D-M3-001-session-api.md`, ADR 0003) were **absent**
+   from `origin/main`. The handoff explicitly flagged this and asked a reviewer
+   to diff against the real contract when it landed.
+2. `b0f61c3` — independent Qwen review. Found one MAJOR: the public types fork
+   the D-M3-001 contract in 6 of 8 places (the contract lives in the fleet repo
+   at `state/D-M3-001-session-api.md`; the review quotes it side-by-side). The
+   coordinator judged the finding real.
+3. **`df3afcc` — conformance fix (current).** All six deviations conformed to
+   the contract as written; none were kept. Details below.
+
+## The conformance fix (`df3afcc`) — all 6 deviations conformed, 0 kept
+
+For each deviation I chose to **conform** rather than argue a better shape: the
+contract was written to be imported by four other lanes, not to be optimal.
+
+| Type | Deviation | Resolution |
 | --- | --- | --- |
-| `crates/noren-app/src/session.rs` | new | The domain model. |
-| `crates/noren-app/tests/session_domain.rs` | new | The invariant test suite. |
-| `docs/coordination/handoffs/glm-a.md` | new | This handoff. |
+| `SessionKind` | missing `Project`/`Worktree`; `Ssh`/`Agent` were unit | **Conformed:** `Local`, `Project{root:PathBuf}`, `Worktree{path:PathBuf}`, `Ssh{target:String}`, `Agent{name:String}` |
+| `SessionStatus` | `Created` vs `Starting`; dropped `Exited.code`/`Failed.reason` | **Conformed:** `Starting`, `Running`, `Exited{code:Option<i32>}`, `Failed{reason:String}` |
+| `SessionDescriptor` | `label:Option<String>` vs `title:String` | **Conformed:** `title:String`, registry-generated at create (the contract `Create` carries no title) |
+| `SessionAction` | added `Observe` and `Create.label` | **Conformed:** reduced to `{Create{kind}, Select{id}, Close{id}}` |
+| `SessionEvent` | `Created{id,descriptor}`, `SelectionChanged`, `StatusChanged{id,status}` | **Conformed:** tuple `Created(SessionId)`, `Selected(Option<SessionId>)`, `StatusChanged` (unit), `Closed(SessionId)` |
+| `SelectedSession` | `struct{id,descriptor}` | **Conformed:** `pub type SelectedSession = Option<SessionId>;` |
 
-Nothing else was created or edited. The module is **not** wired into
-`crates/noren-app/src/lib.rs` (forbidden by the lease; reserved for the serial
-integration commit).
+`SessionId` and `SessionRegistry` already conformed (per the review); `SessionError`
+is a local addition the review accepted (D-M3-001 defines no error type).
 
-## What was implemented
+### What this required beyond renaming
 
-The shared session contract, defined once for every other M3 lane to import:
+- **Status payloads made `SessionStatus` and `SessionKind` non-`Copy`.**
+  `Descriptor::kind()`/`status()` now return references; `create(kind)` takes
+  `kind` by value. `is_launchable` is now `&self`.
+- **`title` generation.** Since `Create{kind}` carries no title, the registry
+  generates one: the session's stable display id (e.g. `"session-1"`). This is a
+  policy choice on top of the contract, not a contract claim; a future lane may
+  override it once a rename/observation path exists.
+- **`observe` moved off the action enum.** It is now a registry **method**
+  `observe(id, status) -> Result<Option<SessionEvent>, SessionError>` returning
+  `Some(StatusChanged)` on change. This preserves invariant 3 (status is only set
+  from a reported observation) without re-forking `SessionAction`.
 
-- `SessionId` — opaque `u64` newtype; private inner field so callers cannot
-  fabricate ids, minted only by `SessionRegistry`. `Copy/Clone/Eq/Ord/Hash`,
-  plus `Display` (`session-<n>`). No numeric accessor exposed (kept opaque).
-- `SessionKind` — `Local` (default, only launchable), `Ssh`, `Agent` (both
-  **reserved shapes only**; `is_launchable()` returns false). `#[derive(Default)]`
-  via `#[default] Local`.
-- `SessionStatus` — `Created` (default/initial), `Running`, `Failed`, `Exited`.
-- `SessionDescriptor` — `{ id, kind, status, label: Option<String> }` with
-  `id()/kind()/status()/label()` accessors.
-- `SessionAction` — command enum: `Create{kind,label}`, `Close{id}`,
-  `Select{id}`, `Observe{id,status}`.
-- `SessionEvent` — result enum: `Created{id,descriptor}`, `Closed{id}`,
-  `StatusChanged{id,status}`, `SelectionChanged{selected: Option<SessionId>}`.
-- `SelectedSession` — `{ id, descriptor }` view returned by `selected()`.
-- `SessionError` — `UnknownSession` (implements `Display + std::error::Error`).
-- `SessionRegistry` — pure state machine. API: `new()`/`Default`, `apply(action)`
-  -> `Result<Vec<SessionEvent>, SessionError>`, convenience `create(kind,label)`
-  -> `SessionId` (infallible), `close/select/observe` -> `Result<(), _>`, and
-  queries `get/sessions/selected/len/is_empty`.
+### Escalation item for the coordinator (do not let this stay implicit)
 
-### Key design decisions (so a reviewer can challenge them)
+`SessionRegistry::observe` is the only way a session advances past `Starting`,
+yet it is a registry method, not one of the three contract `SessionAction`
+variants. This is **not** a contract-type deviation (`SessionRegistry` conforms;
+methods are not specified by D-M3-001), but the contract's `SessionAction` set
+has no observation path, so the question is open: **should D-M3-001 ratify an
+observation action, or is a registry method the intended seam?** The review
+explicitly flagged this as an escalate-don't-silently-keep item. I kept the
+mechanism (invariant 3 requires it) and am calling it out here rather than
+dropping it or smuggling it back into `SessionAction`.
 
-1. **Closing the selected session clears the selection to `None`** (rather than
-   reassigning to another live session). The invariant only requires "empty or
-   on another existing session — never dangling"; clearing is the simplest
-   always-correct policy. Reassignment-to-most-recent is left as a future UX
-   decision for the app lane.
-2. **No auto-select on create.** Selection is explicit via `Select`. The first
-   created session is not selected until a `Select` follows. This keeps the
-   invariant trivially provable.
-3. **`Close` removes the entry entirely** — no tombstone. This is what makes
-   "repeated create/close does not grow state" hold; a closed id becomes
-   `UnknownSession` to every later action.
-4. **`Observe` only mutates the status field**; it never removes an entry.
-   Lifecycle removal is exclusively `Close`'s job, so observation and lifecycle
-   stay decoupled.
-5. **`create` is infallible** (returns `SessionId`, not `Result`). The counter
-   is `u64`; exhaustion is unreachable in practice and would corrupt uniqueness,
-   so it `.expect()`s with a clear message. This is the **only** panic point in
-   the module and it is reasoned, not accidental.
-6. **`SessionEvent` history is not retained.** `apply` returns events; the
-   registry stores no `Vec<SessionEvent>`, so state stays bounded to live
-   sessions + counter + selection.
-7. **No persistence format chosen.** No `serde` derives; the model is in-memory
-   only, as instructed.
-8. **No Noren/Zellij boundary crossing.** No pane, tab, layout, or split type
-   exists anywhere in the model.
-9. **Reserved kinds are bookkept but not gated at create.** `Create{Ssh}` /
-   `Create{Agent}` succeed (pure data); the future spawn layer gates on
-   `SessionKind::is_launchable()`.
+## What was implemented (current, conformed shape)
+
+- `SessionId` — opaque `u64` newtype; private field (not fabricable); `Copy`,
+  `Ord`, `Hash`, `Display` (`session-<n>`).
+- `SessionKind` — `Local` (default, only launchable), `Project{root}`,
+  `Worktree{path}`, `Ssh{target}`, `Agent{name}`. `is_launchable(&self)` is
+  `Local`-only.
+- `SessionStatus` — `Starting` (default), `Running`, `Exited{code}`,
+  `Failed{reason}`.
+- `SessionDescriptor` — `{ id, kind, status, title }`; accessors
+  `id()->SessionId`, `kind()->&SessionKind`, `status()->&SessionStatus`,
+  `title()->&str`.
+- `SessionAction` — `Create{kind}`, `Select{id}`, `Close{id}`.
+- `SessionEvent` — `Created(SessionId)`, `Selected(Option<SessionId>)`,
+  `StatusChanged`, `Closed(SessionId)`.
+- `SelectedSession` — `pub type SelectedSession = Option<SessionId>;`.
+- `SessionError` — `UnknownSession` (`Display + std::error::Error`).
+- `SessionRegistry` — `new()`/`Default`; `apply(SessionAction) ->
+  Result<Vec<SessionEvent>, SessionError>`; `create(kind)->SessionId`
+  (infallible); `close/select -> Result<(),_>`; **`observe(id,status) ->
+  Result<Option<SessionEvent>,_>`** (the observation seam); queries
+  `get/sessions/selected/len/is_empty`.
+
+### Standing design decisions (so a reviewer can challenge them)
+
+1. Closing the selected session **clears** selection to `None` (never dangles;
+   the invariant allows empty-or-another; clear is simplest).
+2. **No auto-select on create**; selection is explicit.
+3. `Close` **removes** the entry (no tombstone) — this is what bounds live state.
+4. `observe` mutates only the status field; it never removes an entry.
+5. `create` is **infallible**; the lone panic point is `checked_add` id-space
+   exhaustion (reasoned; a u64 counter cannot realistically exhaust).
+6. No event history is retained; `apply`/`observe` return events, state stays
+   bounded to live sessions + counter + selection.
+7. No persistence format; no `serde`; in-memory only.
+8. No pane/tab/layout/split type (ADR 0003 respected).
+9. Two **compile-shape guard tests** (`session_action_has_exactly_the_three_contract_variants`,
+   `session_event_matches_the_contract_variants`) fail to build if anyone
+   re-forks the contract enum shapes.
 
 ## How the unwired module is tested
 
-Because the lease forbids editing `lib.rs`, the module is not part of the
-crate's module tree yet. The integration test compiles it **standalone** with:
+The lease forbids editing `lib.rs`, so the module is compiled **standalone** in
+the integration test:
 
 ```rust
 #[path = "../src/session.rs"]
 mod session;
 ```
 
-This is the idiomatic way to test an unwired module: `cargo test --workspace`
-and `cargo clippy --workspace --all-targets` both see `session.rs` through the
-test target's module tree. **When the serial wiring commit adds
-`pub mod session;` to `lib.rs`, that `#[path]` line must be replaced by
-`use noren_app::session;`** — otherwise the module compiles twice (once in lib,
-once in the test) as two unrelated types. This is the single integration step a
-resumer must perform; it is called out here because it cannot be done from this
-branch.
+`cargo test --workspace` and `cargo clippy --workspace --all-targets` both see
+`session.rs` through the test target. **When the serial wiring commit adds
+`pub mod session;` to `lib.rs`, that `#[path]` line must become
+`use noren_app::session;`** or the module compiles twice as two unrelated types.
 
 ## Commands actually run (gate), with real results
 
-Run from the worktree root on `agent/m3-session-domain` after the code commit
-`d31e3ac`, on macOS arm64, rustc 1.88.0 (pinned by `rust-toolchain.toml`).
+On `agent/m3-session-domain` at fix commit `df3afcc`, macOS arm64, rustc 1.88.0.
 
-1. `cargo fmt --all` → exit 0 (applied formatting).
-   `cargo fmt --all --check` → exit 0 (clean).
-2. `cargo clippy --workspace --all-targets -- -D warnings` → exit 0, no
-   warnings. (One earlier run failed with three compile errors — missing
-   `#[default]` on the two derived-`Default` enums, and `const fn new()` calling
-   non-const `HashMap::new()`. All three were fixed: `#[default]` markers added
-   to `Local`/`Created`, and `new()` made non-`const`. The clean run above is
-   post-fix.)
-3. `cargo test --workspace` → exit 0.
+```
+$ cargo fmt --all && cargo fmt --all --check   → exit 0 (clean)
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile; exit 0, 0 warnings
+$ cargo test --workspace                       → exit 0
+    PASSED=387 FAILED=0 IGNORED=1
+```
 
-### Test result totals (`cargo test --workspace`)
+Two compile errors were hit and fixed during the fix run: a borrow of a
+temporary `Descriptor` (`.title()` on an unnamed `get().unwrap()`) and a
+mutable-then-immutable borrow of `registry` in one expression. Both fixed by
+binding intermediates; the clean clippy output above is post-fix.
 
-**385 passed, 0 failed, 1 ignored, 0 measured.**
+### Test totals (`cargo test --workspace`)
 
-Breakdown of the relevant targets:
+**387 passed, 0 failed, 1 ignored.** Baseline 353 → `session_domain` now **34**
+(was 32; +3 contract-shape/type-alias guards, −2 removed label/struct-view
+tests). Reconciles: 353 + 34 = 387.
 
-| Target | Result |
-| --- | --- |
-| `noren-app` lib unittests (`src/lib.rs`) | 79 passed, 1 ignored (macOS clipboard test) |
-| `noren-app` bin unittests (`src/main.rs`) | 24 passed |
-| `tests/session_domain.rs` (NEW) | **32 passed** (27 integration + 5 inline `session::tests`) |
-| `tests/verify59_independent.rs` | 19 passed |
-| `noren-pty` | 10 passed |
-| `noren-terminal` | 45 passed |
-| `noren-terminal` adversarial / feature suites | 153 passed total |
-| doc-tests (all crates) | 0 |
+## What could NOT be verified
 
-Baseline at branch point was **353** workspace tests; this lane adds **32**
-(`session_domain`), bringing the workspace to **385**. The arithmetic
-(353 + 32 = 385) reconciles.
-
-## How each required invariant is tested
-
-All four are pinned in `tests/session_domain.rs`:
-
-1. **At most one selected; closing the selected never dangles** —
-   `selecting_replaces_the_prior_selection`, `closing_the_selected_session_clears_the_selection`,
-   `closing_a_non_selected_session_keeps_the_selection`, `closing_the_only_session_leaves_no_selection`,
-   `selecting_an_unknown_session_errors`, `selected_descriptor_matches_get_descriptor`.
-2. **Registry spawns no process** — documented and exercised by
-   `a_full_session_lifecycle_runs_without_any_child_process` (a full
-   create/observe/select/close lifecycle runs in pure memory).
-3. **Status observed, not inferred** — `a_newly_created_session_is_created_not_running`,
-   `observe_advances_status_to_running`, `observe_records_failure_and_exit_statuses`,
-   `observing_the_current_status_is_a_no_op`, `create_then_observe_then_close_keeps_status_observed_only`.
-4. **Bounded live state** — `repeated_create_close_cycles_do_not_accumulate`
-   (1000 cycles, `len()==0`), `a_recreated_session_gets_a_fresh_distinct_id`,
-   `close_is_idempotent_in_state_only_second_close_errors`.
-
-The reducer event contract is pinned by `apply_*` tests; the query surface and
-reserved-kind behavior by `sessions_are_listed_in_identifier_order`,
-`descriptors_expose_kind_label_and_status`, and
-`reserved_kinds_can_be_bookkept_but_are_not_launchable`.
-
-## What could NOT be verified (wiring pending)
-
-- **The module does not compile as part of `noren-app`'s library yet**, because
-  `mod session;` is deliberately absent from `lib.rs`. It compiles and is
-  lint-tested **only** through the `#[path]` include in the integration test.
-  A reviewer cannot confirm `noren_app::session::SessionRegistry` resolves until
-  the serial wiring commit lands; that is expected by design.
-- **No `#[path]`-free consumer exists**, so I could not exercise the types from
-  a second crate or the binary. The `#[path]` test is the sole consumer.
-- I could not run any gate against the spec documents
-  `docs/coordination/tasks/M3-1a.md` and
-  `docs/coordination/decisions/D-M3-001-session-api.md` because **they are not
-  present on `origin/main`** (nor anywhere in the tree at `1d329a5`). I
-  implemented to the lane prompt, which is the stated authority ("it is the
-  authority, not this prompt" referred to a file that does not exist; the prompt
-  body was therefore the only available contract). **A reviewer should diff my
-  types against the real spec the moment it lands** and reconcile any field or
-  variant mismatch — I had no way to do so.
-- **ADR 0003** is referenced by the prompt as "owner-decided" but is not present
-  in `docs/adr/` (only 0001/0002 + the template exist). I honored the boundary
-  as described in the prompt (no pane/tab/layout/split) but could not read the
-  ADR itself.
-
-## Assumptions
-
-- The lane prompt is the authority because the named spec files are absent.
-- `SessionAction::Create` does not need a command/argv field for this lane: the
-  registry owns no process, so launch arguments belong to the future spawn lane.
-  I kept `Create` to `{kind, label}` only. If the real D-M3-001 requires argv on
-  the descriptor, that is an additive change for the wiring commit.
-- "Status is only set from a reported observation" means create records
-  `Created` and only `Observe` advances it. I treated `Created` as a recorded
-  fact of entry existence, not an inference of liveness.
-- Selection-on-close policy (clear vs. reassign) was left to my judgment since
-  the prompt allowed both; I chose clear.
-
-## Unresolved findings
-
-- None within the code. The only open items are the missing spec/ADR/TEMPLATE
-  documents listed above, which are outside this lane's file lease.
+- **The module is not compiled as part of `noren-app`'s library yet** (`mod
+  session;` absent from `lib.rs` by lease). It compiles only via the `#[path]`
+  test. `noren_app::session::*` cannot resolve until the serial wiring commit.
+- **`SessionKind` struct-variant field names are inferred.** The review quotes
+  D-M3-001 with `{..}` ellipsis for `Project`/`Worktree`/`Ssh`/`Agent` payloads;
+  the full contract file is **not in this repo**. I chose `root`/`path`
+  (`PathBuf`) and `target`/`name` (`String`) as the conventional names. **The
+  coordinator must confirm exact field names/types against the canonical
+  D-M3-001** — if they differ, four downstream lanes coding against my names
+  would break. This is the single highest-risk unverifiable item.
+- **`SessionAction` lacks an observation path in the contract.** I implemented
+  observation as a registry method (see the escalation item). Whether D-M3-001
+  intends an action variant is not knowable from this repo.
+- **`title` generation policy is unspecified by the contract.** I generate the
+  display id; the contract only requires `title: String`.
+- D-M3-001, `M3-1a.md`, and ADR 0003 are still absent from `origin/main`; I
+  worked from the review's quoted contract.
 
 ## Authorship / conflict of interest
 
-- **I (GLM `glm-a`) authored all of the code under review** (`session.rs` and
-  `session_domain.rs`). I did **not** review a different lane's code here. Per
-  fleet policy (lanes scoped so two engines never review the same code), an
-  independent lane should perform the review, not this one.
-- I also authored this handoff.
+- **I (GLM `glm-a`) authored all the code** (`session.rs`, `session_domain.rs`)
+  and this handoff, across both the initial commit and the conformance fix. I
+  did **not** author the review (`b0f61c3` is an independent Qwen lane). Per
+  fleet policy an independent lane should review the fix, not this one.
 
 ## Resume instructions
 
-1. `git checkout agent/m3-session-domain`; confirm code commit
-   `d31e3ac` is present.
-2. Re-run the gate to reproduce: `cargo fmt --all --check`,
+1. `git checkout agent/m3-session-domain`; confirm fix commit `df3afcc`.
+2. Re-run the gate: `cargo fmt --all --check`,
    `cargo clippy --workspace --all-targets -- -D warnings`,
-   `cargo test --workspace` (expect 385 passed / 1 ignored).
-3. To wire into the crate (serial integration commit, **not** this branch): add
+   `cargo test --workspace` (expect 387 passed / 1 ignored).
+3. **Reconcile `SessionKind` field names** against canonical D-M3-001 before any
+   downstream lane codes against them.
+4. Decide the `observe` escalation (ratify as a contract action vs. keep as a
+   registry method).
+5. To wire into the crate (serial integration commit, **not** this branch): add
    `pub mod session;` to `crates/noren-app/src/lib.rs`, then change the first
    non-comment line of `tests/session_domain.rs` from
    `#[path = "../src/session.rs"] mod session;` to `use noren_app::session;`.
-4. Reconcile the types against `M3-1a.md` / `D-M3-001-session-api.md` once those
-   files exist on `main`.
