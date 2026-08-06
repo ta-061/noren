@@ -231,6 +231,19 @@ impl std::error::Error for ChildError {}
 /// [`PollOutcome::Exited`], and absence to [`PollOutcome::StillRunning`]), and
 /// `shutdown` forwards to `PtySession::shutdown`. That adapter lives in the
 /// serial integration commit, not here, so this module stays free of PTY types.
+///
+/// # Drop semantics (integration note)
+///
+/// The production adapter (`noren-pty::PtySession`) runs a full `shutdown` in
+/// its `Drop` impl under its own internal deadline. Two consequences the serial
+/// integration commit must resolve: (a) `PtySession::shutdown` takes no
+/// deadline argument, so the `deadline` parameter here is advisory and the
+/// adapter's internal `SHUTDOWN_DEADLINE` governs; (b) when `terminate` marks
+/// `Failed(ReapTimeout)` on an already-elapsed deadline it drops the handle
+/// *without* calling `shutdown`, but the adapter's `Drop` will still run a
+/// shutdown attempt — so "no backend call" (asserted by the mock tests) will
+/// not hold in production. The integrator should either deadline-parameterise
+/// the adapter or make the kill path concurrent.
 pub trait Child: Send {
     /// Non-blocking liveness probe.
     fn poll_exit(&mut self) -> Result<PollOutcome, ChildError>;
@@ -328,6 +341,15 @@ struct SupervisedSession {
 /// supervisor is single-threaded by design (it runs on the app's main thread or
 /// a dedicated worker); it does not need to be `Send` because child handles need
 /// not be `Sync`.
+///
+/// # Record retention
+///
+/// Every spawned session's record is retained — even after it exits — until
+/// [`SessionSupervisor::forget`] is called. There is no automatic reaping of
+/// terminal records and no cap. A long-running supervisor whose owner never
+/// forgets grows without bound; the registry/domain (D-M3-001) must own an
+/// explicit retirement policy (e.g. forget after the UI observes the terminal
+/// status, or a record cap).
 pub struct SessionSupervisor {
     sessions: HashMap<SessionId, SupervisedSession>,
     order: Vec<SessionId>,
@@ -436,12 +458,18 @@ impl SessionSupervisor {
     /// The transitioned sessions are returned in a [`ReapReport`].
     pub fn poll(&mut self) -> ReapReport {
         let mut report = ReapReport::default();
-        // Collect ids first to avoid borrowing `sessions` across child calls.
+        // Collect ids in insertion order from `order`, not from `sessions` (a
+        // HashMap whose iteration order is randomized). The report's contract
+        // promises insertion order; iterating `order` is what delivers it.
         let running: Vec<SessionId> = self
-            .sessions
+            .order
             .iter()
-            .filter(|(_, session)| session.status == SessionStatus::Running)
-            .map(|(id, _)| *id)
+            .copied()
+            .filter(|id| {
+                self.sessions
+                    .get(id)
+                    .is_some_and(|session| session.status == SessionStatus::Running)
+            })
             .collect();
 
         for id in running {
@@ -475,6 +503,12 @@ impl SessionSupervisor {
     /// - Otherwise delegates to [`Child::shutdown`], then reads the exit code:
     ///   a code → `Exited`, no observable code → `Exited { code: None }`, a
     ///   backend error → `Failed`.
+    /// - An unknown `id` (never spawned or already forgotten) is reported as
+    ///   `Failed(PollFailed)` because `terminate` has no dedicated error
+    ///   channel. This is a defensive classification, not a genuine poll fault;
+    ///   callers that must distinguish unknown ids should check
+    ///   [`Self::status`] first. At D-M3-001 integration a typed `Unknown`
+    ///   variant (or a `Result` return) should replace this.
     ///
     /// The child handle is released once terminal.
     pub fn terminate(&mut self, id: SessionId, deadline: Instant) -> SessionStatus {
@@ -665,6 +699,7 @@ pub mod mock {
         shutdown_error: Option<ShutdownError>,
         shutdown_calls: u32,
         poll_calls: u32,
+        deadlines: Vec<Instant>,
     }
 
     impl Default for MockState {
@@ -676,6 +711,7 @@ pub mod mock {
                 shutdown_error: None,
                 shutdown_calls: 0,
                 poll_calls: 0,
+                deadlines: Vec::new(),
             }
         }
     }
@@ -731,9 +767,10 @@ pub mod mock {
             }
         }
 
-        fn shutdown(&mut self, _deadline: Instant) -> Result<(), ChildError> {
+        fn shutdown(&mut self, deadline: Instant) -> Result<(), ChildError> {
             let mut state = self.state.lock().expect("mock lock");
             state.shutdown_calls += 1;
+            state.deadlines.push(deadline);
             if let Some(error) = state.shutdown_error {
                 return Err(ChildError::Shutdown(error));
             }
@@ -773,6 +810,12 @@ pub mod mock {
         #[must_use]
         pub fn poll_count(&self) -> u32 {
             self.state.lock().expect("mock lock").poll_calls
+        }
+
+        /// Deadlines passed to each `shutdown` call, in call order.
+        #[must_use]
+        pub fn deadlines(&self) -> Vec<Instant> {
+            self.state.lock().expect("mock lock").deadlines.clone()
         }
     }
 

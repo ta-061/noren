@@ -273,3 +273,102 @@ fn error_and_status_displays_redact_all_child_content() {
         assert_eq!(rendered, expected);
     }
 }
+
+// ── Claim 7: ReapReport delivers transitions in insertion order ───────────
+//
+// The contract on `ReapReport` promises insertion order. `poll` collects ids
+// from `self.order` (a Vec), not from `sessions` (a HashMap with randomized
+// iteration order). A single-element case trivially passes regardless of the
+// source, so this test transitions enough sessions in one pass that a HashMap
+// order would almost certainly differ (10! permutations; only one is sorted).
+
+#[test]
+fn poll_reports_multi_session_transitions_in_insertion_order() {
+    const N: usize = 10;
+    let mut ctrls = Vec::new();
+    let mut children = Vec::new();
+    for _ in 0..N {
+        let (child, ctrl) = MockChild::running_with_control();
+        children.push(child);
+        ctrls.push(ctrl);
+    }
+    let mut sup = supervisor_with(children);
+    let ids: Vec<_> = (0..N).map(|_| sup.spawn().expect("spawn")).collect();
+
+    // Exit every child with a distinct code before polling so one pass observes
+    // all N transitions. Distinct codes also verify the right code is tied to
+    // the right id, not just that the id set matches.
+    for (i, ctrl) in ctrls.iter().enumerate() {
+        ctrl.exit(Some(i as u32));
+    }
+    let report = sup.poll();
+    assert_eq!(report.transitioned(), N);
+
+    let reported_ids: Vec<_> = report.exited().iter().map(|(id, _)| *id).collect();
+    assert_eq!(
+        reported_ids, ids,
+        "ReapReport must deliver transitions in insertion order"
+    );
+}
+
+// ── Claim 8: shutdown_all feeds one shared deadline to every child ─────────
+//
+// The shared-deadline contract (`shutdown_all` computes one Instant and feeds
+// it to every session, not n * deadline) cannot be caught by a wall-clock
+// assertion with an instant mock. This test records the deadline argument each
+// child received and asserts they are all identical — directly proving one
+// shared Instant reached the whole batch.
+
+#[test]
+fn shutdown_all_feeds_one_shared_deadline_to_every_child() {
+    const N: usize = 4;
+    let mut ctrls = Vec::new();
+    let mut children = Vec::new();
+    for _ in 0..N {
+        let (child, ctrl) = MockChild::running_with_control();
+        children.push(child);
+        ctrls.push(ctrl);
+    }
+    let mut sup = supervisor_with(children);
+    for _ in 0..N {
+        sup.spawn().expect("spawn");
+    }
+
+    let _results = sup.shutdown_all();
+
+    let all_deadlines: Vec<Instant> = ctrls.iter().flat_map(|c| c.deadlines()).collect();
+    assert_eq!(all_deadlines.len(), N, "each child shut down exactly once");
+    let shared = all_deadlines[0];
+    assert!(
+        all_deadlines.iter().all(|d| *d == shared),
+        "all children received the same shared deadline"
+    );
+}
+
+// ── Claim 9: forget + shutdown_all — forgotten ids stay forgotten ──────────
+//
+// `forget` removes the id from both `sessions` and `order`. If the `order`
+// removal regressed, `shutdown_all` (which iterates `order`) would resurrect
+// the forgotten id and report a fabricated failure for it.
+
+#[test]
+fn forget_then_shutdown_all_omits_the_forgotten_id() {
+    let mut sup = supervisor_with(vec![
+        MockChild::running(),
+        MockChild::running(),
+        MockChild::running(),
+    ]);
+    let a = sup.spawn().expect("spawn");
+    let b = sup.spawn().expect("spawn");
+    let c = sup.spawn().expect("spawn");
+
+    // Terminate + forget the middle session.
+    sup.terminate_now(b);
+    sup.forget(b).expect("retire middle");
+
+    // shutdown_all reports only the remaining ids, in insertion order — the
+    // forgotten id must not be resurrected.
+    let results = sup.shutdown_all();
+    let reported: Vec<_> = results.iter().map(|(id, _)| *id).collect();
+    assert_eq!(reported, vec![a, c]);
+}

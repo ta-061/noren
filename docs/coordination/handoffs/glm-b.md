@@ -138,20 +138,21 @@ result:` lines):
 |---|---|---|---|
 | noren-app lib unittests (`src/lib.rs`) | 79 | 0 | 1 (pre-existing) |
 | noren-app bin unittests (`src/main.rs`) | 24 | 0 | 0 |
-| **`tests/session_supervisor.rs` (NEW)** | **26** | **0** | **0** |
+| **`tests/session_supervisor.rs` (NEW)** | **29** | **0** | **0** |
 | `tests/verify59_independent.rs` | 19 | 0 | 0 |
 | noren-pty lib unittests | 10 | 0 | 0 |
 | noren-terminal lib unittests | 45 | 0 | 0 |
 | noren-terminal integration tests (`adversarial`, `adversarial_kimi`, `alternate_screen`, `application_modes`, `bracketed_paste`, `control_sequences`, `embedded_c0`, `erase_operations`, `scroll_regions`, `scrollback`, `selection`, `sgr_attributes`, `string_states`, `terminal_state`, `unicode_width`, `vt_compat`) | 23+20+7+6+3+9+6+6+9+6+17+25+6+7+22+4 = 176 | 0 | 0 |
 | doc-tests (3 crates) | 0 each | 0 | 0 |
 
-**Total: 379 passed, 0 failed, 1 ignored.** The 1 ignored test is pre-existing
-(in `noren-app` lib), not introduced by this lane. The new
-`tests/session_supervisor.rs` target contributes **26 tests** = 14 inline unit
+**Total: 382 passed, 0 failed, 1 ignored.** The 1 ignored test is pre-existing
+(in `noren-app` lib), not introduced by this lane. The
+`tests/session_supervisor.rs` target contributes **29 tests** = 14 inline unit
 tests (`session_supervisor::tests::*`, compiled into the test binary via the
-`#[path]` include) + 12 independent integration tests, all green. The mainline
-baseline on `origin/main` was 353 passing; 353 + 26 = 379, confirming this lane
-added exactly its 26 tests and broke nothing.
+`#[path]` include) + 15 independent integration tests (12 original + 3 added by
+the review fix), all green. The mainline baseline on `origin/main` was 353
+passing; 353 + 29 = 382, confirming this lane added exactly its 29 tests and
+broke nothing.
 
 **Commands run during development that surfaced bugs** (kept for the record):
 two earlier iterations of `cargo test --workspace` caught (a) the private-stub
@@ -233,3 +234,70 @@ documented in §5. Both were fixed before the final green run above.
    `crates/noren-app/src/lib.rs`, and write the `PtySession`-backed `Child` +
    `Spawner` adapters (per the contract notes in §5.1 and §5.2). The test file's
    `#[path]` include can then be replaced with `use noren_app::session_supervisor`.
+
+## 8. Independent review fix-up (post-review commit)
+
+An independent Qwen review (`docs/coordination/reviews/M3-1b-review.md`) found 1
+MAJOR + 5 MINORs. The coordinator judged the MAJOR real. All were addressed on
+this branch in a follow-up commit.
+
+### MAJOR 1 — `ReapReport` order (fixed)
+
+`poll` collected running ids from `self.sessions.iter()` — a `HashMap` with
+randomized iteration order — but `ReapReport`'s contract promises insertion
+order. **Fix:** `poll` now iterates `self.order` (the `Vec<SessionId>` that holds
+insertion order), filtering to `Running` sessions. **Test added:**
+`poll_reports_multi_session_transitions_in_insertion_order` spawns 10 sessions,
+exits all before one `poll`, and asserts the reported id sequence equals the
+spawn order. 10 elements gives 10! permutations (only one is sorted), so a
+HashMap source would fail this test on virtually every run.
+
+### MINOR 2 — shared-deadline test gap (fixed)
+
+The shared-deadline contract of `shutdown_all` had no test that a wall-clock
+assertion with an instant mock could catch. **Fix:** the mock's `MockController`
+now records the `deadline` argument of every `shutdown` call (`deadlines()`).
+**Test added:** `shutdown_all_feeds_one_shared_deadline_to_every_child` asserts
+all recorded deadlines across all children are identical — directly proving one
+shared `Instant` reached the batch. Moving the deadline inside the loop (the
+n*deadline regression) makes each value distinct and fails this test.
+
+### MINOR 3 — forget + shutdown_all interaction (fixed)
+
+`forget`'s `order.retain` had no committed coverage; deleting it left the suite
+green while `shutdown_all` resurrected forgotten ids. **Test added:**
+`forget_then_shutdown_all_omits_the_forgotten_id` spawns 3, terminates+forgets
+the middle one, and asserts `shutdown_all` reports exactly the remaining two in
+insertion order. Deleting `order.retain` makes the forgotten id reappear and
+fails this test.
+
+### MINOR 4 — `terminate` on unknown id fabricates `Failed(PollFailed)` (documented)
+
+`terminate` has no error channel, so an unknown id is defensively classified as
+`Failed(PollFailed)`. **Disposition: documented** on the method's rustdoc. A
+typed `Unknown` variant (or a `Result` return) is deferred to D-M3-001
+integration because `SessionFailure` is a STUB type that the domain lane
+replaces; adding a variant now risks a conflicting shape at the deletion/merge.
+
+### MINOR 5 — `Child::shutdown` deadline vs production `Drop` (documented)
+
+The production adapter's `shutdown` takes no deadline (uses its internal 2 s) and
+its `Drop` runs a full shutdown attempt, so the "no backend call" path asserted
+by mock tests will not hold in production. **Disposition: documented** on the
+`Child` trait as a "Drop semantics (integration note)" section. No code change
+is possible in this lane (the adapter does not exist yet); the serial
+integration commit must decide between a deadline-parameterised adapter or a
+concurrent kill path.
+
+### MINOR 6 — unbounded terminal-record retention (documented)
+
+Terminal records are retained until cooperative `forget` with no cap. This is a
+deliberate design (callers observe outcomes by id), but nothing enforces a
+retirement policy. **Disposition: documented** on `SessionSupervisor` as a
+"Record retention" section. The registry/domain (D-M3-001) must own the policy.
+
+### Summary
+
+`minors_fixed=3` (2, 3), `minors_deferred=3` (4, 5, 6 — all documented with
+clear integration guidance). The MAJOR is fixed with a regression-catching test.
+All three gates pass on the fix-up commit.
