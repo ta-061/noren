@@ -61,6 +61,19 @@ use std::time::{Duration, Instant};
 /// the two layers. Termination never blocks longer than this.
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
 
+/// Maximum number of terminal (dead) records the supervisor retains at once.
+///
+/// The supervisor is **bounded**: it keeps every live session plus a small ring
+/// of recently-terminal records so a caller can still read the outcome of a
+/// session that just died. When a session becomes terminal and the number of
+/// retained terminal records would exceed this cap, the oldest terminal record
+/// is retired automatically (the same effect as [`forget`](Self::forget)). The
+/// total number of retained records is therefore at most
+/// `running_count() + RETAIN_TERMINAL_RECORDS`, independent of how many
+/// sessions have ever been spawned — so repeated spawn/die cycles cannot grow
+/// memory without bound (the boundedness class the brief warns about).
+pub const RETAIN_TERMINAL_RECORDS: usize = 16;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // STUB block — delete on integration with D-M3-001 (session-domain lane).
 // These stand in for the domain's `SessionId` / status / failure types only so
@@ -342,14 +355,16 @@ struct SupervisedSession {
 /// a dedicated worker); it does not need to be `Send` because child handles need
 /// not be `Sync`.
 ///
-/// # Record retention
+/// # Record retention (bounded)
 ///
-/// Every spawned session's record is retained — even after it exits — until
-/// [`SessionSupervisor::forget`] is called. There is no automatic reaping of
-/// terminal records and no cap. A long-running supervisor whose owner never
-/// forgets grows without bound; the registry/domain (D-M3-001) must own an
-/// explicit retirement policy (e.g. forget after the UI observes the terminal
-/// status, or a record cap).
+/// The supervisor is bounded: it retains every live session plus at most
+/// [`RETAIN_TERMINAL_RECORDS`] terminal records at a time. A terminal record is
+/// kept long enough for a caller to read the outcome by id, then retired
+/// automatically once the terminal ring is full (the oldest dead record is
+/// dropped when a newer death would exceed the cap). Total retained records ≤
+/// `running_count() + RETAIN_TERMINAL_RECORDS`, so repeated spawn/die cycles
+/// cannot grow memory without limit. [`SessionSupervisor::forget`] retires a
+/// specific terminal record on demand.
 pub struct SessionSupervisor {
     sessions: HashMap<SessionId, SupervisedSession>,
     order: Vec<SessionId>,
@@ -503,29 +518,32 @@ impl SessionSupervisor {
     /// - Otherwise delegates to [`Child::shutdown`], then reads the exit code:
     ///   a code → `Exited`, no observable code → `Exited { code: None }`, a
     ///   backend error → `Failed`.
-    /// - An unknown `id` (never spawned or already forgotten) is reported as
-    ///   `Failed(PollFailed)` because `terminate` has no dedicated error
-    ///   channel. This is a defensive classification, not a genuine poll fault;
-    ///   callers that must distinguish unknown ids should check
-    ///   [`Self::status`] first. At D-M3-001 integration a typed `Unknown`
-    ///   variant (or a `Result` return) should replace this.
+    /// - An **unknown** `id` (never spawned, already forgotten, or
+    ///   auto-retired) is reported honestly as [`SessionOpError::Unknown`].
+    ///   `terminate` does not fabricate a status for a session it does not
+    ///   track: there was no child to poll, so no `Failed` reason is invented.
     ///
-    /// The child handle is released once terminal.
-    pub fn terminate(&mut self, id: SessionId, deadline: Instant) -> SessionStatus {
+    /// The child handle is released once terminal. Marking a session terminal
+    /// may auto-retire older terminal records (see
+    /// [`RETAIN_TERMINAL_RECORDS`]).
+    pub fn terminate(
+        &mut self,
+        id: SessionId,
+        deadline: Instant,
+    ) -> Result<SessionStatus, SessionOpError> {
         // Fast path: already terminal — idempotent, no backend call.
         let already = self.sessions.get(&id).map(|session| session.status);
         match already {
-            Some(status) if is_terminal(status) => return status,
-            None => {
-                return SessionStatus::Failed {
-                    reason: SessionFailure::PollFailed,
-                };
-            }
+            Some(status) if is_terminal(status) => return Ok(status),
+            // Unknown id: there is no child to terminate and no poll that
+            // failed, so reporting a `Failed` status would fabricate an event
+            // that never happened. Surface the honest `Unknown` instead.
+            None => return Err(SessionOpError::Unknown),
             _ => {}
         }
 
         if Instant::now() >= deadline {
-            return self.finalize_failed(id, SessionFailure::ReapTimeout);
+            return Ok(self.finalize_failed(id, SessionFailure::ReapTimeout));
         }
 
         let backend = self
@@ -549,12 +567,12 @@ impl SessionSupervisor {
                     Ok(PollOutcome::StillRunning) => None,
                     Err(_) => None,
                 };
-                self.finalize_exited(id, code)
+                Ok(self.finalize_exited(id, code))
             }
             Err(ChildError::Shutdown(reason)) => {
-                self.finalize_failed(id, shutdown_to_failure(reason))
+                Ok(self.finalize_failed(id, shutdown_to_failure(reason)))
             }
-            Err(ChildError::Poll) => self.finalize_failed(id, SessionFailure::ShutdownFailed),
+            Err(ChildError::Poll) => Ok(self.finalize_failed(id, SessionFailure::ShutdownFailed)),
         }
     }
 
@@ -570,7 +588,9 @@ impl SessionSupervisor {
     }
 
     /// Terminate `id` under the standard [`SHUTDOWN_DEADLINE`] from now.
-    pub fn terminate_now(&mut self, id: SessionId) -> SessionStatus {
+    ///
+    /// See [`Self::terminate`] for the return type and semantics.
+    pub fn terminate_now(&mut self, id: SessionId) -> Result<SessionStatus, SessionOpError> {
         let deadline = Instant::now() + SHUTDOWN_DEADLINE;
         self.terminate(id, deadline)
     }
@@ -581,14 +601,18 @@ impl SessionSupervisor {
     /// [`Self::terminate`], so the whole batch is bounded by one deadline
     /// rather than `n * deadline`. Already-terminal sessions are skipped.
     /// Idempotent: a second call performs no backend work. Returns the final
-    /// status of every session in insertion order, and clears the selection.
+    /// status of every still-tracked session in insertion order (ids
+    /// auto-retired since the last call are omitted), and clears the selection.
     pub fn shutdown_all(&mut self) -> Vec<(SessionId, SessionStatus)> {
         let deadline = Instant::now() + SHUTDOWN_DEADLINE;
         let ids = self.order.clone();
         let mut results = Vec::with_capacity(ids.len());
         for id in ids {
-            let status = self.terminate(id, deadline);
-            results.push((id, status));
+            // A tracked id yields its terminal status; an id auto-retired
+            // since `ids` was snapshotted is Unknown and naturally omitted.
+            if let Ok(status) = self.terminate(id, deadline) {
+                results.push((id, status));
+            }
         }
         self.selected = None;
         results
@@ -597,7 +621,10 @@ impl SessionSupervisor {
     /// Retire a terminal session's record.
     ///
     /// Returns [`SessionOpError::StillRunning`] for a live session (terminate it
-    /// first) and [`SessionOpError::Unknown`] for an unknown id.
+    /// first) and [`SessionOpError::Unknown`] for an unknown id (including one
+    /// auto-retired past the [`RETAIN_TERMINAL_RECORDS`] cap). Retirement is
+    /// also automatic: once the terminal ring fills, the oldest dead record is
+    /// retired without this call.
     pub fn forget(&mut self, id: SessionId) -> Result<(), SessionOpError> {
         let status = self
             .sessions
@@ -621,6 +648,39 @@ impl SessionSupervisor {
         id
     }
 
+    /// Number of retained terminal (dead) records.
+    fn terminal_count(&self) -> usize {
+        self.sessions
+            .values()
+            .filter(|session| is_terminal(session.status))
+            .count()
+    }
+
+    /// Enforce the [`RETAIN_TERMINAL_RECORDS`] cap on dead records.
+    ///
+    /// While more terminal records than the cap are retained, retire the oldest
+    /// (first in insertion `order`) until back within bounds. This is the
+    /// boundedness guarantee: total retained records never exceed
+    /// `running_count() + RETAIN_TERMINAL_RECORDS`. A retired id behaves as if
+    /// [`forget`](Self::forget)ted — it is gone from both `sessions` and
+    /// `order` (selection was already cleared when it went terminal).
+    fn retire_overflow(&mut self) {
+        while self.terminal_count() > RETAIN_TERMINAL_RECORDS {
+            let victim = self
+                .order
+                .iter()
+                .copied()
+                .find(|id| self.sessions.get(id).is_some_and(is_terminal_session));
+            match victim {
+                Some(id) => {
+                    self.sessions.remove(&id);
+                    self.order.retain(|existing| *existing != id);
+                }
+                None => break,
+            }
+        }
+    }
+
     fn mark_exited(&mut self, report: &mut ReapReport, id: SessionId, code: Option<u32>) {
         if let Some(session) = self.sessions.get_mut(&id) {
             session.status = SessionStatus::Exited { code };
@@ -630,6 +690,7 @@ impl SessionSupervisor {
         if self.selected == Some(id) {
             self.selected = None;
         }
+        self.retire_overflow();
     }
 
     fn mark_failed(&mut self, report: &mut ReapReport, id: SessionId, reason: SessionFailure) {
@@ -641,6 +702,7 @@ impl SessionSupervisor {
         if self.selected == Some(id) {
             self.selected = None;
         }
+        self.retire_overflow();
     }
 
     fn finalize_exited(&mut self, id: SessionId, code: Option<u32>) -> SessionStatus {
@@ -651,6 +713,7 @@ impl SessionSupervisor {
         if self.selected == Some(id) {
             self.selected = None;
         }
+        self.retire_overflow();
         SessionStatus::Exited { code }
     }
 
@@ -662,8 +725,14 @@ impl SessionSupervisor {
         if self.selected == Some(id) {
             self.selected = None;
         }
+        self.retire_overflow();
         SessionStatus::Failed { reason }
     }
+}
+
+/// Predicate form of [`is_terminal`] over a [`SupervisedSession`]'s status.
+fn is_terminal_session(session: &SupervisedSession) -> bool {
+    is_terminal(session.status)
 }
 
 fn shutdown_to_failure(reason: ShutdownError) -> SessionFailure {
@@ -728,6 +797,22 @@ pub mod mock {
     }
 
     impl MockChild {
+        /// A child that is already dead; its first poll reports `Exited`.
+        ///
+        /// No controller is needed because nothing scripts the child further.
+        /// This is the fixture for "spawn a session that is already dead".
+        /// Not every test binary that links this mock exercises it, so the
+        /// unused case is allowed rather than forcing every binary to call it.
+        #[allow(dead_code)]
+        #[must_use]
+        pub fn exited() -> Self {
+            let state = Arc::new(Mutex::new(MockState {
+                alive: false,
+                ..MockState::default()
+            }));
+            Self { state }
+        }
+
         /// A live child with no scripted failure.
         #[must_use]
         pub fn running() -> Self {
@@ -951,14 +1036,14 @@ mod tests {
         let mut sup = supervisor_with(vec![child]);
         let id = sup.spawn().expect("spawn");
 
-        let status = sup.terminate_now(id);
+        let status = sup.terminate_now(id).expect("terminate");
         // The mock's shutdown kills the child; a kill yields no clean exit code,
         // so the recorded status is `Exited { code: None }`.
         assert_eq!(status, SessionStatus::Exited { code: None });
         assert_eq!(ctrl.shutdown_count(), 1);
 
         // Idempotent: no second backend shutdown, same status.
-        let again = sup.terminate_now(id);
+        let again = sup.terminate_now(id).expect("terminate again");
         assert_eq!(again, status);
         assert_eq!(ctrl.shutdown_count(), 1);
     }
@@ -971,7 +1056,7 @@ mod tests {
         ctrl.exit(Some(3));
         let _ = sup.poll();
         let before = ctrl.shutdown_count();
-        let status = sup.terminate_now(id);
+        let status = sup.terminate_now(id).expect("terminate");
         assert_eq!(status, SessionStatus::Exited { code: Some(3) });
         assert_eq!(ctrl.shutdown_count(), before);
     }
@@ -982,7 +1067,7 @@ mod tests {
         let mut sup = supervisor_with(vec![child]);
         let id = sup.spawn().expect("spawn");
         ctrl.fail_shutdown(ShutdownError::Failed);
-        let status = sup.terminate_now(id);
+        let status = sup.terminate_now(id).expect("terminate");
         assert_eq!(
             status,
             SessionStatus::Failed {
@@ -997,7 +1082,7 @@ mod tests {
         let mut sup = supervisor_with(vec![child]);
         let id = sup.spawn().expect("spawn");
         ctrl.fail_shutdown(ShutdownError::TimedOut);
-        let status = sup.terminate_now(id);
+        let status = sup.terminate_now(id).expect("terminate");
         assert_eq!(
             status,
             SessionStatus::Failed {
@@ -1012,7 +1097,7 @@ mod tests {
         let mut sup = supervisor_with(vec![child]);
         let id = sup.spawn().expect("spawn");
         let past = std::time::Instant::now();
-        let status = sup.terminate(id, past);
+        let status = sup.terminate(id, past).expect("terminate");
         assert_eq!(
             status,
             SessionStatus::Failed {

@@ -37,6 +37,10 @@
 //! 4. **Bounded live state.** [`SessionAction::Close`] removes an entry, so
 //!    repeated create/close cycles do not accumulate dead sessions. The registry
 //!    retains no event history.
+//! 5. **Monotonic status.** [`SessionRegistry::observe`] only accepts a status
+//!    of equal or higher [`rank`](SessionStatus::rank). A session never moves
+//!    backwards (`Running` → `Starting`) and is never resurrected once terminal
+//!    (`Exited`/`Failed` → `Running`), so lifecycle order is sound.
 //!
 //! No persistence format is chosen: the model is in-memory only and derives no
 //! `serde` traits.
@@ -120,6 +124,13 @@ impl SessionKind {
 /// [`SessionAction::Create`]: a fresh entry is [`Starting`], and every other
 /// status is set only by an explicit [`SessionRegistry::observe`] report.
 ///
+/// Status transitions are **monotonic**: [`observe`](SessionRegistry::observe)
+/// only accepts a status whose [`rank`](Self::rank) is greater than or equal to
+/// the current one. A session can therefore advance (`Starting` → `Running` → a
+/// terminal status, or refine one terminal report into another) but can never
+/// regress (e.g. `Running` back to `Starting`) and can never be resurrected
+/// once terminal (a dead session stays dead). See [`Self::rank`].
+///
 /// [`Starting`]: SessionStatus::Starting
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -138,6 +149,25 @@ pub enum SessionStatus {
         /// A short, human-readable failure reason.
         reason: String,
     },
+}
+
+impl SessionStatus {
+    /// Lifecycle rank used to enforce monotonic, forward-only observations.
+    ///
+    /// `Starting` (0) < `Running` (1) < terminal `Exited`/`Failed` (2). An
+    /// observation may move a session to an equal or higher rank — so it can
+    /// advance, or refine one terminal report into another (e.g. `Failed` →
+    /// `Exited` once a real exit code arrives) — but never to a lower rank.
+    /// That single rule forbids both a backwards slide (`Running` → `Starting`)
+    /// and a resurrection (`Exited` → `Running`).
+    #[must_use]
+    pub fn rank(&self) -> u8 {
+        match self {
+            Self::Starting => 0,
+            Self::Running => 1,
+            Self::Exited { .. } | Self::Failed { .. } => 2,
+        }
+    }
 }
 
 /// A snapshot of a session's stable facts.
@@ -236,7 +266,7 @@ pub type SelectedSession = Option<SessionId>;
 /// Typed failure of a [`SessionAction`] (or observation) against the registry.
 ///
 /// D-M3-001 defines no error type; this is a local addition so callers handle
-/// unknown-session cases without panicking.
+/// unknown-session and invalid-transition cases without panicking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionError {
     /// The action named a session the registry does not know.
@@ -244,12 +274,21 @@ pub enum SessionError {
     /// A closed id is unknown because [`SessionAction::Close`] removes the
     /// entry entirely rather than retaining a tombstone.
     UnknownSession,
+    /// The observation would regress the status.
+    ///
+    /// Status transitions are monotonic (see [`SessionStatus::rank`]): an
+    /// [`SessionRegistry::observe`] may advance or laterally refine a status
+    /// but never lower its rank. A regression (`Running` → `Starting`) or a
+    /// resurrection of a dead session (`Exited`/`Failed` → `Running`) is
+    /// rejected so any consumer reasoning about lifecycle order is sound.
+    InvalidStatusTransition,
 }
 
 impl fmt::Display for SessionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownSession => f.write_str("unknown session"),
+            Self::InvalidStatusTransition => f.write_str("invalid status transition"),
         }
     }
 }
@@ -356,6 +395,13 @@ impl SessionRegistry {
     /// Observing the current status is a no-op and returns `Ok(None)`. Returns
     /// [`SessionError::UnknownSession`] when `id` is not live.
     ///
+    /// Transitions are **monotonic** (see [`SessionStatus::rank`]): an
+    /// observation may advance the status or refine one terminal report into
+    /// another, but never lower its rank. A regression such as `Running` →
+    /// `Starting`, or a resurrection such as `Exited` → `Running`, is rejected
+    /// with [`SessionError::InvalidStatusTransition`] — a dead session stays
+    /// dead, so consumers can rely on lifecycle order.
+    ///
     /// This is a registry method, not a contract [`SessionAction`]; see the
     /// module and handoff for the open ratification question.
     pub fn observe(
@@ -369,6 +415,9 @@ impl SessionRegistry {
             .ok_or(SessionError::UnknownSession)?;
         if descriptor.status == status {
             return Ok(None);
+        }
+        if status.rank() < descriptor.status.rank() {
+            return Err(SessionError::InvalidStatusTransition);
         }
         descriptor.status = status;
         Ok(Some(SessionEvent::StatusChanged))

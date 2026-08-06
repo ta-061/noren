@@ -79,7 +79,9 @@ fn terminate_reaps_and_second_call_is_a_no_op() {
     let id = sup.spawn().expect("spawn");
 
     let started = Instant::now();
-    let status = sup.terminate(id, started + Duration::from_secs(1));
+    let status = sup
+        .terminate(id, started + Duration::from_secs(1))
+        .expect("terminate");
     assert!(matches!(status, SessionStatus::Exited { .. }));
     assert!(started.elapsed() <= Duration::from_secs(1));
     let shutdowns_after_first = ctrl.shutdown_count();
@@ -87,7 +89,7 @@ fn terminate_reaps_and_second_call_is_a_no_op() {
     let polls_after_first = ctrl.poll_count();
 
     // Idempotent: status stable, no further backend work or reaping polls.
-    let again = sup.terminate_now(id);
+    let again = sup.terminate_now(id).expect("terminate again");
     assert_eq!(again, status);
     assert_eq!(ctrl.shutdown_count(), shutdowns_after_first);
     assert_eq!(ctrl.poll_count(), polls_after_first);
@@ -145,7 +147,7 @@ fn shutdown_hard_error_becomes_failed_shutdown_failed() {
     let mut sup = supervisor_with(vec![child]);
     let id = sup.spawn().expect("spawn");
     ctrl.fail_shutdown(ShutdownError::Failed);
-    let status = sup.terminate_now(id);
+    let status = sup.terminate_now(id).expect("terminate");
     assert_eq!(
         status,
         SessionStatus::Failed {
@@ -161,7 +163,7 @@ fn shutdown_timeout_becomes_failed_reap_timeout_and_does_not_hang() {
     let id = sup.spawn().expect("spawn");
     ctrl.fail_shutdown(ShutdownError::TimedOut);
     let started = Instant::now();
-    let status = sup.terminate_now(id);
+    let status = sup.terminate_now(id).expect("terminate");
     assert!(started.elapsed() <= session_supervisor::SHUTDOWN_DEADLINE);
     assert_eq!(
         status,
@@ -178,7 +180,7 @@ fn an_already_passed_deadline_skips_the_backend_and_times_out() {
     let (child, ctrl) = MockChild::running_with_control();
     let mut sup = supervisor_with(vec![child]);
     let id = sup.spawn().expect("spawn");
-    let status = sup.terminate(id, Instant::now());
+    let status = sup.terminate(id, Instant::now()).expect("terminate");
     assert_eq!(
         status,
         SessionStatus::Failed {
@@ -203,7 +205,7 @@ fn selection_cannot_focus_a_dead_session() {
 
     // Terminate + forget `other` so its id is genuinely unknown to the
     // supervisor (this avoids depending on the STUB id's private constructor).
-    sup.terminate_now(other);
+    sup.terminate_now(other).expect("terminate other");
     sup.forget(other).expect("retire other");
     assert_eq!(sup.select(other), Err(SessionOpError::Unknown));
 
@@ -363,7 +365,7 @@ fn forget_then_shutdown_all_omits_the_forgotten_id() {
     let c = sup.spawn().expect("spawn");
 
     // Terminate + forget the middle session.
-    sup.terminate_now(b);
+    sup.terminate_now(b).expect("terminate middle");
     sup.forget(b).expect("retire middle");
 
     // shutdown_all reports only the remaining ids, in insertion order — the
