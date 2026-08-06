@@ -11,6 +11,7 @@ publish.workspace = true
 [dependencies]
 noren-pty.workspace = true
 noren-terminal.workspace = true
+toml_edit.workspace = true
 winit.workspace = true
 wgpu.workspace = true
 
