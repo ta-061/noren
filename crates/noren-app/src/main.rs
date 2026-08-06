@@ -6,7 +6,10 @@ use noren_app::{
     Arrow, CursorKeyMode, FunctionKey, GridGeometry, GridSize, InputMode, Key, KeyDropReason,
     KeyEncoder, KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode, MAX_RENDER_ROWS, Modifiers,
     PARSE_BUDGET_BYTES_PER_TURN, POC_CELL_HEIGHT, POC_CELL_WIDTH, PasteReject, Resize,
-    SystemClipboard, config::AppConfig, diagnostics::{self, PtyChildStatus}, encode_paste,
+    SystemClipboard,
+    config::AppConfig,
+    diagnostics::{self, PtyChildStatus},
+    encode_paste,
 };
 use noren_pty::{PtyEvent, PtySession, PtySize};
 use noren_terminal::{Cell, GridPoint, Selection, SelectionMode, TerminalEngine, TerminalState};
