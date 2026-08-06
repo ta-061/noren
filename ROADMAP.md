@@ -8,7 +8,7 @@ Only evidence-backed work is marked complete.
 | 0 — Discovery | Landscape, feature/library matrices, risks, agent inventory and calibration | Complete |
 | 1 — Requirements and design | Independent proposals, critiques, integrated requirements, architecture, threat model, tests, RFCs, ADRs | Complete |
 | 2 — Terminal foundation | Window, PTY, shell, terminal state/rendering, input, resize, scrollback, selection, copy/paste/search, configuration and diagnostics | In progress |
-| 3 — Workspace | Tabs, panes, workspaces, persistence, sidebar, palette, configurable keybindings, Zellij pass-through | Not started |
+| 3 — Workspace | External workspace management (sidebar: projects, git worktrees, SSH connections, agents, terminal sessions), single-session view, session lifecycle, sidebar-state persistence, palette, configurable keybindings, Zellij pass-through — no native tabs/panes/layout (delegated to Zellij per [ADR 0003](docs/adr/0003-noren-zellij-responsibility-boundary.md)) | Not started |
 | 4 — SSH and remote | OpenSSH configuration, connections, reconnect, remote panes, daemon decision/PoC and recovery | Not started |
 | 5 — Agent experience | Launchers, verified adapters, trustworthy state, notifications and jump-to-source | Not started |
 | 6 — Themes and accessibility | Light/dark/high-contrast palettes, contrast checks, IME/CJK/HiDPI and keyboard/accessibility work | Not started |
