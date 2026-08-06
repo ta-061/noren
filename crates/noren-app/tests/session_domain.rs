@@ -5,7 +5,8 @@
 //! standalone with `#[path]`. When the module is re-exported from the crate,
 //! this line is replaced by `use noren_app::session;`.
 //!
-//! These tests pin the four invariants the model must hold:
+//! These tests pin the four invariants the model must hold, and assert that the
+//! public types match the D-M3-001 contract shape:
 //!
 //! 1. at most one selected session, and closing it never dangles;
 //! 2. the registry spawns no process (the tests run no children);
@@ -16,13 +17,14 @@
 mod session;
 
 use session::{
-    SessionAction, SessionDescriptor, SessionError, SessionEvent, SessionKind, SessionRegistry,
-    SessionStatus,
+    SelectedSession, SessionAction, SessionDescriptor, SessionError, SessionEvent, SessionKind,
+    SessionRegistry, SessionStatus,
 };
+use std::path::PathBuf;
 
-/// Build a fresh local session and return its id.
+/// Build a fresh local session and return its descriptor.
 fn fresh(registry: &mut SessionRegistry) -> SessionDescriptor {
-    let id = registry.create(SessionKind::Local, None);
+    let id = registry.create(SessionKind::Local);
     registry.get(id).expect("just-created session is live")
 }
 
@@ -35,12 +37,21 @@ fn selecting_replaces_the_prior_selection() {
     let second = fresh(&mut registry);
 
     registry.select(first.id()).unwrap();
-    assert_eq!(registry.selected().map(|s| s.id()), Some(first.id()));
+    assert_eq!(registry.selected(), Some(first.id()));
 
     registry.select(second.id()).unwrap();
-    assert_eq!(registry.selected().map(|s| s.id()), Some(second.id()));
-    // The prior selection is gone, not retained alongside.
-    assert_eq!(registry.selected().unwrap().id(), second.id());
+    assert_eq!(registry.selected(), Some(second.id()));
+}
+
+#[test]
+fn selected_is_the_contract_type_alias() {
+    // SelectedSession is `Option<SessionId>` per D-M3-001, so `selected()`
+    // returns the id directly (not a wrapper struct).
+    let mut registry = SessionRegistry::new();
+    let session = fresh(&mut registry);
+    registry.select(session.id()).unwrap();
+    let selected: SelectedSession = registry.selected();
+    assert_eq!(selected, Some(session.id()));
 }
 
 #[test]
@@ -49,7 +60,7 @@ fn selecting_an_unknown_session_errors() {
     let live = fresh(&mut registry);
     registry.close(live.id()).unwrap();
 
-    let unknown = registry.create(SessionKind::Local, None);
+    let unknown = registry.create(SessionKind::Local);
     registry.close(unknown).unwrap();
     assert_eq!(registry.select(unknown), Err(SessionError::UnknownSession));
     assert_eq!(registry.selected(), None);
@@ -65,7 +76,7 @@ fn selecting_the_already_selected_session_is_a_no_op() {
         .apply(SessionAction::Select { id: session.id() })
         .expect("re-selecting a live session is valid");
     assert!(events.is_empty(), "no-op select emits no events");
-    assert_eq!(registry.selected().map(|s| s.id()), Some(session.id()));
+    assert_eq!(registry.selected(), Some(session.id()));
 }
 
 // ── Invariant 1 (continued): closing the selected never dangles ─────────
@@ -90,7 +101,7 @@ fn closing_a_non_selected_session_keeps_the_selection() {
     registry.select(selected.id()).unwrap();
 
     registry.close(other.id()).unwrap();
-    assert_eq!(registry.selected().map(|s| s.id()), Some(selected.id()));
+    assert_eq!(registry.selected(), Some(selected.id()));
     // The selected id still resolves to a live entry.
     assert!(registry.get(selected.id()).is_some());
 }
@@ -106,19 +117,6 @@ fn closing_the_only_session_leaves_no_selection() {
     assert_eq!(registry.selected(), None);
 }
 
-#[test]
-fn selected_descriptor_matches_get_descriptor() {
-    let mut registry = SessionRegistry::new();
-    let session = fresh(&mut registry);
-    registry
-        .observe(session.id(), SessionStatus::Running)
-        .unwrap();
-    registry.select(session.id()).unwrap();
-
-    let selected = registry.selected().expect("a session is selected");
-    assert_eq!(selected.descriptor(), &registry.get(session.id()).unwrap());
-}
-
 // ── Invariant 2: the registry spawns no process ─────────────────────────
 //
 // There is no assertion to make because there is nothing to observe: creating,
@@ -130,8 +128,8 @@ fn selected_descriptor_matches_get_descriptor() {
 #[test]
 fn a_full_session_lifecycle_runs_without_any_child_process() {
     let mut registry = SessionRegistry::new();
-    let a = registry.create(SessionKind::Local, Some("edit".to_owned()));
-    let b = registry.create(SessionKind::Local, None);
+    let a = registry.create(SessionKind::Local);
+    let b = registry.create(SessionKind::Local);
 
     registry.observe(a, SessionStatus::Running).unwrap();
     registry.observe(b, SessionStatus::Running).unwrap();
@@ -147,12 +145,12 @@ fn a_full_session_lifecycle_runs_without_any_child_process() {
 // ── Invariant 3: status is observed, not inferred from create ───────────
 
 #[test]
-fn a_newly_created_session_is_created_not_running() {
+fn a_newly_created_session_is_starting_not_running() {
     let mut registry = SessionRegistry::new();
     let session = fresh(&mut registry);
     assert_eq!(
         session.status(),
-        SessionStatus::Created,
+        &SessionStatus::Starting,
         "create must not infer a running status"
     );
 }
@@ -167,29 +165,36 @@ fn observe_advances_status_to_running() {
         .unwrap();
     assert_eq!(
         registry.get(session.id()).unwrap().status(),
-        SessionStatus::Running
+        &SessionStatus::Running
     );
 }
 
 #[test]
-fn observe_records_failure_and_exit_statuses() {
+fn observe_records_failure_and_exit_statuses_with_payloads() {
     let mut registry = SessionRegistry::new();
     let session = fresh(&mut registry);
 
     registry
-        .observe(session.id(), SessionStatus::Failed)
+        .observe(
+            session.id(),
+            SessionStatus::Failed {
+                reason: "exit 1".to_owned(),
+            },
+        )
         .unwrap();
     assert_eq!(
         registry.get(session.id()).unwrap().status(),
-        SessionStatus::Failed
+        &SessionStatus::Failed {
+            reason: "exit 1".to_owned()
+        }
     );
 
     registry
-        .observe(session.id(), SessionStatus::Exited)
+        .observe(session.id(), SessionStatus::Exited { code: Some(0) })
         .unwrap();
     assert_eq!(
         registry.get(session.id()).unwrap().status(),
-        SessionStatus::Exited
+        &SessionStatus::Exited { code: Some(0) }
     );
 }
 
@@ -201,16 +206,14 @@ fn observing_the_current_status_is_a_no_op() {
         .observe(session.id(), SessionStatus::Running)
         .unwrap();
 
-    let events = registry
-        .apply(SessionAction::Observe {
-            id: session.id(),
-            status: SessionStatus::Running,
-        })
+    // Re-observing the same status returns no event and changes nothing.
+    let event = registry
+        .observe(session.id(), SessionStatus::Running)
         .unwrap();
-    assert!(events.is_empty());
+    assert_eq!(event, None);
     assert_eq!(
         registry.get(session.id()).unwrap().status(),
-        SessionStatus::Running
+        &SessionStatus::Running
     );
 }
 
@@ -232,16 +235,28 @@ fn observe_on_an_unknown_session_errors() {
 #[test]
 fn create_then_observe_then_close_keeps_status_observed_only() {
     let mut registry = SessionRegistry::new();
-    let id = registry.create(SessionKind::Local, None);
+    let id = registry.create(SessionKind::Local);
 
-    // After create: Created.
-    assert_eq!(registry.get(id).unwrap().status(), SessionStatus::Created);
+    // After create: Starting.
+    assert_eq!(registry.get(id).unwrap().status(), &SessionStatus::Starting);
     // After observe: Running.
     registry.observe(id, SessionStatus::Running).unwrap();
-    assert_eq!(registry.get(id).unwrap().status(), SessionStatus::Running);
+    assert_eq!(registry.get(id).unwrap().status(), &SessionStatus::Running);
     // After a failed observation: Failed.
-    registry.observe(id, SessionStatus::Failed).unwrap();
-    assert_eq!(registry.get(id).unwrap().status(), SessionStatus::Failed);
+    registry
+        .observe(
+            id,
+            SessionStatus::Failed {
+                reason: "boom".to_owned(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        registry.get(id).unwrap().status(),
+        &SessionStatus::Failed {
+            reason: "boom".to_owned()
+        }
+    );
     // Close removes it; the status never gets "inferred back".
     registry.close(id).unwrap();
     assert_eq!(registry.get(id), None);
@@ -253,7 +268,7 @@ fn create_then_observe_then_close_keeps_status_observed_only() {
 fn repeated_create_close_cycles_do_not_accumulate() {
     let mut registry = SessionRegistry::new();
     for _ in 0..1000 {
-        let id = registry.create(SessionKind::Local, None);
+        let id = registry.create(SessionKind::Local);
         registry.close(id).unwrap();
     }
     assert_eq!(registry.len(), 0);
@@ -263,10 +278,10 @@ fn repeated_create_close_cycles_do_not_accumulate() {
 #[test]
 fn a_recreated_session_gets_a_fresh_distinct_id() {
     let mut registry = SessionRegistry::new();
-    let first = registry.create(SessionKind::Local, None);
+    let first = registry.create(SessionKind::Local);
     registry.close(first).unwrap();
 
-    let second = registry.create(SessionKind::Local, None);
+    let second = registry.create(SessionKind::Local);
     assert_ne!(first, second, "ids must never collide");
     assert_eq!(registry.len(), 1);
 }
@@ -274,106 +289,82 @@ fn a_recreated_session_gets_a_fresh_distinct_id() {
 #[test]
 fn close_is_idempotent_in_state_only_second_close_errors() {
     let mut registry = SessionRegistry::new();
-    let id = registry.create(SessionKind::Local, None);
+    let id = registry.create(SessionKind::Local);
 
     registry.close(id).unwrap();
     assert_eq!(registry.close(id), Err(SessionError::UnknownSession));
     assert_eq!(registry.len(), 0);
 }
 
-// ── Event correctness for the reducer API ───────────────────────────────
+// ── Event correctness for the reducer API (D-M3-001 tuple shape) ────────
 
 #[test]
-fn apply_create_emits_a_created_event_with_the_descriptor() {
+fn apply_create_emits_a_created_event_with_the_id() {
     let mut registry = SessionRegistry::new();
     let events = registry
         .apply(SessionAction::Create {
             kind: SessionKind::Local,
-            label: Some("shell".to_owned()),
         })
         .unwrap();
-    let [SessionEvent::Created { id, descriptor }] = events.as_slice() else {
+    // Contract event shape: Created(SessionId).
+    let [SessionEvent::Created(id)] = events.as_slice() else {
         panic!("expected exactly one Created event, got {events:?}");
     };
-    assert_eq!(descriptor.id(), *id);
-    assert_eq!(descriptor.kind(), SessionKind::Local);
-    assert_eq!(descriptor.status(), SessionStatus::Created);
-    assert_eq!(descriptor.label(), Some("shell"));
-    assert_eq!(registry.get(*id), Some(descriptor.clone()));
+    assert!(registry.get(*id).is_some());
 }
 
 #[test]
-fn apply_close_of_selected_emits_closed_then_selection_cleared() {
+fn apply_close_of_selected_emits_closed_then_selected_none() {
     let mut registry = SessionRegistry::new();
-    let id = registry.create(SessionKind::Local, None);
+    let id = registry.create(SessionKind::Local);
     registry.select(id).unwrap();
 
     let events = registry.apply(SessionAction::Close { id }).unwrap();
     assert_eq!(
         events.as_slice(),
-        &[
-            SessionEvent::Closed { id },
-            SessionEvent::SelectionChanged { selected: None },
-        ]
+        &[SessionEvent::Closed(id), SessionEvent::Selected(None)]
     );
 }
 
 #[test]
 fn apply_close_of_non_selected_emits_only_closed() {
     let mut registry = SessionRegistry::new();
-    let selected = registry.create(SessionKind::Local, None);
-    let other = registry.create(SessionKind::Local, None);
+    let selected = registry.create(SessionKind::Local);
+    let other = registry.create(SessionKind::Local);
     registry.select(selected).unwrap();
 
     let events = registry.apply(SessionAction::Close { id: other }).unwrap();
-    assert_eq!(events.as_slice(), &[SessionEvent::Closed { id: other }]);
+    assert_eq!(events.as_slice(), &[SessionEvent::Closed(other)]);
 }
 
 #[test]
-fn apply_observe_emits_status_changed_only_when_it_differs() {
+fn apply_select_emits_selected_some() {
     let mut registry = SessionRegistry::new();
-    let id = registry.create(SessionKind::Local, None);
-
-    let changed = registry
-        .apply(SessionAction::Observe {
-            id,
-            status: SessionStatus::Running,
-        })
-        .unwrap();
-    assert_eq!(
-        changed.as_slice(),
-        &[SessionEvent::StatusChanged {
-            id,
-            status: SessionStatus::Running,
-        }]
-    );
-
-    let unchanged = registry
-        .apply(SessionAction::Observe {
-            id,
-            status: SessionStatus::Running,
-        })
-        .unwrap();
-    assert!(unchanged.is_empty());
-}
-
-#[test]
-fn apply_select_emits_selection_changed() {
-    let mut registry = SessionRegistry::new();
-    let id = registry.create(SessionKind::Local, None);
+    let id = registry.create(SessionKind::Local);
 
     let events = registry.apply(SessionAction::Select { id }).unwrap();
-    assert_eq!(
-        events.as_slice(),
-        &[SessionEvent::SelectionChanged { selected: Some(id) }]
-    );
+    assert_eq!(events.as_slice(), &[SessionEvent::Selected(Some(id))]);
+}
+
+#[test]
+fn observe_emits_status_changed_only_when_it_differs() {
+    let mut registry = SessionRegistry::new();
+    let id = registry.create(SessionKind::Local);
+
+    // A real change yields the unit StatusChanged event.
+    let changed = registry.observe(id, SessionStatus::Running).unwrap();
+    assert_eq!(changed, Some(SessionEvent::StatusChanged));
+
+    // Re-observing the same status yields nothing.
+    let unchanged = registry.observe(id, SessionStatus::Running).unwrap();
+    assert_eq!(unchanged, None);
 }
 
 #[test]
 fn apply_against_an_unknown_session_errors() {
     let mut registry = SessionRegistry::new();
     let unknown = {
-        let id = registry.create(SessionKind::Local, None);
+        let id = registry.create(SessionKind::Local);
         registry.close(id).unwrap();
         id
     };
@@ -385,13 +376,39 @@ fn apply_against_an_unknown_session_errors() {
         registry.apply(SessionAction::Select { id: unknown }),
         Err(SessionError::UnknownSession)
     );
+    // Observation is a registry method, not an action; it errors the same way.
     assert_eq!(
-        registry.apply(SessionAction::Observe {
-            id: unknown,
-            status: SessionStatus::Running,
-        }),
+        registry.observe(unknown, SessionStatus::Running),
         Err(SessionError::UnknownSession)
     );
+}
+
+#[test]
+fn session_action_has_exactly_the_three_contract_variants() {
+    // D-M3-001 fixes SessionAction to {Create, Select, Close}. These
+    // constructions compile only while that shape holds; if a variant is added
+    // or renamed, this test fails to build.
+    let mut registry = SessionRegistry::new();
+    let id = registry.create(SessionKind::Local);
+    let _create = SessionAction::Create {
+        kind: SessionKind::Local,
+    };
+    let _select = SessionAction::Select { id };
+    let _close = SessionAction::Close { id };
+}
+
+#[test]
+fn session_event_matches_the_contract_variants() {
+    // D-M3-001 fixes SessionEvent to Created/Selected/StatusChanged/Closed.
+    // These constructors compile only while that shape holds.
+    let mut registry = SessionRegistry::new();
+    let id = registry.create(SessionKind::Local);
+    let _ = [
+        SessionEvent::Created(id),
+        SessionEvent::Selected(Some(id)),
+        SessionEvent::StatusChanged,
+        SessionEvent::Closed(id),
+    ];
 }
 
 // ── Descriptor and query surface ────────────────────────────────────────
@@ -399,9 +416,9 @@ fn apply_against_an_unknown_session_errors() {
 #[test]
 fn sessions_are_listed_in_identifier_order() {
     let mut registry = SessionRegistry::new();
-    let c = registry.create(SessionKind::Local, None);
-    let a = registry.create(SessionKind::Local, None);
-    let b = registry.create(SessionKind::Local, None);
+    let c = registry.create(SessionKind::Local);
+    let a = registry.create(SessionKind::Local);
+    let b = registry.create(SessionKind::Local);
     // Creation order is c < a < b by minted id; listing is by id.
     assert!(a < b);
     assert!(c < a);
@@ -415,23 +432,45 @@ fn sessions_are_listed_in_identifier_order() {
 }
 
 #[test]
-fn descriptors_expose_kind_label_and_status() {
+fn descriptors_expose_kind_title_and_status() {
     let mut registry = SessionRegistry::new();
-    let id = registry.create(SessionKind::Local, Some("main".to_owned()));
+    let id = registry.create(SessionKind::Local);
     registry.observe(id, SessionStatus::Running).unwrap();
 
     let descriptor = registry.get(id).unwrap();
     assert_eq!(descriptor.id(), id);
-    assert_eq!(descriptor.kind(), SessionKind::Local);
-    assert_eq!(descriptor.label(), Some("main"));
-    assert_eq!(descriptor.status(), SessionStatus::Running);
+    assert_eq!(descriptor.kind(), &SessionKind::Local);
+    assert_eq!(descriptor.status(), &SessionStatus::Running);
+    // Title is the generated stable display id ("session-1" for the first id).
+    assert_eq!(descriptor.title(), "session-1");
 }
 
 #[test]
-fn a_labelless_session_descriptor_reports_none() {
+fn a_descriptor_has_a_generated_title_for_every_kind() {
     let mut registry = SessionRegistry::new();
-    let id = registry.create(SessionKind::Local, None);
-    assert_eq!(registry.get(id).unwrap().label(), None);
+    let local = registry.create(SessionKind::Local);
+    let project = registry.create(SessionKind::Project {
+        root: PathBuf::from("/code/noren"),
+    });
+    let worktree = registry.create(SessionKind::Worktree {
+        path: PathBuf::from("/code/noren-wt"),
+    });
+    let ssh = registry.create(SessionKind::Ssh {
+        target: "dev@example.com".to_owned(),
+    });
+    let agent = registry.create(SessionKind::Agent {
+        name: "glm".to_owned(),
+    });
+
+    // Title is always a non-empty generated String, regardless of kind, since
+    // the contract Create action carries no title.
+    for id in [local, project, worktree, ssh, agent] {
+        let descriptor = registry.get(id).expect("live session");
+        assert!(
+            !descriptor.title().is_empty(),
+            "title must be generated for every kind"
+        );
+    }
 }
 
 // ── Reserved session kinds ──────────────────────────────────────────────
@@ -439,18 +478,32 @@ fn a_labelless_session_descriptor_reports_none() {
 #[test]
 fn reserved_kinds_can_be_bookkept_but_are_not_launchable() {
     let mut registry = SessionRegistry::new();
-    let ssh = registry.create(SessionKind::Ssh, None);
-    let agent = registry.create(SessionKind::Agent, None);
+    let project = registry.create(SessionKind::Project {
+        root: PathBuf::from("/p"),
+    });
+    let worktree = registry.create(SessionKind::Worktree {
+        path: PathBuf::from("/w"),
+    });
+    let ssh = registry.create(SessionKind::Ssh {
+        target: "host".to_owned(),
+    });
+    let agent = registry.create(SessionKind::Agent {
+        name: "a".to_owned(),
+    });
 
     // The registry accepts reserved shapes as entries (bookkeeping only); it
     // never launches anything, so this stays pure data.
+    assert!(!registry.get(project).unwrap().kind().is_launchable());
+    assert!(!registry.get(worktree).unwrap().kind().is_launchable());
     assert!(!registry.get(ssh).unwrap().kind().is_launchable());
     assert!(!registry.get(agent).unwrap().kind().is_launchable());
+    let local = registry.create(SessionKind::Local);
+    assert!(registry.get(local).unwrap().kind().is_launchable());
 
-    // They still obey the same lifecycle and selection rules.
+    // Reserved kinds still obey the same lifecycle and selection rules.
     registry.select(ssh).unwrap();
-    assert_eq!(registry.selected().map(|s| s.id()), Some(ssh));
+    assert_eq!(registry.selected(), Some(ssh));
     registry.close(ssh).unwrap();
     assert_eq!(registry.selected(), None);
-    assert_eq!(registry.len(), 1);
+    assert_eq!(registry.len(), 4);
 }
