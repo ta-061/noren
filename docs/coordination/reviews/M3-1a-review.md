@@ -1,160 +1,205 @@
-# Review — M3-1a session domain model (`glm-a`)
+# Re-review — M3-1a session domain model (`glm-a`) after the conformance fix
 
-Independent review. I did not author this code and did not take the handoff at
-its word: every claim below is backed by a command I ran on this branch.
+Independent re-review. I did not author this code; the earlier review on this
+branch (`b0f61c3`) is void per the re-review brief, so I reviewed head from
+scratch and separately re-verified whether its MAJOR finding is genuinely
+resolved rather than papered over.
 
-- Reviewed at: `c2d5963` on `agent/m3-session-domain` (code commit `d31e3ac`),
-  off `origin/main` @ `1d329a5`.
-- Authority: `state/tasks/M3-1a.md` (fleet repo); contract source
-  `state/D-M3-001-session-api.md` (fleet repo — see the MAJOR finding).
-- Scope of diff (`git diff --stat origin/main...HEAD`): 3 files, **+1164 / -0**.
-  Only additions; nothing removed, nothing outside the lease edited.
+- Re-reviewed at: `d4e50d1` on `agent/m3-session-domain`, off `origin/main` @
+  `1d329a5` (macOS arm64).
+- Authority: task spec `state/tasks/M3-1a.md` (fleet repo).
+- Contract source: `state/D-M3-001-session-api.md` (fleet repo). This is the
+  only extant copy: the spec's `docs/coordination/decisions/` path does not
+  exist in the noren repo on `origin/main`, and PR #68
+  (`docs/noren-zellij-boundary`, d49ed8f, open) carries no copy either.
+- Scope of diff (`git diff --stat origin/main...HEAD`): 4 files, **+1365 /
+  −0**. Additions only; nothing removed.
 
-## Gate output (actually run)
+## Gate output (actually run on `d4e50d1`)
 
 ```
-$ cargo fmt --all -- --check        → exit 0 (clean, no diff)
+$ cargo fmt --all -- --check
+    (exit 0, no diff)
 $ cargo clippy --workspace --all-targets -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s)  (exit 0, 0 warnings)
-$ cargo test --workspace            → exit 0
-    PASSED=385 FAILED=0 IGNORED=1
-    (lib 79+1ignored, bin 24, session_domain 32, verify59 19, pty 10,
-     terminal 45 + adversarial/feature suites = 385 total)
+    Checking noren-app v0.1.0 (.../pool-m3a/crates/noren-app)
+    Finished `dev` profile [unoptimized + debuginfo]  → exit 0, 0 warnings
+    (I `touch`-forced a rebuild of both leased files first, so this is a
+    genuine check of this branch's code, not a cache hit.)
+$ cargo test --workspace
+    lib 79 passed/1 ignored, bin 24, session_domain 34, verify59 19,
+    pty 10, terminal 45, remaining suites → PASSED=387 FAILED=0 IGNORED=1
 ```
 
-Totals reconcile with the handoff's claimed 385 passed / 1 ignored.
+Totals reconcile with the handoff's claim (387 passed / 1 ignored).
 
-## Acceptance criteria (from `state/tasks/M3-1a.md`), one by one
+## Acceptance criteria (`state/tasks/M3-1a.md`), one by one
 
-1. **"Registry holds sessions with at most one selection, never dangling after
-   close." — MET.** Selection is `Option<SessionId>` (`session.rs:257`);
-   `close_entry` clears it when the closed id was selected
-   (`session.rs:395-405`). Tests `closing_the_selected_session_clears_the_selection`,
-   `closing_a_non_selected_session_keeps_the_selection`,
-   `closing_the_only_session_leaves_no_selection` cover it. I additionally broke
-   this (Mutation 1 below) and a test failed, so the coverage is real.
-2. **"Registry spawns no process; domain tests run without any child." — MET.**
-   No `Command`/`spawn`/process API anywhere in `session.rs`; it is pure
-   `HashMap`/`Option`/`u64` state. The full lifecycle test runs in memory.
-3. **"Status is only set from a reported observation, never inferred." — MET.**
-   New entries start `Created` (`session.rs:388`); only `observe_entry`
-   (`session.rs:418-432`) advances status. Mutation 2 (infer `Running` on
-   create) failed 4 tests.
+1. **"At most one selection, never dangling after close." — MET.** Selection
+   is a single `Option<SessionId>` (`session.rs:273`); `close_events` clears
+   it when the closed id was selected (`session.rs:423-433`). Mutation M1
+   below removed the clear → 5 tests failed.
+2. **"Registry spawns no process; domain tests run without any child." —
+   MET.** `grep -nE 'Command|spawn|std::process|fork|exec' session.rs`
+   matches only doc-comment words; the full-lifecycle test
+   (`tests/session_domain.rs:129-143`) runs purely in memory.
+3. **"Status is only set from a reported observation, never inferred." —
+   MET.** `create` records `Starting` (`session.rs:330`); only `observe`
+   (`session.rs:361-375`) advances status. Mutation M2 (infer `Running` on
+   create) failed 3 tests.
 4. **"No pane, tab, or layout type exists anywhere in the module." — MET.**
-   `grep -inE 'pane|\btab\b|layout|split|zellij'` matches only the module doc
-   comment (`session.rs:9-10`) that states the boundary; no such types exist.
-   ADR 0003 boundary respected.
+   `grep -inE 'pane|\btab\b|layout|split|zellij' session.rs` matches only the
+   boundary statement in the module docs (`session.rs:8-9`). ADR 0003
+   respected; no pane/tab/layout/split type is introduced, and the module
+   reads and persists nothing.
 
-## Required tests — present, and they actually bite
+## The earlier MAJOR (contract fork) — resolved in 5 of 6 places
 
-All four required behaviours have tests, and I confirmed they are not vacuous by
-mutating the implementation and watching tests fail (then reverted):
+I diffed every contract type at head against the fleet's canonical
+D-M3-001, not against the handoff's table:
 
-| Mutation (reverted after) | Result |
+| Type | Head location | Conforms? |
+| --- | --- | --- |
+| `SessionId(u64)` | `session.rs:54` | yes |
+| `SessionKind` (5 variants; `{..}` payloads) | `session.rs:80-104` | yes — contract leaves payloads unspecified; `root/path/target/name` are an implementation choice the handoff already flags for coordinator confirmation |
+| `SessionStatus` incl. `Exited{code:Option<i32>}`, `Failed{reason:String}` | `session.rs:124-141` | yes, exact |
+| `SessionDescriptor {id,kind,status,title:String}` | `session.rs:150-156` | yes |
+| `SessionAction {Create{kind},Select{id},Close{id}}` | `session.rs:191-207` | yes, exact |
+| `SelectedSession = Option<SessionId>` | `session.rs:234` | yes |
+| `SessionRegistry { .. }` | unspecified by contract | yes (methods free) |
+| `SessionEvent` | `session.rs:218-227` | **NO — see finding** |
+
+`SessionError` remains an acceptable local addition (D-M3-001 defines no
+error type); `observe` as a registry *method* is conforming (the contract's
+`SessionRegistry { .. }` specifies no methods) and — unlike the finding
+below — was properly escalated in the handoff for coordinator ratification.
+
+## Finding — MAJOR: `SessionEvent::StatusChanged` still forks D-M3-001, and
+## the fork is now presented as conformance
+
+D-M3-001 defines, at fleet `state/D-M3-001-session-api.md:76`:
+
+```rust
+StatusChanged { id: SessionId, status: SessionStatus },
+```
+
+Head ships a **unit variant** (`session.rs:224`) and documents the deviation
+as deliberate ("intentionally payload-free — a consumer that needs the new
+value queries the registry", `session.rs:213-214`), while simultaneously
+claiming "Conforms to D-M3-001: tuple-variant shape" (`session.rs:211`) and
+declaring in the handoff: *"All six deviations conformed to the contract as
+written; none were kept"* with table row *"Conformed: … StatusChanged
+(unit)"*.
+
+**How this happened (timeline evidence):** the canonical fleet file has
+carried the struct variant since before the fix was authored (file mtime
+`Aug 7 02:04`; fix commit `df3afcc` at `03:14`). The previous review's
+table misquoted the contract's `SessionEvent` row as unit `StatusChanged`
+and its "minimal suggested fix" never mentions the payload; the author
+states it "worked from the review's quoted contract" (handoff). So the fix
+conformed to the misquote, not to the contract, and the deviation was kept
+silently: no escalation of the `StatusChanged` shape exists anywhere in the
+handoff, even though the task spec's stop conditions require escalating a
+contract change instead of forking one.
+
+**Reproduction (run on `d4e50d1`, then reverted):** change `StatusChanged`
+to the contract-mandated `StatusChanged { id: SessionId, status: SessionStatus }`:
+
+```
+error[E0533]: expected value, found struct variant `SessionEvent::StatusChanged`
+error[E0533]: expected value, found struct variant `SessionEvent::StatusChanged`
+error[E0533]: expected value, found struct variant `SessionEvent::StatusChanged`
+error: could not compile `noren-app` (test "session_domain") due to 3 previous errors
+```
+
+Expected: with the contract shape in place, the suite compiles and passes.
+Actual: it does not compile — the fork is baked into the tests, including
+the guard test `session_event_matches_the_contract_variants`
+(`tests/session_domain.rs:400-412`, unit construction at `:409`), whose
+stated purpose ("compile only while the contract shape holds", `:402`) is
+inverted: it fails to build when the module is *aligned* to the true
+contract and passes against the forked shape. A test that passes against
+broken conformance is worse than none. After reverting, the suite returns to
+`34 passed; 0 failed`.
+
+**Cross-lane breakage (same failure mode as the original MAJOR, 1 of 8
+places):** the M3-ADV lane already constructs the contract shape —
+`crates/noren-app/tests/session_adversarial.rs:158` and `:349` on
+`agent/m3-session-adversarial` use `SessionEvent::StatusChanged { id, status }`.
+Whichever side lands first, the wiring commit breaks the other; the sidebar
+and supervisor lanes importing this module face the same risk. The handoff's
+"none were kept" claim actively misleads the integrator about this.
+
+**Minimal suggested fix:** restore the contract shape at `session.rs:218-227`;
+emit `SessionEvent::StatusChanged { id, status }` from `observe`
+(`session.rs:374` — the values are already in scope); update
+`tests/session_domain.rs:356` and `:409`; delete the "intentionally
+payload-free" doctrine (`session.rs:211-216`) and the handoff's
+"StatusChanged (unit)" conformance claim. If the author believes the payload
+should be dropped from the contract, that is an escalation to the
+coordinator per the task's stop conditions — not a doc comment.
+
+## What else I tried to break
+
+**Mutation testing (each reverted; suite green again after each revert):**
+
+| Mutation | Result |
 | --- | --- |
-| `close_entry` stops clearing selection (dangling id) | `apply_close_of_selected_emits_closed_then_selection_cleared` **FAILED** |
-| `create_entry` infers `Running` instead of `Created` | 4 tests **FAILED** incl. `a_newly_created_session_is_created_not_running` |
-| `close_entry` retains the entry (tombstone leak) | 10 tests **FAILED** incl. `repeated_create_close_cycles_do_not_accumulate` |
+| M1: `close_events` stops clearing the selection | 5 tests FAILED (e.g. `closing_the_selected_session_clears_the_selection`) |
+| M2: `create` infers `Running` | 3 tests FAILED (e.g. `a_newly_created_session_is_starting_not_running`) |
+| M3: `close` keeps the entry (tombstone) | 10 tests FAILED (e.g. `repeated_create_close_cycles_do_not_accumulate`) |
+| M4: `select` accepts an unknown id | 2 tests FAILED (`selecting_an_unknown_session_errors`, `apply_against_an_unknown_session_errors`) |
+| M5: conform `StatusChanged` to D-M3-001 | **compile failure ×3 (E0533)** — the MAJOR finding, above |
 
-After reverting, `session_domain` returns to `32 passed; 0 failed`. The suite
-genuinely encodes the invariants.
+The behavioural suite genuinely bites; the conformance guard does not.
 
-## Interactions the author did not test
+**Interactions the author did not test** (scratch `#[path]` target, run,
+then deleted; tree left clean): observe on one session while another is
+selected leaves the selection untouched; interleaved select/observe/close
+across three kinds with reselection after clearing; `get()` snapshots are
+isolated from later observations (cloned, not aliased); `sessions()` keeps
+id order after closing a middle id; 5000 creates / 2500 closes with strictly
+increasing ids (reuse can never alias a live session, per D-M3-001
+invariant 2) and no collision with a fresh id; a 1,000,000-char
+`Failed.reason` plus NUL/emoji/CJK in an `Ssh` target round-trip without
+panic; the full event stream `apply(Create) → apply(Select) → observe →
+apply(Close)` emits exactly `Created / Selected(Some) / StatusChanged /
+Closed + Selected(None)`. All passed:
+`test result: ok. 13 passed; 0 failed` (8 scratch + 5 module unit tests).
 
-I wrote a scratch `#[path]` test target (deleted after running; tree left clean)
-covering combinations not in the suite. All passed:
+**Panics, leaks, unbounded growth:** one deliberate panic point, reasoned —
+u64 id-space exhaustion via `checked_add` (`session.rs:321-326`); no other
+`unwrap`/`expect`/`panic!` in non-test code. `close` removes the entry, no
+event history is retained, `next_id` is the sole monotonic counter, and
+`sessions()` allocates a fresh view per call — state is bounded to live
+sessions + counter + selection; nothing grows with call count. No resource
+handles are held. (Selecting an `Exited` session is allowed — the contract
+is silent on status-gated selection; recorded for completeness, not a
+finding.)
 
-- select → observe → read `selected()`: the descriptor is a **fresh** snapshot
-  (`Running` reflected), not stale.
-- interleaved select/observe/close across 3 sessions, reselect, close former
-  selection: selection and statuses stay consistent; `len()==1` at the end.
-- hostile labels: empty string, 1_000_000-char label, emoji/CJK/NUL — no panic,
-  values round-trip intact.
-- full kind×status transition matrix (`Local`/`Ssh`/`Agent` × every status) via
-  `apply`; no panic, `close` leaves `is_empty()`.
-- stale id after close is rejected by `select`/`observe`/`close`/`get`.
+**Unintended deletions:** `git diff --name-status origin/main...HEAD` →
+four `A` entries only (`src/session.rs`, `tests/session_domain.rs`, the
+handoff, the prior review); zero deletions. The combined diff of the
+forbidden files (`lib.rs`, `Cargo.toml`, `Cargo.lock`, `status.md`) is 0
+lines, and `lib.rs` contains no `session` — the module is unwired per the
+lease, with the `#[path]` test as sole consumer. The handoff's "when wiring,
+replace `#[path]` with `use noren_app::session;`" note remains correct and
+necessary.
 
-```
-test result: ok. 10 passed; 0 failed; 0 ignored  (scratch, then removed)
-```
+## Sound areas
 
-## Panics, leaks, unbounded growth
-
-- Exactly one panic point, deliberate and reasoned: id-space exhaustion via
-  `.expect("session id space exhausted")` with `checked_add`
-  (`session.rs:381-384`). No other `unwrap`/`expect`/`panic!` in non-test code
-  (`grep` confirmed).
-- `close` **removes** the entry (`session.rs:396`), so repeated create/close
-  cannot accumulate; verified by the 1000-cycle test and by Mutation 3. No
-  event/history buffer is retained. `next_id` is the only monotonic counter and
-  is bounded by `u64`.
-- `sessions()` and `selected()` allocate fresh views per call; nothing grows
-  with call count. No resource handles are held. No leak.
-
-## Unintended deletions / lease
-
-`git diff --name-status origin/main...HEAD` → three `A` (add) entries only:
-`src/session.rs`, `tests/session_domain.rs`, `docs/coordination/handoffs/glm-a.md`.
-Zero deletions. Forbidden files untouched: the combined diff for
-`lib.rs`, `Cargo.toml`, `Cargo.lock`, `status.md` is empty. `lib.rs` is **not**
-wired (as required); the `#[path]` test mechanism is the sole consumer.
-
-## Findings
-
-### MAJOR — Public types deviate from the D-M3-001 contract
-
-The task spec's **Public API contract** section says: *"Owns and defines every
-type in D-M3-001. Others import… A lane needing a contract change escalates
-instead of forking it."* The committed types fork the contract in 6 of 8 places:
-
-| Type | D-M3-001 (fleet `state/D-M3-001-session-api.md`) | Committed (`crates/noren-app/src/session.rs`) | Deviation |
-| --- | --- | --- | --- |
-| `SessionKind` | `Local, Project{..}, Worktree{..}, Ssh{..}, Agent{..}` | `Local, Ssh, Agent` (`session.rs:56-65`) | **missing `Project`, `Worktree`**; struct-variants rendered unit |
-| `SessionStatus` | `Starting, Running, Exited{code:Option<i32>}, Failed{reason:String}` | `Created, Running, Failed, Exited` (`session.rs:84-95`) | `Starting`→`Created`; **dropped `Exited.code` and `Failed.reason` payloads** |
-| `SessionDescriptor` | `{id,kind,status,title:String}` | `{id,kind,status,label:Option<String>}` (`session.rs:102-108`) | `title`→`label`, `String`→`Option<String>` |
-| `SessionAction` | `Create{kind}, Select{id}, Close{id}` | adds `Observe{id,status}`, adds `label` to `Create` (`session.rs:141-167`) | additive |
-| `SessionEvent` | `Created(SessionId), Selected(Option<SessionId>), StatusChanged, Closed(SessionId)` | `Created{id,descriptor}, …, SelectionChanged{selected}` (`session.rs:173-199`) | `Selected`→`SelectionChanged`; `Created` payload widened |
-| `SelectedSession` | `pub type SelectedSession = Option<SessionId>;` | `struct SelectedSession{id,descriptor}` (`session.rs:206-210`) | type alias → struct |
-
-`SessionId` and `SessionRegistry` conform; `SessionError` is a reasonable
-addition (D-M3-001 defines no error type).
-
-**Why it matters (expected vs actual):** the other four M3 lanes (M3-1b
-supervisor, M3-3, M3-4 dispatch, M3-ADV) are told to *import* these types. A
-lane constructing `SessionKind::Project`, matching `SessionEvent::Selected`, or
-reading `descriptor.title` / `Exited { code }` **will not compile** against this
-branch. Expected: lanes share one contract shape; actual: this branch is the
-contract owner yet diverges from it — exactly the fork the contract exists to
-prevent.
-
-**Root cause / mitigation (recorded for fairness, not as absolution):**
-`git ls-tree -r origin/main` confirms D-M3-001 is **absent from the noren repo**
-(no `docs/coordination/decisions/`). The author's lane pointed at a path that did
-not exist, so the fork was made blind and was explicitly flagged in the handoff
-("A reviewer should diff my types against the real spec the moment it lands").
-The behavioural core is sound and reusable; the fix is shape alignment, not a
-rewrite.
-
-**Minimal suggested fix:** before the serial wiring commit lands, align the six
-types to D-M3-001 (add `Project`/`Worktree`, restore `Starting` and the
-`Exited{code}`/`Failed{reason}` payloads, rename to `title: String`, restore
-`Selected(Option<SessionId>)` and `pub type SelectedSession = Option<SessionId>`),
-and decide with the coordinator whether the added `Observe` action/`Created.label`
-should be ratified *into* D-M3-001 (escalate, per the stop conditions) rather than
-silently kept. Independently, the coordinator should sync D-M3-001 into the repo
-so downstream lanes are not coding blind.
-
-### No BLOCKER
-
-ADR 0003 is respected (no pane/tab/layout/split type), so the prompt's explicit
-blocker condition is not triggered. The MAJOR above is a contract-shape
-mismatch, recoverable by alignment; it is not an architectural boundary break.
+The behavioural core is solid and mutation-verified: selection invariants,
+no-process purity, observed-only status, bounded live state, typed rejection
+of unknown/double-close. Escalating `observe` instead of smuggling it back
+into `SessionAction` was the right call per the stop conditions, as was
+keeping `SessionError` local.
 
 ## Verdict
 
-Behavioural acceptance criteria are met and mutation-tested; no panics, leaks,
-unbounded growth, unintended deletions, or boundary violations. The single issue
-is that the owned public types do not match the D-M3-001 contract that four
-downstream lanes import. That must be reconciled before integration.
+FINDINGS — the previous MAJOR was genuinely fixed in five of six places, but
+the sixth (`SessionEvent::StatusChanged`) was silently substituted with a
+new fork, documented as intentional, and certified in the handoff as
+conforming. It breaks downstream lanes that match the contract shape and is
+frozen by a guard test. Everything else checked out under mutation and
+adversarial testing.
 
-`REVIEW_M3-1a verdict=FINDINGS blockers=0 majors=1 minors=0 tests=PASS total=385`
+`REVIEW_M3-1a verdict=FINDINGS blockers=0 majors=1 minors=0 tests=PASS total=387`
