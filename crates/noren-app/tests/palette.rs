@@ -3,15 +3,10 @@
 //! renderer and the future wiring layer will: building the canonical catalog,
 //! searching it, and resolving stable IDs to actions.
 //!
-//! The palette module is not yet wired into `lib.rs` (that export is a separate
-//! serial commit owned by another lane), so the module is included here by
-//! path. Once wired, the `#[path]` line is removed and these tests reach the
-//! type through `noren_app::palette` instead.
+//! The palette module is wired into `lib.rs` as `pub mod palette`, so these
+//! tests reach the type through the crate path `noren_app::palette`.
 
-#[path = "../src/palette.rs"]
-mod palette;
-
-use palette::{Command, CommandId, Palette};
+use noren_app::palette::{Command, CommandId, Palette};
 
 /// A tiny stand-in for the shared action vocabulary the wiring layer will bind
 /// to `A`. The palette is action-agnostic, so any owned type proves the action

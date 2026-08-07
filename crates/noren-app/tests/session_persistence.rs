@@ -1,14 +1,9 @@
 //! Behavioral tests for sidebar persistence (`src/session_persistence.rs`).
 //!
-//! The persistence module is not yet wired into `noren-app`'s `lib.rs` —
-//! that one-line declaration belongs to the M3 integration lane, keeping
-//! this lane's file lease intact. Until then this target compiles the
-//! module through a `#[path]` shim, exactly as `tests/session_domain.rs`
-//! did for `session` before PR #75 wired it. The `session` shim module
-//! below mirrors the crate's public session surface so the persistence
-//! module's `crate::session` references resolve identically in both
-//! contexts; once `lib.rs` declares `pub mod session_persistence;`, replace
-//! the shim with crate imports as the session-domain lane did.
+//! The persistence module is wired into `lib.rs` as
+//! `pub mod session_persistence`; its `crate::session` references resolve to
+//! the crate's real public session module, so this target reaches both through
+//! their crate paths.
 //!
 //! Pinned behavior:
 //!
@@ -20,16 +15,8 @@
 //! 5. session lists are bounded in both directions;
 //! 6. the ADR 0003 boundary is enforced: session-interior keys never parse.
 
-mod session {
-    //! Mirror of `noren_app::session` for the still-unwired module below.
-    pub use noren_app::session::*;
-}
-
-#[path = "../src/session_persistence.rs"]
-mod session_persistence;
-
 use noren_app::session::{SessionDescriptor, SessionKind, SessionRegistry, SessionStatus};
-use session_persistence::{
+use noren_app::session_persistence::{
     MAX_SESSION_STATE_BYTES, MAX_SESSIONS, SESSION_STATE_VERSION, SessionPersistenceError, encode,
     load, load_bytes, save,
 };
