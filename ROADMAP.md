@@ -13,7 +13,7 @@ Only evidence-backed work is marked complete.
 | 5 — Agent experience | Launchers, verified adapters, trustworthy state, notifications and jump-to-source | Not started |
 | 6 — Themes and accessibility | Light/dark/high-contrast palettes, contrast checks, IME/CJK/HiDPI and keyboard/accessibility work | Not started |
 | 7 — Quality | Unit/integration/compatibility/fault/security/visual tests, fuzzing, soak tests and benchmarks | Not started |
-| 8 — Public Preview | Honest docs/site, binaries, checksums, release review, known limitations and `0.1.0-preview` | Not started |
+| 8 — Public Preview | Honest docs/site, binaries, checksums, release review, known limitations and `0.1.0-preview` | Not started; scope decided by [D-M8-001](docs/coordination/decisions/D-M8-001-preview-scope.md) |
 
 A renderer-independent terminal state core is merged as PR
 [#19](https://github.com/ta-061/noren/pull/19) (`c695920`), described in
@@ -73,3 +73,30 @@ drawing. IME and accessibility remain deferred.
 
 No milestone date is promised. Implementation advances through scoped Issues,
 Draft PRs, and current-head CI evidence.
+
+## What blocks a public preview
+
+Two independent specification reviews, run without sight of each other, both
+concluded that the current tree cannot honestly be released as "0.1.0-preview of
+the Noren terminal." The reasoning and the decision are recorded in
+[D-M8-001](docs/coordination/decisions/D-M8-001-preview-scope.md). In short:
+
+- **The workspace is not on `main`.** Noren's defining feature is the external
+  sidebar (ADR 0003). Of the Milestone 3 modules, only `session.rs` has landed;
+  the sidebar, palette, pass-through, supervisor, and persistence exist only in
+  unmerged PRs. What `main` contains today is a terminal foundation.
+- **The renderer is monochrome.** `renderer.rs:35` returns a constant colour and
+  the vertex layout carries no colour channel, so `ls --color`, `vim`, and
+  Zellij's status bar all draw in one shade. Truecolor is modelled in terminal
+  state and never reaches drawing.
+- **The font is ASCII-only and case-blind.** Non-ASCII renders as `?`, and
+  `renderer.rs:457` asserts `glyph_rows('a') == glyph_rows('A')`.
+- **FR-005's rendered-frame oracle does not exist**, so glyph correctness has
+  never been mechanically verified. Waiving the project's own PoC gate in silence
+  is the one path that would make a release claim dishonest.
+- **NFR-009 requires release-integrity gates** — signing, notarization,
+  packaging — to pass before any Preview claim.
+
+Milestone 8 therefore stops at a release candidate. Signing keys, Apple
+certificates, tagging, and publication are owner decisions and are not taken
+autonomously.
