@@ -8,7 +8,7 @@ Only evidence-backed work is marked complete.
 | 0 — Discovery | Landscape, feature/library matrices, risks, agent inventory and calibration | Complete |
 | 1 — Requirements and design | Independent proposals, critiques, integrated requirements, architecture, threat model, tests, RFCs, ADRs | Complete |
 | 2 — Terminal foundation | Window, PTY, shell, terminal state/rendering, input, resize, scrollback, selection, copy/paste/search, configuration and diagnostics | Complete |
-| 3 — Workspace | External workspace management (sidebar: projects, git worktrees, SSH connections, agents, terminal sessions), single-session view, session lifecycle, sidebar-state persistence, palette, configurable keybindings, Zellij pass-through — no native tabs/panes/layout (delegated to Zellij per [ADR 0003](docs/adr/0003-noren-zellij-responsibility-boundary.md)) | Not started |
+| 3 — Workspace | External workspace management (sidebar: projects, git worktrees, SSH connections, agents, terminal sessions), single-session view, session lifecycle, sidebar-state persistence, palette, configurable keybindings, Zellij pass-through — no native tabs/panes/layout (delegated to Zellij per [ADR 0003](docs/adr/0003-noren-zellij-responsibility-boundary.md)) | In progress |
 | 4 — SSH and remote | OpenSSH configuration, connections, reconnect, remote panes, daemon decision/PoC and recovery | Not started |
 | 5 — Agent experience | Launchers, verified adapters, trustworthy state, notifications and jump-to-source | Not started |
 | 6 — Themes and accessibility | Light/dark/high-contrast palettes, contrast checks, IME/CJK/HiDPI and keyboard/accessibility work | Not started |
@@ -86,12 +86,13 @@ the Noren terminal." The reasoning and the decision are recorded in
   the library compiles them and CI covers them, but `main.rs` consumes none of
   them and they are absent from the linked binary (Issue #88). Launching the
   build still presents no workspace sidebar.
-- **The renderer is monochrome.** `renderer.rs:40` returns a constant colour and
-  the vertex layout carries no colour channel, so `ls --color`, `vim`, and
-  Zellij's status bar all draw in one shade. Truecolor is modelled in terminal
-  state and never reaches drawing.
-- **The font is ASCII-only and case-blind.** Non-ASCII renders as `?`, and
-  `renderer.rs:474` asserts `glyph_rows('a') == glyph_rows('A')`.
+- **The renderer is monochrome.** The fragment shader `fs_main` in
+  `renderer.rs` returns a constant colour and the vertex layout carries no
+  colour channel, so `ls --color`, `vim`, and Zellij's status bar all draw in
+  one shade. Truecolor is modelled in terminal state and never reaches drawing.
+- **The font is ASCII-only and case-blind.** Non-ASCII renders as `?`, and the
+  `renderer.rs` test `ascii_glyphs_are_distinct_and_unknown_is_question_mark`
+  asserts `glyph_rows('a') == glyph_rows('A')`.
 - **The FR-005 rendered-frame oracle now exists** (PR #89). It drives the real
   pipeline offscreen, and its `#[ignore]`d defect tests record the font's
   case-fold and non-ASCII-`?` failures — the same defects above.

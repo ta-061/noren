@@ -33,18 +33,20 @@ The brief's errors, corrected by both and re-confirmed against the current tree:
 
 - The brief claimed 388 tests. The Milestone 2 completion evidence in
   `ROADMAP.md` records **353**.
-- The brief claimed Milestone 3 was "largely verified." The milestone table in
-  `ROADMAP.md` marks Milestone 3 **Not started**, and the tree bears this out
-  more sharply than the brief allowed. The six M3 modules — `session`,
-  `sidebar`, `palette`, `passthrough`, `session_supervisor`, and
-  `session_persistence` — plus `mouse` (an M2 input deliverable, PR #79) are
-  now files on `main` (PRs #77, #78, #79, #81, #82, and #84 merged after the
-  brief was written), and PR #92 declared all seven in `lib.rs`, so they are
-  compiled into the library and covered by CI's clippy and dead-code checks.
-  But `main.rs` imports none of them, the linked binary contains no symbols
-  from them, and nothing presents a sidebar to a user (Issue #88). "Verified"
-  described lane state, not the application a user runs: launching the build
-  still presents no workspace sidebar.
+- The brief claimed Milestone 3 was "largely verified." It is not. The
+  milestone table in `ROADMAP.md` marks Milestone 3 **In progress**, which is
+  accurate in both directions: the six M3 modules — `session`, `sidebar`,
+  `palette`, `passthrough`, `session_supervisor`, and `session_persistence` —
+  plus `mouse` (an M2 input deliverable, PR #79) are now files on `main` (PRs
+  #77, #78, #79, #81, #82, and #84 merged after the brief was written), and
+  PR #92 declared all seven in `lib.rs`, so they are compiled into the library
+  and covered by CI's clippy and dead-code checks. Those merges are genuine
+  progress, and why the table moved off "Not started." But the progress is
+  landed, not shipped: `main.rs` imports none of them, the linked binary
+  contains no symbols from them, and nothing presents a sidebar to a user
+  (Issue #88). What a user sees is unchanged. "Verified" described lane state,
+  not the application a user runs: launching the build still presents no
+  workspace sidebar.
 
 The distinction that carries the decision is neither *merged versus unmerged*
 nor *declared versus undeclared in the library* — the first line moved with
@@ -103,11 +105,14 @@ These are **not** M8 polish items; they gate the artifact reaching strangers.
    and non-ASCII-`?` defects. The gate is no longer missing — it is satisfied on
    structure and honest about its gaps. Hiding those gaps would be the dishonest
    path, and the project's evidence rule forbids it.
-2. **Release-integrity gates.** NFR-009 (`docs/requirements/v0.1.md`) states
-   signing,
-   notarization, packaging, and release-integrity gates "must pass before Preview
-   claims." Reproducible binaries, checksums, and toolchain provenance are
-   required by NFR-008.
+2. **Release-integrity and reproducibility gates.** NFR-009
+   (`docs/requirements/v0.1.md`) states signing, notarization, packaging, and
+   release-integrity gates "must pass before Preview claims"; checksums are a
+   release-integrity concern, so they fall to NFR-009. NFR-008 separately
+   requires reproducibility: CI and local handoff record `rustc`/`cargo`
+   versions, installed targets, macOS version, architecture, the lockfile, and
+   exact direct dependencies — the toolchain provenance a reproducible build
+   rests on.
 3. **Front-loaded honest documentation** — monochrome, ASCII-only and
    case-insensitive glyphs, no IME, no accessibility surface, macOS-only, and no
    workspace sidebar — stated where a reader meets them first, not in a footnote.
