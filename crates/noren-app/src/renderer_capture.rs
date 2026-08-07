@@ -188,13 +188,14 @@ impl OffscreenRenderer {
     pub(crate) fn capture(
         &self,
         terminal: Option<&TerminalSnapshot>,
+        sidebar: Option<&[String]>,
         status: Option<&str>,
         width: u32,
         height: u32,
     ) -> CapturedFrame {
         assert!(width > 0 && height > 0, "capture target must be non-zero");
 
-        let vertices = glyph_vertices(terminal, status, width, height);
+        let vertices = glyph_vertices(terminal, sidebar, status, width, height);
         let bytes = vertex_bytes(&vertices);
 
         let vertex_buffer = if bytes.is_empty() {

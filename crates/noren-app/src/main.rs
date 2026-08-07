@@ -133,7 +133,6 @@ impl WorkspaceState {
     }
 
     /// The current sidebar view (immutable snapshot for the renderer).
-    #[allow(dead_code)]
     fn sidebar(&self) -> &SidebarView {
         &self.sidebar
     }
@@ -248,31 +247,32 @@ impl NorenApp {
             return;
         };
 
-        let Ok(terminal) = TerminalState::new(grid.rows(), grid.cols()) else {
+        let Ok(terminal) = TerminalState::new(grid.rows(), terminal_cols(grid.cols())) else {
             eprintln!("Noren terminal state creation failed");
             event_loop.exit();
             return;
         };
         self.terminal = Some(terminal);
-        self.pty = match pty_size(grid).and_then(PtySession::spawn) {
-            Ok(session) => {
-                self.status = "Noren PoC ready";
-                self.show_status = false;
-                self.pty_child = PtyChildStatus::Running;
-                let session_id = self.workspace.create_session(SessionKind::Local);
-                self.workspace
-                    .select_session(session_id)
-                    .expect("freshly created session is live");
-                self.active_session = Some(session_id);
-                Some(session)
-            }
-            Err(_) => {
-                self.status = "Noren PTY start failed";
-                self.show_status = true;
-                self.pty_child = PtyChildStatus::NotLaunched;
-                None
-            }
-        };
+        self.pty =
+            match pty_size(grid.rows(), terminal_cols(grid.cols())).and_then(PtySession::spawn) {
+                Ok(session) => {
+                    self.status = "Noren PoC ready";
+                    self.show_status = false;
+                    self.pty_child = PtyChildStatus::Running;
+                    let session_id = self.workspace.create_session(SessionKind::Local);
+                    self.workspace
+                        .select_session(session_id)
+                        .expect("freshly created session is live");
+                    self.active_session = Some(session_id);
+                    Some(session)
+                }
+                Err(_) => {
+                    self.status = "Noren PTY start failed";
+                    self.show_status = true;
+                    self.pty_child = PtyChildStatus::NotLaunched;
+                    None
+                }
+            };
         self.renderer = match Renderer::new(Arc::clone(&window)) {
             Ok(renderer) => Some(renderer),
             Err(_) => {
@@ -488,6 +488,12 @@ impl NorenApp {
         let terminal = self.terminal.as_ref()?;
         let window = self.window.as_ref()?;
         let physical = window.inner_size();
+        // The sidebar occupies the leftmost SIDEBAR_COLS cell columns; clicks
+        // inside it do not address the terminal grid.
+        let sidebar_px = f64::from((renderer::SIDEBAR_COLS as u32) * POC_CELL_WIDTH);
+        if position.x < sidebar_px {
+            return None;
+        }
         let visible_rows = usize::try_from(physical.height / POC_CELL_HEIGHT)
             .unwrap_or(0)
             .clamp(1, usize::from(MAX_RENDER_ROWS));
@@ -508,7 +514,8 @@ impl NorenApp {
         if line_index >= usize::from(rows) {
             return None;
         }
-        let column = pixel_row_index(position.x, POC_CELL_WIDTH)?.min(usize::from(cols) - 1);
+        let column =
+            pixel_row_index(position.x - sidebar_px, POC_CELL_WIDTH)?.min(usize::from(cols) - 1);
         Some(GridPoint::new(
             terminal.scrollback_len() + line_index,
             column,
@@ -588,13 +595,14 @@ impl NorenApp {
         // Resize re-addresses the grid, so captured coordinates expire.
         self.selection = None;
         self.drag_origin = None;
+        let cols = terminal_cols(grid.cols());
         if let Some(terminal) = &mut self.terminal {
-            if terminal.resize(grid.rows(), grid.cols()).is_err() {
+            if terminal.resize(grid.rows(), cols).is_err() {
                 self.status = "Noren terminal resize failed";
                 self.show_status = true;
             }
         }
-        if let (Some(session), Ok(size)) = (&self.pty, pty_size(grid)) {
+        if let (Some(session), Ok(size)) = (&self.pty, pty_size(grid.rows(), cols)) {
             if session.resize(size).is_err() {
                 self.status = "Noren PTY resize failed";
                 self.show_status = true;
@@ -690,10 +698,11 @@ impl NorenApp {
         } else {
             None
         };
+        let sidebar_lines = sidebar_text_lines(self.workspace.sidebar());
         let outcome = self
             .renderer
             .as_mut()
-            .map(|renderer| renderer.render(snapshot.as_ref(), status));
+            .map(|renderer| renderer.render(snapshot.as_ref(), Some(&sidebar_lines), status));
         match outcome {
             Some(RenderOutcome::DeviceLost) => {
                 self.status = "Noren renderer device lost";
@@ -786,8 +795,44 @@ impl ApplicationHandler for NorenApp {
     }
 }
 
-fn pty_size(grid: GridSize) -> Result<PtySize, noren_pty::PtyError> {
-    PtySize::from_raw(grid.rows(), grid.cols()).ok_or(noren_pty::PtyError::InvalidSize)
+fn pty_size(rows: u16, cols: u16) -> Result<PtySize, noren_pty::PtyError> {
+    PtySize::from_raw(rows, cols).ok_or(noren_pty::PtyError::InvalidSize)
+}
+
+/// Terminal column count for a given window column count, reserving
+/// [`renderer::SIDEBAR_COLS`] columns on the left for the sidebar. The PTY
+/// winsize, terminal state's column count, and the renderer's drawn region all
+/// use this value so they never disagree.
+fn terminal_cols(window_cols: u16) -> u16 {
+    window_cols
+        .saturating_sub(u16::try_from(renderer::SIDEBAR_COLS).unwrap_or(u16::MAX))
+        .max(1)
+}
+
+/// Convert the sidebar view into text lines the renderer can draw.
+///
+/// Each row is prefixed with `>` when selected, space otherwise, followed by
+/// the label and optional detail — using [`SidebarRow::label`] and
+/// [`SidebarRow::detail`] verbatim. When the sidebar is empty the
+/// empty-state message is returned as the sole line.
+fn sidebar_text_lines(sidebar: &SidebarView) -> Vec<String> {
+    if sidebar.is_empty() {
+        return sidebar
+            .empty_state()
+            .map(|state| vec![state.message().to_string()])
+            .unwrap_or_default();
+    }
+    sidebar
+        .rows()
+        .iter()
+        .map(|row| {
+            let marker = if row.is_selected() { '>' } else { ' ' };
+            match row.detail() {
+                Some(detail) => format!("{marker} {} {}", row.label(), detail),
+                None => format!("{marker} {}", row.label()),
+            }
+        })
+        .collect()
 }
 
 /// Index of the cell row containing a non-negative pixel coordinate, or
