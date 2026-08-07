@@ -1,5 +1,13 @@
 # Independent review — M3-1a session domain model (`glm-a`) at the StatusChanged fix
 
+> **Post-review correction:** this document records the historical review at
+> `0718f56`, not the final PR #74 head. Its treatment of non-monotonic status as
+> a non-defect was overturned by the later adversarial ADV-S1 reproduction:
+> `Exited -> Running` resurrected a dead session. The merge candidate rejects
+> regressions/resurrections, adds a mutation-sensitive regression test, and
+> publishes the authoritative [session API](../session-api.md). The current-head
+> GitHub review supersedes this verdict for merge purposes.
+
 Independent review. I did not author this code; I reviewed head from scratch on
 the branch rather than trusting the author handoff. This supersedes the two
 earlier reviews on this branch (first review `b0f61c3`, re-review `6fc1e39`,
@@ -8,9 +16,9 @@ below against the current head.
 
 - Reviewed at: `0718f56` on `agent/m3-session-domain`, off `origin/main` @
   `1d329a5` (macOS arm64).
-- Authority: task spec `state/tasks/M3-1a.md` (fleet repo `noren-fleet-private`).
-- Contract source: `state/D-M3-001-session-api.md` (fleet repo). Diffed directly,
-  not via the handoff's table.
+- Historical authority: the lane task supplied to the implementer.
+- Contract source: D-M3-001, now published as
+  [session API](../session-api.md), rather than an operations-only artifact.
 - Scope of diff (`git diff --name-status origin/main...HEAD`): 4 files, all `A`
   (additions only, +1473 / −0). Note: the lane prompt's `git checkout
   agent/m3-session-domain` was run from a sibling worktree because the branch was
@@ -119,9 +127,11 @@ module unit tests, `ok. 14 passed; 0 failed`:
   registry, so this is not a contract violation — but it is a real footgun if the
   app ever recreates a registry mid-run and a stale id survives it. Recorded for
   the coordinator; see Observations.
-- **Non-monotonic status.** `observe` accepts `Running→Failed→Running→Exited{None}`
-  (pure reporter, no transition gating). Contract is silent and puts lifecycle
-  truth in the supervisor; not a defect.
+- **Non-monotonic status (later reclassified and fixed).** At this reviewed
+  head, `observe` accepted `Running -> Failed -> Running -> Exited { None }`.
+  ADV-S1 subsequently demonstrated that terminal resurrection violates
+  lifecycle ordering. The merge candidate now rejects lower-ranked reports
+  without mutation while permitting terminal-detail refinement.
 - **Selecting an `Exited`/`Failed` session is allowed**, and closing it
   afterwards still clears selection. Contract silent; consistent with prior
   review.
@@ -172,25 +182,25 @@ correctly-oriented guard. Escalating `observe` (rather than forking
 `SessionAction`) and keeping `SessionError` local were the right calls under the
 stop conditions.
 
-## Observations for the coordinator (not ranked defects)
+## Historical observations — resolved on the merge candidate
 
-1. **`SessionKind` payload field names** (`root`/`path`/`target`/`name`) are
-   inferred; the canonical contract elides them as `{..}`. Confirm before any
-   downstream lane codes against them (highest-risk unverifiable item, per the
-   handoff).
-2. **`observe` ratification.** Decide whether D-M3-001 should ratify an
-   observation action or keep it a registry method (handoff escalation item).
-3. **Cross-registry id opacity** (see Combinations): ids carry no registry
-   affinity; fine for the single-registry design but worth a sentence in D-M3-001
-   if registry recreation or multiple registries ever become possible.
+1. `SessionKind` payload fields (`root`/`path`/`target`/`name`) and concrete
+   types are now recorded in the public contract.
+2. `observe` is ratified as the supervisor-fact registry method, deliberately
+   separate from user/UI `SessionAction` requests.
+3. IDs are explicitly registry-local, one registry is used per app run, and
+   cross-registry IDs must never be mixed.
 
-## Verdict
+## Historical verdict
 
-PASS — all four acceptance criteria met; all six previously-deviating contract
+PASS at `0718f56` — all four then-reviewed acceptance criteria met; all six previously-deviating contract
 types (including the `StatusChanged` struct variant that forked twice) now match
 D-M3-001, verified by direct diff and by a compile-failing mutation; the test
 suite bites under six independent mutations and survived nine adversarial
 interaction/growth scenarios beyond the author's suite. No BLOCKER, MAJOR, or
 MINOR defect found; three coordination observations recorded.
 
-`REVIEW_M3-1a verdict=PASS blockers=0 majors=0 minors=0 tests=PASS total=387`
+This historical verdict did not cover ADV-S1 or the public-contract correction;
+the current-head PR review is authoritative for merge.
+
+`REVIEW_M3-1a historical_verdict=PASS blockers=0 majors=0 minors=0 tests=PASS total=387`
