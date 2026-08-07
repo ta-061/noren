@@ -1,4 +1,11 @@
 //! Minimal, bounded `wgpu` terminal view for the PoC.
+//!
+//! Cell attributes recorded by the terminal state are resolved into drawing
+//! colors before any vertex is emitted: [`resolve_cell_colors`] runs every
+//! `Color` selection through the default palette (or passes `Rgb` through
+//! directly) and applies reverse video by swapping the resolved foreground
+//! and background. Bold widens glyph pixels by one physical pixel; underline
+//! draws a bar across the cell bottom in the resolved underline color.
 
 use std::borrow::Cow;
 use std::future::Future;
@@ -13,28 +20,174 @@ use winit::window::Window;
 use noren_app::{
     MAX_RENDER_COLS, MAX_RENDER_ROWS, POC_CELL_HEIGHT as CELL_HEIGHT, POC_CELL_WIDTH as CELL_WIDTH,
 };
-use noren_terminal::TerminalSnapshot;
+use noren_terminal::{Cell, CellAttributes, Color, TerminalSnapshot};
+
 const GLYPH_SCALE: u32 = 2;
 const GLYPH_TOP: u32 = 3;
-const MAX_VERTICES: usize = (MAX_RENDER_ROWS as usize) * (MAX_RENDER_COLS as usize) * 35 * 6;
+/// Distance in physical pixels from a cell's top edge to its underline bar.
+const UNDERLINE_TOP: u32 = CELL_HEIGHT - GLYPH_SCALE;
+/// A one-glyph cell emits at most 35 pixel rects (the 5×7 bitmap) plus one
+/// background rect and one underline bar. Bold widens pixel rects without
+/// adding any, so `35 + 2` rects bounds a normal cell; cells stacking more
+/// combining marks than one extra glyph hit the vertex truncation below, as
+/// they did before colors were wired.
+const MAX_VERTICES: usize = (MAX_RENDER_ROWS as usize) * (MAX_RENDER_COLS as usize) * (35 + 2) * 6;
+/// Two position floats plus three color floats per vertex.
+const VERTEX_BYTES: usize = 20;
 
 const SHADER: &str = r#"
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
+    @location(0) color: vec3<f32>,
 };
 
 @vertex
-fn vs_main(@location(0) position: vec2<f32>) -> VertexOutput {
+fn vs_main(@location(0) position: vec2<f32>, @location(1) color: vec3<f32>) -> VertexOutput {
     var output: VertexOutput;
     output.position = vec4<f32>(position, 0.0, 1.0);
+    output.color = color;
     return output;
 }
 
 @fragment
-fn fs_main() -> @location(0) vec4<f32> {
-    return vec4<f32>(0.80, 0.92, 0.82, 1.0);
+fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(input.color, 1.0);
 }
 "#;
+
+/// Default terminal foreground: the concrete color behind `Color::Default`
+/// foreground selections and the status line.
+pub(crate) const DEFAULT_FOREGROUND: [u8; 3] = [204, 235, 209];
+/// Default terminal background: the concrete color behind `Color::Default`
+/// background selections and the window clear.
+pub(crate) const DEFAULT_BACKGROUND: [u8; 3] = [9, 11, 10];
+
+/// The sixteen ANSI colors of the default theme as `(red, green, blue)`, in
+/// palette index order (standard colors 0..=7, bright colors 8..=15). This
+/// named table is the single theme seam: a future theme replaces it here and
+/// every palette-derived draw color follows.
+pub(crate) const DEFAULT_ANSI_PALETTE: [[u8; 3]; 16] = [
+    [0, 0, 0],
+    [205, 0, 0],
+    [0, 205, 0],
+    [205, 205, 0],
+    [0, 0, 238],
+    [205, 0, 205],
+    [0, 205, 205],
+    [229, 229, 229],
+    [127, 127, 127],
+    [255, 0, 0],
+    [0, 255, 0],
+    [255, 255, 0],
+    [92, 92, 255],
+    [255, 0, 255],
+    [0, 255, 255],
+    [255, 255, 255],
+];
+
+/// One channel of the xterm 6×6×6 color cube: zero maps to zero, and the
+/// remaining five levels are `55 + 40 * level`.
+const fn cube_channel(level: u8) -> u8 {
+    if level == 0 { 0 } else { level * 40 + 55 }
+}
+
+const fn build_default_palette() -> [[u8; 3]; 256] {
+    let mut palette = [[0_u8; 3]; 256];
+    let mut index = 0usize;
+    while index < 256 {
+        palette[index] = if index < 16 {
+            DEFAULT_ANSI_PALETTE[index]
+        } else if index < 232 {
+            let cube = (index - 16) as u32;
+            [
+                cube_channel((cube / 36) as u8),
+                cube_channel(((cube / 6) % 6) as u8),
+                cube_channel((cube % 6) as u8),
+            ]
+        } else {
+            let gray = (8 + (index - 232) * 10) as u8;
+            [gray, gray, gray]
+        };
+        index += 1;
+    }
+    palette
+}
+
+/// The xterm 256-color default palette derived once from
+/// [`DEFAULT_ANSI_PALETTE`] (entries 0..=15), the 6×6×6 color cube
+/// (entries 16..=231), and the 24-step grayscale ramp (entries 232..=255).
+pub(crate) const DEFAULT_PALETTE: [[u8; 3]; 256] = build_default_palette();
+
+/// Resolve one renderer-independent color selection to concrete
+/// `(red, green, blue)` against the default palette.
+///
+/// [`Color::Default`] resolves to `default` (callers pass the default
+/// foreground or background according to the slot), [`Color::Ansi`] and
+/// [`Color::Indexed`] resolve through [`DEFAULT_PALETTE`], and [`Color::Rgb`]
+/// is used directly.
+#[must_use]
+pub(crate) const fn resolve_color(color: Color, default: [u8; 3]) -> [u8; 3] {
+    match color {
+        Color::Default => default,
+        Color::Ansi(ansi) => DEFAULT_PALETTE[ansi.palette_index() as usize],
+        Color::Indexed(index) => DEFAULT_PALETTE[index as usize],
+        Color::Rgb(red, green, blue) => [red, green, blue],
+    }
+}
+
+/// Concrete draw colors for one cell, after palette resolution and the
+/// reverse-video swap; the shape returned by [`resolve_cell_colors`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedCellColors {
+    /// The color drawn glyphs use, swapped with the background under reverse.
+    pub(crate) foreground: [u8; 3],
+    /// The color the cell's background area uses; cells whose resolved
+    /// background equals [`DEFAULT_BACKGROUND`] draw no background rect.
+    pub(crate) background: [u8; 3],
+    /// The underline bar color: an explicit underline color passes through,
+    /// and a default one follows the (possibly swapped) foreground.
+    pub(crate) underline: [u8; 3],
+}
+
+/// Pure attribute-to-color resolution: the testable seam between terminal
+/// state and drawing.
+///
+/// Foreground and background are resolved against the default palette first;
+/// reverse video then swaps the two resolved colors at draw time. An explicit
+/// underline color is applied as-is (reverse does not move it), while a
+/// default underline color follows the swapped foreground so the bar matches
+/// the glyphs it underlines.
+#[must_use]
+pub(crate) fn resolve_cell_colors(attributes: &CellAttributes) -> ResolvedCellColors {
+    let mut foreground = resolve_color(attributes.foreground(), DEFAULT_FOREGROUND);
+    let mut background = resolve_color(attributes.background(), DEFAULT_BACKGROUND);
+    if attributes.is_reversed() {
+        std::mem::swap(&mut foreground, &mut background);
+    }
+    let underline = resolve_color(attributes.underline_color(), foreground);
+    ResolvedCellColors {
+        foreground,
+        background,
+        underline,
+    }
+}
+
+/// One GPU vertex: NDC position plus the cell-resolved draw color.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Vertex {
+    pub(crate) position: [f32; 2],
+    pub(crate) color: [f32; 3],
+}
+
+impl Vertex {
+    const fn rgb_floats([red, green, blue]: [u8; 3]) -> [f32; 3] {
+        [
+            red as f32 / 255.0,
+            green as f32 / 255.0,
+            blue as f32 / 255.0,
+        ]
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RendererError {
@@ -115,13 +268,20 @@ impl Renderer {
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: 8,
+                    array_stride: VERTEX_BYTES as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x2,
-                        offset: 0,
-                        shader_location: 0,
-                    }],
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 8,
+                            shader_location: 1,
+                        },
+                    ],
                 })],
             },
             primitive: wgpu::PrimitiveState::default(),
@@ -215,6 +375,7 @@ impl Renderer {
                 label: Some("noren-poc-render-encoder"),
             });
         {
+            let [clear_red, clear_green, clear_blue] = DEFAULT_BACKGROUND;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("noren-poc-render-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -223,9 +384,9 @@ impl Renderer {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.035,
-                            g: 0.045,
-                            b: 0.04,
+                            r: f64::from(clear_red) / 255.0,
+                            g: f64::from(clear_green) / 255.0,
+                            b: f64::from(clear_blue) / 255.0,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -272,12 +433,113 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-fn glyph_vertices(
+/// Vertex accumulation bounded by [`MAX_VERTICES`] within one frame.
+struct Frame {
+    vertices: Vec<Vertex>,
+    width: u32,
+    height: u32,
+}
+
+impl Frame {
+    /// Push one NDC rect and report whether the vertex budget is exhausted.
+    fn push_rect(&mut self, x: u32, y: u32, rect: (u32, u32), color: [u8; 3]) -> bool {
+        let (rect_width, rect_height) = rect;
+        let color = Vertex::rgb_floats(color);
+        let left = x as f32 / self.width as f32 * 2.0 - 1.0;
+        let right = x.saturating_add(rect_width) as f32 / self.width as f32 * 2.0 - 1.0;
+        let top = 1.0 - y as f32 / self.height as f32 * 2.0;
+        let bottom = 1.0 - y.saturating_add(rect_height) as f32 / self.height as f32 * 2.0;
+        self.vertices.extend_from_slice(&[
+            Vertex {
+                position: [left, top],
+                color,
+            },
+            Vertex {
+                position: [left, bottom],
+                color,
+            },
+            Vertex {
+                position: [right, bottom],
+                color,
+            },
+            Vertex {
+                position: [left, top],
+                color,
+            },
+            Vertex {
+                position: [right, bottom],
+                color,
+            },
+            Vertex {
+                position: [right, top],
+                color,
+            },
+        ]);
+        self.vertices.len() >= MAX_VERTICES
+    }
+
+    /// Fill `span_cols` display columns of one cell row, offset `y_offset`
+    /// pixels down from the cell top; used for background and underline bars.
+    fn fill_cell(
+        &mut self,
+        col: usize,
+        row: usize,
+        span_cols: usize,
+        y_offset: u32,
+        rect_height: u32,
+        color: [u8; 3],
+    ) -> bool {
+        self.push_rect(
+            u32::try_from(col).unwrap_or(u32::MAX) * CELL_WIDTH,
+            u32::try_from(row).unwrap_or(u32::MAX) * CELL_HEIGHT + y_offset,
+            (
+                u32::try_from(span_cols).unwrap_or(u32::MAX) * CELL_WIDTH,
+                rect_height,
+            ),
+            color,
+        )
+    }
+
+    /// One glyph bitmap at display column `col`; bold widens every pixel rect
+    /// by one physical pixel. Returns whether the vertex budget is exhausted.
+    fn glyph(
+        &mut self,
+        character: char,
+        col: usize,
+        row: usize,
+        color: [u8; 3],
+        bold: bool,
+    ) -> bool {
+        let pixel_width = GLYPH_SCALE + u32::from(bold);
+        for (glyph_y, bits) in glyph_rows(character).into_iter().enumerate() {
+            for glyph_x in 0..5 {
+                if bits & (1 << (4 - glyph_x)) == 0 {
+                    continue;
+                }
+                let exhausted = self.push_rect(
+                    u32::try_from(col).unwrap_or(u32::MAX) * CELL_WIDTH
+                        + u32::try_from(glyph_x).unwrap_or(0) * GLYPH_SCALE,
+                    u32::try_from(row).unwrap_or(u32::MAX) * CELL_HEIGHT
+                        + GLYPH_TOP
+                        + u32::try_from(glyph_y).unwrap_or(0) * GLYPH_SCALE,
+                    (pixel_width, GLYPH_SCALE),
+                    color,
+                );
+                if exhausted {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+pub(crate) fn glyph_vertices(
     terminal: Option<&TerminalSnapshot>,
     status: Option<&str>,
     width: u32,
     height: u32,
-) -> Vec<[f32; 2]> {
+) -> Vec<Vertex> {
     if width == 0 || height == 0 {
         return Vec::new();
     }
@@ -287,64 +549,102 @@ fn glyph_vertices(
     let visible_cols = usize::try_from(width / CELL_WIDTH)
         .unwrap_or(usize::MAX)
         .clamp(1, usize::from(MAX_RENDER_COLS));
-    // display_lines preserves wide-character continuation columns, so the
-    // character index below is the display column for every glyph.
-    let lines = terminal
-        .map(TerminalSnapshot::display_lines)
+    // display_cells is the cell-facing view of the snapshot, parallel to
+    // display_lines: it selects exactly the rows display_lines renders, and
+    // yields one cell per display column (a wide lead's continuation keeps
+    // its own column and draws nothing). The renderer never re-derives the
+    // column rule or reads `&[String]` line content — the walked cell is the
+    // display column, with attributes attached.
+    let rows: Vec<&[Cell]> = terminal
+        .map(|snapshot| snapshot.display_cells().collect())
         .unwrap_or_default();
-    let total_lines = lines.len() + usize::from(status.is_some());
+    let total_lines = rows.len() + usize::from(status.is_some());
     let first_line = total_lines.saturating_sub(visible_rows);
-    let mut vertices = Vec::new();
+    let mut frame = Frame {
+        vertices: Vec::new(),
+        width,
+        height,
+    };
 
     for (row, line_index) in (first_line..total_lines).enumerate() {
-        let line = if line_index < lines.len() {
-            lines[line_index].as_str()
-        } else {
-            status.unwrap_or_default()
-        };
-        for (col, character) in line.chars().take(visible_cols).enumerate() {
-            let glyph = glyph_rows(character);
-            for (glyph_y, bits) in glyph.into_iter().enumerate() {
-                for glyph_x in 0..5 {
-                    if bits & (1 << (4 - glyph_x)) == 0 {
-                        continue;
-                    }
-                    let x = u32::try_from(col).unwrap_or(u32::MAX) * CELL_WIDTH
-                        + u32::try_from(glyph_x).unwrap_or(0) * GLYPH_SCALE;
-                    let y = u32::try_from(row).unwrap_or(u32::MAX) * CELL_HEIGHT
-                        + GLYPH_TOP
-                        + u32::try_from(glyph_y).unwrap_or(0) * GLYPH_SCALE;
-                    push_rect(&mut vertices, x, y, GLYPH_SCALE, width, height);
-                    if vertices.len() >= MAX_VERTICES {
-                        return vertices;
-                    }
+        if line_index >= rows.len() {
+            // Status line: plain text in the default foreground, no cell
+            // attributes.
+            for (col, character) in status
+                .unwrap_or_default()
+                .chars()
+                .take(visible_cols)
+                .enumerate()
+            {
+                if frame.glyph(character, col, row, DEFAULT_FOREGROUND, false) {
+                    return frame.vertices;
                 }
             }
+            continue;
+        }
+        let row_cells = rows[line_index];
+
+        // Walk cells, not string characters, so every glyph inherits the
+        // attributes captured when its cell was written. Each cell in the
+        // slice occupies exactly one display column; a wide lead's fills span
+        // into its continuation cell's column, so the continuation itself
+        // draws nothing.
+        let mut col = 0usize;
+        for cell in row_cells {
+            if col >= visible_cols {
+                break;
+            }
+            if cell.is_continuation() {
+                col += 1;
+                continue;
+            }
+            let attributes = cell.attributes();
+            let colors = resolve_cell_colors(attributes);
+            let span = usize::from(cell.width()).max(1);
+
+            if colors.background != DEFAULT_BACKGROUND
+                && frame.fill_cell(col, row, span, 0, CELL_HEIGHT, colors.background)
+            {
+                return frame.vertices;
+            }
+            let mut glyph_col = col;
+            for character in cell.text().chars() {
+                if glyph_col >= visible_cols {
+                    break;
+                }
+                if frame.glyph(
+                    character,
+                    glyph_col,
+                    row,
+                    colors.foreground,
+                    attributes.is_bold(),
+                ) {
+                    return frame.vertices;
+                }
+                glyph_col += 1;
+            }
+            if attributes.is_underlined()
+                && frame.fill_cell(col, row, span, UNDERLINE_TOP, GLYPH_SCALE, colors.underline)
+            {
+                return frame.vertices;
+            }
+            // One cell, one display column — the wide lead's width-2 span is
+            // covered by its own continuation cell further down the slice —
+            // except that combining marks extend the cell's text exactly as
+            // they extend `display_lines`, so later cells keep their
+            // character-indexed columns.
+            col += cell.text().chars().count().max(1);
         }
     }
-    vertices
+    frame.vertices
 }
 
-fn push_rect(vertices: &mut Vec<[f32; 2]>, x: u32, y: u32, size: u32, width: u32, height: u32) {
-    let left = x as f32 / width as f32 * 2.0 - 1.0;
-    let right = x.saturating_add(size) as f32 / width as f32 * 2.0 - 1.0;
-    let top = 1.0 - y as f32 / height as f32 * 2.0;
-    let bottom = 1.0 - y.saturating_add(size) as f32 / height as f32 * 2.0;
-    vertices.extend_from_slice(&[
-        [left, top],
-        [left, bottom],
-        [right, bottom],
-        [left, top],
-        [right, bottom],
-        [right, top],
-    ]);
-}
-
-fn vertex_bytes(vertices: &[[f32; 2]]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(vertices.len().saturating_mul(8));
+pub(crate) fn vertex_bytes(vertices: &[Vertex]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vertices.len().saturating_mul(VERTEX_BYTES));
     for vertex in vertices {
-        bytes.extend_from_slice(&vertex[0].to_ne_bytes());
-        bytes.extend_from_slice(&vertex[1].to_ne_bytes());
+        for value in vertex.position.iter().chain(vertex.color.iter()) {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
     }
     bytes
 }
@@ -459,10 +759,10 @@ mod tests {
     }
 
     #[test]
-    fn vertex_encoding_has_two_floats_per_vertex() {
+    fn vertex_encoding_has_two_floats_and_three_color_floats_per_vertex() {
         let terminal = snapshot(1, 2, b"A");
         let vertices = glyph_vertices(Some(&terminal), None, 900, 600);
-        assert_eq!(vertex_bytes(&vertices).len(), vertices.len() * 8);
+        assert_eq!(vertex_bytes(&vertices).len(), vertices.len() * VERTEX_BYTES);
     }
 
     fn ndc_left(column: u32) -> f32 {
@@ -473,9 +773,11 @@ mod tests {
         1.0 - GLYPH_TOP as f32 / 600.0 * 2.0
     }
 
-    fn has_rect_top_left(vertices: &[[f32; 2]], left: f32) -> bool {
+    fn has_rect_top_left(vertices: &[Vertex], left: f32) -> bool {
         let top = ndc_top_row_zero();
-        vertices.chunks_exact(6).any(|rect| rect[0] == [left, top])
+        vertices
+            .chunks_exact(6)
+            .any(|rect| rect[0].position == [left, top])
     }
 
     #[test]
