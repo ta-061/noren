@@ -4,9 +4,9 @@ mod renderer;
 
 use noren_app::{
     Arrow, CursorKeyMode, FunctionKey, GridGeometry, GridSize, InputMode, Key, KeyDropReason,
-    KeyEncoder, KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode, MAX_RENDER_ROWS, Modifiers,
-    PARSE_BUDGET_BYTES_PER_TURN, POC_CELL_HEIGHT, POC_CELL_WIDTH, PasteReject, Resize,
-    SystemClipboard,
+    KeyEncoder, KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode, MAX_RENDER_COLS,
+    MAX_RENDER_ROWS, Modifiers, PARSE_BUDGET_BYTES_PER_TURN, POC_CELL_HEIGHT, POC_CELL_WIDTH,
+    PasteReject, Resize, SystemClipboard,
     config::AppConfig,
     diagnostics::{self, PtyChildStatus},
     encode_paste,
@@ -133,7 +133,6 @@ impl WorkspaceState {
     }
 
     /// The current sidebar view (immutable snapshot for the renderer).
-    #[allow(dead_code)]
     fn sidebar(&self) -> &SidebarView {
         &self.sidebar
     }
@@ -248,31 +247,32 @@ impl NorenApp {
             return;
         };
 
-        let Ok(terminal) = TerminalState::new(grid.rows(), grid.cols()) else {
+        let Ok(terminal) = TerminalState::new(grid.rows(), terminal_cols(grid.cols())) else {
             eprintln!("Noren terminal state creation failed");
             event_loop.exit();
             return;
         };
         self.terminal = Some(terminal);
-        self.pty = match pty_size(grid).and_then(PtySession::spawn) {
-            Ok(session) => {
-                self.status = "Noren PoC ready";
-                self.show_status = false;
-                self.pty_child = PtyChildStatus::Running;
-                let session_id = self.workspace.create_session(SessionKind::Local);
-                self.workspace
-                    .select_session(session_id)
-                    .expect("freshly created session is live");
-                self.active_session = Some(session_id);
-                Some(session)
-            }
-            Err(_) => {
-                self.status = "Noren PTY start failed";
-                self.show_status = true;
-                self.pty_child = PtyChildStatus::NotLaunched;
-                None
-            }
-        };
+        self.pty =
+            match pty_size(grid.rows(), terminal_cols(grid.cols())).and_then(PtySession::spawn) {
+                Ok(session) => {
+                    self.status = "Noren PoC ready";
+                    self.show_status = false;
+                    self.pty_child = PtyChildStatus::Running;
+                    let session_id = self.workspace.create_session(SessionKind::Local);
+                    self.workspace
+                        .select_session(session_id)
+                        .expect("freshly created session is live");
+                    self.active_session = Some(session_id);
+                    Some(session)
+                }
+                Err(_) => {
+                    self.status = "Noren PTY start failed";
+                    self.show_status = true;
+                    self.pty_child = PtyChildStatus::NotLaunched;
+                    None
+                }
+            };
         self.renderer = match Renderer::new(Arc::clone(&window)) {
             Ok(renderer) => Some(renderer),
             Err(_) => {
@@ -488,6 +488,11 @@ impl NorenApp {
         let terminal = self.terminal.as_ref()?;
         let window = self.window.as_ref()?;
         let physical = window.inner_size();
+        // The sidebar occupies the leftmost SIDEBAR_COLS cell columns; clicks
+        // inside it do not address the terminal grid.
+        if position.x < sidebar_pixel_width() {
+            return None;
+        }
         let visible_rows = usize::try_from(physical.height / POC_CELL_HEIGHT)
             .unwrap_or(0)
             .clamp(1, usize::from(MAX_RENDER_ROWS));
@@ -508,7 +513,7 @@ impl NorenApp {
         if line_index >= usize::from(rows) {
             return None;
         }
-        let column = pixel_row_index(position.x, POC_CELL_WIDTH)?.min(usize::from(cols) - 1);
+        let column = terminal_column_at(position.x, cols)?;
         Some(GridPoint::new(
             terminal.scrollback_len() + line_index,
             column,
@@ -588,13 +593,14 @@ impl NorenApp {
         // Resize re-addresses the grid, so captured coordinates expire.
         self.selection = None;
         self.drag_origin = None;
+        let cols = terminal_cols(grid.cols());
         if let Some(terminal) = &mut self.terminal {
-            if terminal.resize(grid.rows(), grid.cols()).is_err() {
+            if terminal.resize(grid.rows(), cols).is_err() {
                 self.status = "Noren terminal resize failed";
                 self.show_status = true;
             }
         }
-        if let (Some(session), Ok(size)) = (&self.pty, pty_size(grid)) {
+        if let (Some(session), Ok(size)) = (&self.pty, pty_size(grid.rows(), cols)) {
             if session.resize(size).is_err() {
                 self.status = "Noren PTY resize failed";
                 self.show_status = true;
@@ -690,10 +696,11 @@ impl NorenApp {
         } else {
             None
         };
+        let sidebar_lines = sidebar_text_lines(self.workspace.sidebar());
         let outcome = self
             .renderer
             .as_mut()
-            .map(|renderer| renderer.render(snapshot.as_ref(), status));
+            .map(|renderer| renderer.render(snapshot.as_ref(), Some(&sidebar_lines), status));
         match outcome {
             Some(RenderOutcome::DeviceLost) => {
                 self.status = "Noren renderer device lost";
@@ -786,8 +793,53 @@ impl ApplicationHandler for NorenApp {
     }
 }
 
-fn pty_size(grid: GridSize) -> Result<PtySize, noren_pty::PtyError> {
-    PtySize::from_raw(grid.rows(), grid.cols()).ok_or(noren_pty::PtyError::InvalidSize)
+fn pty_size(rows: u16, cols: u16) -> Result<PtySize, noren_pty::PtyError> {
+    PtySize::from_raw(rows, cols).ok_or(noren_pty::PtyError::InvalidSize)
+}
+
+/// Terminal column count for a given window column count, reserving
+/// [`renderer::SIDEBAR_COLS`] columns on the left for the sidebar and clamping
+/// the remainder to the renderer's drawable budget. The PTY winsize, terminal
+/// state's column count, and the renderer's drawn region all use this value so
+/// they never disagree.
+///
+/// Reserve the sidebar first, then clamp the terminal to
+/// `MAX_RENDER_COLS - SIDEBAR_COLS` (floored at one). The sidebar sits *inside*
+/// the renderer's `MAX_RENDER_COLS` ceiling, so the terminal must never be told
+/// it owns more columns than the renderer can draw beside the sidebar —
+/// otherwise columns are clipped invisibly. `renderer::glyph_vertices` applies
+/// the identical formula independently; the sidebar geometry test pins that the
+/// two sites agree.
+fn terminal_cols(window_cols: u16) -> u16 {
+    let sidebar = u16::try_from(renderer::SIDEBAR_COLS).unwrap_or(u16::MAX);
+    let budget = MAX_RENDER_COLS.saturating_sub(sidebar).max(1);
+    window_cols.saturating_sub(sidebar).clamp(1, budget)
+}
+
+/// Convert the sidebar view into text lines the renderer can draw.
+///
+/// Each row is prefixed with `>` when selected, space otherwise, followed by
+/// the label and optional detail — using [`SidebarRow::label`] and
+/// [`SidebarRow::detail`] verbatim. When the sidebar is empty the
+/// empty-state message is returned as the sole line.
+fn sidebar_text_lines(sidebar: &SidebarView) -> Vec<String> {
+    if sidebar.is_empty() {
+        return sidebar
+            .empty_state()
+            .map(|state| vec![state.message().to_string()])
+            .unwrap_or_default();
+    }
+    sidebar
+        .rows()
+        .iter()
+        .map(|row| {
+            let marker = if row.is_selected() { '>' } else { ' ' };
+            match row.detail() {
+                Some(detail) => format!("{marker} {} {}", row.label(), detail),
+                None => format!("{marker} {}", row.label()),
+            }
+        })
+        .collect()
 }
 
 /// Index of the cell row containing a non-negative pixel coordinate, or
@@ -798,6 +850,26 @@ fn pixel_row_index(pixel: f64, cell_size: u32) -> Option<usize> {
         return None;
     }
     Some((pixel / f64::from(cell_size)) as usize)
+}
+
+/// Pixel width of the sidebar's left strip: `SIDEBAR_COLS` cell columns. The
+/// terminal is drawn to the right of this edge, so a click at exactly this x is
+/// the first terminal column.
+fn sidebar_pixel_width() -> f64 {
+    f64::from((renderer::SIDEBAR_COLS as u32) * POC_CELL_WIDTH)
+}
+
+/// Terminal cell column under pixel x, or `None` when the click lands in the
+/// sidebar strip, on a non-finite coordinate, or past the grid. The sidebar
+/// boundary is exclusive: x exactly at [`sidebar_pixel_width`] is the first
+/// terminal column and maps to cell 0; anything strictly left of it is the
+/// sidebar and is rejected.
+fn terminal_column_at(pixel_x: f64, terminal_cols: u16) -> Option<usize> {
+    if !pixel_x.is_finite() || pixel_x < sidebar_pixel_width() {
+        return None;
+    }
+    pixel_row_index(pixel_x - sidebar_pixel_width(), POC_CELL_WIDTH)
+        .map(|raw| raw.min(usize::from(terminal_cols).saturating_sub(1)))
 }
 
 /// Number of visible grid rows the renderer will draw: rows up to and
@@ -1400,5 +1472,266 @@ mod tests {
                 .any(|hit| hit.command().id() == CommandId::SESSION_CREATE),
             "searching 'session' must find the create command"
         );
+    }
+
+    // =========================================================================
+    // Sidebar geometry: the terminal width, the PTY winsize, and the renderer's
+    // drawn region must all agree once the sidebar reserves 16 columns.
+    // =========================================================================
+
+    /// Number of terminal cell columns the renderer drew, measured from its
+    /// vertex output rather than restating the column formula. Each terminal
+    /// column is fed a glyph the renderer lights starting at the cell's left
+    /// pixel edge (`B` lights glyph column 0), so a drawn column is detectable
+    /// as a glyph rect whose LEFT edge sits on that boundary. Scanning runs
+    /// rightward from the first terminal column (`SIDEBAR_COLS`) until a column
+    /// has no glyph — terminal content is contiguous, so the first gap marks
+    /// the end of the drawn region.
+    ///
+    /// Matching a rect's left edge (its top-left corner) — not *any* vertex on
+    /// the boundary — is essential: a glyph's rightmost lit pixel column (e.g.
+    /// `B`, whose rows `17 = 0b10001` light glyph column 4) produces a rect
+    /// whose RIGHT edge lands exactly on the next column's left edge. Matching
+    /// arbitrary vertices would count that bleed as a drawn column and over-
+    /// count by one. Each rect is emitted as a 6-vertex fan whose first vertex
+    /// is its top-left corner, so the left edges are read from every 6th group.
+    fn rendered_terminal_columns(vertices: &[[f32; 2]], width: u32) -> usize {
+        let rect_lefts: Vec<f32> = vertices.chunks_exact(6).map(|rect| rect[0][0]).collect();
+        let mut drawn = 0;
+        for col in renderer::SIDEBAR_COLS..usize::from(MAX_RENDER_COLS) {
+            let edge = ((col as u32) * POC_CELL_WIDTH) as f32 / width as f32 * 2.0 - 1.0;
+            if rect_lefts.iter().any(|left| (left - edge).abs() < 1e-5) {
+                drawn += 1;
+            } else {
+                break;
+            }
+        }
+        drawn
+    }
+
+    /// Drive the three terminal-width consumers — `TerminalState`'s stored
+    /// column count, the PTY winsize, and the columns the renderer actually
+    /// draws — at one window width, asserting they all agree on
+    /// `terminal_cols(window_cols)`. Asserting `terminal_cols() == window_cols -
+    /// 16` would merely restate the formula and pass any consistent-but-wrong
+    /// value; instead this exercises the three real consumers and is shared by
+    /// the swept agreement test below across every regime where they can drift
+    /// apart.
+    fn assert_three_consumers_agree_at(width: u32) {
+        let height = 600_u32;
+        // Grid columns and the renderer's visible columns both derive
+        // `width / CELL_WIDTH`, so they share this `window_cols`.
+        let window_cols = u16::try_from(width / POC_CELL_WIDTH).expect("fits in u16");
+        let cols = terminal_cols(window_cols);
+
+        // Consumer 1: the terminal state stores the sidebar-adjusted width.
+        let rows = u16::try_from(height / POC_CELL_HEIGHT).expect("fits in u16");
+        let mut terminal = TerminalState::new(rows, cols).expect("valid terminal");
+        // Fill every terminal column of row 0 so each drawn column is visible
+        // to `rendered_terminal_columns` via its left pixel edge.
+        terminal.feed_bytes(&vec![b'B'; usize::from(cols)]);
+        let (_, term_cols) = terminal.size();
+        assert_eq!(
+            term_cols, cols,
+            "at {width}px: terminal must store terminal_cols({window_cols}) = {cols}"
+        );
+
+        // Consumer 2: the PTY winsize carries the same column count.
+        let pty = pty_size(rows, cols).expect("valid pty size");
+        assert_eq!(
+            pty.cols(),
+            cols,
+            "at {width}px: PTY winsize must agree with the terminal"
+        );
+
+        // Consumer 3: the renderer draws exactly that many terminal columns —
+        // measured from vertex output, independent of `terminal_cols`.
+        let snapshot = terminal.snapshot();
+        let sidebar: Vec<String> = Vec::new();
+        let vertices = renderer::glyph_vertices(
+            Some(&snapshot),
+            Some(sidebar.as_slice()),
+            None,
+            width,
+            height,
+        );
+        let drawn = rendered_terminal_columns(&vertices, width);
+        assert_eq!(
+            drawn,
+            usize::from(cols),
+            "at {width}px (window_cols={window_cols}): renderer drew {drawn} terminal columns but \
+             terminal/PTY agree on {cols} — the sidebar width is not consistently subtracted or \
+             the upper clamp is missing"
+        );
+    }
+
+    /// The PR's headline property: the three consumers agree once the sidebar
+    /// reserves 16 columns — swept across the input range rather than pinned at
+    /// one width. A single point cannot support "agreement across the range",
+    /// and the original 900px point sits squarely inside the band (17..=160
+    /// columns) where the pre-fix geometry already agreed. Each swept width
+    /// targets a distinct regime so a regression of either pre-fix defect is
+    /// caught:
+    ///   - 80px   (8 cols, below the sidebar width): the floor regime. A
+    ///     renderer that floored at zero terminal columns while the terminal
+    ///     and PTY held one is exposed.
+    ///   - 900px  (90 cols, a typical window): the common case — the very width
+    ///     a prior commit message wrongly cited as the divergence (both the
+    ///     pre- and post-fix geometry agree at 74 here).
+    ///   - 1600px (160 cols, exactly `MAX_RENDER_COLS`): the budget boundary,
+    ///     where the terminal fills the whole drawable budget (144).
+    ///   - 2000px (200 cols, above `MAX_RENDER_COLS`): the upper-clamp regime.
+    ///     A `terminal_cols` with no upper clamp would claim 184 columns while
+    ///     the renderer draws 144, silently clipping 40 columns of output.
+    ///
+    /// This is a regression guard, not a reproduced bug: at the moment this
+    /// test was added all three consumers already agreed at every swept width,
+    /// and it exists to hold that line. Mutating `terminal_cols` to drop the
+    /// sidebar subtraction breaks the typical/above-max widths, and dropping
+    /// the upper clamp breaks the 2000px width.
+    #[test]
+    fn terminal_cols_pty_winsize_and_renderer_agree_across_the_width_range() {
+        for width in [80_u32, 900, 1600, 2000] {
+            assert_three_consumers_agree_at(width);
+        }
+    }
+
+    /// MINOR-1: below ~160px the window fits inside the sidebar. `terminal_cols`
+    /// floors at one (the terminal/PTY reject zero columns); the renderer must
+    /// floor at the same one rather than drawing zero terminal columns while the
+    /// terminal still holds one. Drives the real renderer so the agreement is
+    /// measured, not assumed.
+    #[test]
+    fn terminal_cols_and_renderer_floor_at_one_below_the_sidebar() {
+        // A window exactly SIDEBAR_COLS wide: visible_cols == SIDEBAR_COLS, so
+        // the terminal region has no room — both floors must keep it at one.
+        let width = (renderer::SIDEBAR_COLS as u32) * POC_CELL_WIDTH;
+        let height = 600_u32;
+        let window_cols = u16::try_from(width / POC_CELL_WIDTH).expect("fits in u16");
+        assert_eq!(window_cols, u16::try_from(renderer::SIDEBAR_COLS).unwrap());
+        let cols = terminal_cols(window_cols);
+        assert_eq!(cols, 1, "terminal_cols floors at one, never zero");
+
+        let mut terminal = TerminalState::new(2, cols).expect("valid terminal");
+        terminal.feed_bytes(&vec![b'B'; usize::from(cols)]);
+        let snapshot = terminal.snapshot();
+        let sidebar: Vec<String> = Vec::new();
+        let vertices = renderer::glyph_vertices(
+            Some(&snapshot),
+            Some(sidebar.as_slice()),
+            None,
+            width,
+            height,
+        );
+        let drawn = rendered_terminal_columns(&vertices, width);
+        assert_eq!(
+            drawn,
+            usize::from(cols),
+            "renderer must draw the terminal's one column, not zero — the floor \
+             disagrees with terminal_cols below the sidebar width"
+        );
+    }
+
+    /// MINOR-2: `sidebar_text_lines` is the seam between the view model and the
+    /// renderer. Drive a real `SidebarView` built by the workspace from a live
+    /// registry — not hardcoded strings — so a change in how rows are formatted
+    /// is caught here.
+    #[test]
+    fn sidebar_text_lines_format_a_real_workspace_sidebar() {
+        // Empty workspace: the empty-state notice is the sole line.
+        let empty = WorkspaceState::new();
+        assert_eq!(
+            sidebar_text_lines(empty.sidebar()),
+            vec!["No sessions".to_string()],
+            "empty workspace renders its empty-state notice"
+        );
+
+        let mut state = WorkspaceState::new();
+        let first = state.create_session(SessionKind::Local);
+        let second = state.create_session(SessionKind::Local);
+        state.select_session(first).expect("first session is live");
+
+        let lines = sidebar_text_lines(state.sidebar());
+        assert_eq!(lines.len(), 2, "one formatted line per sidebar row");
+
+        // The selected row is prefixed with '>' and the unselected with a
+        // space; both carry the real descriptor's label and detail.
+        assert!(
+            lines[0].starts_with("> "),
+            "selected row must be marked with '>': {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].starts_with("  "),
+            "unselected row must be marked with a space: {:?}",
+            lines[1]
+        );
+        assert!(
+            lines[0].contains(first.to_string().as_str()),
+            "selected row carries the session label: {:?}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains(second.to_string().as_str()),
+            "unselected row carries the session label: {:?}",
+            lines[1]
+        );
+        // A freshly created session sits at the Starting status, so the detail
+        // is derived from the real descriptor, not a constant.
+        assert!(
+            lines[0].contains("local · starting"),
+            "detail comes from the real descriptor: {:?}",
+            lines[0]
+        );
+    }
+
+    /// MINOR-3: `grid_point_at`'s sidebar boundary. A click in the last sidebar
+    /// column must be rejected, and a click at the first terminal column must
+    /// map to terminal cell 0. `grid_point_at` itself needs a live window this
+    /// harness cannot create, so this drives the extracted column mapper that
+    /// `grid_point_at` delegates to.
+    #[test]
+    fn terminal_column_at_rejects_the_sidebar_and_starts_the_terminal_at_zero() {
+        let cols = 40_u16;
+        let sidebar_edge = sidebar_pixel_width();
+
+        // The last sidebar column — just inside the sidebar's right edge — does
+        // not address the terminal grid.
+        assert_eq!(
+            terminal_column_at(sidebar_edge - 1.0, cols),
+            None,
+            "a click in the last sidebar column must be rejected"
+        );
+        // The first terminal column, exactly at the sidebar's right edge, maps
+        // to terminal cell 0.
+        assert_eq!(
+            terminal_column_at(sidebar_edge, cols),
+            Some(0),
+            "the first terminal column must map to cell 0"
+        );
+        // One cell width further in lands in terminal cell 1.
+        assert_eq!(
+            terminal_column_at(sidebar_edge + f64::from(POC_CELL_WIDTH), cols),
+            Some(1)
+        );
+        // The last terminal column maps to the highest valid cell.
+        assert_eq!(
+            terminal_column_at(
+                sidebar_edge + f64::from(POC_CELL_WIDTH) * f64::from(cols - 1),
+                cols
+            ),
+            Some(usize::from(cols - 1))
+        );
+        // A click past the last column clamps to the last cell, never overflows.
+        assert_eq!(
+            terminal_column_at(
+                sidebar_edge + f64::from(POC_CELL_WIDTH) * f64::from(cols),
+                cols
+            ),
+            Some(usize::from(cols - 1))
+        );
+        // Negative and non-finite clicks are rejected.
+        assert_eq!(terminal_column_at(-1.0, cols), None);
+        assert_eq!(terminal_column_at(f64::NAN, cols), None);
     }
 }

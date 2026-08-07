@@ -43,6 +43,7 @@ mod renderer_capture;
 
 use noren_app::{POC_CELL_HEIGHT as CELL_HEIGHT, POC_CELL_WIDTH as CELL_WIDTH};
 use noren_terminal::{TerminalSnapshot, TerminalState};
+use renderer_capture::renderer_source::SIDEBAR_COLS;
 use renderer_capture::{CaptureError, CapturedFrame, OffscreenRenderer};
 
 /// Construct a snapshot by feeding `bytes` through the real terminal state.
@@ -56,7 +57,7 @@ fn snapshot(rows: u16, cols: u16, bytes: &[u8]) -> TerminalSnapshot {
 fn render(renderer: &OffscreenRenderer, snapshot: &TerminalSnapshot) -> CapturedFrame {
     let width = u32::from(snapshot.cols()) * CELL_WIDTH;
     let height = u32::from(snapshot.rows()) * CELL_HEIGHT;
-    renderer.capture(Some(snapshot), None, width, height)
+    renderer.capture(Some(snapshot), None, None, width, height)
 }
 
 /// A pixel counts as "background" when it is close to the clear colour. Glyph
@@ -376,4 +377,134 @@ fn utf8_cell_is_at_least_lit_so_the_pipeline_handles_wide_input() {
     let frame = render(&renderer, &snap);
     // c, a, f are ASCII and lit; the final cell holds the non-ASCII 'é' lead.
     assert!(cell_is_lit(&frame, 0, 3), "non-ASCII cell drew nothing");
+}
+
+// ===========================================================================
+// Sidebar rendering: the sidebar is a fixed-width column on the left; the
+// terminal occupies the remaining columns to the right. These tests drive the
+// real wgpu pipeline offscreen and assert on rendered pixels — the same
+// approach as the core oracle above.
+// ===========================================================================
+
+/// Render a snapshot plus sidebar text at `(terminal_cols + SIDEBAR_COLS)` cell
+/// columns wide — mirroring how the real app partitions the window.
+fn render_with_sidebar(
+    renderer: &OffscreenRenderer,
+    snap: &TerminalSnapshot,
+    sidebar: &[String],
+) -> CapturedFrame {
+    let total_cols = u32::from(snap.cols()) + SIDEBAR_COLS as u32;
+    let width = total_cols * CELL_WIDTH;
+    let height = u32::from(snap.rows()) * CELL_HEIGHT;
+    renderer.capture(Some(snap), Some(sidebar), None, width, height)
+}
+
+#[test]
+fn sidebar_rows_appear_in_the_left_columns() {
+    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    // One selected session row: '>' marker, then label and detail.
+    let sidebar = vec!["> SESSION-1 LOCAL".to_string()];
+    let snap = snapshot(1, 20, b"");
+    let frame = render_with_sidebar(&renderer, &snap, &sidebar);
+
+    // The '>' selection marker at column 0 must be lit.
+    assert!(
+        cell_is_lit(&frame, 0, 0),
+        "selection marker '>' at column 0 should be lit"
+    );
+    // Column 1 is the space separator — blank.
+    assert!(
+        !cell_is_lit(&frame, 0, 1),
+        "space after marker at column 1 should be blank"
+    );
+    // 'S' of SESSION at column 2 must be lit.
+    assert!(
+        cell_is_lit(&frame, 0, 2),
+        "'S' of SESSION at column 2 should be lit"
+    );
+    // The lit pattern at (0,0) must differ from a blank cell to prove a real
+    // glyph was drawn, not noise.
+    let blank = vec![false; (CELL_WIDTH * CELL_HEIGHT) as usize];
+    assert_ne!(
+        cell_pattern(&frame, 0, 0),
+        blank,
+        "selection marker cell has a non-blank glyph pattern"
+    );
+}
+
+#[test]
+fn terminal_content_does_not_overlap_sidebar_columns() {
+    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    // No sidebar text — the sidebar region stays entirely blank.
+    let sidebar: Vec<String> = vec![];
+    // Terminal with 'A' at column 0.
+    let snap = snapshot(1, 10, b"A");
+    let frame = render_with_sidebar(&renderer, &snap, &sidebar);
+
+    let sc = SIDEBAR_COLS as u32;
+    // The terminal's column 0 maps to window column SIDEBAR_COLS — the 'A'
+    // must appear there, not inside the sidebar.
+    assert!(
+        cell_is_lit(&frame, 0, sc),
+        "terminal 'A' should be lit at window column SIDEBAR_COLS ({sc})"
+    );
+    // Every sidebar column must be blank.
+    for col in 0..sc {
+        assert!(
+            !cell_is_lit(&frame, 0, col),
+            "sidebar column {col} is lit — terminal bled into the sidebar"
+        );
+    }
+}
+
+#[test]
+fn sidebar_plus_terminal_columns_equal_window_columns() {
+    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let sidebar: Vec<String> = vec![];
+    let term_cols = 10u16;
+    // Fill every terminal column with 'A'.
+    let snap = snapshot(1, term_cols, b"AAAAAAAAAA");
+    let frame = render_with_sidebar(&renderer, &snap, &sidebar);
+
+    let sc = SIDEBAR_COLS as u32;
+    let total = sc + u32::from(term_cols);
+
+    // Sidebar region: columns 0..SIDEBAR_COLS must be blank.
+    for col in 0..sc {
+        assert!(
+            !cell_is_lit(&frame, 0, col),
+            "sidebar column {col} should be blank"
+        );
+    }
+    // Terminal region: columns SIDEBAR_COLS..total must be lit.
+    for col in sc..total {
+        assert!(
+            cell_is_lit(&frame, 0, col),
+            "terminal column {col} (window col {col}) should be lit"
+        );
+    }
+}
+
+#[test]
+fn empty_state_message_is_drawn_in_the_sidebar() {
+    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let sidebar = vec!["NO SESSIONS".to_string()];
+    let snap = snapshot(1, 10, b"");
+    let frame = render_with_sidebar(&renderer, &snap, &sidebar);
+
+    // 'N' at column 0 and 'O' at column 1 must both be lit.
+    assert!(
+        cell_is_lit(&frame, 0, 0),
+        "'N' of NO SESSIONS should be lit"
+    );
+    assert!(
+        cell_is_lit(&frame, 0, 1),
+        "'O' of NO SESSIONS should be lit"
+    );
+    // The patterns must differ — they are different glyphs.
+    assert_ne!(
+        cell_pattern(&frame, 0, 0),
+        cell_pattern(&frame, 0, 1),
+        "'N' and 'O' rendered the same pattern"
+    );
 }
