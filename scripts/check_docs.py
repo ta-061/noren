@@ -115,7 +115,6 @@ def main() -> int:
         raw_cli_evidence = relative_path.parts[:3] == (
             "docs",
             "coordination",
-            "cli-help",
         )
         try:
             text = path.read_text(encoding="utf-8")

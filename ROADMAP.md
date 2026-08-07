@@ -7,8 +7,8 @@ Only evidence-backed work is marked complete.
 | --- | --- | --- |
 | 0 — Discovery | Landscape, feature/library matrices, risks, agent inventory and calibration | Complete |
 | 1 — Requirements and design | Independent proposals, critiques, integrated requirements, architecture, threat model, tests, RFCs, ADRs | Complete |
-| 2 — Terminal foundation | Window, PTY, shell, terminal state/rendering, input, resize, scrollback, selection, copy/paste/search, configuration and diagnostics | In progress |
-| 3 — Workspace | Tabs, panes, workspaces, persistence, sidebar, palette, configurable keybindings, Zellij pass-through | Not started |
+| 2 — Terminal foundation | Window, PTY, shell, terminal state/rendering, input, resize, scrollback, selection, copy/paste/search, configuration and diagnostics | Complete |
+| 3 — Workspace | External workspace management (sidebar: projects, git worktrees, SSH connections, agents, terminal sessions), single-session view, session lifecycle, sidebar-state persistence, palette, configurable keybindings, Zellij pass-through — no native tabs/panes/layout (delegated to Zellij per [ADR 0003](docs/adr/0003-noren-zellij-responsibility-boundary.md)) | Not started |
 | 4 — SSH and remote | OpenSSH configuration, connections, reconnect, remote panes, daemon decision/PoC and recovery | Not started |
 | 5 — Agent experience | Launchers, verified adapters, trustworthy state, notifications and jump-to-source | Not started |
 | 6 — Themes and accessibility | Light/dark/high-contrast palettes, contrast checks, IME/CJK/HiDPI and keyboard/accessibility work | Not started |
@@ -27,14 +27,49 @@ into the key encoder. PR [#32](https://github.com/ta-061/noren/pull/32)
 (`aa41530`) adds a bounded VT compatibility harness. Escape-intermediate
 sequences and horizontal tab are handled.
 
-This is not a VT100/xterm or vim/tmux/zellij compatibility claim. Known
-non-conformance is tracked as Issues
-[#35](https://github.com/ta-061/noren/issues/35) (renderer and PTY grids
-disagree above 160x60), [#36](https://github.com/ta-061/noren/issues/36)
-(Delete, navigation, function, and modifier keys are not encoded), and
-[#37](https://github.com/ta-061/noren/issues/37) (DECSTBM clamping, embedded C0
-in CSI). Origin mode and query/reply remain deferred, Unicode/CJK width and IME
-remain later, and no hostile-input robustness claim is made yet.
+Those foundation PRs did not by themselves establish VT100/xterm or
+vim/tmux/zellij compatibility. Their tracked follow-ups were subsequently
+closed: PR [#38](https://github.com/ta-061/noren/pull/38) aligned renderer and
+PTY grids (Issue #35), PRs [#40](https://github.com/ta-061/noren/pull/40),
+[#48](https://github.com/ta-061/noren/pull/48), and
+[#60](https://github.com/ta-061/noren/pull/60) completed key encoding (Issue
+#36), and PR [#45](https://github.com/ta-061/noren/pull/45) fixed DECSTBM
+clamping and embedded C0 handling (Issue #37). PR
+[#53](https://github.com/ta-061/noren/pull/53) added Unicode/CJK display width;
+IME, origin mode, and query/reply remain deferred. The completion evidence and
+remaining limits below supersede that earlier foundation-only snapshot.
+
+## Milestone 2 completion evidence
+
+Closed at `1d329a5` with **353 workspace tests** passing, plus `cargo fmt --check`,
+`cargo clippy --workspace --all-targets -- -D warnings`, `cargo deny check`, MSRV
+verification, and the documentation validator — all four CI checks required by branch
+protection.
+
+Delivered across the milestone: window and local zsh PTY, the renderer-independent
+terminal state core, scroll regions, alternate screen and mode state, erase/insert/
+delete, SGR with 256-color and truecolor including colon sub-parameter forms, escape
+intermediates and horizontal tab, DCS/SOS/PM/APC string sequences, DECSTBM clamping,
+C0 inside CSI, application cursor and keypad modes, key encoding through xterm
+modifier parameters, Unicode/CJK display width, bounded scrollback, grid selection
+with clipboard copy/paste, scrollback search, and optional configuration with
+diagnostics.
+
+Quality evidence: a bounded VT compatibility harness, two independent adversarial
+hostile-input suites, and a per-cell grapheme cap that made the documented memory
+ceiling true rather than aspirational.
+
+Manual macOS gate, re-run at this head: a release build opened a window, owned a
+direct `zsh` child, and that child's tty reported `30 90` — the 900x600 window divided
+by the 10x20 cell, so the window to grid to PTY chain agrees. On termination the app
+exited, the child was reaped, and the pty device was gone.
+
+**What this does not establish.** There is still no rendered-frame oracle and no key
+injection into the real window, so glyph correctness and live input remain unverified
+by automation; the byte-level input contract is covered by tests instead. Mouse
+reporting is unimplemented and, per Issue #46, belongs in an input encoder rather than
+output-side parsing. Truecolor is modelled in terminal state but not yet wired to
+drawing. IME and accessibility remain deferred.
 
 No milestone date is promised. Implementation advances through scoped Issues,
 Draft PRs, and current-head CI evidence.
