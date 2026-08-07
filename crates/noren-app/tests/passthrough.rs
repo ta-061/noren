@@ -109,26 +109,38 @@ impl Harness {
             return GateKind::Forwarded;
         };
         let decision = self.gate.press(policy, chord);
-        let replayed_inputs: Vec<KeyInput> = self.held.drain(..decision.replayed.len()).collect();
-        let replayed_chords: Vec<Chord> = replayed_inputs
+        // The expected replay is computed from the harness's own held-stream,
+        // independently of the decision, so a dropped or truncated replay can
+        // never self-satisfy the assertion.
+        let expected_replayed: Vec<Chord> = self
+            .held
             .iter()
-            .filter_map(|held| chord_of(*held))
+            .map(|held| chord_of(*held).expect("harness feeds mappable chords"))
             .collect();
-        assert_eq!(
-            decision.replayed, replayed_chords,
-            "replayed chords must be the held leader chords in order"
-        );
-        for held in replayed_inputs {
-            self.forward_bytes.push(Self::encode(held, mode));
-        }
         match decision.kind {
             GateKind::Forwarded => {
+                assert_eq!(
+                    decision.replayed, expected_replayed,
+                    "a mismatch must replay every held leader chord, in order"
+                );
+                for held in self.held.drain(..) {
+                    self.forward_bytes.push(Self::encode(held, mode));
+                }
                 self.forward_bytes.push(Self::encode(input, mode));
             }
             GateKind::Pending => {
+                assert!(
+                    decision.replayed.is_empty(),
+                    "a pending leader must not replay anything yet"
+                );
                 self.held.push(input);
             }
-            GateKind::Intercepted(_) => {}
+            GateKind::Intercepted(_) => {
+                assert!(
+                    decision.replayed.is_empty(),
+                    "a completed leader consumes its chords; nothing replays"
+                );
+            }
         }
         decision.kind
     }
@@ -139,7 +151,15 @@ impl Harness {
 
     fn timeout(&mut self, mode: InputMode) {
         let replayed = self.gate.replay_timeout();
-        assert_eq!(replayed.len(), self.held.len());
+        let expected: Vec<Chord> = self
+            .held
+            .iter()
+            .map(|held| chord_of(*held).expect("harness feeds mappable chords"))
+            .collect();
+        assert_eq!(
+            replayed, expected,
+            "a timed-out leader must replay every held chord, in order"
+        );
         for held in self.held.drain(..) {
             self.forward_bytes.push(Self::encode(held, mode));
         }
@@ -689,24 +709,36 @@ fn app_key_of(code: KeyCode) -> Option<Key> {
 
 // ── Leader sequences: pending, replay, timeout ─────────────────────────
 
-fn two_chord_policy() -> PassthroughPolicy {
+/// Two-chord exit leader on printable chords absent from the pinned corpus
+/// (bare `a` and `g` appear in no mode). Unlike Super chords these encode
+/// non-empty bytes, so replay order is observable at the byte boundary: a
+/// lost replay changes what the child receives, not just metadata.
+fn printable_leader_policy() -> PassthroughPolicy {
     PassthroughPolicy::try_new(vec![claim_with_seq(
         CLAIM_ID_EXIT,
         PassthroughAction::ExitToWorkspace,
         ChordSeq::new(vec![
-            super_chord(KeyCode::Char('e'), false),
-            super_chord(KeyCode::Char('s'), false),
+            Chord::new(KeyCode::Char('a'), Modifiers::empty()).unwrap(),
+            Chord::new(KeyCode::Char('g'), Modifiers::empty()).unwrap(),
         ])
         .unwrap(),
     )])
-    .expect("Super-space leader is collision-free")
+    .expect("leader is collision-free against the pinned corpus")
+}
+
+fn leader_first() -> KeyInput {
+    pressed(Key::Character('a'), AppModifiers::empty())
+}
+
+fn leader_second() -> KeyInput {
+    pressed(Key::Character('g'), AppModifiers::empty())
 }
 
 #[test]
 fn leader_completion_intercepts_and_mismatch_replays_in_order() {
-    let policy = two_chord_policy();
-    let first = pressed(Key::Character('e'), AppModifiers::empty().super_key());
-    let second = pressed(Key::Character('s'), AppModifiers::empty().super_key());
+    let policy = printable_leader_policy();
+    let first = leader_first();
+    let second = leader_second();
     let other = pressed(Key::Character('x'), AppModifiers::empty());
 
     // Completion: both chords consumed, zero bytes reach the child.
@@ -722,25 +754,91 @@ fn leader_completion_intercepts_and_mismatch_replays_in_order() {
     );
     assert!(harness.bytes().is_empty());
 
-    // Mismatch: the held leader chord is replayed before the new chord,
-    // preserving input order. (Super chords carry no encoder bytes today, so
-    // the ordering assertion is on the decision/held-stream, not the bytes.)
+    // Mismatch: the held leader chord must reach the child BEFORE the
+    // mismatching chord, observed at the byte boundary. A lost or reordered
+    // replay changes these bytes (the child would see "x" instead of "ax"),
+    // which is exactly the no-lost-input property the matrix forbids
+    // breaking.
     let mut harness = Harness::default();
     assert_eq!(
         harness.step(&policy, first, InputMode::normal()),
         GateKind::Pending
+    );
+    assert!(
+        harness.bytes().is_empty(),
+        "the held leader chord must emit no bytes yet"
     );
     assert_eq!(
         harness.step(&policy, other, InputMode::normal()),
         GateKind::Forwarded
     );
     assert!(harness.gate.pending().is_empty());
+    assert_eq!(
+        harness.bytes(),
+        b"ax",
+        "the held leader chord must be replayed byte-for-byte before the mismatching chord"
+    );
+}
+
+#[test]
+fn a_second_live_claim_does_not_swallow_a_held_leader_prefix() {
+    // Exit is the two-chord leader [a, g]; palette is the single chord q.
+    // Both chords are unbound in the pinned corpus and share no prefix, so
+    // the manifest validates and both claims are live at once.
+    let policy = PassthroughPolicy::try_new(vec![
+        claim_with_seq(
+            CLAIM_ID_EXIT,
+            PassthroughAction::ExitToWorkspace,
+            ChordSeq::new(vec![
+                Chord::new(KeyCode::Char('a'), Modifiers::empty()).unwrap(),
+                Chord::new(KeyCode::Char('g'), Modifiers::empty()).unwrap(),
+            ])
+            .unwrap(),
+        ),
+        claim_with_seq(
+            CLAIM_ID_PALETTE,
+            PassthroughAction::OpenCommandPalette,
+            ChordSeq::single(Chord::new(KeyCode::Char('q'), Modifiers::empty()).unwrap()),
+        ),
+    ])
+    .expect("manifest is collision-free and prefix-unambiguous");
+
+    // A standalone palette chord intercepts.
+    let mut harness = Harness::default();
+    assert_eq!(
+        harness.step(
+            &policy,
+            pressed(Key::Character('q'), AppModifiers::empty()),
+            InputMode::normal()
+        ),
+        GateKind::Intercepted(PassthroughAction::OpenCommandPalette)
+    );
+    assert!(harness.bytes().is_empty());
+
+    // A palette chord after a held exit prefix completes neither claim: the
+    // held prefix must replay first, then the new chord forwards as literal
+    // input. The byte stream proves the order.
+    let mut harness = Harness::default();
+    assert_eq!(
+        harness.step(&policy, leader_first(), InputMode::normal()),
+        GateKind::Pending
+    );
+    assert_eq!(
+        harness.step(
+            &policy,
+            pressed(Key::Character('q'), AppModifiers::empty()),
+            InputMode::normal()
+        ),
+        GateKind::Forwarded
+    );
+    assert!(harness.gate.pending().is_empty());
+    assert_eq!(harness.bytes(), b"aq");
 }
 
 #[test]
 fn leader_timeout_replays_held_chords_for_forwarding() {
-    let policy = two_chord_policy();
-    let first = pressed(Key::Character('e'), AppModifiers::empty().super_key());
+    let policy = printable_leader_policy();
+    let first = leader_first();
 
     let mut gate = PassthroughGate::new();
     let decision = gate.press(&policy, chord_of(first).unwrap());
@@ -758,7 +856,9 @@ fn leader_timeout_replays_held_chords_for_forwarding() {
     assert!(decision.replayed.is_empty());
 
     // The byte pipeline expresses the same timeout: held chords are replayed
-    // through the encoder instead of being consumed.
+    // through the encoder instead of being consumed. The printable leader
+    // makes this byte-observable: a dropped replay would leave an empty
+    // stream where the child is owed b"a".
     let mut harness = Harness::default();
     assert_eq!(
         harness.step(&policy, first, InputMode::normal()),
@@ -768,7 +868,7 @@ fn leader_timeout_replays_held_chords_for_forwarding() {
     assert!(harness.gate.pending().is_empty());
     assert_eq!(
         harness.bytes(),
-        KeyEncoder::encode_with(first, InputMode::normal()).unwrap_or_default(),
+        b"a",
         "a timed-out leader must be forwarded byte-for-byte"
     );
 }

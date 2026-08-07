@@ -294,12 +294,6 @@ impl ChordSeq {
         self.chords.len() <= other.chords.len()
             && self.chords.iter().zip(&other.chords).all(|(a, b)| a == b)
     }
-
-    /// Whether `self` begins with exactly the chords in `prefix`.
-    #[must_use]
-    pub fn starts_with(&self, prefix: &[Chord]) -> bool {
-        self.chords.len() >= prefix.len() && self.chords.iter().zip(prefix).all(|(a, b)| a == b)
-    }
 }
 
 /// One binding record from the pinned Zellij default-keymap corpus.
@@ -667,7 +661,10 @@ pub enum CollisionKind {
     /// Both bind the identical sequence.
     Exact,
     /// The claimed sequence is a strict prefix of a Zellij sequence: Noren
-    /// would intercept before Zellij's sequence could complete.
+    /// would intercept before Zellij's sequence could complete. The pinned
+    /// corpus is single-chord, so only `Exact` and `ZellijPrefixesClaim` are
+    /// reachable with it today; the branch is retained as defense for a
+    /// future multi-chord corpus.
     ClaimPrefixesZellij,
     /// A Zellij sequence is a strict prefix of the claimed sequence: Noren
     /// would hold the Zellij chord waiting for further leader chords.
@@ -775,12 +772,19 @@ impl Default for PassthroughPolicy {
 impl PassthroughPolicy {
     /// The frozen default: exactly one claim, the `Super+Escape` exit leader.
     /// Nothing else is claimed until a justified need exists.
+    ///
+    /// Built through [`PassthroughPolicy::try_new`] so the default passes the
+    /// same collision, ambiguity, and justification validation as any
+    /// configured manifest; the expect is defense-in-depth, guarded by
+    /// `default_manifest_has_zero_collisions_with_zellij_defaults`.
+    ///
+    /// # Panics
+    ///
+    /// Only if the frozen default claim is edited into an invalid manifest.
     #[must_use]
     pub fn default_policy() -> Self {
-        Self {
-            exit: default_exit_claim(),
-            palette: None,
-        }
+        Self::try_new(vec![default_exit_claim()])
+            .expect("the frozen default manifest is valid and collision-free")
     }
 
     /// Validate and build a policy from a claim manifest.
@@ -873,9 +877,13 @@ impl PassthroughPolicy {
     /// Every claimed sequence, exit leader first.
     #[must_use]
     pub fn claims(&self) -> Vec<&PassthroughClaim> {
-        iter::once(&self.exit)
-            .chain(self.palette.as_ref())
-            .collect()
+        self.iter_claims().collect()
+    }
+
+    /// Borrowing iterator over the claims, exit leader first. Allocation-free
+    /// because the gate walks it on every key press.
+    fn iter_claims(&self) -> impl Iterator<Item = &PassthroughClaim> {
+        iter::once(&self.exit).chain(self.palette.as_ref())
     }
 
     /// The recovery routes out of pass-through, always non-empty.
@@ -945,11 +953,18 @@ impl PassthroughGate {
     }
 
     /// Route one pressed chord.
+    ///
+    /// Allocation-free on the common path: claims are borrowed, and the
+    /// pending prefix is matched in place rather than cloned into a
+    /// candidate.
     pub fn press(&mut self, policy: &PassthroughPolicy, chord: Chord) -> GateDecision {
-        let mut candidate = self.pending.clone();
-        candidate.push(chord);
-        for claim in policy.claims() {
-            if claim.seq.chords() == candidate.as_slice() {
+        let pending = self.pending.as_slice();
+        for claim in policy.iter_claims() {
+            let seq = claim.seq.chords();
+            if seq.len() == pending.len() + 1
+                && seq.starts_with(pending)
+                && seq[pending.len()] == chord
+            {
                 self.pending.clear();
                 return GateDecision {
                     kind: GateKind::Intercepted(claim.action),
@@ -957,8 +972,9 @@ impl PassthroughGate {
                 };
             }
         }
-        if policy.claims().iter().any(|claim| {
-            claim.seq.chords().len() > candidate.len() && claim.seq.starts_with(&candidate)
+        if policy.iter_claims().any(|claim| {
+            let seq = claim.seq.chords();
+            seq.len() > pending.len() + 1 && seq.starts_with(pending) && seq[pending.len()] == chord
         }) {
             self.pending.push(chord);
             return GateDecision {

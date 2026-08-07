@@ -161,3 +161,108 @@ Toolchain: `cargo 1.88.0 (873a06493 2025-05-10)`,
 - Unlock-First preset behavior is covered only via the note that its shared
   Alt chords are corpus-representative and still Super-free; the hashed
   `Z-UF-*` fixtures are evidence targets, not inputs to this lane.
+
+---
+
+# Review round 1 response (M3-5-review, GLM, commit `f86ae61`)
+
+Verdict was FINDINGS: 1 MAJOR, 3 MINOR. All four are addressed below; none
+deferred. File lease unchanged.
+
+## MAJOR-1 — replay-on-mismatch was not verified (fixed, mutation-proven)
+
+The reviewer's mutation (forwarding branch of `PassthroughGate::press`
+returning `replayed: Vec::new()`, silently dropping held leader chords) was
+reproduced exactly as described before any fix was attempted:
+
+```text
+mutation applied, tests as shipped:
+test result: ok. 15 passed; 0 failed; 0 ignored   <- defect: suite proves nothing
+```
+
+Root causes, both confirmed: the Harness asserted `decision.replayed`
+against held chords drained by `decision.replayed.len()` — an empty replay
+self-satisfies `[] == []`; and the mismatch test used Super chords, which
+the encoder drops to zero bytes, so the byte stream could not witness lost
+input either.
+
+Fix, in `crates/noren-app/tests/passthrough.rs` only:
+
+- The Harness now computes the expected replay from its own held-stream,
+  independently of the decision: a `Forwarded` outcome must replay every
+  held chord in order, and `Pending`/`Intercepted` must replay none. The
+  drain-by-decision-length pattern is gone.
+- `leader_completion_intercepts_and_mismatch_replays_in_order` now drives
+  the mismatch through a printable, corpus-unbound leader (`[a, g]`, both
+  absent from every pinned Zellij mode, so `try_new` accepts it): the child
+  must receive `b"ax"` — replayed held chord before the mismatching chord.
+- `leader_timeout_replays_held_chords_for_forwarding` uses the same
+  printable leader, making the timeout replay byte-observable (`b"a"`)
+  instead of empty-vs-empty.
+- New regression `a_second_live_claim_does_not_swallow_a_held_leader_prefix`
+  pins down the reviewer's own untested combination (two live claims of
+  unequal length, exit `[a, g]` plus palette `q`): standalone palette chord
+  intercepts; a palette chord after a held exit prefix replays the prefix
+  and forwards — child bytes `b"aq"`.
+
+Re-applied the same mutation after the fix; it is now caught on both the
+original and the MINOR-3-refactored `press`:
+
+```text
+mutation applied, tests after fix:
+test leader_completion_intercepts_and_mismatch_replays_in_order ... FAILED
+test a_second_live_claim_does_not_swallow_a_held_leader_prefix ... FAILED
+  assertion `left == right` failed: a mismatch must replay every held leader chord, in order
+    left: []
+    right: [Chord { code: Char('a'), ... }]
+test result: FAILED. 14 passed; 2 failed; 0 ignored
+
+mutation reverted:
+test result: ok. 16 passed; 0 failed; 0 ignored   (tests/passthrough.rs)
+```
+
+## MINOR-1 — dead `ClaimPrefixesZellij` branch (documented)
+
+Variant docstring now states that the pinned corpus is single-chord, so only
+`Exact` and `ZellijPrefixesClaim` are reachable with it today, and the
+branch is retained as defense for a future multi-chord corpus. Kept, not
+deleted: removing a collision shape the generic algorithm must support
+would weaken the contract the moment the corpus grows a sequence.
+
+## MINOR-2 — `default_policy()` bypassed its own validator (fixed)
+
+`default_policy()` now builds through
+`try_new(vec![default_exit_claim()])`, so the frozen default passes the
+same collision/ambiguity/justification validation as any configured
+manifest. A future edit of the default claim into a colliding chord fails
+at construction and in the existing collision test, not only in the test.
+
+## MINOR-3 — per-keypress allocation in `press` (fixed)
+
+`press` no longer allocates: it borrows claims through a private
+`iter_claims()` (no collected `Vec`) and matches the pending prefix in
+place instead of cloning it into a candidate. The public `claims()`
+accessor keeps its `Vec` shape for callers that want ownership; the hot
+path never touches it. (The same refactor switched prefix matching to
+slice `starts_with`, so the now-unused `ChordSeq::starts_with` helper was
+removed rather than left dead.)
+
+## Round 1 gate output (real, post-fix)
+
+```text
+$ cargo fmt --all
+(exit 0)
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.97s
+(exit 0)
+
+$ cargo test --workspace
+...
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out   (tests/passthrough.rs)
+...
+total: 369 passed, 0 failed, 1 ignored (pre-existing) across all targets
+```
+
+Test-count delta vs round 0: +1 (`a_second_live_claim...`); the other 15
+strengthened in place. `python3 scripts/check_docs.py` re-run: OK.
