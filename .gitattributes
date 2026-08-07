@@ -1,2 +1,0 @@
-# CLI help snapshots intentionally preserve presentation whitespace.
-docs/coordination/cli-help/*.txt -whitespace
