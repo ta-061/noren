@@ -322,13 +322,28 @@ pub(crate) fn glyph_vertices(
     let visible_rows = usize::try_from(height / CELL_HEIGHT)
         .unwrap_or(usize::MAX)
         .clamp(1, usize::from(MAX_RENDER_ROWS));
-    let visible_cols = usize::try_from(width / CELL_WIDTH)
-        .unwrap_or(usize::MAX)
-        .clamp(1, usize::from(MAX_RENDER_COLS));
+    let window_cols = usize::try_from(width / CELL_WIDTH).unwrap_or(usize::MAX);
 
     let has_sidebar = sidebar.is_some();
     let col_offset = if has_sidebar { SIDEBAR_COLS } else { 0 };
-    let terminal_cols = visible_cols.saturating_sub(col_offset);
+    // Reserve the sidebar, then clamp the terminal to the renderer's drawable
+    // budget (`MAX_RENDER_COLS - SIDEBAR_COLS`), floored at one. This is the
+    // same formula `main::terminal_cols` applies — kept independent rather than
+    // shared so the sidebar geometry test can still pin that the two sites
+    // agree (a single shared function would make their agreement structural and
+    // the sidebar subtraction itself un-testable). The sidebar lives *inside*
+    // the `MAX_RENDER_COLS` ceiling, so the terminal never owns more columns
+    // than the renderer can draw beside it.
+    let terminal_cols = if has_sidebar {
+        let budget = usize::from(MAX_RENDER_COLS)
+            .saturating_sub(SIDEBAR_COLS)
+            .max(1);
+        window_cols.saturating_sub(SIDEBAR_COLS).clamp(1, budget)
+    } else {
+        // No sidebar (offscreen oracle's pre-sidebar mode): the terminal fills
+        // the window, clamped to the renderer's column ceiling.
+        window_cols.clamp(1, usize::from(MAX_RENDER_COLS))
+    };
     let mut vertices = Vec::new();
 
     if let Some(lines) = sidebar {
