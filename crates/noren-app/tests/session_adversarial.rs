@@ -49,9 +49,11 @@
 //! modules (`src/session.rs`, `src/session_supervisor.rs`). The original
 //! `#[ignore]` reproducers mirrored the buggy algorithm through the fakes; the
 //! fix lane replaces them with normal `#[test]` regression guards that compile
-//! and run against the **real merged modules** (included below via `#[path]`),
-//! not the fakes. The fakes and their 20 defensive tests remain as the original
-//! attack record; the three regression guards live in the final section.
+//! and run against the **real merged modules** (still pulled in via `#[path]`
+//! because the supervisor's `mock` harness is `#[cfg(test)]` and unreachable
+//! from an integration test through the crate path), not the fakes. The fakes
+//! and their 20 defensive tests remain as the original attack record; the three
+//! regression guards live in the final section.
 
 // The two `fake_*` modules intentionally mirror the *full* published API
 // surface of the branch modules line-for-line, including methods and enum
@@ -64,8 +66,19 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // The real merged modules. The three regression guards at the end of this file
 // compile against these (not the fakes), so they guard the actual fixed code.
-// `cfg(test)` is enabled for an integration binary, which also brings the
-// supervisor's `mock` harness and each module's own unit tests into scope.
+// `session` and `session_supervisor` are both declared in `lib.rs`
+// (`pub mod session`, `pub mod session_supervisor`), so their non-test public
+// surface is reachable from outside the crate. The supervisor's `mock` harness,
+// however, is `#[cfg(test)]` inside `src/session_supervisor.rs`, and an
+// integration test is a separate crate — `cfg(test)` is not set for the
+// `noren-app` dependency, so `noren_app::session_supervisor::mock` does not
+// resolve here. Two of the three regression guards use that `mock` harness, so
+// both real modules are still compiled into this test binary directly via
+// `#[path]`, where `cfg(test)` *is* enabled for the test binary. (`session`
+// itself could be reached via `noren_app::session`; it is kept via `#[path]`
+// for file coherence, and its reachability is independently proven by
+// `tests/session_domain.rs`, `tests/sidebar_view.rs`, and the migrated
+// `tests/session_persistence.rs`.)
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[path = "../src/session.rs"]
@@ -73,7 +86,6 @@ mod session;
 
 #[path = "../src/session_supervisor.rs"]
 mod session_supervisor;
-
 // ─────────────────────────────────────────────────────────────────────────────
 // fake_domain — mirror of `session.rs` (lane glm-a / D-M3-001 shape).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1396,11 +1408,12 @@ fn controlled_children(n: usize) -> (Vec<MockChild>, Vec<MockController>) {
 // algorithm through the `fake_*` modules above). The defects are fixed in
 // `src/session.rs` and `src/session_supervisor.rs`, so each guard below
 // compiles and runs against the real merged code via the `#[path]` includes at
-// the top of this file. They assert the fixed property holds; if any fix
-// regresses they fail. The property each guards is the same the original
-// reproducer attacked; the assertions are adapted to the fixed contracts
-// (regressions now error / unknown ids now surface honestly) rather than
-// weakened.
+// the top of this file (`session_supervisor::mock` is `#[cfg(test)]`, so the
+// crate path is unavailable to this integration test). They assert the fixed
+// property holds; if any fix regresses they fail. The property each guards is
+// the same the original reproducer attacked; the assertions are adapted to the
+// fixed contracts (regressions now error / unknown ids now surface honestly)
+// rather than weakened.
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]

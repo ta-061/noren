@@ -1,18 +1,14 @@
 //! Integration tests for the Zellij pass-through lane (M3-5, ADR 0003
 //! boundary).
 //!
-//! The file lease for this lane excludes `lib.rs`, so the pass-through module
-//! is included from source; an integration lane later declares it in the
-//! crate. The tests bind the pass-through decision to the app's byte contract
+//! The pass-through module is wired into `lib.rs` as `pub mod passthrough`.
+//! The tests bind the pass-through decision to the app's byte contract
 //! through [`noren_app::KeyEncoder`]: unclaimed input must produce exactly
 //! the bytes a direct encode produces, and claimed input must produce none.
 
-#[path = "../src/passthrough.rs"]
-mod passthrough;
-
 use noren_app::{
     Arrow, CursorKeyMode, FunctionKey, InputMode, Key, KeyEncoder, KeyInput, KeyPhase,
-    Modifiers as AppModifiers,
+    Modifiers as AppModifiers, passthrough,
 };
 use passthrough::{
     CLAIM_ID_EXIT, CLAIM_ID_PALETTE, Chord, ChordSeq, CollisionKind, GateKind, KeyCode, Modifiers,
