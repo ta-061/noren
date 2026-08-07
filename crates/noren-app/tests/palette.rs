@@ -59,7 +59,7 @@ fn no_pane_tab_split_or_layout_command_is_offered() {
         let lower = label.to_ascii_lowercase();
         assert!(
             !lower.contains("pane")
-                && !lower.contains(" tab")
+                && !lower.contains("tab")
                 && !lower.contains("split")
                 && !lower.contains("layout"),
             "ADR 0003 boundary violated by command label {label:?}"
@@ -146,6 +146,21 @@ fn special_and_escaped_characters_are_matched_literally_without_panicking() {
     let result = std::panic::catch_unwind(|| palette.search(hostile));
     assert!(result.is_ok(), "literal special-char query must not panic");
     assert!(result.expect("search returned").is_empty());
+}
+
+#[test]
+fn match_index_counts_chars_not_bytes_for_non_ascii_labels() {
+    let palette = Palette::from_commands([Command::new(
+        CommandId::new("x.cafe"),
+        "Café Spotlight",
+        TestAction::Do("cafe"),
+    )]);
+    let hits = palette.search("spotlight");
+    assert_eq!(hits.len(), 1);
+    // "Café Spotlight" — "Spotlight" begins at char index 5 (after "Café ").
+    // é is one char but two UTF-8 bytes, so a byte-indexing regression would
+    // report 6 instead of 5.
+    assert_eq!(hits[0].match_index(), 5);
 }
 
 // ── Ranking ─────────────────────────────────────────────────────────────

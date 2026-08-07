@@ -261,6 +261,11 @@ pub struct TerminalModes {
     application_cursor_key: bool,
     application_keypad: bool,
     bracketed_paste: bool,
+    mouse_normal_tracking: bool,
+    mouse_button_event_tracking: bool,
+    mouse_any_event_tracking: bool,
+    mouse_sgr_encoding: bool,
+    mouse_urxvt_encoding: bool,
 }
 
 impl TerminalModes {
@@ -290,6 +295,36 @@ impl TerminalModes {
     #[must_use]
     pub const fn is_bracketed_paste_enabled(self) -> bool {
         self.bracketed_paste
+    }
+
+    /// Whether DEC private mode 1000 (normal mouse tracking) is enabled.
+    #[must_use]
+    pub const fn is_mouse_normal_tracking_enabled(self) -> bool {
+        self.mouse_normal_tracking
+    }
+
+    /// Whether DEC private mode 1002 (button-event mouse tracking) is enabled.
+    #[must_use]
+    pub const fn is_mouse_button_event_tracking_enabled(self) -> bool {
+        self.mouse_button_event_tracking
+    }
+
+    /// Whether DEC private mode 1003 (any-event mouse tracking) is enabled.
+    #[must_use]
+    pub const fn is_mouse_any_event_tracking_enabled(self) -> bool {
+        self.mouse_any_event_tracking
+    }
+
+    /// Whether DEC private mode 1006 (SGR mouse encoding) is enabled.
+    #[must_use]
+    pub const fn is_mouse_sgr_encoding_enabled(self) -> bool {
+        self.mouse_sgr_encoding
+    }
+
+    /// Whether DEC private mode 1015 (urxvt mouse encoding) is enabled.
+    #[must_use]
+    pub const fn is_mouse_urxvt_encoding_enabled(self) -> bool {
+        self.mouse_urxvt_encoding
     }
 }
 
@@ -1218,6 +1253,21 @@ impl TerminalState {
             }
             (PrivateMode::BracketedPaste, enabled) => {
                 self.modes.bracketed_paste = enabled;
+            }
+            (PrivateMode::MouseTrackingNormal, enabled) => {
+                self.modes.mouse_normal_tracking = enabled;
+            }
+            (PrivateMode::MouseTrackingButtonEvent, enabled) => {
+                self.modes.mouse_button_event_tracking = enabled;
+            }
+            (PrivateMode::MouseTrackingAnyEvent, enabled) => {
+                self.modes.mouse_any_event_tracking = enabled;
+            }
+            (PrivateMode::MouseEncodingSgr, enabled) => {
+                self.modes.mouse_sgr_encoding = enabled;
+            }
+            (PrivateMode::MouseEncodingUrxvt, enabled) => {
+                self.modes.mouse_urxvt_encoding = enabled;
             }
         }
     }

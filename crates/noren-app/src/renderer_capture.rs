@@ -48,6 +48,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 
+use noren_app::CellMetrics;
 use noren_terminal::TerminalSnapshot;
 use renderer_source::{CLEAR_COLOR, SHADER, glyph_vertices, vertex_bytes};
 
@@ -188,13 +189,15 @@ impl OffscreenRenderer {
     pub(crate) fn capture(
         &self,
         terminal: Option<&TerminalSnapshot>,
+        sidebar: Option<&[String]>,
         status: Option<&str>,
         width: u32,
         height: u32,
+        metrics: CellMetrics,
     ) -> CapturedFrame {
         assert!(width > 0 && height > 0, "capture target must be non-zero");
 
-        let vertices = glyph_vertices(terminal, status, width, height);
+        let vertices = glyph_vertices(terminal, sidebar, status, width, height, metrics);
         let bytes = vertex_bytes(&vertices);
 
         let vertex_buffer = if bytes.is_empty() {
