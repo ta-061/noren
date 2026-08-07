@@ -169,18 +169,14 @@ impl SessionViewport {
         self.session.id()
     }
 
-    /// The visible session's own label, if it has one.
+    /// The text a renderer is expected to use as the viewport title.
+    ///
+    /// Delegates to the descriptor's auto-generated title (the session's
+    /// stable display id, e.g. `"session-1"`); the session contract carries
+    /// no caller-supplied label.
     #[must_use]
-    pub fn label(&self) -> Option<&str> {
-        self.session.label()
-    }
-
-    /// The text a renderer is expected to use as the viewport title: the
-    /// session label when present, otherwise the session identifier.
-    #[must_use]
-    pub fn title(&self) -> String {
-        self.label()
-            .map_or_else(|| self.session.id().to_string(), str::to_string)
+    pub fn title(&self) -> &str {
+        self.session.title()
     }
 }
 
@@ -296,12 +292,10 @@ impl SidebarView {
     }
 }
 
-/// The text label for a session row: the descriptor's label when present,
-/// otherwise the stable session identifier.
+/// The text label for a session row: the descriptor's auto-generated title
+/// (its stable display id, e.g. `"session-1"`).
 fn session_label(descriptor: &SessionDescriptor) -> String {
-    descriptor
-        .label()
-        .map_or_else(|| descriptor.id().to_string(), str::to_string)
+    descriptor.title().to_string()
 }
 
 /// The secondary text for a session row: launch shape and last observed
@@ -314,20 +308,22 @@ fn session_detail(descriptor: &SessionDescriptor) -> String {
     )
 }
 
-fn session_kind_text(kind: SessionKind) -> &'static str {
+fn session_kind_text(kind: &SessionKind) -> &'static str {
     match kind {
         SessionKind::Local => "local",
-        SessionKind::Ssh => "ssh",
-        SessionKind::Agent => "agent",
+        SessionKind::Project { .. } => "project",
+        SessionKind::Worktree { .. } => "worktree",
+        SessionKind::Ssh { .. } => "ssh",
+        SessionKind::Agent { .. } => "agent",
     }
 }
 
-fn session_status_text(status: SessionStatus) -> &'static str {
+fn session_status_text(status: &SessionStatus) -> &'static str {
     match status {
-        SessionStatus::Created => "created",
+        SessionStatus::Starting => "starting",
         SessionStatus::Running => "running",
-        SessionStatus::Failed => "failed",
-        SessionStatus::Exited => "exited",
+        SessionStatus::Exited { .. } => "exited",
+        SessionStatus::Failed { .. } => "failed",
     }
 }
 
@@ -340,17 +336,19 @@ pub mod fixtures {
     use crate::session::{SessionId, SessionKind, SessionRegistry, SessionStatus};
 
     /// A deterministic registry with three sessions and no selection: two
-    /// observed-running local shells with labels and one reserved SSH-shaped
-    /// session without a label, still at its created status because no
-    /// observation was reported for it.
+    /// observed-running local shells and one reserved SSH-shaped session
+    /// still at its starting status because no observation was reported for
+    /// it. Titles are auto-generated from the session id by the registry.
     #[must_use]
     pub fn session_registry() -> SessionRegistry {
         let mut registry = SessionRegistry::new();
-        let build = registry.create(SessionKind::Local, Some("build".to_string()));
-        let tests = registry.create(SessionKind::Local, Some("tests".to_string()));
-        let _ = registry.create(SessionKind::Ssh, None);
-        observe_running(&mut registry, build);
-        observe_running(&mut registry, tests);
+        let first = registry.create(SessionKind::Local);
+        let second = registry.create(SessionKind::Local);
+        let _ = registry.create(SessionKind::Ssh {
+            target: "web1.internal".to_string(),
+        });
+        observe_running(&mut registry, first);
+        observe_running(&mut registry, second);
         debug_assert_eq!(registry.len(), 3);
         registry
     }

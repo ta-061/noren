@@ -51,18 +51,11 @@ fn each_entry_kind_maps_to_a_distinct_view_row() {
         .iter()
         .map(|row| row.label().to_string())
         .collect();
-    let mut expected: Vec<String> = [
-        "noren",
-        "pool-m3c",
-        "web-1",
-        "claude-code",
-        "build",
-        "tests",
-    ]
-    .iter()
-    .map(|label| (*label).to_string())
-    .collect();
-    expected.push(ids[2].to_string());
+    let mut expected: Vec<String> = ["noren", "pool-m3c", "web-1", "claude-code"]
+        .iter()
+        .map(|label| (*label).to_string())
+        .collect();
+    expected.extend(ids.iter().map(SessionId::to_string));
     assert_eq!(labels, expected);
     let distinct_labels: BTreeSet<String> = labels.iter().cloned().collect();
     assert_eq!(
@@ -78,7 +71,7 @@ fn each_entry_kind_maps_to_a_distinct_view_row() {
         (EntryKind::Agent, None),
         (EntryKind::Session, Some("local · running")),
         (EntryKind::Session, Some("local · running")),
-        (EntryKind::Session, Some("ssh · created")),
+        (EntryKind::Session, Some("ssh · starting")),
     ];
     for (row, (kind, detail)) in view.rows().iter().zip(expected_rows) {
         assert_eq!(row.kind(), kind);
@@ -118,8 +111,7 @@ fn one_selected_session_among_many_describes_exactly_one_viewport() {
         viewport.descriptor(),
         &registry.get(ids[1]).expect("fixture id is live")
     );
-    assert_eq!(viewport.label(), Some("tests"));
-    assert_eq!(viewport.title(), "tests");
+    assert_eq!(viewport.title(), ids[1].to_string());
 
     assert_eq!(view.selected_row_count(), 1, "exactly one row is selected");
     let selected_row = view
@@ -128,7 +120,7 @@ fn one_selected_session_among_many_describes_exactly_one_viewport() {
         .find(|row| row.is_selected())
         .expect("one selected row");
     assert_eq!(selected_row.kind(), EntryKind::Session);
-    assert_eq!(selected_row.label(), "tests");
+    assert_eq!(selected_row.label(), ids[1].to_string());
 }
 
 #[test]
@@ -191,17 +183,16 @@ fn duplicate_session_descriptions_keep_exactly_one_selection() {
 }
 
 #[test]
-fn session_rows_fall_back_to_the_session_id_label() {
+fn session_rows_use_the_descriptor_title() {
     let registry = fixtures::session_registry();
     let ids = fixture_ids(&registry);
-    let unlabeled = registry.get(ids[2]).expect("fixture id is live");
-    assert_eq!(unlabeled.label(), None);
+    let session = registry.get(ids[2]).expect("fixture id is live");
+    assert_eq!(session.title(), ids[2].to_string());
 
-    let entries = [SidebarEntry::Session(unlabeled)];
+    let entries = [SidebarEntry::Session(session)];
     let view = SidebarView::build(&entries, Some(ids[2]));
     assert_eq!(view.rows()[0].label(), ids[2].to_string());
     let viewport = view.viewport().expect("selected session is visible");
-    assert_eq!(viewport.label(), None);
     assert_eq!(viewport.title(), ids[2].to_string());
 }
 
@@ -210,7 +201,12 @@ fn session_rows_report_observed_status() {
     let mut registry = fixtures::session_registry();
     let ids = fixture_ids(&registry);
     registry
-        .observe(ids[0], SessionStatus::Failed)
+        .observe(
+            ids[0],
+            SessionStatus::Failed {
+                reason: "exit 1".to_string(),
+            },
+        )
         .expect("fixture id is live");
 
     let view = SidebarView::build(&fixtures::entries(&registry), None);
@@ -227,7 +223,7 @@ fn session_rows_report_observed_status() {
         [
             Some("local · failed"),
             Some("local · running"),
-            Some("ssh · created")
+            Some("ssh · starting")
         ]
     );
 }
