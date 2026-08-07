@@ -2,10 +2,14 @@
 
 > A Zellij-friendly terminal for local, remote, and agent workflows.
 
-> **Project status: Discovery.** Noren does not yet contain a terminal
-> application, installable binaries, or a Preview release. Everything described
-> below is a product goal until the implementation and release evidence says
-> otherwise.
+> **Current state: terminal foundation, not the product.** What exists on
+> `main` is a macOS window over a local `zsh` PTY with a tested terminal state
+> core. It renders in a single colour, in a case-insensitive 5x7 ASCII bitmap
+> font, with all non-ASCII shown as `?`, no IME, no accessibility surface, and
+> no workspace sidebar. There are no published binaries. Read
+> **[docs/known-limitations.md](docs/known-limitations.md)** first — it is the
+> accurate predictor of what happens when you run the build. Everything below
+> the status block describes **intent**, not current capability.
 
 Noren (ノレン) is being designed as a Rust workspace terminal for macOS and
 Linux. Its name comes from the Japanese *noren*: a curtain that divides a space
@@ -33,8 +37,10 @@ pass-through takes priority over Noren shortcuts.
 
 ## Current phase
 
-The project is completing Discovery and requirements work before production
-implementation. The required sequence is:
+Milestones 0–2 (discovery, requirements/design, terminal foundation) are
+complete on the evidence recorded in [ROADMAP.md](ROADMAP.md); the workspace,
+SSH, agent-experience, theming/accessibility, quality, and preview milestones
+are open. The required sequence remains:
 
 1. verify tools, upstream behavior, licenses, and project constraints;
 2. calibrate the available AI contributors on the same bounded task;
