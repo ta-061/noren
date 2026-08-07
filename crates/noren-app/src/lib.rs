@@ -138,6 +138,36 @@ impl GridSize {
     }
 }
 
+/// Runtime cell metrics: the configured width and height of one terminal grid
+/// cell in physical pixels.
+///
+/// `GridGeometry` produces this from configuration; every consumer — the
+/// renderer's `glyph_vertices`, the offscreen capture path, and the binary's
+/// click-to-grid mappers — reads width and height from this single value
+/// rather than from a compile-time constant. Bundling the two dimensions
+/// prevents width and height from drifting to different origins at a call
+/// site (the defect from issue #76: the renderer drew at the constant while
+/// the geometry used the configured value).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CellMetrics {
+    width: u32,
+    height: u32,
+}
+
+impl CellMetrics {
+    /// Cell width in physical pixels.
+    #[must_use]
+    pub const fn width(self) -> u32 {
+        self.width
+    }
+
+    /// Cell height in physical pixels.
+    #[must_use]
+    pub const fn height(self) -> u32 {
+        self.height
+    }
+}
+
 /// Deterministic fixed-cell geometry and resize coalescing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridGeometry {
@@ -172,6 +202,35 @@ impl GridGeometry {
             cell_height,
             current: None,
         })
+    }
+
+    /// Configured cell width in physical pixels.
+    ///
+    /// This is the single runtime source of truth for cell width: the renderer,
+    /// the click-to-grid mapper, and the sidebar boundary all read it from here
+    /// rather than from a compile-time constant.
+    #[must_use]
+    pub const fn cell_width(self) -> u32 {
+        self.cell_width
+    }
+
+    /// Configured cell height in physical pixels.
+    ///
+    /// See [`cell_width`](Self::cell_width) for the single-source rationale.
+    #[must_use]
+    pub const fn cell_height(self) -> u32 {
+        self.cell_height
+    }
+
+    /// The configured [`CellMetrics`] — the single runtime source of truth
+    /// for cell size, threaded to the renderer and click-handling code so
+    /// every consumer reads the same width and height.
+    #[must_use]
+    pub const fn cell_metrics(self) -> CellMetrics {
+        CellMetrics {
+            width: self.cell_width,
+            height: self.cell_height,
+        }
     }
 
     /// Current last valid grid.

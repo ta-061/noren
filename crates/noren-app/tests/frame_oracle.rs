@@ -41,10 +41,16 @@
 #[path = "../src/renderer_capture.rs"]
 mod renderer_capture;
 
-use noren_app::{POC_CELL_HEIGHT as CELL_HEIGHT, POC_CELL_WIDTH as CELL_WIDTH};
+use noren_app::{GridGeometry, POC_CELL_HEIGHT as CELL_HEIGHT, POC_CELL_WIDTH as CELL_WIDTH};
 use noren_terminal::{TerminalSnapshot, TerminalState};
 use renderer_capture::renderer_source::SIDEBAR_COLS;
 use renderer_capture::{CaptureError, CapturedFrame, OffscreenRenderer};
+
+/// The PoC default cell metrics, used by every frame-oracle capture call so
+/// the renderer draws at the same size the geometry computed.
+fn poc_metrics() -> noren_app::CellMetrics {
+    GridGeometry::poc().cell_metrics()
+}
 
 /// Construct a snapshot by feeding `bytes` through the real terminal state.
 fn snapshot(rows: u16, cols: u16, bytes: &[u8]) -> TerminalSnapshot {
@@ -57,7 +63,7 @@ fn snapshot(rows: u16, cols: u16, bytes: &[u8]) -> TerminalSnapshot {
 fn render(renderer: &OffscreenRenderer, snapshot: &TerminalSnapshot) -> CapturedFrame {
     let width = u32::from(snapshot.cols()) * CELL_WIDTH;
     let height = u32::from(snapshot.rows()) * CELL_HEIGHT;
-    renderer.capture(Some(snapshot), None, None, width, height)
+    renderer.capture(Some(snapshot), None, None, width, height, poc_metrics())
 }
 
 /// A pixel counts as "background" when it is close to the clear colour. Glyph
@@ -396,7 +402,14 @@ fn render_with_sidebar(
     let total_cols = u32::from(snap.cols()) + SIDEBAR_COLS as u32;
     let width = total_cols * CELL_WIDTH;
     let height = u32::from(snap.rows()) * CELL_HEIGHT;
-    renderer.capture(Some(snap), Some(sidebar), None, width, height)
+    renderer.capture(
+        Some(snap),
+        Some(sidebar),
+        None,
+        width,
+        height,
+        poc_metrics(),
+    )
 }
 
 #[test]
