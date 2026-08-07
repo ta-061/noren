@@ -331,6 +331,7 @@ fn session_status_text(status: &SessionStatus) -> &'static str {
 ///
 /// Sessions are constructed through the shared `SessionRegistry`, which is
 /// pure state and spawns nothing; SSH and agent entries are text facts only.
+#[cfg(feature = "test-support")]
 pub mod fixtures {
     use super::SidebarEntry;
     use crate::session::{SessionId, SessionKind, SessionRegistry, SessionStatus};

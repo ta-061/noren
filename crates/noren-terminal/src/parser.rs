@@ -114,6 +114,11 @@ pub(crate) enum PrivateMode {
     AlternateScreen,
     ApplicationCursorKey,
     BracketedPaste,
+    MouseTrackingNormal,
+    MouseTrackingButtonEvent,
+    MouseTrackingAnyEvent,
+    MouseEncodingSgr,
+    MouseEncodingUrxvt,
 }
 
 /// Incremental UTF-8 decoder for printable text in the Ground state.
@@ -497,6 +502,11 @@ impl Csi {
             1 => PrivateMode::ApplicationCursorKey,
             1049 => PrivateMode::AlternateScreen,
             2004 => PrivateMode::BracketedPaste,
+            1000 => PrivateMode::MouseTrackingNormal,
+            1002 => PrivateMode::MouseTrackingButtonEvent,
+            1003 => PrivateMode::MouseTrackingAnyEvent,
+            1006 => PrivateMode::MouseEncodingSgr,
+            1015 => PrivateMode::MouseEncodingUrxvt,
             _ => return None,
         };
         match final_byte {
@@ -700,6 +710,48 @@ mod tests {
                 },
                 Action::SetPrivateMode {
                     mode: PrivateMode::BracketedPaste,
+                    enabled: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn mouse_tracking_and_encoding_modes_are_tracked_as_private_modes() {
+        assert_eq!(
+            actions(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?1015h"),
+            [
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseTrackingNormal,
+                    enabled: true,
+                },
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseTrackingButtonEvent,
+                    enabled: true,
+                },
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseTrackingAnyEvent,
+                    enabled: true,
+                },
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseEncodingSgr,
+                    enabled: true,
+                },
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseEncodingUrxvt,
+                    enabled: true,
+                },
+            ]
+        );
+        assert_eq!(
+            actions(b"\x1b[?1000l\x1b[?1006l"),
+            [
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseTrackingNormal,
+                    enabled: false,
+                },
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseEncodingSgr,
                     enabled: false,
                 },
             ]
