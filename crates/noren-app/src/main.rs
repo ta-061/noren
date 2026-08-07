@@ -3,9 +3,10 @@
 mod renderer;
 
 use noren_app::{
-    Arrow, CursorKeyMode, FunctionKey, GridGeometry, GridSize, InputMode, Key, KeyDropReason,
-    KeyEncoder, KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode, MAX_RENDER_COLS,
-    MAX_RENDER_ROWS, Modifiers, PARSE_BUDGET_BYTES_PER_TURN, PasteReject, Resize, SystemClipboard,
+    Arrow, CellMetrics, CursorKeyMode, FunctionKey, GridGeometry, GridSize, InputMode, Key,
+    KeyDropReason, KeyEncoder, KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode,
+    MAX_RENDER_COLS, MAX_RENDER_ROWS, Modifiers, PARSE_BUDGET_BYTES_PER_TURN, PasteReject, Resize,
+    SystemClipboard,
     config::AppConfig,
     diagnostics::{self, PtyChildStatus},
     encode_paste,
@@ -877,7 +878,7 @@ impl NorenApp {
             return;
         };
         let mods = self.pointer_modifiers();
-        for direction in wheel_clicks(delta) {
+        for direction in wheel_clicks(delta, self.geometry.cell_metrics()) {
             let event = PointerEvent::wheel(direction, col, row, mods);
             self.encode_and_send_mouse(event);
         }
@@ -1513,10 +1514,17 @@ fn encode_button(button: MouseButton) -> Option<EncoderButton> {
 ///
 /// A non-zero delta that rounds to zero lines still produces one click so a
 /// single-notch wheel is never lost.
-fn wheel_clicks(delta: MouseScrollDelta) -> Vec<WheelDirection> {
+///
+/// `metrics` carries the configured cell height — the same runtime
+/// [`CellMetrics`] the renderer and the click-to-grid mappers read — so a
+/// `PixelDelta` is converted to lines at the configured stride. Dividing by a
+/// compile-time constant instead would convert at the PoC height regardless of
+/// `[font] cell_height`, halving the line count at the default and doubling it
+/// wherever the height is raised.
+fn wheel_clicks(delta: MouseScrollDelta, metrics: CellMetrics) -> Vec<WheelDirection> {
     let lines = match delta {
         MouseScrollDelta::LineDelta(_, y) => y,
-        MouseScrollDelta::PixelDelta(pos) => (pos.y / f64::from(POC_CELL_HEIGHT)) as f32,
+        MouseScrollDelta::PixelDelta(pos) => (pos.y / f64::from(metrics.height())) as f32,
     };
     let count = lines.abs().floor().max(0.0) as usize;
     let count = if count == 0 && lines != 0.0 { 1 } else { count };
@@ -1659,7 +1667,6 @@ mod tests {
     use noren_app::palette::CommandId;
     use noren_app::passthrough::{self, collisions};
     use noren_app::sidebar::EntryKind;
-    use noren_app::{CellMetrics, POC_CELL_WIDTH};
 
     #[test]
     fn winit_space_variants_encode_ascii_space() {
@@ -2286,11 +2293,12 @@ mod tests {
     /// measured, not assumed.
     #[test]
     fn terminal_cols_and_renderer_floor_at_one_below_the_sidebar() {
+        let cell_width = GridGeometry::poc().cell_width();
         // A window exactly SIDEBAR_COLS wide: visible_cols == SIDEBAR_COLS, so
         // the terminal region has no room — both floors must keep it at one.
-        let width = (renderer::SIDEBAR_COLS as u32) * POC_CELL_WIDTH;
+        let width = (renderer::SIDEBAR_COLS as u32) * cell_width;
         let height = 600_u32;
-        let window_cols = u16::try_from(width / POC_CELL_WIDTH).expect("fits in u16");
+        let window_cols = u16::try_from(width / cell_width).expect("fits in u16");
         assert_eq!(window_cols, u16::try_from(renderer::SIDEBAR_COLS).unwrap());
         let cols = terminal_cols(window_cols);
         assert_eq!(cols, 1, "terminal_cols floors at one, never zero");
@@ -2307,7 +2315,7 @@ mod tests {
             height,
             GridGeometry::poc().cell_metrics(),
         );
-        let drawn = rendered_terminal_columns(&vertices, width, POC_CELL_WIDTH);
+        let drawn = rendered_terminal_columns(&vertices, width, cell_width);
         assert_eq!(
             drawn,
             usize::from(cols),
@@ -2377,52 +2385,49 @@ mod tests {
     #[test]
     fn terminal_column_at_rejects_the_sidebar_and_starts_the_terminal_at_zero() {
         let cols = 40_u16;
-        let sidebar_edge = sidebar_pixel_width(POC_CELL_WIDTH);
+        let cell_width = GridGeometry::poc().cell_width();
+        let sidebar_edge = sidebar_pixel_width(cell_width);
 
         // The last sidebar column — just inside the sidebar's right edge — does
         // not address the terminal grid.
         assert_eq!(
-            terminal_column_at(sidebar_edge - 1.0, cols, POC_CELL_WIDTH),
+            terminal_column_at(sidebar_edge - 1.0, cols, cell_width),
             None,
             "a click in the last sidebar column must be rejected"
         );
         // The first terminal column, exactly at the sidebar's right edge, maps
         // to terminal cell 0.
         assert_eq!(
-            terminal_column_at(sidebar_edge, cols, POC_CELL_WIDTH),
+            terminal_column_at(sidebar_edge, cols, cell_width),
             Some(0),
             "the first terminal column must map to cell 0"
         );
         // One cell width further in lands in terminal cell 1.
         assert_eq!(
-            terminal_column_at(
-                sidebar_edge + f64::from(POC_CELL_WIDTH),
-                cols,
-                POC_CELL_WIDTH
-            ),
+            terminal_column_at(sidebar_edge + f64::from(cell_width), cols, cell_width),
             Some(1)
         );
         // The last terminal column maps to the highest valid cell.
         assert_eq!(
             terminal_column_at(
-                sidebar_edge + f64::from(POC_CELL_WIDTH) * f64::from(cols - 1),
+                sidebar_edge + f64::from(cell_width) * f64::from(cols - 1),
                 cols,
-                POC_CELL_WIDTH
+                cell_width
             ),
             Some(usize::from(cols - 1))
         );
         // A click past the last column clamps to the last cell, never overflows.
         assert_eq!(
             terminal_column_at(
-                sidebar_edge + f64::from(POC_CELL_WIDTH) * f64::from(cols),
+                sidebar_edge + f64::from(cell_width) * f64::from(cols),
                 cols,
-                POC_CELL_WIDTH
+                cell_width
             ),
             Some(usize::from(cols - 1))
         );
         // Negative and non-finite clicks are rejected.
-        assert_eq!(terminal_column_at(-1.0, cols, POC_CELL_WIDTH), None);
-        assert_eq!(terminal_column_at(f64::NAN, cols, POC_CELL_WIDTH), None);
+        assert_eq!(terminal_column_at(-1.0, cols, cell_width), None);
+        assert_eq!(terminal_column_at(f64::NAN, cols, cell_width), None);
     }
 
     /// Issue #76: at a non-default cell width, the sidebar's drawn pixel
@@ -2890,7 +2895,8 @@ mod tests {
     #[test]
     fn sidebar_offset_first_terminal_column_reports_col_1() {
         let cols = 40_u16;
-        let col = terminal_column_at(sidebar_pixel_width(), cols)
+        let cell_width = GridGeometry::poc().cell_width();
+        let col = terminal_column_at(sidebar_pixel_width(cell_width), cols, cell_width)
             .expect("first terminal column must map to a cell");
         assert_eq!(col, 0, "sidebar offset: first terminal column = cell 0");
 
@@ -2915,14 +2921,15 @@ mod tests {
     #[test]
     fn sidebar_click_produces_no_terminal_column() {
         let cols = 40_u16;
-        let edge = sidebar_pixel_width();
+        let cell_width = GridGeometry::poc().cell_width();
+        let edge = sidebar_pixel_width(cell_width);
         assert_eq!(
-            terminal_column_at(edge - 1.0, cols),
+            terminal_column_at(edge - 1.0, cols, cell_width),
             None,
             "last sidebar column must not map to a terminal cell"
         );
         assert_eq!(
-            terminal_column_at(0.0, cols),
+            terminal_column_at(0.0, cols, cell_width),
             None,
             "leftmost pixel is sidebar"
         );
@@ -3056,20 +3063,24 @@ mod tests {
     /// same sign convention.
     #[test]
     fn wheel_clicks_direction_and_count() {
+        let metrics = GridGeometry::poc().cell_metrics();
         // LineDelta: positive y = wheel up (content moves down, revealing
         // earlier content). See the winit sentence quoted above.
-        let up = wheel_clicks(MouseScrollDelta::LineDelta(0.0, 1.0));
+        let up = wheel_clicks(MouseScrollDelta::LineDelta(0.0, 1.0), metrics);
         assert_eq!(up, vec![WheelDirection::Up]);
 
         // Negative y = wheel down.
-        let down = wheel_clicks(MouseScrollDelta::LineDelta(0.0, -3.0));
+        let down = wheel_clicks(MouseScrollDelta::LineDelta(0.0, -3.0), metrics);
         assert_eq!(down, vec![WheelDirection::Down; 3]);
 
         // PixelDelta shares the same sign convention: positive y = wheel up.
-        let pixel_up = wheel_clicks(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
-            0.0,
-            f64::from(POC_CELL_HEIGHT) * 2.0,
-        )));
+        let pixel_up = wheel_clicks(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+                0.0,
+                f64::from(metrics.height()) * 2.0,
+            )),
+            metrics,
+        );
         assert_eq!(pixel_up, vec![WheelDirection::Up; 2]);
 
         // Pin the full path through the encoder so the emitted bytes are fixed:
@@ -3096,15 +3107,60 @@ mod tests {
     /// the PTY — a spurious `Down` click would corrupt the application.
     #[test]
     fn wheel_clicks_zero_delta_produces_nothing() {
+        let metrics = GridGeometry::poc().cell_metrics();
         // PixelDelta zero — the resting-trackpad case the bug shipped on.
-        let pixel_zero = wheel_clicks(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
-            0.0, 0.0,
-        )));
+        let pixel_zero = wheel_clicks(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, 0.0)),
+            metrics,
+        );
         assert!(pixel_zero.is_empty(), "zero PixelDelta must emit nothing");
 
         // LineDelta zero must likewise emit nothing.
-        let line_zero = wheel_clicks(MouseScrollDelta::LineDelta(0.0, 0.0));
+        let line_zero = wheel_clicks(MouseScrollDelta::LineDelta(0.0, 0.0), metrics);
         assert!(line_zero.is_empty(), "zero LineDelta must emit nothing");
+    }
+
+    /// A `PixelDelta` must convert pixels to lines at the **configured** cell
+    /// height, never a compile-time constant. Built the same way the app builds
+    /// its geometry — from parsed configuration — at `cell_height = 40`, double
+    /// the PoC default of 20. A 40px scroll is exactly one line here; if
+    /// `wheel_clicks` divided by the hardcoded default it would yield two. This
+    /// is the guard that stops the constant creeping back into the pixel→line
+    /// conversion.
+    #[test]
+    fn wheel_clicks_pixel_delta_uses_configured_cell_height() {
+        let config = AppConfig::parse("[font]\ncell_height = 40\n").expect("valid configuration");
+        let metrics =
+            GridGeometry::with_cells(config.font().cell_width(), config.font().cell_height())
+                .expect("valid geometry")
+                .cell_metrics();
+        assert_eq!(metrics.height(), 40);
+
+        // One configured cell height of pixels up = exactly one wheel-up click.
+        // A hardcoded POC_CELL_HEIGHT (20) would divide 40px into two clicks.
+        let one_line_up = wheel_clicks(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, f64::from(metrics.height()))),
+            metrics,
+        );
+        assert_eq!(
+            one_line_up,
+            vec![WheelDirection::Up],
+            "at cell_height=40, 40px is one line, not the two a hardcoded 20 would give"
+        );
+
+        // Two configured cell heights down = exactly two wheel-down clicks.
+        let two_lines_down = wheel_clicks(
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+                0.0,
+                -f64::from(metrics.height()) * 2.0,
+            )),
+            metrics,
+        );
+        assert_eq!(
+            two_lines_down,
+            vec![WheelDirection::Down; 2],
+            "at cell_height=40, -80px is two lines, not the four a hardcoded 20 would give"
+        );
     }
 
     // ── Selection preservation with tracking disabled ───────────────────
@@ -3174,7 +3230,10 @@ mod tests {
 
         assert!(app.mouse_reportable());
 
-        app.cursor_position = Some(PhysicalPosition::new(sidebar_pixel_width(), 0.0));
+        app.cursor_position = Some(PhysicalPosition::new(
+            sidebar_pixel_width(app.geometry.cell_width()),
+            0.0,
+        ));
         app.handle_mouse_button(ElementState::Pressed, MouseButton::Left);
         assert_eq!(
             app.held_mouse_button, None,
@@ -3220,7 +3279,10 @@ mod tests {
         // still returns None, so no motion report is encoded — but even if it
         // did resolve, the button field would be None because
         // `held_mouse_button` was never set, so no orphan drag report.
-        app.handle_mouse_move(PhysicalPosition::new(sidebar_pixel_width(), 0.0));
+        app.handle_mouse_move(PhysicalPosition::new(
+            sidebar_pixel_width(app.geometry.cell_width()),
+            0.0,
+        ));
         assert_eq!(
             app.held_mouse_button, None,
             "no orphan motion report: held button is still None"
