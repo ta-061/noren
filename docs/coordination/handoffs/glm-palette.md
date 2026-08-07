@@ -49,7 +49,7 @@ A test asserts that no canonical command id or label contains `pane`, `tab`,
 `Command<A>` is **generic over the action type**. The palette defines no session or
 sidebar action enum of its own, so it cannot drift into a parallel vocabulary. At
 wire-up, `A` is bound to the shared action type that reuses `SessionAction` from
-`docs/coordination/decisions/D-M3-001-session-api.md` (which did not yet exist on
+`docs/coordination/session-api.md` (which did not yet exist on
 `main` when this lane ran). `Palette::noren(create, select, close, sidebar_focus)`
 takes the four dispatchable actions from the caller — the wiring layer supplies the
 real `SessionAction`/sidebar values, and the palette only assigns the stable IDs and
