@@ -2,10 +2,8 @@
 //!
 //! These tests speak the leased public API the way the task describes. They
 //! import the session contract types from the crate's `session` module, owned
-//! by task M3-1a (D-M3-001); the sidebar never redefines them. Both modules
-//! are still unwired in `lib.rs` — export wiring is the serial integration
-//! commit — so this target begins compiling once that commit lands
-//! `pub mod session;` and `pub mod sidebar;`.
+//! by task M3-1a (see `docs/coordination/session-api.md`); the sidebar never
+//! redefines them.
 
 use std::collections::BTreeSet;
 
@@ -93,8 +91,18 @@ fn empty_sidebar_yields_an_empty_state_view_not_a_panic() {
     let empty = view
         .empty_state()
         .expect("empty sidebar carries its notice");
-    assert_eq!(empty.message(), EMPTY_SIDEBAR_MESSAGE);
-    assert_eq!(empty, &EmptyState::new(EMPTY_SIDEBAR_MESSAGE.to_string()));
+    // Pin the literal text, not the constant. Comparing `message()` to
+    // `EMPTY_SIDEBAR_MESSAGE` is a tautology: `build()` constructs the
+    // `EmptyState` from that same constant (`sidebar.rs:256`), so the assertion
+    // holds for any value the constant takes. A reviewer mutated the constant to
+    // "MUTATED" and all ten tests still passed. The user-visible string is a
+    // documented guarantee and needs a test that fails when it changes.
+    assert_eq!(empty.message(), "No sessions");
+    assert_eq!(
+        EMPTY_SIDEBAR_MESSAGE, "No sessions",
+        "the exported constant is part of the public contract"
+    );
+    assert_eq!(empty, &EmptyState::new("No sessions".to_string()));
 }
 
 #[test]
