@@ -75,9 +75,10 @@ and two of its tests are `#[ignore]`d because they document real font defects
 to the `?` glyph). Key injection into the real window still does not exist, so
 live keyboard input remains unverified by automation; the byte-level input
 contract is covered by tests instead. Mouse reporting is no longer encoder-only:
-`MouseEncoder::encode` (`crates/noren-app/src/mouse.rs`) is now called from the
-pointer and wheel handlers in `main.rs`, which write the report bytes to the
-PTY. Truecolor is modelled in terminal state but not yet wired to drawing. IME
+`MouseEncoder::encode` (`crates/noren-app/src/mouse.rs`) is now reached from the
+pointer and wheel handlers in `main.rs` through their shared
+`encode_and_send_mouse` helper, which writes the report bytes to the PTY.
+Truecolor is modelled in terminal state but not yet wired to drawing. IME
 and accessibility remain deferred.
 
 No milestone date is promised. Implementation advances through scoped Issues,
@@ -110,7 +111,7 @@ Measured against it, item by item:
 | Sidebar-state persistence | Done | `sessions.toml` (`SESSION_STATE_FILE_NAME`) under the `config::default_path` directory, resolved by `session_state_path` |
 | Palette | Done | `Super+p` via `palette_policy`; `Palette::noren`'s four commands dispatched by `handle_palette_key` |
 | Configurable keybindings | **Not started** | `palette_policy` and `handle_palette_key` hard-code the chords; `config.rs` exposes no keymap surface |
-| Zellij pass-through | Done | `passthrough.rs` policy claims only Super-space chords the pinned Zellij default corpus never binds |
+| Zellij pass-through | Done against a pinned corpus | `passthrough.rs` policy claims only Super-space chords that the pinned Zellij `v0.44.3` default corpus (`ZELLIJ_FIXTURE_TAG`) never binds; no test drives a live Zellij |
 
 Two named scope items are unsatisfied: **configurable keybindings do not exist
 at all**, and the sidebar's **SSH-connection and agent kinds are fixtures** that
@@ -131,8 +132,8 @@ the Noren terminal." The reasoning and the decision are recorded in
   reach the binary: the sidebar is drawn, the palette opens on `Super+p`,
   sessions are created/selected/closed, mouse reports reach the PTY, and
   sidebar state persists across a restart. What is still missing is breadth —
-  only `SessionKind::Local` is ever constructed, so SSH hosts, git worktrees,
-  and agents are modelled but unreachable, and keybindings are not
+  no runtime path constructs anything but `SessionKind::Local`, so SSH hosts,
+  git worktrees and agents are modelled but unreachable, and keybindings are not
   configurable. See [Milestone 3 status](#milestone-3-status).
 - **The renderer is monochrome.** The fragment shader `fs_main` in
   `renderer.rs` returns a constant colour and the vertex layout carries no

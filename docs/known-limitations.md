@@ -35,10 +35,10 @@ binary. What now actually happens on screen:
   built by `Palette::noren`, routed through `handle_palette_key`. Arrow keys and
   Enter navigate the same list; Escape dismisses it.
 - **Mouse reporting reaches the program.** `handle_mouse_button`,
-  `handle_mouse_move`, and `handle_mouse_wheel` in `main.rs` call
-  `MouseEncoder::encode` and write the resulting report bytes to the PTY, so
-  clicks, drags, and the wheel now work in Zellij, `vim` with `set mouse=a`, and
-  `tmux`.
+  `handle_mouse_move`, and `handle_mouse_wheel` in `main.rs` each call
+  `encode_and_send_mouse`, the helper that invokes `MouseEncoder::encode` and
+  writes the resulting report bytes to the PTY, so clicks, drags, and the wheel
+  now work in Zellij, `vim` with `set mouse=a`, and `tmux`.
 - **Configured cell size reaches the renderer.** `[font] cell_width` /
   `cell_height` flow through `GridGeometry::with_cells` to the drawing path;
   the regression test `configured_cell_sizes_drive_the_app_geometry` in
@@ -126,7 +126,8 @@ Each item states what you would actually see if you ran the build.
   `Local`, `Project`, `Worktree`, `Ssh`, and `Agent`, and `EntryKind` in
   `sidebar.rs` can describe project, worktree, SSH-connection, and agent rows —
   but every creation path in the running binary passes `SessionKind::Local`
-  (the only variant `main.rs` constructs). The doc comments on the `Ssh` and
+  (the other variants are constructed only in `main.rs`'s tests, never on a
+  runtime path). The doc comments on the `Ssh` and
   `Agent` variants say so directly: *reserved*, *fixture only — no connection is
   opened*, *no agent is launched*. In practice: the palette's "New Session"
   gives you another local `zsh`, and there is no way to open an SSH host, a git
