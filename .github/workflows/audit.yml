@@ -14,14 +14,17 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: audit-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   deny:
     name: Dependency audit (cargo-deny)
     runs-on: ubuntu-latest
+    # Scoped per job: these two jobs use different runner pools, so a shared
+    # workflow-level concurrency group meant re-queuing the macOS MSRV job also
+    # cancelled a dependency audit that was about to pass.
+    concurrency:
+      group: audit-deny-${{ github.ref }}
+      cancel-in-progress: true
     timeout-minutes: 10
     steps:
       - name: Check out repository
@@ -45,6 +48,9 @@ jobs:
   msrv:
     name: Verify MSRV build (rust-version)
     runs-on: macos-14
+    concurrency:
+      group: audit-msrv-${{ github.ref }}
+      cancel-in-progress: true
     timeout-minutes: 20
     steps:
       - name: Check out repository
