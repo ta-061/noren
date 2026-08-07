@@ -15,5 +15,14 @@ toml_edit.workspace = true
 winit.workspace = true
 wgpu.workspace = true
 
+[features]
+test-support = []
+
+[dev-dependencies]
+# Self-dev-dependency so integration tests (separate crates) can reach the
+# `test-support`-gated `sidebar::fixtures` module without shipping it in
+# release builds.
+noren-app = { path = ".", features = ["test-support"] }
+
 [lints]
 workspace = true
