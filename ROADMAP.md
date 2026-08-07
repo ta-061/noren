@@ -81,10 +81,11 @@ concluded that the current tree cannot honestly be released as "0.1.0-preview of
 the Noren terminal." The reasoning and the decision are recorded in
 [D-M8-001](docs/coordination/decisions/D-M8-001-preview-scope.md). In short:
 
-- **The workspace is landed, not shipped.** All seven Milestone 3 modules are
-  files on `main`, but only `session` and `sidebar` are declared in `lib.rs`;
-  the rest are compiled only by tests via `#[path]` and are unreachable from the
-  binary (Issue #88). Launching the build still presents no workspace sidebar.
+- **The workspace is landed, not shipped.** The Milestone 3 modules (and the
+  M2 `mouse` module) are files on `main` and declared in `lib.rs` (PR #92), so
+  the library compiles them and CI covers them, but `main.rs` consumes none of
+  them and they are absent from the linked binary (Issue #88). Launching the
+  build still presents no workspace sidebar.
 - **The renderer is monochrome.** `renderer.rs:40` returns a constant colour and
   the vertex layout carries no colour channel, so `ls --color`, `vim`, and
   Zellij's status bar all draw in one shade. Truecolor is modelled in terminal
