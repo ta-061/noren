@@ -10,6 +10,10 @@ use noren_app::{
     config::AppConfig,
     diagnostics::{self, PtyChildStatus},
     encode_paste,
+    mouse::{
+        MouseButton as EncoderButton, MouseEncoder, MouseGrid, MouseModes, PointerEvent,
+        PointerModifiers, WheelDirection,
+    },
     palette::{CommandId, Palette},
     passthrough::{
         CLAIM_ID_PALETTE, Chord, ChordSeq, GateKind, KeyCode as GateKeyCode,
@@ -29,7 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key as WinitKey, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -202,6 +206,103 @@ fn created_session_id(events: Vec<SessionEvent>) -> SessionId {
         .expect("SessionAction::Create yields exactly one Created event")
 }
 
+/// Passive scanner that observes DECSET (`CSI ? Pn h`) and DECRST
+/// (`CSI ? Pn l`) sequences in PTY *output* and updates the app's
+/// [`MouseModes`].
+///
+/// TerminalState's parser recognises only modes 1, 1049, and 2004; mouse
+/// tracking and encoding modes (1000/1002/1003/1005/1006/1015) are dropped at
+/// `private_action` and never reach `TerminalModes`. This scanner sits on the
+/// output side as a read-only observer — it consumes no bytes and alters no
+/// parsing — so the terminal's own state machine is undisturbed. It exists
+/// because the alternative (a second parser) is what the project keeps filing
+/// as a bug; this is the narrowest possible seam.
+///
+/// Cross-chunk boundaries: the DFA retains its state across calls, so a
+/// `CSI ? 1000 h` split across two `PtyEvent::Output` chunks is still detected.
+#[derive(Default)]
+struct MouseModeScanner {
+    state: ScanState,
+    /// Parsed parameter values; supports multi-param sequences
+    /// (`CSI ? 1000 ; 1006 h`).
+    params: Vec<u16>,
+}
+
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanState {
+    #[default]
+    Ground,
+    Esc,
+    Csi,
+    /// After `ESC [ ?` or after a `;` separator — expecting the first digit
+    /// of the next parameter.
+    CsiQuestion,
+    /// Accumulating digits of the current parameter.
+    Param,
+}
+
+impl MouseModeScanner {
+    /// Feed one PTY output byte. Updates `modes` when a complete DECSET/DECRST
+    /// for a recognized mouse mode is observed.
+    fn feed(&mut self, byte: u8, modes: &mut MouseModes) {
+        // ESC always starts a fresh sequence regardless of current state.
+        if byte == 0x1b {
+            self.params.clear();
+            self.state = ScanState::Esc;
+            return;
+        }
+        match (self.state, byte) {
+            (ScanState::Esc, b'[') => {
+                self.state = ScanState::Csi;
+            }
+            (ScanState::Csi, b'?') => {
+                self.params.clear();
+                self.state = ScanState::CsiQuestion;
+            }
+            (ScanState::CsiQuestion, digit @ b'0'..=b'9') => {
+                self.params.push(u16::from(digit - b'0'));
+                self.state = ScanState::Param;
+            }
+            (ScanState::Param, digit @ b'0'..=b'9') => {
+                if let Some(last) = self.params.last_mut() {
+                    *last = last
+                        .saturating_mul(10)
+                        .saturating_add(u16::from(digit - b'0'));
+                }
+            }
+            (ScanState::Param, b';') => {
+                // Multi-parameter: wait for the next digit.
+                self.state = ScanState::CsiQuestion;
+            }
+            (ScanState::Param, b'h') => {
+                for &mode in &self.params {
+                    *modes = modes.set(mode, true);
+                }
+                self.params.clear();
+                self.state = ScanState::Ground;
+            }
+            (ScanState::Param, b'l') => {
+                for &mode in &self.params {
+                    *modes = modes.set(mode, false);
+                }
+                self.params.clear();
+                self.state = ScanState::Ground;
+            }
+            _ => {
+                self.params.clear();
+                self.state = ScanState::Ground;
+            }
+        }
+    }
+
+    /// Convenience: feed an entire byte slice.
+    fn scan(&mut self, bytes: &[u8], modes: &mut MouseModes) {
+        for &byte in bytes {
+            self.feed(byte, modes);
+        }
+    }
+}
+
 struct NorenApp {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -223,6 +324,15 @@ struct NorenApp {
     drag_origin: Option<GridPoint>,
     drag_mode: SelectionMode,
     cursor_position: Option<PhysicalPosition<f64>>,
+    /// Mouse tracking/encoding modes observed from PTY output (DECSET/DECRST).
+    /// TerminalState does not track mouse modes, so the app maintains this as
+    /// the single source of truth for whether pointer events are reported.
+    mouse_modes: MouseModes,
+    /// DFA retaining partial DECSET/DECRST sequences across PTY chunks.
+    mouse_mode_scanner: MouseModeScanner,
+    /// The currently-held mouse button when tracking is active, or `None`.
+    /// Drives the `button` field of motion (drag/hover) reports.
+    held_mouse_button: Option<MouseButton>,
     workspace: WorkspaceState,
     active_session: Option<SessionId>,
     palette_open: bool,
@@ -262,6 +372,9 @@ impl NorenApp {
             drag_origin: None,
             drag_mode: SelectionMode::Char,
             cursor_position: None,
+            mouse_modes: MouseModes::disabled(),
+            mouse_mode_scanner: MouseModeScanner::default(),
+            held_mouse_button: None,
             workspace: WorkspaceState::new(),
             active_session: None,
             palette_open: false,
@@ -656,6 +769,14 @@ impl NorenApp {
 
     fn handle_mouse_move(&mut self, position: PhysicalPosition<f64>) {
         self.cursor_position = Some(position);
+        if self.mouse_reportable() {
+            if let Some((col, row)) = self.mouse_cell_at(position) {
+                let button = self.held_mouse_button.and_then(encode_button);
+                let event = PointerEvent::move_to(button, col, row, self.pointer_modifiers());
+                self.encode_and_send_mouse(event);
+            }
+            return;
+        }
         let Some(origin) = self.drag_origin else {
             return;
         };
@@ -668,6 +789,12 @@ impl NorenApp {
     }
 
     fn handle_mouse_button(&mut self, state: ElementState, button: MouseButton) {
+        if self.mouse_reportable() {
+            self.handle_tracked_mouse_button(state, button);
+            return;
+        }
+        // Tracking disabled (or Shift-bypassed): byte-identical to the
+        // pre-tracking selection behaviour.
         if button != MouseButton::Left {
             return;
         }
@@ -697,6 +824,56 @@ impl NorenApp {
             ElementState::Released => {
                 self.drag_origin = None;
             }
+        }
+    }
+
+    /// Handle a mouse button event while tracking is active (no Shift bypass).
+    ///
+    /// Encodes a press or release report for Left/Middle/Right and sends it to
+    /// the PTY. Sidebar clicks and unmapped buttons produce no bytes. The held
+    /// button is tracked as early as possible so that subsequent motion events
+    /// carry the correct button parameter — even a press that produced no
+    /// report (e.g. in the sidebar) still updates the tracking state.
+    fn handle_tracked_mouse_button(&mut self, state: ElementState, button: MouseButton) {
+        let Some(encode_btn) = encode_button(button) else {
+            return;
+        };
+        match state {
+            ElementState::Pressed => self.held_mouse_button = Some(button),
+            ElementState::Released => self.held_mouse_button = None,
+        }
+        let Some(position) = self.cursor_position else {
+            return;
+        };
+        let Some((col, row)) = self.mouse_cell_at(position) else {
+            return;
+        };
+        let kind = match state {
+            ElementState::Pressed => noren_app::mouse::PointerKind::Press(encode_btn),
+            ElementState::Released => noren_app::mouse::PointerKind::Release(encode_btn),
+        };
+        let event = PointerEvent::new(kind, col, row, self.pointer_modifiers());
+        self.encode_and_send_mouse(event);
+    }
+
+    /// Handle a scroll-wheel event. Under tracking, each line of delta
+    /// generates one wheel report; without tracking, the event is ignored
+    /// (matching the pre-tracking behaviour where `MouseWheel` fell into the
+    /// `_ => {}` catch-all).
+    fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
+        if !self.mouse_reportable() {
+            return;
+        }
+        let Some(position) = self.cursor_position else {
+            return;
+        };
+        let Some((col, row)) = self.mouse_cell_at(position) else {
+            return;
+        };
+        let mods = self.pointer_modifiers();
+        for direction in wheel_clicks(delta) {
+            let event = PointerEvent::wheel(direction, col, row, mods);
+            self.encode_and_send_mouse(event);
         }
     }
 
@@ -740,6 +917,67 @@ impl NorenApp {
             terminal.scrollback_len() + line_index,
             column,
         ))
+    }
+
+    /// Whether pointer events should be reported to the PTY instead of driving
+    /// local text selection. Active when a tracking mode (1000/1002/1003) is on
+    /// and Shift is not held — Shift bypasses reporting so the user can still
+    /// select text while a program tracks the mouse, matching xterm/iTerm.
+    fn mouse_reportable(&self) -> bool {
+        self.mouse_modes.is_tracked() && !self.modifiers.is_shift()
+    }
+
+    /// Map a pixel position to 0-based `(col, row)` cell indices suitable for
+    /// the mouse encoder. Delegates to [`grid_point_at`](Self::grid_point_at)
+    /// which already excludes sidebar clicks and accounts for the bottom-aligned
+    /// content layout, then converts the absolute scrollback line to a
+    /// 0-based visible row.
+    fn mouse_cell_at(&self, position: PhysicalPosition<f64>) -> Option<(u32, u32)> {
+        let terminal = self.terminal.as_ref()?;
+        let point = self.grid_point_at(position)?;
+        let visible_row = point.line().checked_sub(terminal.scrollback_len())?;
+        let col = u32::try_from(point.column()).ok()?;
+        let row = u32::try_from(visible_row).ok()?;
+        Some((col, row))
+    }
+
+    /// Build a [`MouseGrid`] from the terminal's current size for encoder
+    /// clamping. The terminal's column count already excludes the sidebar
+    /// (via [`terminal_cols`]), so clamping uses the correct grid bounds.
+    fn mouse_grid(&self) -> Option<MouseGrid> {
+        let terminal = self.terminal.as_ref()?;
+        let (rows, cols) = terminal.size();
+        MouseGrid::new(rows, cols)
+    }
+
+    /// Convert the app's current modifier state to mouse pointer modifiers.
+    /// Super/Command is excluded (the window layer drops it), matching the key
+    /// encoder's policy.
+    fn pointer_modifiers(&self) -> PointerModifiers {
+        let mut mods = PointerModifiers::empty();
+        if self.modifiers.is_shift() {
+            mods = mods.shift();
+        }
+        if self.modifiers.is_alt() {
+            mods = mods.alt();
+        }
+        if self.modifiers.is_ctrl() {
+            mods = mods.ctrl();
+        }
+        mods
+    }
+
+    /// Encode one pointer event and write the report bytes to the PTY. When
+    /// the encoder returns `None` (event not reportable under the active
+    /// tracking mode, or coordinate out of range), no bytes are sent.
+    fn encode_and_send_mouse(&mut self, event: PointerEvent) {
+        let Some(grid) = self.mouse_grid() else {
+            return;
+        };
+        let modes = self.mouse_modes;
+        if let Some(bytes) = MouseEncoder::encode(event, modes, grid) {
+            self.send_input(&bytes);
+        }
     }
 
     fn send_input(&mut self, bytes: &[u8]) {
@@ -853,6 +1091,9 @@ impl NorenApp {
                         break;
                     }
                     remaining -= bytes.len();
+                    // Passively observe DECSET/DECRST for mouse modes before
+                    // feeding the terminal. The scanner consumes no bytes.
+                    self.mouse_mode_scanner.scan(&bytes, &mut self.mouse_modes);
                     if let Some(terminal) = &mut self.terminal {
                         terminal.feed_bytes(&bytes);
                     }
@@ -999,6 +1240,7 @@ impl ApplicationHandler for NorenApp {
             WindowEvent::MouseInput { state, button, .. } => {
                 self.handle_mouse_button(state, button)
             }
+            WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(&event),
             WindowEvent::Ime(_) => {
                 let _ = KeyDropReason::ImeOrDeadKey;
@@ -1231,6 +1473,36 @@ fn terminal_column_at(pixel_x: f64, terminal_cols: u16) -> Option<usize> {
     }
     pixel_row_index(pixel_x - sidebar_pixel_width(), POC_CELL_WIDTH)
         .map(|raw| raw.min(usize::from(terminal_cols).saturating_sub(1)))
+}
+
+/// Map a winit mouse button to the encoder's button type. `Back`, `Forward`,
+/// and `Other` are not reportable and return `None`.
+fn encode_button(button: MouseButton) -> Option<EncoderButton> {
+    match button {
+        MouseButton::Left => Some(EncoderButton::Left),
+        MouseButton::Middle => Some(EncoderButton::Middle),
+        MouseButton::Right => Some(EncoderButton::Right),
+        MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => None,
+    }
+}
+
+/// Convert a winit scroll delta to a sequence of wheel directions (one per
+/// line scrolled). Positive vertical delta means content moves down (wheel
+/// down); negative means wheel up. A non-zero delta that rounds to zero lines
+/// still produces one click so a single-notch wheel is never lost.
+fn wheel_clicks(delta: MouseScrollDelta) -> Vec<WheelDirection> {
+    let lines = match delta {
+        MouseScrollDelta::LineDelta(_, y) => y,
+        MouseScrollDelta::PixelDelta(pos) => (pos.y / f64::from(POC_CELL_HEIGHT)) as f32,
+    };
+    let count = lines.abs().floor().max(0.0) as usize;
+    let count = if count == 0 && lines != 0.0 { 1 } else { count };
+    let direction = if lines < 0.0 {
+        WheelDirection::Up
+    } else {
+        WheelDirection::Down
+    };
+    vec![direction; count.max(1)]
 }
 
 /// Number of visible grid rows the renderer will draw: rows up to and
@@ -2384,5 +2656,374 @@ mod tests {
             "first line must not be selected, got {:?}",
             lines[0]
         );
+    }
+
+    // ── Mouse mode scanner ───────────────────────────────────────────────
+
+    /// DECSET 1000 is detected and enables tracking. This is the most basic
+    /// mode-detection test: without it, no mouse event ever reaches the PTY.
+    #[test]
+    fn scanner_detects_decset_1000_and_enables_tracking() {
+        let mut scanner = MouseModeScanner::default();
+        let mut modes = MouseModes::disabled();
+        scanner.scan(b"\x1b[?1000h", &mut modes);
+        assert!(modes.is_tracked(), "mode 1000 must enable tracking");
+    }
+
+    /// DECRST clears a previously-set mode. If reset is broken, a program
+    /// that disables tracking would still receive reports.
+    #[test]
+    fn scanner_detects_decrst_and_clears_mode() {
+        let mut scanner = MouseModeScanner::default();
+        let mut modes = MouseModes::disabled();
+        scanner.scan(b"\x1b[?1000h\x1b[?1000l", &mut modes);
+        assert!(!modes.is_tracked(), "DECRST must clear the mode");
+    }
+
+    /// Multiple mouse modes in one DECSET (`CSI ? 1002 ; 1006 h`) are all
+    /// applied. Zellij enables tracking and encoding in a single sequence on
+    /// attach, so this is the realistic path.
+    #[test]
+    fn scanner_handles_multi_param_decset() {
+        let mut scanner = MouseModeScanner::default();
+        let mut modes = MouseModes::disabled();
+        scanner.scan(b"\x1b[?1002;1006h", &mut modes);
+        assert!(modes.is_tracked(), "1002 must be set");
+        // Encoding must also be set; verify via the SGR output form.
+        let grid = MouseGrid::new(10, 40).expect("grid");
+        let event = PointerEvent::press(EncoderButton::Left, 0, 0, PointerModifiers::empty());
+        let bytes = MouseEncoder::encode(event, modes, grid).expect("must encode");
+        assert!(
+            bytes.starts_with(b"\x1b[<"),
+            "1006 SGR must be active after multi-param DECSET, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    /// A sequence split across two scan() calls is still detected. PTY output
+    /// arrives in arbitrary chunks; the DFA must retain state.
+    #[test]
+    fn scanner_retains_state_across_chunks() {
+        let mut scanner = MouseModeScanner::default();
+        let mut modes = MouseModes::disabled();
+        scanner.scan(b"\x1b[?10", &mut modes);
+        assert!(!modes.is_tracked(), "partial sequence must not set mode");
+        scanner.scan(b"00h", &mut modes);
+        assert!(modes.is_tracked(), "completed sequence must set mode");
+    }
+
+    /// Unrelated private modes (1049, 2004) do not alter mouse tracking.
+    #[test]
+    fn scanner_ignores_non_mouse_private_modes() {
+        let mut scanner = MouseModeScanner::default();
+        let mut modes = MouseModes::disabled().with_normal(true);
+        scanner.scan(b"\x1b[?1049h\x1b[?2004h\x1b[?1h", &mut modes);
+        assert!(
+            modes.is_tracked(),
+            "non-mouse modes must not change tracking"
+        );
+    }
+
+    /// Random garbage between valid sequences does not confuse the DFA.
+    #[test]
+    fn scanner_recovers_from_garbage_between_sequences() {
+        let mut scanner = MouseModeScanner::default();
+        let mut modes = MouseModes::disabled();
+        scanner.scan(b"garbage\x1b[?1000h more text", &mut modes);
+        assert!(
+            modes.is_tracked(),
+            "DECSET after garbage must still be detected"
+        );
+    }
+
+    // ── Tracking / selection-bypass policy ──────────────────────────────
+
+    /// With no tracking mode set, events are not reportable and local
+    /// selection runs unchanged — byte-identical to the pre-tracking behaviour.
+    #[test]
+    fn no_tracking_mode_means_not_reportable() {
+        let app = NorenApp::default();
+        assert!(!app.mouse_reportable());
+    }
+
+    /// Mode 1000 without Shift: tracking active, events go to the PTY.
+    #[test]
+    fn mode_1000_without_shift_is_reportable() {
+        let app = NorenApp {
+            mouse_modes: MouseModes::disabled().with_normal(true),
+            ..Default::default()
+        };
+        assert!(app.mouse_reportable());
+    }
+
+    /// Shift bypasses tracking so the user can still select text in a program
+    /// that enabled mouse reporting. This is the standard xterm/iTerm policy.
+    #[test]
+    fn shift_bypasses_tracking_for_local_selection() {
+        let mut app = NorenApp {
+            mouse_modes: MouseModes::disabled().with_normal(true),
+            ..Default::default()
+        };
+
+        assert!(app.mouse_reportable(), "active without Shift");
+
+        app.modifiers = Modifiers::empty().shift();
+        assert!(!app.mouse_reportable(), "Shift bypasses tracking");
+    }
+
+    // ── Sidebar offset and coordinate mapping ───────────────────────────
+
+    /// A click on the first terminal column (exactly at the sidebar edge)
+    /// reports column 1, not 17. This exercises the sidebar subtraction in
+    /// `terminal_column_at` through the encoder's 1-based conversion — if the
+    /// sidebar offset were dropped, the column would be 17 (16 sidebar cells
+    /// + 1).
+    #[test]
+    fn sidebar_offset_first_terminal_column_reports_col_1() {
+        let cols = 40_u16;
+        let col = terminal_column_at(sidebar_pixel_width(), cols)
+            .expect("first terminal column must map to a cell");
+        assert_eq!(col, 0, "sidebar offset: first terminal column = cell 0");
+
+        let grid = MouseGrid::new(10, cols).expect("grid");
+        let modes = MouseModes::disabled().with_normal(true).with_sgr(true);
+        let event = PointerEvent::press(
+            EncoderButton::Left,
+            col as u32,
+            0,
+            PointerModifiers::empty(),
+        );
+        let bytes = MouseEncoder::encode(event, modes, grid).expect("must encode");
+        let report = String::from_utf8(bytes).expect("SGR is ASCII");
+        assert_eq!(
+            report, "\x1b[<0;1;1M",
+            "column must be 1 (sidebar offset applied), not 17"
+        );
+    }
+
+    /// A click inside the sidebar produces no terminal column, hence no PTY
+    /// bytes can be constructed for it.
+    #[test]
+    fn sidebar_click_produces_no_terminal_column() {
+        let cols = 40_u16;
+        let edge = sidebar_pixel_width();
+        assert_eq!(
+            terminal_column_at(edge - 1.0, cols),
+            None,
+            "last sidebar column must not map to a terminal cell"
+        );
+        assert_eq!(
+            terminal_column_at(0.0, cols),
+            None,
+            "leftmost pixel is sidebar"
+        );
+    }
+
+    // ── Encoder integration: tracking modes ─────────────────────────────
+
+    /// Mode 1000 with X10 byte form: a left click at (0,0) produces
+    /// `ESC[M` followed by three offset bytes (32, 33, 33 for button-0,
+    /// col-1, row-1).
+    #[test]
+    fn mode_1000_x10_left_click_at_origin() {
+        let grid = MouseGrid::new(10, 40).expect("grid");
+        let modes = MouseModes::disabled().with_normal(true);
+        let event = PointerEvent::press(EncoderButton::Left, 0, 0, PointerModifiers::empty());
+        let bytes = MouseEncoder::encode(event, modes, grid).expect("must encode");
+        // Cb=0→32, Cx=1→33, Cy=1→33
+        assert_eq!(bytes, b"\x1b[M\x20\x21\x21");
+    }
+
+    /// Mode 1002 (button-event): drag with left button held produces motion
+    /// reports. A Move with a held button must produce bytes under 1002.
+    #[test]
+    fn mode_1002_drag_produces_motion_report() {
+        let grid = MouseGrid::new(10, 40).expect("grid");
+        let modes = MouseModes::disabled()
+            .with_button_event(true)
+            .with_sgr(true);
+        let event =
+            PointerEvent::move_to(Some(EncoderButton::Left), 2, 0, PointerModifiers::empty());
+        let bytes = MouseEncoder::encode(event, modes, grid).expect("must encode");
+        // Cb = 0 (button1) | 32 (motion) = 32; Cx=3, Cy=1
+        let report = String::from_utf8(bytes).expect("SGR");
+        assert_eq!(report, "\x1b[<32;3;1M");
+    }
+
+    /// Mode 1003 (any-event): hover with no button held produces motion
+    /// reports. Under 1002 alone this would return None.
+    #[test]
+    fn mode_1003_hover_produces_motion_report() {
+        let grid = MouseGrid::new(10, 40).expect("grid");
+        let modes = MouseModes::disabled().with_any_event(true).with_sgr(true);
+        let event = PointerEvent::move_to(None, 2, 0, PointerModifiers::empty());
+        let bytes = MouseEncoder::encode(event, modes, grid).expect("must encode");
+        // Cb = 3 (no-button) | 32 (motion) = 35; Cx=3, Cy=1
+        let report = String::from_utf8(bytes).expect("SGR");
+        assert_eq!(report, "\x1b[<35;3;1M");
+    }
+
+    /// Mode 1003 hover must NOT report under 1002 (button-event) alone.
+    #[test]
+    fn mode_1002_hover_without_button_produces_nothing() {
+        let grid = MouseGrid::new(10, 40).expect("grid");
+        let modes = MouseModes::disabled().with_button_event(true);
+        let event = PointerEvent::move_to(None, 2, 0, PointerModifiers::empty());
+        assert_eq!(
+            MouseEncoder::encode(event, modes, grid),
+            None,
+            "1002 must not report hover"
+        );
+    }
+
+    /// Mode 1015 (urxvt): `CSI Cb ; Cx ; Cy M` — decimal, no angle bracket.
+    #[test]
+    fn mode_1015_uses_urxvt_format() {
+        let grid = MouseGrid::new(10, 40).expect("grid");
+        let modes = MouseModes::disabled().with_normal(true).with_urxvt(true);
+        let event = PointerEvent::press(EncoderButton::Left, 0, 0, PointerModifiers::empty());
+        let bytes = MouseEncoder::encode(event, modes, grid).expect("must encode");
+        let report = String::from_utf8(bytes).expect("urxvt is ASCII");
+        assert_eq!(report, "\x1b[0;1;1M");
+    }
+
+    /// No tracking mode: the encoder returns None for every event kind.
+    #[test]
+    fn no_modes_means_no_bytes_for_any_mouse_event() {
+        let grid = MouseGrid::new(10, 40).expect("grid");
+        let modes = MouseModes::disabled();
+        let press = PointerEvent::press(EncoderButton::Left, 0, 0, PointerModifiers::empty());
+        let release = PointerEvent::release(EncoderButton::Left, 0, 0, PointerModifiers::empty());
+        let motion =
+            PointerEvent::move_to(Some(EncoderButton::Left), 1, 0, PointerModifiers::empty());
+        let wheel = PointerEvent::wheel(WheelDirection::Up, 0, 0, PointerModifiers::empty());
+        for (label, event) in [
+            ("press", press),
+            ("release", release),
+            ("motion", motion),
+            ("wheel", wheel),
+        ] {
+            assert_eq!(
+                MouseEncoder::encode(event, modes, grid),
+                None,
+                "{label} must produce nothing with no modes"
+            );
+        }
+    }
+
+    // ── Button and wheel mapping ────────────────────────────────────────
+
+    /// Left/Middle/Right map to the encoder's button enum; Back/Forward/Other
+    /// return None and are never reported.
+    #[test]
+    fn encode_button_maps_known_and_ignores_extended() {
+        assert_eq!(encode_button(MouseButton::Left), Some(EncoderButton::Left));
+        assert_eq!(
+            encode_button(MouseButton::Middle),
+            Some(EncoderButton::Middle)
+        );
+        assert_eq!(
+            encode_button(MouseButton::Right),
+            Some(EncoderButton::Right)
+        );
+        assert_eq!(encode_button(MouseButton::Back), None);
+        assert_eq!(encode_button(MouseButton::Forward), None);
+        assert_eq!(encode_button(MouseButton::Other(1)), None);
+    }
+
+    /// Wheel delta sign maps to direction, and magnitude maps to click count.
+    #[test]
+    fn wheel_clicks_direction_and_count() {
+        // LineDelta: negative y = wheel up
+        let up = wheel_clicks(MouseScrollDelta::LineDelta(0.0, -1.0));
+        assert_eq!(up, vec![WheelDirection::Up]);
+
+        // Positive y = wheel down
+        let down = wheel_clicks(MouseScrollDelta::LineDelta(0.0, 3.0));
+        assert_eq!(down, vec![WheelDirection::Down; 3]);
+
+        // PixelDelta: convert by cell height
+        let pixel_up = wheel_clicks(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+            0.0,
+            -f64::from(POC_CELL_HEIGHT) * 2.0,
+        )));
+        assert_eq!(pixel_up, vec![WheelDirection::Up; 2]);
+    }
+
+    // ── Selection preservation with tracking disabled ───────────────────
+
+    /// With tracking disabled, a left press sets up the same selection state
+    /// as before (drag_origin, selection, drag_mode). We verify the gate
+    /// (`mouse_reportable`) is false so the handler follows the selection
+    /// branch; the selection code itself is unchanged.
+    #[test]
+    fn disabled_tracking_routes_to_selection_not_pty() {
+        let mut terminal = TerminalState::new(4, 8).expect("valid terminal");
+        terminal.feed_bytes(b"hello");
+        let mut app = NorenApp {
+            terminal: Some(terminal),
+            ..Default::default()
+        };
+
+        // Tracking disabled: reportable is false.
+        assert!(!app.mouse_reportable());
+
+        // Attempt a press; without a window grid_point_at returns None and
+        // no selection starts — but crucially, held_mouse_button stays None
+        // (the tracking branch was not entered).
+        app.cursor_position = Some(PhysicalPosition::new(0.0, 0.0));
+        app.handle_mouse_button(ElementState::Pressed, MouseButton::Left);
+        assert_eq!(app.held_mouse_button, None, "tracking branch must not run");
+    }
+
+    /// With tracking enabled and Shift held, the bypass routes to selection,
+    /// not to the PTY — held_mouse_button must stay None.
+    #[test]
+    fn shift_bypass_with_tracking_routes_to_selection() {
+        let mut terminal = TerminalState::new(4, 8).expect("valid terminal");
+        terminal.feed_bytes(b"hello");
+        let mut app = NorenApp {
+            terminal: Some(terminal),
+            mouse_modes: MouseModes::disabled().with_normal(true),
+            modifiers: Modifiers::empty().shift(),
+            ..Default::default()
+        };
+
+        // Tracking is on but Shift bypasses it.
+        assert!(!app.mouse_reportable());
+
+        app.cursor_position = Some(PhysicalPosition::new(0.0, 0.0));
+        app.handle_mouse_button(ElementState::Pressed, MouseButton::Left);
+        assert_eq!(
+            app.held_mouse_button, None,
+            "Shift bypass must not enter the tracking branch"
+        );
+    }
+
+    /// With tracking enabled (no Shift), a press enters the tracking branch
+    /// and sets held_mouse_button — even though grid_point_at returns None
+    /// without a window, the branch is entered and the button is tracked.
+    #[test]
+    fn tracking_enabled_press_enters_tracking_branch() {
+        let terminal = TerminalState::new(4, 8).expect("valid terminal");
+        let mut app = NorenApp {
+            terminal: Some(terminal),
+            mouse_modes: MouseModes::disabled().with_normal(true),
+            ..Default::default()
+        };
+
+        assert!(app.mouse_reportable());
+
+        app.cursor_position = Some(PhysicalPosition::new(sidebar_pixel_width(), 0.0));
+        app.handle_mouse_button(ElementState::Pressed, MouseButton::Left);
+        assert_eq!(
+            app.held_mouse_button,
+            Some(MouseButton::Left),
+            "tracking branch must track the held button"
+        );
+
+        // Release clears it.
+        app.handle_mouse_button(ElementState::Released, MouseButton::Left);
+        assert_eq!(app.held_mouse_button, None, "release must clear the button");
     }
 }
