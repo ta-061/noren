@@ -5,8 +5,7 @@ mod renderer;
 use noren_app::{
     Arrow, CursorKeyMode, FunctionKey, GridGeometry, GridSize, InputMode, Key, KeyDropReason,
     KeyEncoder, KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode, MAX_RENDER_COLS,
-    MAX_RENDER_ROWS, Modifiers, PARSE_BUDGET_BYTES_PER_TURN, POC_CELL_HEIGHT, POC_CELL_WIDTH,
-    PasteReject, Resize, SystemClipboard,
+    MAX_RENDER_ROWS, Modifiers, PARSE_BUDGET_BYTES_PER_TURN, PasteReject, Resize, SystemClipboard,
     config::AppConfig,
     diagnostics::{self, PtyChildStatus},
     encode_paste,
@@ -437,7 +436,7 @@ impl NorenApp {
                     None
                 }
             };
-        self.renderer = match Renderer::new(Arc::clone(&window)) {
+        self.renderer = match Renderer::new(Arc::clone(&window), self.geometry.cell_metrics()) {
             Ok(renderer) => Some(renderer),
             Err(_) => {
                 self.status = "Noren renderer start failed";
@@ -894,12 +893,14 @@ impl NorenApp {
         let terminal = self.terminal.as_ref()?;
         let window = self.window.as_ref()?;
         let physical = window.inner_size();
+        let cell_width = self.geometry.cell_width();
+        let cell_height = self.geometry.cell_height();
         // The sidebar occupies the leftmost SIDEBAR_COLS cell columns; clicks
         // inside it do not address the terminal grid.
-        if position.x < sidebar_pixel_width() {
+        if position.x < sidebar_pixel_width(cell_width) {
             return None;
         }
-        let visible_rows = usize::try_from(physical.height / POC_CELL_HEIGHT)
+        let visible_rows = usize::try_from(physical.height / cell_height)
             .unwrap_or(0)
             .clamp(1, usize::from(MAX_RENDER_ROWS));
         let content_rows = visible_content_rows(terminal);
@@ -907,7 +908,7 @@ impl NorenApp {
         let displayed = total_lines.min(visible_rows);
         let top_blank_rows = visible_rows - displayed;
         let first_line = total_lines - displayed;
-        let row = pixel_row_index(position.y, POC_CELL_HEIGHT)?;
+        let row = pixel_row_index(position.y, cell_height)?;
         if row < top_blank_rows {
             return None;
         }
@@ -919,7 +920,7 @@ impl NorenApp {
         if line_index >= usize::from(rows) {
             return None;
         }
-        let column = terminal_column_at(position.x, cols)?;
+        let column = terminal_column_at(position.x, cols, cell_width)?;
         Some(GridPoint::new(
             terminal.scrollback_len() + line_index,
             column,
@@ -1465,8 +1466,8 @@ fn pixel_row_index(pixel: f64, cell_size: u32) -> Option<usize> {
 /// Pixel width of the sidebar's left strip: `SIDEBAR_COLS` cell columns. The
 /// terminal is drawn to the right of this edge, so a click at exactly this x is
 /// the first terminal column.
-fn sidebar_pixel_width() -> f64 {
-    f64::from((renderer::SIDEBAR_COLS as u32) * POC_CELL_WIDTH)
+fn sidebar_pixel_width(cell_width: u32) -> f64 {
+    f64::from((renderer::SIDEBAR_COLS as u32) * cell_width)
 }
 
 /// Terminal cell column under pixel x, or `None` when the click lands in the
@@ -1474,11 +1475,12 @@ fn sidebar_pixel_width() -> f64 {
 /// boundary is exclusive: x exactly at [`sidebar_pixel_width`] is the first
 /// terminal column and maps to cell 0; anything strictly left of it is the
 /// sidebar and is rejected.
-fn terminal_column_at(pixel_x: f64, terminal_cols: u16) -> Option<usize> {
-    if !pixel_x.is_finite() || pixel_x < sidebar_pixel_width() {
+fn terminal_column_at(pixel_x: f64, terminal_cols: u16, cell_width: u32) -> Option<usize> {
+    let edge = sidebar_pixel_width(cell_width);
+    if !pixel_x.is_finite() || pixel_x < edge {
         return None;
     }
-    pixel_row_index(pixel_x - sidebar_pixel_width(), POC_CELL_WIDTH)
+    pixel_row_index(pixel_x - edge, cell_width)
         .map(|raw| raw.min(usize::from(terminal_cols).saturating_sub(1)))
 }
 
@@ -1657,6 +1659,7 @@ mod tests {
     use noren_app::palette::CommandId;
     use noren_app::passthrough::{self, collisions};
     use noren_app::sidebar::EntryKind;
+    use noren_app::{CellMetrics, POC_CELL_WIDTH};
 
     #[test]
     fn winit_space_variants_encode_ascii_space() {
@@ -2150,11 +2153,11 @@ mod tests {
     /// arbitrary vertices would count that bleed as a drawn column and over-
     /// count by one. Each rect is emitted as a 6-vertex fan whose first vertex
     /// is its top-left corner, so the left edges are read from every 6th group.
-    fn rendered_terminal_columns(vertices: &[[f32; 2]], width: u32) -> usize {
+    fn rendered_terminal_columns(vertices: &[[f32; 2]], width: u32, cell_width: u32) -> usize {
         let rect_lefts: Vec<f32> = vertices.chunks_exact(6).map(|rect| rect[0][0]).collect();
         let mut drawn = 0;
         for col in renderer::SIDEBAR_COLS..usize::from(MAX_RENDER_COLS) {
-            let edge = ((col as u32) * POC_CELL_WIDTH) as f32 / width as f32 * 2.0 - 1.0;
+            let edge = ((col as u32) * cell_width) as f32 / width as f32 * 2.0 - 1.0;
             if rect_lefts.iter().any(|left| (left - edge).abs() < 1e-5) {
                 drawn += 1;
             } else {
@@ -2166,29 +2169,31 @@ mod tests {
 
     /// Drive the three terminal-width consumers — `TerminalState`'s stored
     /// column count, the PTY winsize, and the columns the renderer actually
-    /// draws — at one window width, asserting they all agree on
+    /// draws — at one window width and cell size, asserting they all agree on
     /// `terminal_cols(window_cols)`. Asserting `terminal_cols() == window_cols -
     /// 16` would merely restate the formula and pass any consistent-but-wrong
     /// value; instead this exercises the three real consumers and is shared by
     /// the swept agreement test below across every regime where they can drift
-    /// apart.
-    fn assert_three_consumers_agree_at(width: u32) {
+    /// apart — including non-default cell sizes.
+    fn assert_three_consumers_agree_at(width: u32, metrics: CellMetrics) {
         let height = 600_u32;
-        // Grid columns and the renderer's visible columns both derive
-        // `width / CELL_WIDTH`, so they share this `window_cols`.
-        let window_cols = u16::try_from(width / POC_CELL_WIDTH).expect("fits in u16");
+        let cell_width = metrics.width();
+        let cell_height = metrics.height();
+        let window_cols = u16::try_from(width / cell_width).expect("fits in u16");
         let cols = terminal_cols(window_cols);
 
         // Consumer 1: the terminal state stores the sidebar-adjusted width.
-        let rows = u16::try_from(height / POC_CELL_HEIGHT).expect("fits in u16");
+        let rows = u16::try_from(height / cell_height).expect("fits in u16");
         let mut terminal = TerminalState::new(rows, cols).expect("valid terminal");
-        // Fill every terminal column of row 0 so each drawn column is visible
-        // to `rendered_terminal_columns` via its left pixel edge.
         terminal.feed_bytes(&vec![b'B'; usize::from(cols)]);
         let (_, term_cols) = terminal.size();
         assert_eq!(
-            term_cols, cols,
-            "at {width}px: terminal must store terminal_cols({window_cols}) = {cols}"
+            term_cols,
+            cols,
+            "at {width}px cell {}x{}: terminal must store \
+             terminal_cols({window_cols}) = {cols}",
+            metrics.width(),
+            metrics.height(),
         );
 
         // Consumer 2: the PTY winsize carries the same column count.
@@ -2196,11 +2201,15 @@ mod tests {
         assert_eq!(
             pty.cols(),
             cols,
-            "at {width}px: PTY winsize must agree with the terminal"
+            "at {width}px cell {}x{}: PTY winsize must agree",
+            metrics.width(),
+            metrics.height(),
         );
 
         // Consumer 3: the renderer draws exactly that many terminal columns —
-        // measured from vertex output, independent of `terminal_cols`.
+        // measured from vertex output, independent of `terminal_cols`. The cell
+        // metrics are threaded through so a renderer still drawing at the
+        // compile-time default is exposed at a non-default size.
         let snapshot = terminal.snapshot();
         let sidebar: Vec<String> = Vec::new();
         let vertices = renderer::glyph_vertices(
@@ -2209,14 +2218,18 @@ mod tests {
             None,
             width,
             height,
+            metrics,
         );
-        let drawn = rendered_terminal_columns(&vertices, width);
+        let drawn = rendered_terminal_columns(&vertices, width, cell_width);
         assert_eq!(
             drawn,
             usize::from(cols),
-            "at {width}px (window_cols={window_cols}): renderer drew {drawn} terminal columns but \
-             terminal/PTY agree on {cols} — the sidebar width is not consistently subtracted or \
-             the upper clamp is missing"
+            "at {width}px cell {}x{} (window_cols={window_cols}): \
+             renderer drew {drawn} terminal columns but terminal/PTY agree on {cols} — \
+             the sidebar width is not consistently subtracted, the upper clamp is missing, \
+             or the renderer ignored the configured cell size",
+            metrics.width(),
+            metrics.height(),
         );
     }
 
@@ -2244,10 +2257,25 @@ mod tests {
     /// and it exists to hold that line. Mutating `terminal_cols` to drop the
     /// sidebar subtraction breaks the typical/above-max widths, and dropping
     /// the upper clamp breaks the 2000px width.
+    ///
+    /// The test is also swept across **cell sizes**. Issue #76: a configured
+    /// `cell_width = 20` flows to the geometry/PTY but the renderer ignored it,
+    /// drawing at the 10px compile-time constant. At 20px every width in the
+    /// sweep produces half the window_cols, so the renderer — if still on the
+    /// constant — would draw *twice* as many terminal columns as the terminal
+    /// and PTY agree on, and the three consumers diverge. This is the
+    /// acceptance criterion from the Issue.
     #[test]
     fn terminal_cols_pty_winsize_and_renderer_agree_across_the_width_range() {
+        let poc = GridGeometry::poc().cell_metrics();
         for width in [80_u32, 900, 1600, 2000] {
-            assert_three_consumers_agree_at(width);
+            assert_three_consumers_agree_at(width, poc);
+        }
+        let big = GridGeometry::with_cells(20, 40)
+            .expect("valid geometry")
+            .cell_metrics();
+        for width in [160_u32, 1800, 3200, 4000] {
+            assert_three_consumers_agree_at(width, big);
         }
     }
 
@@ -2277,8 +2305,9 @@ mod tests {
             None,
             width,
             height,
+            GridGeometry::poc().cell_metrics(),
         );
-        let drawn = rendered_terminal_columns(&vertices, width);
+        let drawn = rendered_terminal_columns(&vertices, width, POC_CELL_WIDTH);
         assert_eq!(
             drawn,
             usize::from(cols),
@@ -2348,32 +2377,37 @@ mod tests {
     #[test]
     fn terminal_column_at_rejects_the_sidebar_and_starts_the_terminal_at_zero() {
         let cols = 40_u16;
-        let sidebar_edge = sidebar_pixel_width();
+        let sidebar_edge = sidebar_pixel_width(POC_CELL_WIDTH);
 
         // The last sidebar column — just inside the sidebar's right edge — does
         // not address the terminal grid.
         assert_eq!(
-            terminal_column_at(sidebar_edge - 1.0, cols),
+            terminal_column_at(sidebar_edge - 1.0, cols, POC_CELL_WIDTH),
             None,
             "a click in the last sidebar column must be rejected"
         );
         // The first terminal column, exactly at the sidebar's right edge, maps
         // to terminal cell 0.
         assert_eq!(
-            terminal_column_at(sidebar_edge, cols),
+            terminal_column_at(sidebar_edge, cols, POC_CELL_WIDTH),
             Some(0),
             "the first terminal column must map to cell 0"
         );
         // One cell width further in lands in terminal cell 1.
         assert_eq!(
-            terminal_column_at(sidebar_edge + f64::from(POC_CELL_WIDTH), cols),
+            terminal_column_at(
+                sidebar_edge + f64::from(POC_CELL_WIDTH),
+                cols,
+                POC_CELL_WIDTH
+            ),
             Some(1)
         );
         // The last terminal column maps to the highest valid cell.
         assert_eq!(
             terminal_column_at(
                 sidebar_edge + f64::from(POC_CELL_WIDTH) * f64::from(cols - 1),
-                cols
+                cols,
+                POC_CELL_WIDTH
             ),
             Some(usize::from(cols - 1))
         );
@@ -2381,13 +2415,67 @@ mod tests {
         assert_eq!(
             terminal_column_at(
                 sidebar_edge + f64::from(POC_CELL_WIDTH) * f64::from(cols),
-                cols
+                cols,
+                POC_CELL_WIDTH
             ),
             Some(usize::from(cols - 1))
         );
         // Negative and non-finite clicks are rejected.
-        assert_eq!(terminal_column_at(-1.0, cols), None);
-        assert_eq!(terminal_column_at(f64::NAN, cols), None);
+        assert_eq!(terminal_column_at(-1.0, cols, POC_CELL_WIDTH), None);
+        assert_eq!(terminal_column_at(f64::NAN, cols, POC_CELL_WIDTH), None);
+    }
+
+    /// Issue #76: at a non-default cell width, the sidebar's drawn pixel
+    /// boundary and the click-handling boundary must agree. The renderer draws
+    /// the terminal starting at column `SIDEBAR_COLS`; `sidebar_pixel_width`
+    /// and `terminal_column_at` must use the same `cell_width` to locate that
+    /// boundary, or clicks land in the wrong region.
+    ///
+    /// At `cell_width = 20` the boundary is `16 * 20 = 320px`. If
+    /// `sidebar_pixel_width` still used `POC_CELL_WIDTH` (10), the boundary
+    /// would drift to 160px and clicks in the 160–320px strip would be
+    /// misattributed to the terminal instead of the sidebar.
+    #[test]
+    fn sidebar_boundary_and_click_boundary_agree_at_non_default_cell_width() {
+        let cell_width = 20_u32;
+        let cols = 40_u16;
+        let sidebar_edge = sidebar_pixel_width(cell_width);
+
+        // The drawn boundary is SIDEBAR_COLS * cell_width.
+        assert_eq!(
+            sidebar_edge,
+            f64::from((renderer::SIDEBAR_COLS as u32) * cell_width),
+            "sidebar pixel width must be SIDEBAR_COLS * cell_width"
+        );
+        assert_eq!(sidebar_edge, 320.0);
+
+        // A click at the boundary maps to terminal column 0.
+        assert_eq!(
+            terminal_column_at(sidebar_edge, cols, cell_width),
+            Some(0),
+            "at cell_width=20, the first terminal column is at the sidebar edge"
+        );
+        // A click one pixel left of the boundary is still the sidebar.
+        assert_eq!(
+            terminal_column_at(sidebar_edge - 1.0, cols, cell_width),
+            None,
+            "at cell_width=20, a click just left of the boundary is the sidebar"
+        );
+        // One cell width further maps to column 1.
+        assert_eq!(
+            terminal_column_at(sidebar_edge + f64::from(cell_width), cols, cell_width),
+            Some(1),
+            "at cell_width=20, one cell past the boundary is column 1"
+        );
+        // The last terminal column maps to the highest valid cell.
+        assert_eq!(
+            terminal_column_at(
+                sidebar_edge + f64::from(cell_width) * f64::from(cols - 1),
+                cols,
+                cell_width
+            ),
+            Some(usize::from(cols - 1)),
+        );
     }
 
     // ── Pass-through gate integration tests ──────────────────────────────
