@@ -12,6 +12,7 @@ mod clipboard;
 pub mod config;
 pub mod diagnostics;
 mod input;
+pub mod session;
 
 pub use clipboard::{
     BRACKET_PASTE_BEGIN, BRACKET_PASTE_END, ClipboardError, PasteReject, SystemClipboard,
