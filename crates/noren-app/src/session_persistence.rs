@@ -89,7 +89,10 @@ pub const MAX_SESSIONS: usize = 512;
 ///
 /// Reads are streamed and bounded like the configuration loader, so a
 /// pathological path cannot grow memory past this cap; oversized input is a
-/// [`SessionPersistenceError::TooLarge`] error instead.
+/// [`SessionPersistenceError::TooLarge`] error instead. Writes check the
+/// same cap as the document is built, so a registry that would encode past
+/// it is rejected with [`SessionPersistenceError::TooLarge`] rather than
+/// written unreadable.
 pub const MAX_SESSION_STATE_BYTES: u64 = 512 * 1024;
 
 /// Suffix of the temporary file used for crash-safe replacement writes.
@@ -112,7 +115,9 @@ pub enum SessionPersistenceError {
     Io(ErrorKind),
     /// The path exists but does not resolve to a regular file.
     NotAFile,
-    /// The file exceeds [`MAX_SESSION_STATE_BYTES`].
+    /// The state exceeds [`MAX_SESSION_STATE_BYTES`], in either direction:
+    /// a file too large to read, or a registry that would encode to a
+    /// document too large to read back.
     TooLarge,
     /// The file is not valid UTF-8.
     NotUtf8,
@@ -231,12 +236,16 @@ pub fn load_bytes(
 /// Deterministic: the same registry state always produces the same text.
 /// Entries are written in [`SessionRegistry::sessions`] order; the selection
 /// is written as a positional index and omitted when nothing is selected.
-/// Refuses more than [`MAX_SESSIONS`] entries and non-UTF-8 paths.
+/// Refuses more than [`MAX_SESSIONS`] entries, a document larger than
+/// [`MAX_SESSION_STATE_BYTES`] (checked as it is built, so the encoded
+/// [`String`] is bounded and anything that would be unreadable on load is
+/// rejected before it is returned), and non-UTF-8 paths.
 pub fn encode(registry: &SessionRegistry) -> Result<String, SessionPersistenceError> {
     let sessions = registry.sessions();
     if sessions.len() > MAX_SESSIONS {
         return Err(SessionPersistenceError::TooManySessions);
     }
+    let byte_cap = usize::try_from(MAX_SESSION_STATE_BYTES).unwrap_or(usize::MAX);
     let selected_index: Option<usize> = registry.selected().map(|selected| {
         sessions
             .iter()
@@ -271,6 +280,9 @@ pub fn encode(registry: &SessionRegistry) -> Result<String, SessionPersistenceEr
                 text.push_str("kind = \"agent\"\n");
                 text.push_str(&format!("name = {}\n", toml_string(name)));
             }
+        }
+        if text.len() > byte_cap {
+            return Err(SessionPersistenceError::TooLarge);
         }
     }
     Ok(text)

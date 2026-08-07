@@ -727,3 +727,71 @@ fn encode_rejects_an_oversized_registry_before_serializing() {
         Err(SessionPersistenceError::TooManySessions)
     );
 }
+
+// ── Required: the byte cap is enforced on write, not only on read ────────
+//
+// encode() bounded session COUNT but never the byte cap, so a single large
+// payload saved a file that load() then rejected as TooLarge: the app could
+// write state it could not read back. The write side must refuse before any
+// such file reaches disk, so saved state is always loadable.
+
+#[test]
+fn encode_rejects_a_document_above_the_byte_cap() {
+    // One SSH target whose payload alone exceeds MAX_SESSION_STATE_BYTES.
+    let mut registry = SessionRegistry::new();
+    let _ = registry.create(SessionKind::Ssh {
+        target: "a".repeat(MAX_SESSION_STATE_BYTES as usize + 1),
+    });
+    assert_eq!(encode(&registry), Err(SessionPersistenceError::TooLarge));
+}
+
+#[test]
+fn an_oversized_save_writes_nothing_and_errors_so_state_stays_loadable() {
+    let mut registry = SessionRegistry::new();
+    let _ = registry.create(SessionKind::Ssh {
+        target: "a".repeat(MAX_SESSION_STATE_BYTES as usize + 1),
+    });
+    let path = temp_path("oversized-payload.toml");
+    let saved = save(&path, &registry);
+
+    assert_eq!(saved, Err(SessionPersistenceError::TooLarge));
+    assert!(
+        !path.exists(),
+        "an oversized save must leave no file behind to corrupt a later load"
+    );
+    cleanup(&path);
+}
+
+#[test]
+fn a_payload_just_under_the_byte_cap_round_trips() {
+    // The cap rejects only documents that would be unreadable; legal state
+    // near the bound still saves and loads. Leave a little headroom for the
+    // TOML envelope (comments, version, the session table) so the written
+    // file stays within MAX_SESSION_STATE_BYTES.
+    let overhead = 256_usize;
+    let target_len = MAX_SESSION_STATE_BYTES as usize - overhead;
+    let mut registry = SessionRegistry::new();
+    let _ = registry.create(SessionKind::Ssh {
+        target: "a".repeat(target_len),
+    });
+    registry
+        .select(registry.sessions()[0].id())
+        .expect("the ssh entry is live");
+
+    let path = temp_path("near-cap.toml");
+    save(&path, &registry).expect("state just under the cap saves");
+    let size = std::fs::metadata(&path).expect("state file exists").len();
+    assert!(
+        size <= MAX_SESSION_STATE_BYTES,
+        "a near-cap save must stay within the byte bound: {size}"
+    );
+
+    let mut restored = SessionRegistry::new();
+    load(&path, &mut restored).expect("near-cap state loads back");
+    assert_eq!(selected_index(&restored), Some(0));
+    assert!(matches!(
+        kinds_of(&restored).as_slice(),
+        [SessionKind::Ssh { .. }]
+    ));
+    cleanup(&path);
+}
