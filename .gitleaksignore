@@ -1,0 +1,2 @@
+# Synthetic canary in the diagnostics privacy regression test, not a credential.
+a45c3a445ea4b653b7a26cc9a9b7194ddd05e89e:crates/noren-app/src/diagnostics.rs:generic-api-key:213
