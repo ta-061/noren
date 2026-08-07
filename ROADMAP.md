@@ -81,19 +81,19 @@ concluded that the current tree cannot honestly be released as "0.1.0-preview of
 the Noren terminal." The reasoning and the decision are recorded in
 [D-M8-001](docs/coordination/decisions/D-M8-001-preview-scope.md). In short:
 
-- **The workspace is not on `main`.** Noren's defining feature is the external
-  sidebar (ADR 0003). Of the Milestone 3 modules, only `session.rs` has landed;
-  the sidebar, palette, pass-through, supervisor, and persistence exist only in
-  unmerged PRs. What `main` contains today is a terminal foundation.
-- **The renderer is monochrome.** `renderer.rs:35` returns a constant colour and
+- **The workspace is landed, not shipped.** All seven Milestone 3 modules are
+  files on `main`, but only `session` and `sidebar` are declared in `lib.rs`;
+  the rest are compiled only by tests via `#[path]` and are unreachable from the
+  binary (Issue #88). Launching the build still presents no workspace sidebar.
+- **The renderer is monochrome.** `renderer.rs:40` returns a constant colour and
   the vertex layout carries no colour channel, so `ls --color`, `vim`, and
   Zellij's status bar all draw in one shade. Truecolor is modelled in terminal
   state and never reaches drawing.
 - **The font is ASCII-only and case-blind.** Non-ASCII renders as `?`, and
-  `renderer.rs:457` asserts `glyph_rows('a') == glyph_rows('A')`.
-- **FR-005's rendered-frame oracle does not exist**, so glyph correctness has
-  never been mechanically verified. Waiving the project's own PoC gate in silence
-  is the one path that would make a release claim dishonest.
+  `renderer.rs:474` asserts `glyph_rows('a') == glyph_rows('A')`.
+- **The FR-005 rendered-frame oracle now exists** (PR #89). It drives the real
+  pipeline offscreen, and its `#[ignore]`d defect tests record the font's
+  case-fold and non-ASCII-`?` failures — the same defects above.
 - **NFR-009 requires release-integrity gates** — signing, notarization,
   packaging — to pass before any Preview claim.
 
