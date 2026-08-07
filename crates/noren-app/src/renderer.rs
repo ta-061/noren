@@ -18,7 +18,12 @@ const GLYPH_SCALE: u32 = 2;
 const GLYPH_TOP: u32 = 3;
 const MAX_VERTICES: usize = (MAX_RENDER_ROWS as usize) * (MAX_RENDER_COLS as usize) * 35 * 6;
 
-const SHADER: &str = r#"
+/// WGSL source for the PoC glyph pipeline.
+///
+/// Exposed as `pub(crate)` solely so the offscreen frame-oracle
+/// (`renderer_capture.rs`) builds its pipeline from the **same** shader the
+/// shipped binary uses, rather than a parallel copy. No behaviour change.
+pub(crate) const SHADER: &str = r#"
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
 };
@@ -35,6 +40,19 @@ fn fs_main() -> @location(0) vec4<f32> {
     return vec4<f32>(0.80, 0.92, 0.82, 1.0);
 }
 "#;
+
+/// Clear colour used by the glyph pipeline's load op.
+///
+/// Exposed as `pub(crate)` so the offscreen frame-oracle
+/// (`renderer_capture.rs`) clears to the exact same colour the shipped binary
+/// uses, rather than a parallel literal that could silently drift. No
+/// behaviour change.
+pub(crate) const CLEAR_COLOR: wgpu::Color = wgpu::Color {
+    r: 0.035,
+    g: 0.045,
+    b: 0.04,
+    a: 1.0,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RendererError {
@@ -222,12 +240,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.035,
-                            g: 0.045,
-                            b: 0.04,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(CLEAR_COLOR),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -272,7 +285,9 @@ fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-fn glyph_vertices(
+/// Exposed as `pub(crate)` for the offscreen frame-oracle (see
+/// `renderer_capture.rs`); no behaviour change.
+pub(crate) fn glyph_vertices(
     terminal: Option<&TerminalSnapshot>,
     status: Option<&str>,
     width: u32,
@@ -340,7 +355,9 @@ fn push_rect(vertices: &mut Vec<[f32; 2]>, x: u32, y: u32, size: u32, width: u32
     ]);
 }
 
-fn vertex_bytes(vertices: &[[f32; 2]]) -> Vec<u8> {
+/// Exposed as `pub(crate)` for the offscreen frame-oracle (see
+/// `renderer_capture.rs`); no behaviour change.
+pub(crate) fn vertex_bytes(vertices: &[[f32; 2]]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(vertices.len().saturating_mul(8));
     for vertex in vertices {
         bytes.extend_from_slice(&vertex[0].to_ne_bytes());
