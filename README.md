@@ -2,12 +2,17 @@
 
 > A Zellij-friendly terminal for local, remote, and agent workflows.
 
-> **Current state: terminal foundation, not the product.** What exists on
-> `main` is a macOS window over a local `zsh` PTY with a tested terminal state
-> core. It renders in a single colour, in a case-insensitive 5x7 ASCII bitmap
-> font, with all non-ASCII shown as `?`, no IME, no accessibility surface, and
-> no visible workspace sidebar (the view model exists, but nothing draws it).
-> There are no published binaries. Read
+> **Current state: a first workspace slice on a terminal foundation.** What
+> exists on `main` is a macOS window over a local `zsh` PTY with a tested
+> terminal state core, plus a drawn workspace sidebar, a `Super+p` command
+> palette that creates/selects/closes local sessions, mouse reporting that
+> reaches the program inside, and sidebar state that survives a restart.
+>
+> It still renders in a single colour, in a case-insensitive 5x7 ASCII bitmap
+> font, with all non-ASCII shown as `?`, no visible cursor, no IME, and no
+> accessibility surface. Only local sessions can be launched — SSH hosts, git
+> worktrees, and agents are modelled but unreachable — and keybindings are not
+> configurable. There are no published binaries. Read
 > **[docs/known-limitations.md](docs/known-limitations.md)** first — it is the
 > accurate predictor of what happens when you run the build. Everything below
 > the status block describes **intent**, not current capability.
@@ -39,9 +44,13 @@ pass-through takes priority over Noren shortcuts.
 ## Current phase
 
 Milestones 0–2 (discovery, requirements/design, terminal foundation) are
-complete on the evidence recorded in [ROADMAP.md](ROADMAP.md); the workspace,
-SSH, agent-experience, theming/accessibility, quality, and preview milestones
-are open. The required sequence remains:
+complete on the evidence recorded in [ROADMAP.md](ROADMAP.md). Milestone 3
+(workspace) is **in progress**: the vertical slice — sidebar, palette, session
+lifecycle, persistence, Zellij pass-through — has landed, while configurable
+keybindings and the SSH/agent session kinds have not; the reasoning is in
+[Milestone 3 status](ROADMAP.md#milestone-3-status). The SSH,
+agent-experience, theming/accessibility, quality, and preview milestones are
+open. The required sequence remains:
 
 1. verify tools, upstream behavior, licenses, and project constraints;
 2. calibrate the available AI contributors on the same bounded task;

@@ -4,25 +4,61 @@ This document exists so that the first thing a reader meets is what Noren
 **cannot** do today, not what it hopes to do. Decision D-M8-001 settled that the
 first artifact is an explicitly dated developer preview, not a
 `0.1.0-preview` of the product; this page is the substance behind that framing.
-Every claim below was verified against the tree on 2026-08-07; citations point
-at the file, function, or test that establishes them, and a line number appears
-only where a name would not pin the evidence. If anything here has drifted,
+Every claim below was verified against the tree on 2026-08-08; citations point
+at the file, function, type, constant, or test that establishes them. Names are
+used rather than line numbers, which rot; where a count is genuinely needed the
+command that reproduces it is given instead. If anything here has drifted,
 treat the code as correct and this page as a bug.
 
 ## What Noren is today
 
-Noren today is a terminal **foundation**: a macOS window backed by a working
-PTY that spawns a local `/bin/zsh`, a renderer-independent terminal state core
-(scroll regions, alternate screen, SGR attributes, Unicode display width,
-bounded scrollback, selection, clipboard, search), and an input encoder that
-covers xterm modifier parameters and application cursor/keypad modes. Several of
-those state features are not yet visible on screen — see "What does not work"
-below, which is the more useful list. It is
-**not yet** the workspace product that [ADR
-0003](adr/0003-noren-zellij-responsibility-boundary.md) describes: no workspace
-sidebar is drawn, and what runs is a single window onto one local shell
-(a single `PtySession::spawn` call in `main.rs`'s `initialize`). Milestones 3–8 are open on the
-[roadmap](../ROADMAP.md).
+Noren today is a **working single-session workspace on a terminal foundation**:
+a macOS window backed by a PTY that spawns a local `/bin/zsh`, a
+renderer-independent terminal state core (scroll regions, alternate screen, SGR
+attributes, Unicode display width, bounded scrollback, selection, clipboard,
+search), and an input encoder covering xterm modifier parameters and
+application cursor/keypad modes.
+
+Since the first draft of this page, the Milestone 3 vertical slice reached the
+binary. What now actually happens on screen:
+
+- **A sidebar is drawn.** The leftmost `SIDEBAR_COLS` columns (a constant equal
+  to 16 in `renderer.rs`) are reserved for workspace rows, and the terminal is
+  drawn starting at that column offset with its grid narrowed to match — see
+  `glyph_vertices` in `renderer.rs`, which takes a `sidebar` argument and
+  applies `col_offset`, and `sidebar_text_lines` in `main.rs`, which formats the
+  rows.
+- **Sessions can be created, selected, and closed.** `Super+p` opens a command
+  palette (claimed by `palette_policy` in `main.rs` as
+  `PassthroughAction::OpenCommandPalette`), and `c`/`s`/`x`/`f` dispatch new
+  session, switch session, close session, and focus sidebar — the four commands
+  built by `Palette::noren`, routed through `handle_palette_key`. Arrow keys and
+  Enter navigate the same list; Escape dismisses it.
+- **Mouse reporting reaches the program.** `handle_mouse_button`,
+  `handle_mouse_move`, and `handle_mouse_wheel` in `main.rs` call
+  `MouseEncoder::encode` and write the resulting report bytes to the PTY, so
+  clicks, drags, and the wheel now work in Zellij, `vim` with `set mouse=a`, and
+  `tmux`.
+- **Configured cell size reaches the renderer.** `[font] cell_width` /
+  `cell_height` flow through `GridGeometry::with_cells` to the drawing path;
+  the regression test `configured_cell_sizes_drive_the_app_geometry` in
+  `main.rs` pins it, and a mutation note in `renderer.rs`'s tests records that
+  reverting `push_glyph` to the fixed `POC_CELL_WIDTH` constants must fail.
+- **Sidebar state survives a restart.** State is written to `sessions.toml`
+  (`SESSION_STATE_FILE_NAME`) in the directory `config::default_path` resolves —
+  `~/Library/Application Support/Noren/` on macOS — resolved by
+  `session_state_path` in `main.rs`. With `HOME` unset the app runs in-memory
+  only, by design.
+- **Session status reflects the real lifecycle.** `SessionStatus` advances
+  `Starting -> Running -> Exited/Failed` through `SessionRegistry::observe`
+  rather than sitting at a permanent "starting"; `main.rs` observes `Running` on
+  spawn and `Exited { code }` on child exit.
+
+It is still **not** the full workspace product that [ADR
+0003](adr/0003-noren-zellij-responsibility-boundary.md) describes — one local
+shell at a time, and the non-local session kinds are modelled but unreachable.
+See "What does not work" below, which remains the more useful list. Milestones
+3–8 are open on the [roadmap](../ROADMAP.md).
 
 ## What does not work
 
@@ -58,23 +94,12 @@ Each item states what you would actually see if you ran the build.
   `ascii_glyphs_are_distinct_and_unknown_is_question_mark` test. CJK text,
   accented characters, box-drawing output, and
   emoji all appear as `?` — even though the terminal state core measures their
-  display width correctly (`ROADMAP.md:38`).
+  display width correctly (Unicode/CJK display width, recorded in the
+  [roadmap](../ROADMAP.md)).
 - **IME input is discarded.** `WindowEvent::Ime(_)` is dropped without reaching
   the terminal — the `WindowEvent::Ime(_)` arm in `main.rs`'s event handler
   drops the event without forwarding it. Japanese, Chinese, and
   Korean input methods produce nothing.
-- **Mouse reporting never reaches the program.** `mouse.rs` ships a complete,
-  tested `MouseEncoder::encode` for xterm tracking modes 1000/1002/1003 and
-  encodings 1006/1015/X10, but `main.rs` never calls it: neither `MouseEncoder`
-  nor `noren_app::mouse` appears in `main.rs` (the `MouseButton` it matches on
-  comes from `winit::event`, not the mouse module). The pointer handlers there
-  (`handle_mouse_button`, `handle_mouse_move`) drive **local text selection
-  only** — `handle_mouse_button` returns early for anything but a left click,
-  and neither handler ever writes report bytes to the PTY. In practice: the
-  mouse selects and copies text in Noren's own window, but the program running
-  inside sees nothing — in `vim` with `set mouse=a`, in `tmux`, and above all
-  in **Zellij**, clicks, drags, and the scroll wheel do nothing. Issue #96
-  tracks wiring the encoder to the PTY.
 - **There is no accessibility surface.** Nothing in the tree integrates with
   assistive technology (no AccessKit, AT-SPI, or AppKit accessibility wiring);
   a screen reader has nothing to work with.
@@ -97,40 +122,53 @@ Each item states what you would actually see if you ran the build.
   The PTY launches `/bin/zsh` with a fixed policy and no caller-controlled
   arguments (`ZSH_PROGRAM` in `crates/noren-pty/src/lib.rs`). Linux support and SSH/remote
   sessions are roadmap intent (Milestones 4 and 6), not current capability.
-- **No workspace sidebar is drawn.** Noren's defining feature per ADR 0003 and
-  FR-009 (`docs/requirements/v0.1.md`) is not yet visible on screen. A
-  renderer-independent sidebar view model exists — `sidebar.rs` (M3-3) defines
-  `EntryKind`, `SidebarRow`, and `SessionViewport`, describing *what* the
-  workspace shows without *how* to paint it — but nothing renders it: the
-  `sidebar` module is declared only in `lib.rs`, and neither `main.rs` nor
-  `renderer.rs` imports it, so the render path still emits only terminal cells
-  plus an optional status line (`glyph_vertices`). Sibling workspace
-  models are present in the tree (`session.rs`, `session_supervisor.rs`,
-  `session_persistence.rs`, `palette.rs`, `passthrough.rs`) but are models and
-  persistence, not a painted workspace, so what runs is still one window on
-  one local shell.
+- **Only local sessions can actually be launched.** `SessionKind` models
+  `Local`, `Project`, `Worktree`, `Ssh`, and `Agent`, and `EntryKind` in
+  `sidebar.rs` can describe project, worktree, SSH-connection, and agent rows —
+  but every creation path in the running binary passes `SessionKind::Local`
+  (the only variant `main.rs` constructs). The doc comments on the `Ssh` and
+  `Agent` variants say so directly: *reserved*, *fixture only — no connection is
+  opened*, *no agent is launched*. In practice: the palette's "New Session"
+  gives you another local `zsh`, and there is no way to open an SSH host, a git
+  worktree, or an agent from the workspace. Milestones 4 and 5 own those.
+- **One session is visible at a time.** The sidebar lists sessions and selection
+  moves between them, but a single terminal viewport is drawn beside it; there
+  is no split, tiled, or multi-session view. Panes and layout *inside* a session
+  are delegated to Zellij by design — see "What is deliberately delegated".
+- **Keybindings are not configurable.** The palette opener (`Super+p`), the exit
+  leader (`Super+Escape`), and the `c`/`s`/`x`/`f` command keys are compiled in:
+  `palette_policy` and `handle_palette_key` in `main.rs` hard-code them, and the
+  config parser (`config.rs`) exposes no keybinding or keymap surface. Rebinding
+  requires editing source.
+- **A restored session's shell is not running.** Sidebar state persists across a
+  restart, but a restored entry comes back as `SessionStatus::Starting` — a
+  visible row whose PTY does not exist yet. The comment on `teardown` in
+  `main.rs` records this as the deliberate meaning of a restored session.
 
 ## What is verified, and how
 
 - **Automated tests.** The workspace commits **hundreds of `#[test]` functions
   across three crates**, and the total grows with every merge — reproduce the
   current count with `grep -rh '#\[test\]' crates/ | wc -l` rather than
-  trusting any number printed here. `ROADMAP.md:44` records **353 workspace
-  tests passing** at the Milestone 2 close (`1d329a5`), a closed-milestone
-  snapshot that does not move; the M2-MOUSE, M3-ADVFIX, M3-5/6/7, M3-3, and
-  FR-005 frame-oracle (PR #89) merges since then each passed CI, which is where
-  the later growth is witnessed. The suites include a bounded VT compatibility
-  harness, two independent adversarial hostile-input suites (`ROADMAP.md:58-60`),
-  and the FR-005 rendered-frame oracle added by PR #89.
-- **Four CI gates** required by branch protection (`ROADMAP.md:46-47`,
-  `.github/workflows/`): the Rust workflow (`cargo fmt --check`, `cargo clippy
-  --workspace --all-targets -- -D warnings`, `cargo test --workspace` on macOS
-  arm64), the documentation validator (`scripts/check_docs.py`), `cargo deny
-  check`, and an MSRV build.
-- **A manual macOS check**, re-run at the M2 close head (`ROADMAP.md:62-65`):
-  a release build opened a window, owned a direct `zsh` child whose tty
-  reported the expected grid size, and on exit the child was reaped and the pty
-  device was gone.
+  trusting any number printed here. The [roadmap](../ROADMAP.md)'s Milestone 2
+  completion evidence records the test count at that close as a
+  closed-milestone snapshot that does not move; the workspace, mouse-wiring,
+  cell-size, persistence, and frame-oracle merges since then each passed CI,
+  which is where the later growth is witnessed. The suites include a bounded VT
+  compatibility harness, two independent adversarial hostile-input suites, and
+  the FR-005 rendered-frame oracle. Workspace behaviour has its own integration
+  suites under `crates/noren-app/tests/` — `sidebar_view.rs`, `palette.rs`,
+  `session_domain.rs`, `session_supervisor.rs`, `session_persistence.rs`,
+  `session_adversarial.rs`, `mouse_encoding.rs`, and `passthrough.rs`.
+- **Four CI gates** required by branch protection (see the
+  [roadmap](../ROADMAP.md) and `.github/workflows/`): the Rust workflow
+  (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo test --workspace` on macOS arm64), the documentation validator
+  (`scripts/check_docs.py`), `cargo deny check`, and an MSRV build.
+- **A manual macOS check**, re-run at the Milestone 2 close head and recorded
+  under the roadmap's manual gate: a release build opened a window, owned a
+  direct `zsh` child whose tty reported the expected grid size, and on exit the
+  child was reaped and the pty device was gone.
 
 What this evidence now covers that the M2 snapshot did not: PR #89 added the
 **FR-005 rendered-frame oracle** (`crates/noren-app/tests/frame_oracle.rs`,
@@ -144,7 +182,9 @@ lit/blank agrees with `TerminalSnapshot` across the FR-005 fixture classes. It
 does **not** assert an `A` looks like an A — only that the structure is right.
 Its two `#[ignore]`d tests (`lowercase_distinct_from_uppercase`,
 `non_ascii_glyph_is_not_the_question_mark`) are the executable specifications of
-the two font defects below, left failing rather than weakened. The oracle needs
+the two font defects listed above — case-blindness and non-ASCII falling
+through to `?` — left failing rather than weakened, and their `#[ignore]`
+attributes say so in the source. The oracle needs
 a headless Metal adapter and reports `offscreen=blocked` honestly when the host
 has none.
 
@@ -167,12 +207,18 @@ two layers owning the same abstraction was judged worse than delegating it.
 When Zellij is running, correct input pass-through takes priority over Noren
 shortcuts. Please do not file the absence of native tabs or panes as a bug —
 but do hold Noren to its side of the boundary: a workspace *outside* the
-terminal, which is precisely the part not built yet.
+terminal. That side now has a first vertical slice — a drawn sidebar, a command
+palette, session create/select/close, and state that survives a restart — and
+the gaps that remain there (non-local session kinds, configurable keybindings)
+are legitimate things to report.
 
 ## What this preview is not
 
 No binary, installer, checksum, or release tag is published with this document;
 building and running from source is the only way to see the current state, and
 publishing any artifact is a reserved owner decision. Nothing here should be
-read as "nearly done": the honest summary is that the foundation is tested and
-the product is not yet present.
+read as "nearly done": the honest summary is that the foundation is tested, a
+first workspace slice is now real and visible, and what stands between this and
+a usable daily terminal is not workspace plumbing but the display itself —
+colour, a real font, a cursor. Those are the things a user sees first, and they
+are the things still missing.
