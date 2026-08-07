@@ -41,7 +41,8 @@ Each item states what you would actually see if you ran the build.
   the pipeline's vertex `buffers` slice carries a single `Float32x2` position
   attribute on an 8-byte stride, no colour channel. SGR
   colours — including 256-colour and truecolor — are parsed and modelled in
-  terminal state but never reach drawing (`ROADMAP.md:71-72`). In practice:
+  terminal state but never reach drawing ([ROADMAP, "What blocks a public
+  preview"](../ROADMAP.md#what-blocks-a-public-preview)). In practice:
   `ls --color`, `vim` syntax highlighting, and Zellij's status bar all appear
   in one shade of green.
 - **The font cannot distinguish case.** Glyphs are a hand-built 5x7 ASCII
