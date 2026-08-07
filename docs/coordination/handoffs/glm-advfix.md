@@ -3,14 +3,46 @@
 > A second model should be able to resume from this file plus `git log` /
 > `git show` alone, with no conversation context.
 
+## Status (second pass — branch-drift re-merge)
+
+An independent Qwen review (`docs/coordination/reviews/M3-ADVFIX-review.md`)
+found one MAJOR and two MINORs; all are resolved on this branch now:
+
+- **M-1 (MAJOR, branch drift) — RESOLVED.** The domain lane landed follow-up
+  commits to `SessionRegistry::observe` *after* being merged here — notably
+  `65ebc45` ("conform `SessionEvent::StatusChanged` to D-M3-001 struct
+  variant") and review-gap closure `25a246c`. I merged
+  `origin/agent/m3-session-domain`; both sides edit `observe`, so the
+  resolution keeps **both** fixes: this branch's ADV-S1 monotonic rank guard
+  (`SessionError::InvalidStatusTransition`) AND the domain lane's
+  `StatusChanged { id, status }` struct conformance. The domain lane
+  independently arrived at the same rank guard, so the merged `observe` carries
+  it; for `session.rs` the domain lane's contract-authoritative version is
+  taken (it contains both fixes; all conflict hunks were doc-comment wording).
+  The merge also brought in `origin/main` (the domain lane had merged main).
+  See §8 for the full resolution.
+- **N-1 (MINOR, supervisor doc commit) — RESOLVED.** The supervisor lane's
+  follow-up doc commit `0ac6512` ("independent re-review of M3-1b") is now
+  folded in (`agent/m3-session-supervisor` merged; its code tip `2686956` was
+  already an ancestor, so only the `M3-1b-review.md` update applied). The
+  supervisor *code* was already fully merged and verified.
+- **N-2 (MINOR, handoff count) — RESOLVED.** §5 now reads the supervisor unit
+  count as **14** (was incorrectly "13"); `grep -c '#[test]'
+  crates/noren-app/src/session_supervisor.rs` → 14.
+
+All three ADV defects remain fixed after the merge; the three `adv_s*` guards
+pass against the merged module (struct `StatusChanged` + rank guard). Gate
+post-merge: fmt clean, clippy `-D warnings` clean, **459 passed / 0 failed /
+1 pre-existing ignored**.
+
 ## Identity
 
 - **Lane:** `glm-advfix` — fix the three defects the independent adversarial
   lane `kimi-a` reported in the session domain and supervisor (engine GLM 5.2
   via opencode).
-- **Branch:** `agent/m3-adv-fixes`, created from `origin/main` and merged with
-  the two owning lanes via `git merge --no-edit agent/m3-session-domain
-  agent/m3-session-supervisor` (octopus merge).
+- **Branch:** `agent/m3-adv-fixes`, created from `origin/main`, merged with the
+  two owning lanes, then (second pass) re-merged with the domain lane's
+  follow-up `StatusChanged` conformance and `origin/main`.
 - **Authorship of the code under fix:** **No** for the original algorithms —
   they are the unmerged sibling branches `agent/m3-session-domain` (lane
   `glm-a`) and `agent/m3-session-supervisor` (lane `glm-b`), which I merged
@@ -178,32 +210,37 @@ Per-binary results (parsed from `test result:` lines):
 | noren-app lib unittests (`src/lib.rs`) | 79 | 0 | 1 (pre-existing) |
 | noren-app bin unittests (`src/main.rs`) | 24 | 0 | 0 |
 | `tests/session_adversarial.rs` | 42 | 0 | 0 |
-| `tests/session_domain.rs` | 34 | 0 | 0 |
+| `tests/session_domain.rs` | 35 | 0 | 0 |
 | `tests/session_supervisor.rs` | 29 | 0 | 0 |
 | `tests/verify59_independent.rs` | 19 | 0 | 0 |
 | noren-pty lib unittests | 10 | 0 | 0 |
 | noren-terminal lib/bin unittests + integration tests | 221 | 0 | 0 |
 | doc-tests (3 crates) | 0 each | 0 | 0 |
 
-**Total: 458 passed, 0 failed, 1 ignored** (the 1 ignored is pre-existing in
+**Total: 459 passed, 0 failed, 1 ignored** (the 1 ignored is pre-existing in
 `noren-app` lib, unrelated to this lane). The three ADV guards pass; the prior
 `#[ignore]` reproducers are gone (replaced by the guards), so there are no
-adversarial `#[ignore]` tests left on this branch.
+adversarial `#[ignore]` tests left on this branch. (`session_domain` rose 34 →
+35 after the re-merge: the domain lane added a unit assertion for the
+`InvalidStatusTransition` Display string.)
 
-The `session_adversarial.rs` binary now also compiles each merged module's own
-unit tests in-scope (via the `#[path]` includes), so those counts include the
-domain (5) and supervisor (13) unit tests — they run green here as well as in
-their dedicated integration binaries.
+The `session_adversarial.rs` binary also compiles each merged module's own unit
+tests in-scope (via the `#[path]` includes), so its 42 includes the domain (5)
+and supervisor (14) unit tests — they run green here as well as in their
+dedicated integration binaries. (N-2 corrected: the supervisor count is 14, not
+13; `grep -c '#[test]' crates/noren-app/src/session_supervisor.rs` → 14.)
 
 ## 6. Resuming from here
 
 - Re-run the gate: `cargo fmt --all && cargo clippy --workspace --all-targets
-  -- -D warnings && cargo test --workspace` (expect 458/0/1).
+  -D warnings && cargo test --workspace` (expect 459/0/1).
 - See the three fixes: `git show` the diff on `src/session.rs` (ADV-S1),
   `src/session_supervisor.rs` (ADV-S2 + ADV-S3).
 - See the guards: the final section of `tests/session_adversarial.rs`
   (`adv_s1_*`, `adv_s2_*`, `adv_s3_*`).
-- **Not pushed.** Commit is `git commit -s` on this branch only.
+- See the branch-drift re-merge: `git log --oneline` for the
+  "Merge origin/agent/m3-session-domain" and supervisor-doc merge commits.
+- **Not pushed.** Commits are `git commit -s` on this branch only.
 
 ## 7. Open items for the serial integration commit (not this lane)
 
@@ -217,3 +254,50 @@ their dedicated integration binaries.
   test still records this; reconcile when the supervisor uses the domain status.
 - These are pre-existing, out of scope for the three reported defects, and
   unchanged by this lane.
+
+## 8. Branch-drift re-merge (M-1) — full resolution
+
+The independent review flagged that `agent/m3-session-domain` landed follow-up
+fixes to `SessionRegistry::observe` *after* it was first merged here, so a naive
+landing could silently drop either this branch's ADV-S1 guard or the domain
+lane's D-M3-001 `StatusChanged` conformance. Resolution:
+
+- **Merge performed:** `git merge --no-edit origin/agent/m3-session-domain`
+  (the remote tip `25a246c`, which had itself merged `origin/main`). Only
+  `crates/noren-app/src/session.rs` conflicted; `tests/session_domain.rs` and
+  everything else auto-merged.
+- **What both sides changed in `observe`:** this branch added the monotonic rank
+  guard and `SessionError::InvalidStatusTransition`; the domain lane changed
+  `SessionEvent::StatusChanged` from a unit variant to the contract struct
+  `StatusChanged { id, status }` (`65ebc45`) and refined docs. The domain lane
+  independently arrived at the same rank guard in `25a246c`.
+- **Resolution choice — both survive.** For `session.rs` the domain lane's
+  version is taken as the contract-authoritative superset (via `git checkout
+  --theirs` on that one file): it carries **both** the rank guard
+  (`if status.rank() < descriptor.status.rank() => Err(InvalidStatusTransition)`,
+  ADV-S1) and the struct `StatusChanged { id, status }` construction
+  (D-M3-001). Git had already auto-merged the `observe` body with both changes;
+  every conflict hunk was doc-comment wording only, so no behaviour was
+  silently dropped on either side.
+- **No genuine behavioural conflict:** the two changes are orthogonal — the
+  guard decides *whether* to accept the observation; the struct variant is the
+  *shape* of the success event. Keeping both is correct, not a compromise.
+- **Confirmation:** `tests/session_domain.rs` (35) and the three `adv_s*` guards
+  all pass against the merged module. `grep` confirms
+  `InvalidStatusTransition` and `StatusChanged {` are both present in the
+  resolved `session.rs`.
+
+### N-1 (supervisor doc) resolution
+
+Folded in the supervisor lane's doc-only follow-up by merging
+`agent/m3-session-supervisor`. Its code tip `2686956` was already an ancestor of
+HEAD, so the merge applied only `0ac6512` (the `M3-1b-review.md` re-review); no
+code changed, no conflict. The supervisor code remains fully merged and verified.
+
+### Carry-in from `origin/main`
+
+The domain lane had merged `main`, so this re-merge also brings in `main`'s
+changes (fleet-tooling removal, PRs #68/#69/#72, the `session-api.md` and
+`milestone-3-breakdown.md` docs, the `merge_gate.py` CI script). None of these
+touch the session code or tests; `git diff --stat origin/main...HEAD` deletes no
+test file. ADR 0003 is still respected.
