@@ -14,7 +14,9 @@ Noren today is a terminal **foundation**: a macOS window backed by a working
 PTY that spawns a local `/bin/zsh`, a renderer-independent terminal state core
 (scroll regions, alternate screen, SGR attributes, Unicode display width,
 bounded scrollback, selection, clipboard, search), and an input encoder that
-covers xterm modifier parameters and application cursor/keypad modes. It is
+covers xterm modifier parameters and application cursor/keypad modes. Several of
+those state features are not yet visible on screen — see "What does not work"
+below, which is the more useful list. It is
 **not yet** the workspace product that [ADR
 0003](adr/0003-noren-zellij-responsibility-boundary.md) describes: there is no
 workspace sidebar, and what runs is a single window onto one local shell
@@ -25,6 +27,13 @@ workspace sidebar, and what runs is a single window onto one local shell
 
 Each item states what you would actually see if you ran the build.
 
+- **There is no visible cursor.** The terminal state tracks a cursor position
+  and moves it correctly, but the render path never draws it: `glyph_vertices`
+  (`crates/noren-app/src/renderer.rs:275-326`) emits only character bitmaps from
+  `display_lines` plus an optional status line, and the word "cursor" does not
+  appear anywhere in `renderer.rs`. In practice: you type, characters appear,
+  and nothing shows you where the insertion point is. This is the first thing
+  most people notice.
 - **Everything renders in one colour.** The fragment shader returns a constant
   pale green (`crates/noren-app/src/renderer.rs:35`) and the vertex layout
   carries only a position, no colour channel (`renderer.rs:117-125`). SGR
@@ -48,8 +57,16 @@ Each item states what you would actually see if you ran the build.
 - **There is no accessibility surface.** Nothing in the tree integrates with
   assistive technology (no AccessKit, AT-SPI, or AppKit accessibility wiring);
   a screen reader has nothing to work with.
-- **macOS only, one fixed shell.** The renderer requests Metal only
-  (`renderer.rs:70`) and the app crate does not compile for other platforms.
+- **Selection and scrollback work, but you cannot see them.** Selection is
+  tracked and copy extracts it, yet the renderer does not highlight the selected
+  region — `main.rs:44-46` says so in the source itself. Scrollback is bounded
+  and searchable, but the renderer has no scroll offset and always draws the
+  bottom `visible_rows` (`renderer.rs:296`), so you cannot scroll the viewport
+  back through it. The data is there; the view onto it is not.
+- **macOS only, one fixed shell.** The renderer requests Metal exclusively
+  (`renderer.rs:70`), so it does not *run* on other platforms — it acquires no
+  adapter and fails at startup. (The app crate has no `cfg(target_os)` gating,
+  so it may well compile elsewhere; compiling is not the barrier, running is.)
   The PTY launches `/bin/zsh` with a fixed policy and no caller-controlled
   arguments (`crates/noren-pty/src/lib.rs:33`). Linux support and SSH/remote
   sessions are roadmap intent (Milestones 4 and 6), not current capability.
