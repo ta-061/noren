@@ -1,34 +1,38 @@
 # Coordination status
 
-Last updated: 2026-08-05 (Asia/Tokyo). `main` is at `c415f54` and passes **177
-workspace tests**. Historical sections below preserve the earlier PR #17/#19
-records at their own heads, corrected only where an active claim went stale.
+Last updated: 2026-08-07 (Asia/Tokyo). The product-code baseline on `main` is
+`1d329a5` and passes **353 workspace tests**. Historical sections below preserve
+the earlier PR #17/#19 records at their own heads, corrected only where an
+active claim went stale.
 
 ## Current phase
 
-Terminal foundation. On `main`: scrolling regions, alternate screen and mode
-state, erase/edit operations, SGR and cell attributes, application cursor/keypad
-modes, escape-intermediate and string-sequence handling, DECSTBM clamping,
-bounded scrollback, and key encoding through stage 3 (Delete, navigation,
-function keys, Alt-as-ESC, Ctrl+named). See
+Milestone 2 terminal foundation is complete. On `main`: window and local zsh
+PTY, renderer-independent terminal state, scrolling regions, alternate screen
+and mode state, erase/edit operations, SGR and cell attributes, application
+cursor/keypad modes, escape-intermediate and string-sequence handling, DECSTBM
+clamping, bounded scrollback, Unicode/CJK display width, complete staged key
+encoding, selection with clipboard copy/paste, scrollback search, configuration,
+and diagnostics. See
 [terminal core foundation](../architecture/terminal-core-foundation.md).
 
-Quality gates: 177 workspace tests, a VT compatibility harness, an adversarial
-hostile-input suite, plus `cargo deny` and MSRV verification in CI.
+Quality gates: 353 workspace tests, a VT compatibility harness, two independent
+adversarial hostile-input suites, plus `cargo deny` and MSRV verification in CI.
 
 This is **not** a VT100/xterm or vim/tmux/zellij compatibility claim. The largest
-outstanding gaps are Unicode/CJK character width and mouse support; the ranked,
-evidence-based list is the [Zellij gap
-analysis](../compatibility/zellij-gap-analysis.md). Known non-conformance is
-recorded in [reviews](reviews/) and under
+outstanding presentation/input gaps are a rendered-frame oracle, mouse input,
+truecolor drawing, IME, and accessibility; the ranked, evidence-based list is
+the [Zellij gap analysis](../compatibility/zellij-gap-analysis.md). Known
+non-conformance is recorded in [reviews](reviews/) and under
 [accepted follow-ups](#accepted-follow-ups) below.
 
-Development now runs as an agent fleet; see [fleet](fleet.md) for lane
-ownership, quota-gated dispatch, and failover.
+Development runs through parallel AI coding lanes with independent verification;
+the rules that apply to every change are in
+[development model](development-model.md).
 
 ## GitHub state
 
-Verified on 2026-08-05 with `gh pr list` and `gh issue list`:
+Verified on 2026-08-07 with `gh pr list` and `gh issue list`:
 
 - PR [#29](https://github.com/ta-061/noren/pull/29) is merged as `22c985e` and
   subsumes PRs [#21](https://github.com/ta-061/noren/pull/21),
@@ -68,13 +72,19 @@ Verified on 2026-08-05 with `gh pr list` and `gh issue list`:
   DECSTBM clamping and C0 inside CSI (Issue #37);
   [#47](https://github.com/ta-061/noren/pull/47) Zellij gap analysis;
   [#49](https://github.com/ta-061/noren/pull/49) lane stall diagnosis;
-  [#50](https://github.com/ta-061/noren/pull/50) bounded scrollback.
-- Issues #22, #24, #26, #27, #28, #35, #37, and #41 are closed as delivered.
-  Issue [#36](https://github.com/ta-061/noren/issues/36) stays open for stage 4
-  (Shift/modifier parameters). Issue
-  [#46](https://github.com/ta-061/noren/issues/46) is open: legacy X10 `CSI M`
-  deletes a line and prints its coordinate bytes, found by the Zellij gap
-  analysis after #41 had fixed only the `<`/`=` markers.
+  [#50](https://github.com/ta-061/noren/pull/50) bounded scrollback;
+  [#53](https://github.com/ta-061/noren/pull/53) Unicode/CJK display width;
+  [#56](https://github.com/ta-061/noren/pull/56) indexed/truecolor terminal
+  state; [#60](https://github.com/ta-061/noren/pull/60) modifier parameters;
+  [#62](https://github.com/ta-061/noren/pull/62) wide-cell edge handling;
+  [#64](https://github.com/ta-061/noren/pull/64) the per-cell grapheme cap;
+  [#65](https://github.com/ta-061/noren/pull/65) scrollback search;
+  [#66](https://github.com/ta-061/noren/pull/66) selection and clipboard; and
+  [#67](https://github.com/ta-061/noren/pull/67) configuration and diagnostics.
+- Issues #22, #24, #26, #27, #28, #35, #36, #37, and #41 are closed as
+  delivered. Issue [#46](https://github.com/ta-061/noren/issues/46) is also
+  closed after review showed its output-channel reproduction was valid Delete
+  Line behavior, not an X10 input report; mouse input remains unimplemented.
 - CI runs four checks per PR: the Rust build/lint/test job, the documentation
   validator, `cargo deny check`, and MSRV verification. These became *required*
   when branch protection was enabled on 2026-08-05 (see [resolved
@@ -125,13 +135,13 @@ tracked to closure rather than left implicit.
 | --- | --- | --- | --- |
 | Renderer clamped the drawn grid to 160x60 while the PTY/terminal grid was capped only at `u16::MAX` | MAJOR | [Qwen](reviews/terminal-stack-qwen.md) | Fixed, PR #38 (Issue #35) |
 | Delete/navigation/function keys, Alt+char, and Ctrl+named keys were silently dropped | MAJOR | [Qwen](reviews/terminal-stack-qwen.md) | Fixed, PRs #40 and #48 |
-| Shift and general modifier parameters are still not encoded, so Shift+Arrow is indistinguishable from a bare arrow | MAJOR | [Qwen](reviews/terminal-stack-qwen.md) | **Open** — Issue #36 stage 4 |
+| Shift and general modifier parameters were not encoded, so Shift+Arrow was indistinguishable from a bare arrow | MAJOR | [Qwen](reviews/terminal-stack-qwen.md) | Fixed, PR #60 (Issue #36 closed) |
 | DECSTBM rejected an out-of-range bottom margin instead of clamping | MINOR | [GLM](reviews/terminal-stack-glm.md) | Fixed, PR #45 (Issue #37) |
 | C0 controls embedded inside a CSI were swallowed rather than executed | MINOR | [GLM](reviews/terminal-stack-glm.md) | Fixed, PR #45 (Issue #37) |
 | DCS/SOS/PM/APC payloads rendered as screen text, allowing a program to spoof screen content | MAJOR | [Kimi](reviews/terminal-stack-kimi.md) | Fixed, PR #43 (Issue #41) |
 | CSI private markers `<` and `=` executed as destructive plain CSI | MAJOR | [Kimi](reviews/terminal-stack-kimi.md) | Fixed, PR #43 (Issue #41) |
 | Legacy X10 `CSI M` "misparse" on the output channel | — | [Zellij gap analysis](../compatibility/zellij-gap-analysis.md) | **Not a bug** — Issue #46 and PR #52 closed; see below |
-| Unicode/CJK character width is not modeled, so wide characters misalign the grid | MAJOR | [Zellij gap analysis](../compatibility/zellij-gap-analysis.md) | **Open** — no Issue yet |
+| Unicode/CJK character width was not modeled, so wide characters misaligned the grid | MAJOR | [Zellij gap analysis](../compatibility/zellij-gap-analysis.md) | Fixed, PR #53 |
 | No mouse support: modes untracked and no pointer events reach the PTY | MAJOR | [Zellij gap analysis](../compatibility/zellij-gap-analysis.md) | **Open** — no Issue yet |
 
 The X10 `CSI M` item was withdrawn after review. `TerminalState::feed_bytes`
@@ -149,8 +159,9 @@ mutation-tested to confirm it detects breakage rather than passing vacuously. An
 independent second sweep from the Kimi lane (PR #43's provenance) found two real
 parser defects the first sweep had reported clean, which is why both are kept.
 
-IME, non-ASCII glyph quality, and truecolor rendering remain outstanding, and no
-compatibility claim is made for any of them.
+IME, non-ASCII glyph quality beyond modeled display width, truecolor rendering,
+and mouse input remain outstanding, and no compatibility claim is made for any
+of them.
 
 ## Merged PR #19 Terminal Core handoff
 
@@ -240,8 +251,8 @@ sibling's tests existed proposed deleting roughly 1,800 lines of passing tests,
 and `mergeable=MERGEABLE`/`CLEAN`/green CI does **not** catch it — a clean delete
 is still a clean merge. The check is `git diff --stat origin/main...HEAD`.
 
-The macOS smoke check is **done**. Run on 2026-08-05 against `main` at `c415f54`
-on macOS Apple Silicon, from a release build (`cargo build --release -p
+The macOS smoke check is **done**. Re-run on 2026-08-07 against the product-code
+baseline `1d329a5` on macOS Apple Silicon, from a release build (`cargo build --release -p
 noren-app`, finished clean):
 
 | Step | Observed evidence |
@@ -283,15 +294,12 @@ The owner decided all four outstanding items:
 
 ## Next steps
 
-1. Fix Issue [#46](https://github.com/ta-061/noren/issues/46): legacy X10
-   `CSI M` corrupts the screen, and Zellij enables mouse mode by default, so
-   moving the mouse is enough to trigger it.
-2. Land Issue [#36](https://github.com/ta-061/noren/issues/36) stage 4
-   (Shift/modifier parameters), the last input-encoding gap.
-3. Open Issues for Unicode/CJK character width and mouse support, the two
-   remaining blocking gaps in the [Zellij gap
-   analysis](../compatibility/zellij-gap-analysis.md). Width work touches the
-   cell model, so it needs its own design review before implementation.
-4. Build a rendered-frame oracle so glyph correctness stops depending on a human
+1. Begin Milestone 3 with the external-session boundary recorded in ADR 0003;
+   do not introduce native tabs, panes, splits, or a layout model.
+2. Specify and implement mouse input as an application-side encoder without
+   reintroducing the withdrawn Issue #46 output-parser premise.
+3. Build a rendered-frame oracle so glyph correctness stops depending on a human
    looking at the window. The smoke check covers the process/PTY/geometry chain
    but cannot see what is drawn.
+4. Wire modeled indexed/truecolor state into drawing and retain the existing
+   byte- and state-level regression coverage.
