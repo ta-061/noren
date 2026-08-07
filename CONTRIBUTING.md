@@ -92,8 +92,8 @@ Work advances through parallel lanes under these rules:
   green CI alone.
 
 Implemented in a Draft PR is not supported behavior and not a compatibility
-claim. Lane ownership and dispatch are described in
-[coordination fleet](docs/coordination/fleet.md).
+claim. The rules that apply to every change are in
+[development model](docs/coordination/development-model.md).
 
 ## Pull requests and review
 
