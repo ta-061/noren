@@ -1,24 +1,31 @@
-# Review — M3-1b session lifecycle supervisor (independent)
+# Re-review — M3-1b session lifecycle supervisor (independent)
 
 - Reviewed branch: `agent/m3-session-supervisor`
-- Reviewed head SHA: `79dff71e3f26` (code commit `e4d6479`, handoff `79dff71`)
-- Base: `origin/main` at `1d329a5`
+- Reviewed head SHA: `2686956b93d9024fadcd0f3dc3367ae7a26c17ce` (fix-up commit
+  `2686956`; code commits `e4d6479`, review/handoff commits `79dff71`, `21d4b49`)
+- Base: `origin/main` at `1d329a51582a937c37e5357e21d9a37eb49079bc`
+  (`git merge-base origin/main HEAD` confirms)
 - Task authority: `state/tasks/M3-1b.md` (fleet repo `noren-fleet-private`)
-- Reviewer: independent (did not author the code under review), run from the
-  `pool-rev-b` worktree checked out detached at `79dff71`.
+- Author handoff: `docs/coordination/handoffs/glm-b.md` (§8 documents the fixes)
+- Reviewer: independent; did not author the code under review. This RE-review
+  supersedes the earlier review of `79dff71` (which found 1 MAJOR + 5 MINORs);
+  that review is void and every claim below was re-derived from the current head.
 
 ## Verdict
 
-**FINDINGS** — 0 blockers, 1 major, 5 minors. All three gates pass; all four
-acceptance criteria and all four required tests are met. The major finding is a
-public contract the docs promise and the code demonstrably does not deliver
-(`ReapReport` ordering). The minors are test-coverage gaps proven by mutation
-testing, a misleading error classification, and two integration notes. No
-ADR 0003 boundary violation, no unintended deletions, no panic/leak surface.
+**FINDINGS** — 0 blockers, 0 majors, 1 minor. All three gates pass. All four
+acceptance criteria and all four required tests are met. Every prior finding is
+genuinely resolved: MAJOR 1 and MINORs 2/3 are fixed with regression-catching
+tests (proven by mutation, below); MINORs 4/5/6 are documented exactly as the
+agreed disposition stated. The single new finding is a non-blocking
+documentation-clarity nit (mixed-pass ordering semantics of `ReapReport`).
+No ADR 0003 violation, no unintended deletions, no panic/leak/unbounded-growth
+surface beyond the retention policy that is now documented on the type.
 
 ## Gates (real output)
 
-Toolchain: `rustc 1.88.0` via `rust-toolchain.toml`.
+Toolchain: `rustc 1.88.0 (6b00bc388 2025-06-23)` via `rust-toolchain.toml`
+(channel `1.88.0`, target `aarch64-apple-darwin`).
 
 ```
 $ cargo fmt --all -- --check
@@ -28,256 +35,206 @@ $ echo $?
 (No output — format clean.)
 
 ```
+$ cargo clean -p noren-app          # force a fresh check, not cache
 $ cargo clippy --workspace --all-targets -- -D warnings
-...
-    Checking noren-app v0.1.0 (...)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.79s
+    Checking noren-app v0.1.0 (.../pool-m3b/crates/noren-app)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.76s
 $ echo $?
 0
 ```
+(Deliberately re-ran after `cargo clean -p noren-app` because the first run was
+fully cached; no warnings, no errors on the fresh check.)
 
 ```
 $ cargo test --workspace
 ```
-Per-binary `test result:` lines (all `ok`):
+All 25 `test result:` lines are `ok`. Per-binary breakdown:
 
 | binary | passed | failed | ignored |
 |---|---|---|---|
 | noren-app lib (`src/lib.rs`) | 79 | 0 | 1 (pre-existing) |
 | noren-app bin (`src/main.rs`) | 24 | 0 | 0 |
-| `tests/session_supervisor.rs` (new) | 26 | 0 | 0 |
+| `tests/session_supervisor.rs` (the lane's target) | 29 | 0 | 0 |
 | `tests/verify59_independent.rs` | 19 | 0 | 0 |
 | noren-pty lib | 10 | 0 | 0 |
 | noren-terminal lib | 45 | 0 | 0 |
 | noren-terminal integration (16 targets) | 176 | 0 | 0 |
 | doc-tests (3 crates) | 0 | 0 | 0 |
 
-Total **379 passed, 0 failed, 1 ignored**. The 1 ignored test is
-`crates/noren-app/src/clipboard.rs:228` (`#[ignore = "touches the real macOS
-system clipboard"]`), present identically on `origin/main` — not introduced by
-this lane. The handoff's count claims (353 baseline + 26 new = 379; 14 inline +
-12 integration = 26) reproduce exactly.
+**Total: 382 passed, 0 failed, 1 ignored.** The 1 ignored test is the
+pre-existing `#[ignore = "touches the real macOS system clipboard"]` in
+`crates/noren-app/src/clipboard.rs:228`, present identically on `origin/main`
+(verified with `git show origin/main:crates/noren-app/src/clipboard.rs`).
+The lane target's 29 = 14 inline unit tests + 15 integration tests (12
+original + 3 added by the fix-up), matching the handoff §4/§8 claims exactly.
+Baseline check: `origin/main` at `1d329a5` has 353 passing; 353 + 29 = 382,
+so the lane adds exactly its tests and breaks nothing.
+
+## Prior findings — genuinely resolved, verified by mutation
+
+The fix-up's own claims were not trusted; each was re-verified by mutating the
+current head and re-running the committed suite. All mutations were reverted
+afterwards (`git status --short` clean).
+
+| prior finding | fix claimed | mutation applied at head | committed suite result | verdict |
+|---|---|---|---|---|
+| MAJOR 1 — `poll` delivered HashMap order | iterate `self.order` + 10-session order test | revert `poll` to `self.sessions.iter()` | `poll_reports_multi_session_transitions_in_insertion_order` FAILS (28 passed; 1 failed) | genuinely fixed |
+| MINOR 2 — shared deadline untested | mock records deadlines + all-equal assertion | move `deadline` computation inside the loop (`n × deadline` regression) | `shutdown_all_feeds_one_shared_deadline_to_every_child` FAILS (28 passed; 1 failed) | genuinely fixed |
+| MINOR 3 — forget+shutdown_all untested | `forget_then_shutdown_all_omits_the_forgotten_id` | delete `order.retain` in `forget` | `forget_then_shutdown_all_omits_the_forgotten_id` FAILS (28 passed; 1 failed) | genuinely fixed |
+| MINOR 4 — unknown-id `Failed(PollFailed)` | documented | n/a (documentation disposition) | rustdoc at `src/session_supervisor.rs:506-511` matches probe-verified behavior | resolved as agreed |
+| MINOR 5 — deadline advisory vs `Drop` | documented | n/a (documentation disposition) | "Drop semantics (integration note)" at `src/session_supervisor.rs:235-246` | resolved as agreed |
+| MINOR 6 — unbounded retention | documented | n/a (documentation disposition) | "Record retention" section at `src/session_supervisor.rs:345-352` | resolved as agreed |
+
+One extra mutation for the core invariant (independent of prior findings):
+suppressing the `Exited` transition in `poll` (stuck `Running`) makes **9
+committed tests fail** (20 passed; 9 failed) — the central contract is
+behavior-bound, not documented into existence.
 
 ## Acceptance criteria (one by one)
 
 1. **Supervisor owns child handles; the registry never does. — MET.**
-   `SupervisedSession.child` (`src/session_supervisor.rs:320-323`) is the only
-   strong reference to `Box<dyn Child + Send>`; every terminal transition sets
-   it to `None` (`mark_exited` line 593, `mark_failed` line 604,
-   `finalize_exited` line 615, `finalize_failed` line 626). No registry exists
-   on this branch (M3-1a unmerged), and the module is not declared in
-   `lib.rs`, so nothing else can hold a handle. Structural, and enforced by
-   type ownership.
-
+   `SupervisedSession.child` (`src/session_supervisor.rs:333-336`) is the only
+   strong reference to `Box<dyn Child + Send>`. Every terminal transition drops
+   it: `mark_exited` (:627), `mark_failed` (:638), `finalize_exited` (:649),
+   `finalize_failed` (:660). No registry exists on this branch (M3-1a
+   unmerged), the module is not declared in `lib.rs` (grep: no reference in
+   `crates/noren-app/src/lib.rs` or `main.rs`), so nothing else can hold a
+   handle. Probe P5 (below) confirms a terminal session's handle is gone:
+   `terminate` after poll-recorded failure performs zero backend calls.
 2. **A dead child produces Exited/Failed rather than a stuck Running. — MET.**
-   Verified by probe: unprompted exit (`ctrl.exit(Some(42))`) is surfaced by a
-   single `poll()` as `Exited { code: Some(42) }`; poll backend error becomes
-   `Failed(PollFailed)`; shutdown timeout becomes `Failed(ReapTimeout)`;
-   elapsed deadline becomes `Failed(ReapTimeout)` without a backend call; even
-   the defensive "handle missing while Running" case (line 452-453) resolves to
-   `Failed`, never `Running`. Also verified a racing natural exit then
-   `terminate_now` keeps the natural code `Exited { code: Some(42) }`.
-
-3. **Termination reaps the child and is idempotent. — MET.** Verified by
-   reading and mutating: with the fast path deleted, 3 committed tests fail
-   (see mutation section). `shutdown_all` is idempotent at the backend level:
-   my probe recorded per-child `shutdown` call counts `[1, 1, 1]` after the
-   first pass and unchanged after a second pass.
-
+   Verified by mutation (9 failures when the transition is suppressed) and by
+   probes: unprompted exit, poll backend error, shutdown hard error, shutdown
+   timeout, elapsed deadline, deadline boundary (`Instant::now()`), and even
+   the defensive handle-missing branch (`src/session_supervisor.rs:479-481`).
+   Every path lands terminal.
+3. **Termination reaps the child and is idempotent. — MET.**
+   `terminate_reaps_and_second_call_is_a_no_op` asserts `shutdown_count == 1`
+   and stable poll counts after a second call; probe P4 extends this to
+   `shutdown_all`'s second pass (zero additional backend calls per child).
 4. **Until M3-1a lands, only a fake process model and a failure matrix exist.
-   — MET.** `docs/coordination/decisions/D-M3-001-session-api.md` is absent on
-   this branch (the `decisions/` directory does not exist); the STUB block
-   (lines 64-149) is clearly marked; the mock + tests are the only executable
-   surface; the module is not wired into `lib.rs` (forbidden by the lease).
+   — MET.** `docs/coordination/decisions/` does not exist on this branch
+   (D-M3-001 absent); the STUB block (`src/session_supervisor.rs:64-149`) is
+   clearly marked; the mock + tests are the only executable surface; the module
+   is not wired into `lib.rs` (forbidden by the lease).
 
 ## Required tests — present and behavior-bound
 
-- spawn then Running via fake supervisor: `spawn_assigns_unique_ids_and_selects_newest`
-  (inline) — mutates `fresh_id` → fails.
-- child crash surfaces as Failed/Exited: `poll_surfaces_unprompted_exit...`,
-  `unprompted_death_surfaces_as_exited_within_one_poll`, plus the poll-error
-  pair.
+- spawn then Running via fake supervisor: `spawn_assigns_unique_ids_and_selects_newest` (inline).
+- child crash surfaces as Failed/Exited: `poll_surfaces_unprompted_exit_as_exited_not_running`,
+  `unprompted_death_surfaces_as_exited_within_one_poll`, plus the poll-error pair.
 - double terminate idempotent, reaps once: `terminate_reaps_a_running_child_and_is_idempotent`,
-  `terminate_reaps_and_second_call_is_a_no_op` (asserts backend call counts).
-- stale session detected: `poll` over a child that died with no status update
-  is exactly the unprompted-death tests above.
+  `terminate_reaps_and_second_call_is_a_no_op` (both assert backend call counts).
+- stale session detected: the unprompted-death tests (child dies with no status
+  update; one `poll` surfaces it).
 
-## Interaction / adversarial tests beyond the author's suite
+## Interactions the author did not test (reviewer probes, temporary — removed)
 
-The author tested each feature alone; this project has repeatedly shipped
-combined-feature defects, so I probed combinations (temporary probes, since
-removed):
+A throwaway `tests/zz_review_probe.rs` (10 tests) was written, run, and deleted
+before the review commit. Three probes failed on their first draft and all
+three were flaws in the probes, not the code — recorded here for honesty:
+selecting the victim instead of the keeper; expecting `shutdown_count == 0`
+when `terminate` kills a child that died unobserved (the supervisor cannot know
+without polling; the natural exit code still survives, which is the real
+invariant); miscounting records after an extra `forget`. After fixing the
+probes, **all 10 pass**:
 
-- **forget + shutdown_all** (finding 3): spawn 3, terminate+forget the middle,
-  `shutdown_all` reports only the two tracked ids. Current behavior correct;
-  not covered by any committed test (proven by mutation).
-- **racing natural exit + terminate**: `exit(Some(42))` then `terminate_now` →
-  `Exited { code: Some(42) }`; the natural code survives the kill path.
-- **terminate after poll-failure**: poll marks `Failed(PollFailed)`; a later
-  `terminate_now` returns the recorded status and performs **zero** backend
-  calls — correct fast-path behavior for `Failed`, not just `Exited`.
-- **shared deadline proof**: a deadline-recording `Child` confirmed all three
-  children in a batch receive the *same* `Instant` from `shutdown_all`.
-- **terminate(unknown id)**: after forget, `terminate_now(id)` fabricates
-  `Failed(PollFailed)` (finding 4).
-- **Degenerate input**: no parse surface — the module is a state machine
-  driven by app code. Panic surface is limited to `.expect("mock lock")` in
-  test-only code. `fresh_id` uses `wrapping_add` (collision after 2^64 spawns;
-  theoretical, noted, not a finding). `shutdown_all` clones `order` (O(n),
-  bounded by session count). No unbounded buffers beyond the intentional
-  terminal-record retention (finding 5 territory — see below).
+- **P1 mixed pass**: 6 sessions, alternating exit/fail, one `poll` → `exited()`
+  and `failed()` each in insertion order, all 6 terminal, `running_count == 0`.
+- **P2 unrelated death preserves selection**: non-selected session dies →
+  selection stays on the live session.
+- **P3 spawn failure preserves state**: failed spawn leaves existing selection
+  and records untouched.
+- **P4 second `shutdown_all` pass does zero backend work** (per-child
+  `shutdown_count` stays 1, poll counts unchanged).
+- **P5 terminate after poll-recorded failure**: fast path, zero backend calls,
+  recorded status returned.
+- **P6 unobserved death then terminate**: natural code `Exited { code: Some(42) }`
+  survives the kill path.
+- **P7 terminate on a forgotten id** returns the documented defensive
+  `Failed(PollFailed)` (matches the new rustdoc, MINOR 4 disposition).
+- **P8 forget mid-lifecycle then new spawn**: `order`/`poll`/selection stay
+  coherent.
+- **P9 shutdown_all reports a pre-terminal status verbatim** (`Exited { code:
+  Some(7) }`) in insertion order, then reaps the rest.
+- **P10 deadline boundary** `Instant::now()`: `Failed(ReapTimeout)`, no panic;
+  generous deadline → `Exited`.
 
-## Mutation testing — do the tests test the behavior?
+## Panics, leaks, unbounded growth
 
-All mutations were applied, tested, and reverted; the tree is clean again.
-
-| mutation | committed suite | verdict |
-|---|---|---|
-| suppress `Exited` transition in `poll` (stuck `Running`) | **8 failures** | caught |
-| delete `terminate` terminal fast path | **3 failures** | caught |
-| per-iteration deadline in `shutdown_all` (n*deadline bug) | **26 pass** | **NOT caught** — only a deadline-recording probe catches it |
-| delete `order.retain` in `forget` (zombie ids re-terminated by `shutdown_all`) | **26 pass** | **NOT caught** — only the forget+shutdown_all probe catches it |
-
-The first two columns show the load-bearing invariants are genuinely tested.
-The last two are findings 2 and 3: real, documented contracts with zero
-committed coverage.
+- No panic surface in production code: the only `.expect()`/`unwrap()` calls
+  are inside `#[cfg(test)]` regions (mock lock, test bodies). No indexing, no
+  arithmetic that can trap (`fresh_id` uses `wrapping_add`; the 2^64 id
+  collision is theoretical and was already noted by the prior review).
+- No `unsafe` anywhere; the integration target carries `#![forbid(unsafe_code)]`.
+- No unbounded buffers beyond the intentional record retention, which is now
+  documented on the type ("Record retention", `src/session_supervisor.rs:345-352`).
+  `order`/`sessions` grow only with spawn count; `ReapReport` is per-pass and
+  bounded by tracked sessions; the mock's `deadlines` vec is test-only and
+  bounded by backend call count. Probe suite fed degenerate inputs (elapsed
+  deadline, unknown/forgotten ids, empty spawner, alternating fault patterns);
+  no panic, no stuck state.
 
 ## Unintended deletions / lease
 
-`git diff --stat origin/main...HEAD`: 3 files, **1573 insertions(+), 0
-deletions**. `git diff --diff-filter=D` lists nothing. Forbidden files
-(`lib.rs`, `main.rs`, `Cargo.toml`, `Cargo.lock`, `status.md`) untouched —
-verified by the diff stat above; `cargo build` therefore still excludes the
-module, as intended. The handoff doc is outside the leased code paths but is
-the workflow's required coordination artifact.
+```
+$ git diff --name-status origin/main...HEAD
+A   crates/noren-app/src/session_supervisor.rs
+A   crates/noren-app/tests/session_supervisor.rs
+A   docs/coordination/handoffs/glm-b.md
+A   docs/coordination/reviews/M3-1b-review.md
+$ git diff --diff-filter=D --name-only origin/main...HEAD | wc -l
+0
+```
+
+Additions only; nothing deleted. Forbidden files (`lib.rs`, `main.rs`,
+`Cargo.toml`, `Cargo.lock`, `status.md`) untouched — the module still does not
+compile into the library/binary (`cargo build` excludes it; only `cargo test`
+exercises it via the `#[path]` include), exactly as the lease requires. The
+handoff and this review are coordination artifacts outside the two leased code
+paths, required by the workflow. The fix-up commit's own diff touches only the
+two leased code files plus the handoff.
 
 ## ADR 0003 boundary
 
-Clean. No pane, tab, layout tree, or split type anywhere in the diff; grep for
-`pane|layout|split|zellij|tab` over both files matches only the word
-"ownership split" in a comment (line 19). The module owns process lifecycle
-only; `select` is session focus, which the task spec itself assigns to this
-lane ("spawn/terminate/select"). No Zellij internal layout is read or
-persisted.
+Clean. `grep -niE "pane|layout|zellij|\btab\b|split"` across both code files
+matches nothing except the phrase "ownership split" in a comment (excluded).
+The module owns process lifecycle only; `select` is session focus, which the
+task spec assigns to this lane. No Zellij internal layout is introduced, read,
+or persisted.
 
-## Findings
+## Findings (new at this head)
 
-### MAJOR 1 — `ReapReport` promises insertion order; `poll` delivers HashMap order
+### MINOR R1 — `ReapReport`'s "in insertion order" is per-list on mixed passes; docs may promise more
 
-- Location: contract at `crates/noren-app/src/session_supervisor.rs:282-284`
+- Location: contract at `crates/noren-app/src/session_supervisor.rs:293-297`
   ("Lists exactly the sessions that left `Running` this pass, **in insertion
-  order**") vs implementation at `crates/noren-app/src/session_supervisor.rs:440-445`
-  (ids collected from `self.sessions.iter()` — a `HashMap` with randomized
-  iteration order). The insertion order is kept in `self.order` (line 333) but
-  `poll` never consults it.
-- Reproduction (reviewer probe, since removed): spawn 10 sessions, exit all
-  via their controllers, one `poll`:
-  ```
-  left:  [SessionId(6), SessionId(1), SessionId(7), SessionId(0), SessionId(4),
-          SessionId(8), SessionId(2), SessionId(3), SessionId(9), SessionId(5)]
-  right: [SessionId(0), SessionId(1), ..., SessionId(9)]
-  assertion `left == right` failed: ReapReport promises insertion order
-  ```
-- Expected: `report.exited()` in spawn order `[0..9]`. Actual: arbitrary
-  `RandomState` order, nondeterministic supervisor-to-supervisor.
-- Impact: no committed test transitions more than one session per `poll`, so
-  the suite cannot see this. A future UI/event loop that renders or applies a
-  pass's transitions in reported order gets shuffled, nondeterministic output.
-- Minimal fix: in `poll`, collect ids from `self.order.iter().filter(...)`
-  (filtering to `Running`) instead of `self.sessions.iter()`, and add one test
-  that transitions ≥2 sessions in a single pass and asserts report order.
-
-### MINOR 2 — shared-deadline contract of `shutdown_all` has no test that can catch a regression
-
-- Location: `crates/noren-app/src/session_supervisor.rs:551-561`; the only
-  timing assertion is `tests/session_supervisor.rs:123`
-  (`elapsed <= SHUTDOWN_DEADLINE`).
-- Evidence: with the deadline moved inside the loop (regressing to
-  `n * SHUTDOWN_DEADLINE` — the exact bug the module doc and commit message
-  claim to prevent), `cargo test -p noren-app --test session_supervisor` still
-  reports `test result: ok. 26 passed; 0 failed`. An instant mock can never
-  make a wall-clock assertion catch this.
-- Current behavior is correct (probe confirmed one shared `Instant` reaches
-  every child); the contract is simply unguarded.
-- Minimal fix: add a `Child` impl that records the `deadline` argument of each
-  `shutdown` call, and assert all recorded values are identical after
-  `shutdown_all`.
-
-### MINOR 3 — `forget`'s `order` maintenance and the forget+`shutdown_all` interaction are untested
-
-- Location: `crates/noren-app/src/session_supervisor.rs:577`
-  (`self.order.retain(...)`).
-- Evidence: deleting the `retain` line leaves committed tests green
-  (`test result: ok. 26 passed`), while `shutdown_all` then resurrects the
-  forgotten id and reports it as `Failed(PollFailed)`. No committed test
-  combines `forget` with `shutdown_all`.
-- Current behavior is correct; the interaction is unguarded.
-- Minimal fix: test spawn-3 → terminate+forget one → `shutdown_all` reports
-  exactly the remaining ids (this is precisely the reviewer probe that caught
-  the mutation).
-
-### MINOR 4 — `terminate` on an unknown id fabricates `Failed(PollFailed)`
-
-- Location: `crates/noren-app/src/session_supervisor.rs:485-489`.
-- Reproduction: spawn → terminate → `forget(id)` → `terminate_now(id)` returns
-  `SessionStatus::Failed { reason: SessionFailure::PollFailed }` (probe-verified).
-- Expected vs actual: `select`/`forget` correctly report
-  `SessionOpError::Unknown` for such ids, but `terminate` has no error channel
-  and invents a "poll failed" status for a session that never existed; a UI
-  rendering statuses cannot tell "unknown id" from a genuine backend poll
-  fault. The reason recorded has no relation to what happened.
-- Minimal fix: at minimum use a dedicated classification (or `Unknown` if one
-  is added to `SessionFailure` at D-M3-001 integration); preferably give
-  `terminate` a `Result<SessionStatus, SessionOpError>` so unknown ids surface
-  as `Unknown`. If kept as-is, document the chosen semantics on the method.
-
-### MINOR 5 — `Child::shutdown` deadline parameter cannot be honored by the known production backend; abandon path may still block in `Drop`
-
-- Location: contract `crates/noren-app/src/session_supervisor.rs:238-239`
-  ("Kill, reap, and join before `deadline`"); pre-check at lines 493-495;
-  production backend `crates/noren-pty/src/lib.rs:376-407` (`shutdown` takes
-  no deadline, uses its own internal `SHUTDOWN_DEADLINE`) and
-  `crates/noren-pty/src/lib.rs:420-424` (`impl Drop for PtySession` calls
-  `shutdown()`).
-- Consequences once the real adapter is wired: (a) the deadline argument is
-  dead weight for `PtySession` (tight caller budgets can be exceeded by the
-  internal 2 s); (b) `terminate`'s already-elapsed-deadline path marks
-  `Failed(ReapTimeout)` and drops the handle *without* calling `shutdown` —
-  but the adapter's `Drop` will then run a full shutdown attempt anyway, so
-  "no backend call" (asserted by the mock-based test at lines 967-980) will not
-  hold in production.
-- The handoff §5.2 flags half of this; the Drop interaction seems new. No code
-  change is required in this lane — but the serial integration commit must
-  decide (deadline-parameterised adapter vs concurrent kill) and the `Child`
-  doc should note Drop semantics. Recorded so the integrator cannot miss it.
-
-### MINOR 6 — terminal records are retained without bound until cooperative `forget`
-
-- Location: `crates/noren-app/src/session_supervisor.rs:315-323` (record
-  kept), 563-582 (`forget` is the only removal path).
-- Behavior: every spawned session's record stays in `sessions` (and `order`)
-  until someone calls `forget`; nothing reaps records automatically and there
-  is no cap. A long-running supervisor whose owner never forgets grows without
-  bound.
-- Assessment: this is a deliberate, documented design ("The status remains so
-  callers can observe the outcome by id", lines 317-319), and the retirement
-  API exists. Ranking MINOR because the retention policy is delegated to a
-  registry that does not exist yet and nothing enforces it. Suggested fix:
-  at integration, the registry/domain must own an explicit retirement policy
-  (e.g., forget after the UI observes the terminal status, or a record cap);
-  alternatively document on the type that the map grows until `forget`.
+  order**"); implementation `mark_exited`/`mark_failed` push into two separate
+  `Vec`s (`src/session_supervisor.rs:300-301`).
+- Reproduction: 6 sessions, alternating exit/fail, one `poll` (reviewer probe
+  P1): `exited() == [id0, id2, id4]`, `failed() == [id1, id3, id5]`.
+- Expected vs actual: under a strict reading of the contract sentence a caller
+  could expect to reconstruct the single global order `[id0..id5]`; the actual
+  API exposes two parallel lists, each internally in insertion order, with no
+  accessor for the combined order. Behavior is correct and matches the most
+  natural reading of the next sentence ("Exited and Failed are reported
+  separately"); this is a doc-clarity gap, not a behavioral defect — a consumer
+  that needs global order can still query `status(id)` per id.
+- Severity: MINOR, non-blocking. Raised only because the MAJOR fixed in this
+  re-review was itself an ordering promise, so the remaining ambiguity is worth
+  pinning down at integration time.
+- Minimal fix: clarify the rustdoc — "insertion order is preserved *within each
+  of the two lists*" — or add a merged-view accessor at D-M3-001 integration.
 
 ## Areas checked and found sound
 
-- Idempotency of `terminate` and `shutdown_all` (mutation-verified, §above).
-- Selection safety: selecting a dead session is refused; selection is cleared
-  on every terminal transition of the selected id (all four `mark_*`/`finalize_*`
-  paths, lines 596-598, 607-609, 617-619, 627-629); `forget` also clears it
-  defensively.
-- The `Ok(())`-shutdown path reads the code via a second `poll_exit` and never
-  leaves the session `Running`, even on backend inconsistency (lines 507-517).
-- `#[path]` inclusion mechanics: the module compiles once per test binary only;
-  `cfg(test)` gating keeps `mock` out of production; `#![forbid(unsafe_code)]`
-  in the integration target; no `unsafe` in the module.
-- File lease and forbidden files (§above); handoff factual claims
-  (§Gates — all reproduce).
+- Idempotency of `terminate` and `shutdown_all` (committed tests + probe P4).
+- Selection safety: selection cleared exactly when the selected session
+  transitions (all four finalizers) and on `forget`; unrelated deaths leave it
+  alone (probe P2); `select` refuses dead/unknown ids.
+- The `Ok(())`-shutdown path (`poll_after_shutdown`,
+  `src/session_supervisor.rs:561-570`) never leaves a session `Running`, even
+  on backend inconsistency.
+- Handoff §4 numbers reproduce exactly (382/0/1; 29 lane tests); §8 fix claims
+  all hold under mutation.
+- No regressions elsewhere in the workspace: all pre-existing targets pass
+  unchanged at the lane's head.
