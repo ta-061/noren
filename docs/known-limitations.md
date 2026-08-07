@@ -62,6 +62,18 @@ Each item states what you would actually see if you ran the build.
   the terminal — the `WindowEvent::Ime(_)` arm in `main.rs`'s event handler
   drops the event without forwarding it. Japanese, Chinese, and
   Korean input methods produce nothing.
+- **Mouse reporting never reaches the program.** `mouse.rs` ships a complete,
+  tested `MouseEncoder::encode` for xterm tracking modes 1000/1002/1003 and
+  encodings 1006/1015/X10, but `main.rs` never calls it: neither `MouseEncoder`
+  nor `noren_app::mouse` appears in `main.rs` (the `MouseButton` it matches on
+  comes from `winit::event`, not the mouse module). The pointer handlers there
+  (`handle_mouse_button`, `handle_mouse_move`) drive **local text selection
+  only** — `handle_mouse_button` returns early for anything but a left click,
+  and neither handler ever writes report bytes to the PTY. In practice: the
+  mouse selects and copies text in Noren's own window, but the program running
+  inside sees nothing — in `vim` with `set mouse=a`, in `tmux`, and above all
+  in **Zellij**, clicks, drags, and the scroll wheel do nothing. Issue #96
+  tracks wiring the encoder to the PTY.
 - **There is no accessibility surface.** Nothing in the tree integrates with
   assistive technology (no AccessKit, AT-SPI, or AppKit accessibility wiring);
   a screen reader has nothing to work with.
