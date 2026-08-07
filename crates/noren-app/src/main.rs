@@ -10,6 +10,9 @@ use noren_app::{
     config::AppConfig,
     diagnostics::{self, PtyChildStatus},
     encode_paste,
+    palette::Palette,
+    session::{SessionAction, SessionError, SessionEvent, SessionId, SessionKind, SessionRegistry},
+    sidebar::{SidebarEntry, SidebarView},
 };
 use noren_pty::{PtyEvent, PtySession, PtySize};
 use noren_terminal::{Cell, GridPoint, Selection, SelectionMode, TerminalEngine, TerminalState};
@@ -26,6 +29,138 @@ use winit::window::{Window, WindowId};
 const WINDOW_WIDTH: u32 = 900;
 const WINDOW_HEIGHT: u32 = 600;
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
+
+/// The dispatchable intent behind each palette command.
+///
+/// The palette module is action-agnostic by design ([`Palette`] is generic
+/// over `A`); this enum binds the four canonical Noren commands to workspace
+/// intents without introducing a parallel vocabulary. Select and close need
+/// a target session resolved by the UI layer (step 2); this step carries the
+/// intent only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspaceAction {
+    /// Create a new local terminal session.
+    CreateSession,
+    /// Begin selecting a session (the UI resolves which).
+    SelectSession,
+    /// Begin closing a session (the UI resolves which).
+    CloseSession,
+    /// Focus the sidebar.
+    FocusSidebar,
+}
+
+/// Application workspace state: owns the session registry, the sidebar view
+/// derived from it, and the command palette.
+///
+/// Every mutation — create, select, close — routes through
+/// [`SessionRegistry::apply`] and then rebuilds the sidebar from the
+/// registry's current sessions and selection, so the view and the model can
+/// never disagree.
+struct WorkspaceState {
+    registry: SessionRegistry,
+    sidebar: SidebarView,
+    /// Owned by the workspace; dispatched in step 2 (palette UI).
+    #[allow(dead_code)]
+    palette: Palette<WorkspaceAction>,
+}
+
+impl Default for WorkspaceState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WorkspaceState {
+    /// Empty workspace: no sessions, empty sidebar, the canonical palette.
+    fn new() -> Self {
+        Self {
+            registry: SessionRegistry::new(),
+            sidebar: SidebarView::build(&[], None),
+            palette: Palette::noren(
+                WorkspaceAction::CreateSession,
+                WorkspaceAction::SelectSession,
+                WorkspaceAction::CloseSession,
+                WorkspaceAction::FocusSidebar,
+            ),
+        }
+    }
+
+    /// Create a new session and rebuild the sidebar.
+    ///
+    /// Creation is infallible: the registry mints a fresh id and accepts every
+    /// [`SessionKind`]. The new session starts at `Starting` status; advancing
+    /// it to `Running` is the supervisor's job (a later step).
+    fn create_session(&mut self, kind: SessionKind) -> SessionId {
+        let events = self
+            .registry
+            .apply(SessionAction::Create { kind })
+            .expect("SessionAction::Create is infallible");
+        self.rebuild_sidebar();
+        created_session_id(events)
+    }
+
+    /// Select a session by id and rebuild the sidebar.
+    ///
+    /// A stale id returns [`SessionError::UnknownSession`] without mutating the
+    /// view — the registry did not change, so the sidebar is still correct.
+    fn select_session(&mut self, id: SessionId) -> Result<(), SessionError> {
+        self.registry.apply(SessionAction::Select { id })?;
+        self.rebuild_sidebar();
+        Ok(())
+    }
+
+    /// Close a session by id and rebuild the sidebar.
+    ///
+    /// Closing the selected session clears the selection (the registry handles
+    /// this), so the rebuilt sidebar shows no selection and no viewport.
+    fn close_session(&mut self, id: SessionId) -> Result<(), SessionError> {
+        self.registry.apply(SessionAction::Close { id })?;
+        self.rebuild_sidebar();
+        Ok(())
+    }
+
+    /// Rebuild the sidebar from the registry's current sessions and selection.
+    ///
+    /// Called after every mutation so the view never lags the model.
+    fn rebuild_sidebar(&mut self) {
+        let entries: Vec<SidebarEntry> = self
+            .registry
+            .sessions()
+            .into_iter()
+            .map(SidebarEntry::Session)
+            .collect();
+        self.sidebar = SidebarView::build(&entries, self.registry.selected());
+    }
+
+    /// The current sidebar view (immutable snapshot for the renderer).
+    #[allow(dead_code)]
+    fn sidebar(&self) -> &SidebarView {
+        &self.sidebar
+    }
+
+    /// The command palette.
+    #[allow(dead_code)]
+    fn palette(&self) -> &Palette<WorkspaceAction> {
+        &self.palette
+    }
+
+    /// The session registry.
+    #[allow(dead_code)]
+    fn registry(&self) -> &SessionRegistry {
+        &self.registry
+    }
+}
+
+/// Extract the created session id from the events emitted by a `Create` action.
+fn created_session_id(events: Vec<SessionEvent>) -> SessionId {
+    events
+        .into_iter()
+        .find_map(|event| match event {
+            SessionEvent::Created(id) => Some(id),
+            _ => None,
+        })
+        .expect("SessionAction::Create yields exactly one Created event")
+}
 
 struct NorenApp {
     window: Option<Arc<Window>>,
@@ -48,6 +183,8 @@ struct NorenApp {
     drag_origin: Option<GridPoint>,
     drag_mode: SelectionMode,
     cursor_position: Option<PhysicalPosition<f64>>,
+    workspace: WorkspaceState,
+    active_session: Option<SessionId>,
 }
 
 impl Default for NorenApp {
@@ -81,6 +218,8 @@ impl NorenApp {
             drag_origin: None,
             drag_mode: SelectionMode::Char,
             cursor_position: None,
+            workspace: WorkspaceState::new(),
+            active_session: None,
         }
     }
 }
@@ -120,6 +259,11 @@ impl NorenApp {
                 self.status = "Noren PoC ready";
                 self.show_status = false;
                 self.pty_child = PtyChildStatus::Running;
+                let session_id = self.workspace.create_session(SessionKind::Local);
+                self.workspace
+                    .select_session(session_id)
+                    .expect("freshly created session is live");
+                self.active_session = Some(session_id);
                 Some(session)
             }
             Err(_) => {
@@ -525,6 +669,9 @@ impl NorenApp {
         self.status = status;
         self.show_status = true;
         self.redraw_needed = true;
+        if let Some(id) = self.active_session.take() {
+            let _ = self.workspace.close_session(id);
+        }
         if let Some(mut session) = self.pty.take()
             && session.shutdown().is_err()
         {
@@ -561,6 +708,9 @@ impl NorenApp {
     }
 
     fn close(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(id) = self.active_session.take() {
+            let _ = self.workspace.close_session(id);
+        }
         if let Some(mut session) = self.pty.take() {
             self.pty_child = PtyChildStatus::NotLaunched;
             if session.shutdown().is_err() {
@@ -778,6 +928,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use noren_app::palette::CommandId;
+    use noren_app::sidebar::EntryKind;
 
     #[test]
     fn winit_space_variants_encode_ascii_space() {
@@ -1087,5 +1239,166 @@ mod tests {
         let grid = actual.update(Resize::new(900, 600)).expect("grid");
         assert_eq!(grid, expected.update(Resize::new(900, 600)).expect("grid"));
         assert_eq!((grid.rows(), grid.cols()), (15, 45));
+    }
+
+    #[test]
+    fn workspace_starts_empty_with_no_sidebar_rows() {
+        let state = WorkspaceState::new();
+        assert!(state.registry().is_empty());
+        assert!(state.sidebar().is_empty());
+        assert!(state.sidebar().rows().is_empty());
+        assert!(
+            state.sidebar().empty_state().is_some(),
+            "empty sidebar must carry an empty-state notice"
+        );
+        assert_eq!(state.sidebar().viewport(), None);
+        assert_eq!(state.sidebar().selected_row_count(), 0);
+    }
+
+    #[test]
+    fn creating_a_session_adds_a_session_row_to_the_sidebar() {
+        let mut state = WorkspaceState::new();
+        let id = state.create_session(SessionKind::Local);
+
+        assert_eq!(state.registry().len(), 1);
+        let rows = state.sidebar().rows();
+        assert_eq!(rows.len(), 1, "sidebar must reflect the new session");
+        assert_eq!(rows[0].kind(), EntryKind::Session);
+        assert_eq!(rows[0].label(), id.to_string());
+        assert!(
+            rows[0].detail().is_some_and(|d| d.contains("local")),
+            "session detail should mention the kind, got {:?}",
+            rows[0].detail()
+        );
+    }
+
+    #[test]
+    fn selecting_a_session_marks_exactly_one_row_selected() {
+        let mut state = WorkspaceState::new();
+        let first = state.create_session(SessionKind::Local);
+        let _second = state.create_session(SessionKind::Local);
+        assert_eq!(
+            state.sidebar().selected_row_count(),
+            0,
+            "no session is selected initially"
+        );
+
+        state.select_session(first).expect("first session is live");
+
+        assert_eq!(state.sidebar().selected_row_count(), 1);
+        let selected = state
+            .sidebar()
+            .rows()
+            .iter()
+            .find(|row| row.is_selected())
+            .expect("exactly one selected row");
+        assert_eq!(selected.label(), first.to_string());
+        let viewport = state
+            .sidebar()
+            .viewport()
+            .expect("a selected session yields a viewport");
+        assert_eq!(viewport.session_id(), first);
+    }
+
+    #[test]
+    fn selecting_the_other_session_moves_the_single_selection() {
+        let mut state = WorkspaceState::new();
+        let first = state.create_session(SessionKind::Local);
+        let second = state.create_session(SessionKind::Local);
+        state.select_session(first).expect("first is live");
+        assert_eq!(state.sidebar().selected_row_count(), 1);
+
+        state.select_session(second).expect("second is live");
+
+        assert_eq!(state.sidebar().selected_row_count(), 1);
+        let selected_label = state
+            .sidebar()
+            .rows()
+            .iter()
+            .find(|row| row.is_selected())
+            .map(|row| row.label())
+            .expect("one selected row");
+        assert_eq!(selected_label, second.to_string());
+    }
+
+    #[test]
+    fn closing_the_selected_session_leaves_a_coherent_view() {
+        let mut state = WorkspaceState::new();
+        let first = state.create_session(SessionKind::Local);
+        let _second = state.create_session(SessionKind::Local);
+        state.select_session(first).expect("first is live");
+        assert!(state.sidebar().viewport().is_some());
+
+        state.close_session(first).expect("first is live");
+
+        assert_eq!(state.registry().len(), 1);
+        let rows = state.sidebar().rows();
+        assert_eq!(rows.len(), 1, "closed session must vanish from sidebar");
+        assert!(
+            !rows.iter().any(|row| row.label() == first.to_string()),
+            "closed session id must not appear"
+        );
+        assert_eq!(
+            state.sidebar().selected_row_count(),
+            0,
+            "closing the selected session clears the selection"
+        );
+        assert!(
+            state.sidebar().viewport().is_none(),
+            "no viewport without a selection"
+        );
+    }
+
+    #[test]
+    fn closing_all_sessions_shows_the_empty_state() {
+        let mut state = WorkspaceState::new();
+        let id = state.create_session(SessionKind::Local);
+        state.close_session(id).expect("session is live");
+
+        assert!(state.registry().is_empty());
+        assert!(state.sidebar().is_empty());
+        assert!(
+            state.sidebar().empty_state().is_some(),
+            "empty registry must produce an empty-state sidebar"
+        );
+        assert_eq!(state.sidebar().viewport(), None);
+    }
+
+    #[test]
+    fn selecting_a_stale_id_does_not_panic_or_mutate_the_view() {
+        let mut state = WorkspaceState::new();
+        let id = state.create_session(SessionKind::Local);
+        state.close_session(id).expect("session is live");
+        let rows_before = state.sidebar().rows().len();
+
+        let result = state.select_session(id);
+
+        assert_eq!(result, Err(SessionError::UnknownSession));
+        assert_eq!(
+            state.sidebar().rows().len(),
+            rows_before,
+            "a failed select must not change the view"
+        );
+    }
+
+    #[test]
+    fn palette_carries_all_four_canonical_commands() {
+        let state = WorkspaceState::new();
+        let palette = state.palette();
+        assert_eq!(palette.len(), 4);
+        for id in [
+            CommandId::SESSION_CREATE,
+            CommandId::SESSION_SELECT,
+            CommandId::SESSION_CLOSE,
+            CommandId::SIDEBAR_FOCUS,
+        ] {
+            assert!(palette.get(id).is_some(), "palette must include {id}");
+        }
+        let hits = palette.search("session");
+        assert!(
+            hits.iter()
+                .any(|hit| hit.command().id() == CommandId::SESSION_CREATE),
+            "searching 'session' must find the create command"
+        );
     }
 }
