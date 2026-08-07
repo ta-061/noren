@@ -1285,13 +1285,29 @@ impl NorenApp {
         }
     }
 
-    fn close(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(id) = self.active_session.take() {
-            let _ = self.workspace.close_session(id);
-        }
-        // Save on clean exit so a session selected but not otherwise mutated is
-        // not lost. `close_session` above already persisted (if it ran); this
-        // catches the no-active-session case and is harmless when redundant.
+    /// Everything `close` does apart from asking the event loop to exit.
+    ///
+    /// Split out so tests can drive the real teardown: `ActiveEventLoop` cannot
+    /// be constructed outside a running event loop, so a test that called
+    /// `close` could not exist, and the quit path went unexercised. Every
+    /// state-affecting step lives here; `close` adds only `event_loop.exit()`.
+    fn teardown(&mut self) {
+        // Quitting is not closing. The user asked to leave Noren, not to
+        // discard the session — and `SessionRegistry::close` *removes* the
+        // entry rather than marking it stopped, so closing here would persist
+        // a deletion and hand back an empty sidebar on the next launch. The
+        // session stays in the registry; only its PTY goes away. On the next
+        // launch it is restored as `SessionStatus::Starting`, which is what
+        // this PR already decided a restored session means: a visible entry
+        // whose shell is not running.
+        //
+        // This also protects the non-quit caller: `redraw` invokes `close` on
+        // `RenderOutcome::DeviceLost`. A lost GPU device must not delete the
+        // user's sessions.
+        self.active_session = None;
+        // Save on clean exit so a session selected but not otherwise mutated
+        // is not lost. No structural mutation precedes this, so it is the only
+        // write on the quit path and does not depend on ordering.
         self.workspace.persist();
         if let Some(mut session) = self.pty.take() {
             self.pty_child = PtyChildStatus::NotLaunched;
@@ -1299,6 +1315,10 @@ impl NorenApp {
                 eprintln!("Noren PTY shutdown reached its failure fallback");
             }
         }
+    }
+
+    fn close(&mut self, event_loop: &ActiveEventLoop) {
+        self.teardown();
         event_loop.exit();
     }
 }
@@ -3700,6 +3720,204 @@ mod tests {
                 target: "host".to_owned()
             },
         );
+        cleanup_state_file(&path);
+    }
+
+    // ── The quit path ──────────────────────────────────────────────────
+    //
+    // The tests above drive `WorkspaceState` directly and so never traverse
+    // what the app actually does on exit. These go through `NorenApp::teardown`
+    // — the whole of `NorenApp::close` except `event_loop.exit()` — and then
+    // read the file back from disk, which is what the next launch would see.
+
+    /// An app with `path` wired up as its state file, as `load_sidebar_state`
+    /// wires it in `main`.
+    fn app_with_state_path(path: &std::path::Path) -> NorenApp {
+        let mut app = NorenApp::new(AppConfig::default());
+        app.load_sidebar_state(Some(path.to_path_buf()));
+        app
+    }
+
+    /// What the next launch would show: load the file into a fresh workspace.
+    fn sidebar_after_relaunch(path: &std::path::Path) -> WorkspaceState {
+        let mut relaunched = WorkspaceState::with_state_path(Some(path.to_path_buf()));
+        relaunched.restore().expect("state loads on relaunch");
+        relaunched
+    }
+
+    /// THE regression test for the blocker: quitting with one active session
+    /// must not erase it. This is the single most common case — one session,
+    /// quit, relaunch — and the delete-then-save ordering failed it while every
+    /// `WorkspaceState`-level test passed.
+    ///
+    /// Mutation check: restoring the original quit path in `teardown`
+    ///
+    /// ```ignore
+    /// if let Some(id) = self.active_session.take() {
+    ///     let _ = self.workspace.close_session(id);
+    /// }
+    /// self.workspace.persist();
+    /// ```
+    ///
+    /// fails this test — the reloaded registry is empty.
+    #[test]
+    fn quitting_with_an_active_session_keeps_it_for_the_next_launch() {
+        let path = temp_state_path();
+        let mut app = app_with_state_path(&path);
+
+        // Reproduce what `initialize` does when the PTY spawns: create, select,
+        // observe Running, and mark it active.
+        let id = app.workspace.create_session(SessionKind::Local);
+        app.workspace.select_session(id).expect("session is live");
+        app.workspace.observe_session(id, SessionStatus::Running);
+        app.active_session = Some(id);
+
+        // The real quit path.
+        app.teardown();
+
+        assert!(
+            app.active_session.is_none(),
+            "teardown releases the active session"
+        );
+
+        let relaunched = sidebar_after_relaunch(&path);
+        assert_eq!(
+            relaunched.registry().len(),
+            1,
+            "the session the user never asked to close must survive quitting"
+        );
+        assert_eq!(
+            relaunched.registry().sessions()[0].kind(),
+            &SessionKind::Local,
+        );
+        assert_eq!(
+            relaunched.sidebar().rows().len(),
+            1,
+            "the sidebar is not empty after relaunch"
+        );
+        assert!(!relaunched.sidebar().is_empty());
+        cleanup_state_file(&path);
+    }
+
+    /// Quitting must not silently downgrade the session's status claim either:
+    /// the shell is gone, so the restored entry is `Starting`, never `Running`.
+    /// Consistent with `restored_sessions_start_at_starting_not_running`, but
+    /// reached through the quit path rather than a direct workspace mutation.
+    #[test]
+    fn session_restored_after_quitting_is_starting_not_running() {
+        let path = temp_state_path();
+        let mut app = app_with_state_path(&path);
+        let id = app.workspace.create_session(SessionKind::Local);
+        app.workspace.select_session(id).expect("session is live");
+        app.workspace.observe_session(id, SessionStatus::Running);
+        app.active_session = Some(id);
+
+        app.teardown();
+
+        let relaunched = sidebar_after_relaunch(&path);
+        for descriptor in relaunched.registry().sessions() {
+            assert_eq!(
+                descriptor.status(),
+                &SessionStatus::Starting,
+                "a session whose PTY was torn down must not claim to be running"
+            );
+        }
+        let detail = relaunched
+            .sidebar()
+            .rows()
+            .first()
+            .and_then(|r| r.detail())
+            .unwrap_or_default();
+        assert!(
+            detail.contains("starting"),
+            "detail says starting: {detail}"
+        );
+        assert!(!detail.contains("running"), "detail must not say running");
+        cleanup_state_file(&path);
+    }
+
+    /// Quitting preserves the selection made through the palette, including
+    /// when the selected session is the active one. This is the case the
+    /// original `persist()` call was added for; it must keep working.
+    #[test]
+    fn quitting_preserves_the_selection_and_every_other_session() {
+        let path = temp_state_path();
+        let mut app = app_with_state_path(&path);
+        let _first = app.workspace.create_session(SessionKind::Local);
+        let second = app.workspace.create_session(SessionKind::Ssh {
+            target: "ops@bastion".to_owned(),
+        });
+        app.workspace
+            .select_session(second)
+            .expect("second is live");
+        app.active_session = Some(second);
+
+        app.teardown();
+
+        let relaunched = sidebar_after_relaunch(&path);
+        assert_eq!(
+            relaunched.registry().len(),
+            2,
+            "quitting closes no session, active or not"
+        );
+        let selected = relaunched
+            .registry()
+            .selected()
+            .expect("selection survives quitting");
+        assert_eq!(
+            relaunched
+                .registry()
+                .get(selected)
+                .expect("resolves")
+                .kind(),
+            &SessionKind::Ssh {
+                target: "ops@bastion".to_owned()
+            },
+            "the active session is still the selected one after relaunch",
+        );
+        cleanup_state_file(&path);
+    }
+
+    /// A session the user *did* close stays closed: quitting must not resurrect
+    /// it. Guards the opposite direction from the blocker — the fix removes the
+    /// exit-time close, not the user-initiated one.
+    #[test]
+    fn a_session_the_user_closed_does_not_come_back_after_quitting() {
+        let path = temp_state_path();
+        let mut app = app_with_state_path(&path);
+        let first = app.workspace.create_session(SessionKind::Local);
+        let second = app.workspace.create_session(SessionKind::Local);
+        app.active_session = Some(second);
+
+        // The user closes `first` explicitly — this one really is a close.
+        app.workspace.close_session(first).expect("first is live");
+
+        app.teardown();
+
+        let relaunched = sidebar_after_relaunch(&path);
+        assert_eq!(
+            relaunched.registry().len(),
+            1,
+            "the explicitly closed session stays closed; the active one survives"
+        );
+        cleanup_state_file(&path);
+    }
+
+    /// Quitting with no active session still saves. `teardown` must not make
+    /// its `persist` conditional on there being a session to release.
+    #[test]
+    fn quitting_with_no_active_session_still_persists() {
+        let path = temp_state_path();
+        let mut app = app_with_state_path(&path);
+        app.workspace.create_session(SessionKind::Local);
+        assert!(app.active_session.is_none(), "no PTY was ever spawned");
+        cleanup_state_file(&path);
+
+        app.teardown();
+
+        assert!(path.exists(), "quit must write the state file");
+        let relaunched = sidebar_after_relaunch(&path);
+        assert_eq!(relaunched.registry().len(), 1);
         cleanup_state_file(&path);
     }
 
