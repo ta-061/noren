@@ -24,11 +24,13 @@ use noren_app::{
         SessionAction, SessionError, SessionEvent, SessionId, SessionKind, SessionRegistry,
         SessionStatus,
     },
+    session_persistence::{SESSION_STATE_FILE_NAME, SessionPersistenceError, load, save},
     sidebar::{SidebarEntry, SidebarView},
 };
 use noren_pty::{PtyEvent, PtySession, PtySize};
 use noren_terminal::{Cell, GridPoint, Selection, SelectionMode, TerminalEngine, TerminalState};
 use renderer::{RenderOutcome, Renderer};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -93,11 +95,29 @@ fn palette_policy() -> PassthroughPolicy {
         .expect("palette policy is valid and collision-free")
 }
 
+/// Resolve the sidebar state file path alongside the configuration file.
+///
+/// Follows config's directory convention exactly: the same directory
+/// [`noren_app::config::default_path`] resolves, with the session-state file
+/// name from [`SESSION_STATE_FILE_NAME`] substituted for the config file name.
+/// Returns `None` when `HOME` is unset — matching config's behavior — so a
+/// headless or containerized environment runs in-memory only.
+fn session_state_path() -> Option<PathBuf> {
+    noren_app::config::default_path().map(|mut path| {
+        path.set_file_name(SESSION_STATE_FILE_NAME);
+        path
+    })
+}
+
 struct WorkspaceState {
     registry: SessionRegistry,
     sidebar: SidebarView,
     /// Owned by the workspace; dispatched when the palette opens.
     palette: Palette<WorkspaceAction>,
+    /// Where sidebar state is persisted. `None` in tests and when `HOME` is
+    /// unset; in both cases the workspace is in-memory only and [`persist`]
+    /// is a no-op.
+    state_path: Option<PathBuf>,
 }
 
 impl Default for WorkspaceState {
@@ -109,6 +129,14 @@ impl Default for WorkspaceState {
 impl WorkspaceState {
     /// Empty workspace: no sessions, empty sidebar, the canonical palette.
     fn new() -> Self {
+        Self::with_state_path(None)
+    }
+
+    /// Empty workspace that persists to `state_path` when the sidebar changes.
+    ///
+    /// Used by the binary (via [`session_state_path`]) and by tests that need
+    /// to verify save/load round-trips through the real file system.
+    fn with_state_path(state_path: Option<PathBuf>) -> Self {
         Self {
             registry: SessionRegistry::new(),
             sidebar: SidebarView::build(&[], None),
@@ -118,6 +146,41 @@ impl WorkspaceState {
                 WorkspaceAction::CloseSession,
                 WorkspaceAction::FocusSidebar,
             ),
+            state_path,
+        }
+    }
+
+    /// Load saved sidebar state from [`state_path`](Self::state_path) into the
+    /// registry before the sidebar is first observed.
+    ///
+    /// A missing file is the first run and returns `Ok` with an untouched
+    /// (empty) registry. Any other failure — corrupt, wrong-version,
+    /// non-UTF-8, oversized — returns a typed [`SessionPersistenceError`] and
+    /// leaves the registry exactly as it was, so the caller can surface the
+    /// error through diagnostics and continue with an empty sidebar rather
+    /// than panicking.
+    fn restore(&mut self) -> Result<(), SessionPersistenceError> {
+        let Some(path) = &self.state_path else {
+            return Ok(());
+        };
+        load(path, &mut self.registry)?;
+        self.rebuild_sidebar();
+        Ok(())
+    }
+
+    /// Persist the current sidebar state to
+    /// [`state_path`](Self::state_path), if one is set.
+    ///
+    /// The write is atomic (temp-file rename) inside [`save`]; this method
+    /// never bypasses it. A failure is surfaced through stderr and swallowed
+    /// so the app keeps running — losing a save is preferable to crashing the
+    /// terminal.
+    fn persist(&self) {
+        let Some(path) = &self.state_path else {
+            return;
+        };
+        if let Err(error) = save(path, &self.registry) {
+            eprintln!("Noren could not save sidebar state: {error}");
         }
     }
 
@@ -132,6 +195,7 @@ impl WorkspaceState {
             .apply(SessionAction::Create { kind })
             .expect("SessionAction::Create is infallible");
         self.rebuild_sidebar();
+        self.persist();
         created_session_id(events)
     }
 
@@ -142,6 +206,7 @@ impl WorkspaceState {
     fn select_session(&mut self, id: SessionId) -> Result<(), SessionError> {
         self.registry.apply(SessionAction::Select { id })?;
         self.rebuild_sidebar();
+        self.persist();
         Ok(())
     }
 
@@ -152,6 +217,7 @@ impl WorkspaceState {
     fn close_session(&mut self, id: SessionId) -> Result<(), SessionError> {
         self.registry.apply(SessionAction::Close { id })?;
         self.rebuild_sidebar();
+        self.persist();
         Ok(())
     }
 
@@ -160,6 +226,11 @@ impl WorkspaceState {
     /// This is the only path that advances a session past `Starting`. The
     /// registry's `observe` enforces monotonic lifecycle transitions; a
     /// rejected transition leaves the view unchanged.
+    ///
+    /// Status is a runtime observation, not a structural change, so this does
+    /// not call [`persist`](Self::persist): the on-disk format records kinds
+    /// and selection only, never status. A status change cannot alter what
+    /// would be written.
     fn observe_session(&mut self, id: SessionId, status: SessionStatus) {
         if self.registry.observe(id, status).is_ok() {
             self.rebuild_sidebar();
@@ -381,6 +452,22 @@ impl NorenApp {
             palette_selection: 0,
             passthrough_gate: PassthroughGate::new(),
             passthrough_policy: palette_policy(),
+        }
+    }
+
+    /// Wire sidebar persistence: set the state path, then load saved state
+    /// before the event loop starts.
+    ///
+    /// Called from [`main`] after construction so that [`NorenApp::new`] (and
+    /// the tests that rely on it) stay free of file-system side effects. A
+    /// corrupt or unreadable file is surfaced through stderr and swallowed —
+    /// the app starts with an empty sidebar and a working terminal, never a
+    /// crash. A missing file (the first run) is silent.
+    fn load_sidebar_state(&mut self, path: Option<PathBuf>) {
+        self.workspace.state_path = path;
+        if let Err(error) = self.workspace.restore() {
+            eprintln!("Noren could not restore sidebar state: {error}");
+            eprintln!("starting with an empty sidebar; the existing file was left in place");
         }
     }
 }
@@ -1198,16 +1285,40 @@ impl NorenApp {
         }
     }
 
-    fn close(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(id) = self.active_session.take() {
-            let _ = self.workspace.close_session(id);
-        }
+    /// Everything `close` does apart from asking the event loop to exit.
+    ///
+    /// Split out so tests can drive the real teardown: `ActiveEventLoop` cannot
+    /// be constructed outside a running event loop, so a test that called
+    /// `close` could not exist, and the quit path went unexercised. Every
+    /// state-affecting step lives here; `close` adds only `event_loop.exit()`.
+    fn teardown(&mut self) {
+        // Quitting is not closing. The user asked to leave Noren, not to
+        // discard the session — and `SessionRegistry::close` *removes* the
+        // entry rather than marking it stopped, so closing here would persist
+        // a deletion and hand back an empty sidebar on the next launch. The
+        // session stays in the registry; only its PTY goes away. On the next
+        // launch it is restored as `SessionStatus::Starting`, which is what
+        // this PR already decided a restored session means: a visible entry
+        // whose shell is not running.
+        //
+        // This also protects the non-quit caller: `redraw` invokes `close` on
+        // `RenderOutcome::DeviceLost`. A lost GPU device must not delete the
+        // user's sessions.
+        self.active_session = None;
+        // Save on clean exit so a session selected but not otherwise mutated
+        // is not lost. No structural mutation precedes this, so it is the only
+        // write on the quit path and does not depend on ordering.
+        self.workspace.persist();
         if let Some(mut session) = self.pty.take() {
             self.pty_child = PtyChildStatus::NotLaunched;
             if session.shutdown().is_err() {
                 eprintln!("Noren PTY shutdown reached its failure fallback");
             }
         }
+    }
+
+    fn close(&mut self, event_loop: &ActiveEventLoop) {
+        self.teardown();
         event_loop.exit();
     }
 }
@@ -1656,6 +1767,7 @@ fn main() {
     };
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = NorenApp::new(config);
+    app.load_sidebar_state(session_state_path());
     if event_loop.run_app(&mut app).is_err() {
         eprintln!("Noren event loop failed");
     }
@@ -3343,5 +3455,479 @@ mod tests {
             report, "\x1b[<0;8;1M",
             "right-edge press must keep its column"
         );
+    }
+
+    // ── Sidebar state persistence (Milestone 3 final piece) ────────────
+    //
+    // These tests exercise the wiring of `save`/`load` into the application
+    // lifecycle through `WorkspaceState`. The persistence format itself is
+    // exhaustively tested in `tests/session_persistence.rs`; these tests
+    // verify WHEN save/load is called, not HOW the format works.
+
+    /// Per-test uniqueness: tests run concurrently and share the temp dir.
+    static PERSIST_CASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn temp_state_path() -> PathBuf {
+        let unique = PERSIST_CASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "noren-sidebar-wire-test-{}-{unique}.toml",
+            std::process::id()
+        ));
+        path
+    }
+
+    fn cleanup_state_file(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Required: state saved through the workspace and then loaded round-trips
+    /// through the real file path, preserving every entry kind and the
+    /// positional selection.
+    #[test]
+    fn saved_state_round_trips_through_the_real_file_path() {
+        let path = temp_state_path();
+        let mut state = WorkspaceState::with_state_path(Some(path.clone()));
+        let _local = state.create_session(SessionKind::Local);
+        let _project = state.create_session(SessionKind::Project {
+            root: PathBuf::from("/srv/noren"),
+        });
+        let _ssh = state.create_session(SessionKind::Ssh {
+            target: "ops@bastion".to_owned(),
+        });
+        state
+            .select_session(state.registry().sessions()[1].id())
+            .expect("project session is live");
+
+        let mut restored = WorkspaceState::with_state_path(Some(path.clone()));
+        restored.restore().expect("state loads");
+
+        assert_eq!(restored.registry().len(), 3);
+        let kinds: Vec<SessionKind> = restored
+            .registry()
+            .sessions()
+            .iter()
+            .map(|d| d.kind().clone())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SessionKind::Local,
+                SessionKind::Project {
+                    root: PathBuf::from("/srv/noren")
+                },
+                SessionKind::Ssh {
+                    target: "ops@bastion".to_owned()
+                },
+            ]
+        );
+        let selected = restored.registry().selected().expect("selection restored");
+        assert_eq!(
+            restored
+                .registry()
+                .get(selected)
+                .expect("selection resolves")
+                .kind(),
+            &SessionKind::Project {
+                root: PathBuf::from("/srv/noren")
+            },
+        );
+        cleanup_state_file(&path);
+    }
+
+    /// Required: a corrupt file leaves the app startable with an empty sidebar
+    /// and an error surfaced, not a panic.
+    #[test]
+    fn corrupt_state_file_surfaces_error_without_panicking() {
+        let path = temp_state_path();
+        std::fs::write(&path, b"this is not valid toml {{{{").expect("write corrupt fixture");
+
+        let mut state = WorkspaceState::with_state_path(Some(path.clone()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| state.restore()));
+        let loaded = result.expect("restore must never panic");
+        assert!(loaded.is_err(), "corrupt file must produce an error");
+        assert!(
+            state.registry().is_empty(),
+            "corrupt file leaves empty registry"
+        );
+        assert!(
+            state.sidebar().is_empty(),
+            "corrupt file leaves empty sidebar"
+        );
+        cleanup_state_file(&path);
+    }
+
+    /// Required: a missing file is not an error — first run must be silent.
+    #[test]
+    fn missing_state_file_is_silent_first_run() {
+        let path = temp_state_path();
+        assert!(!path.exists(), "fixture path must not exist yet");
+
+        let mut state = WorkspaceState::with_state_path(Some(path.clone()));
+        assert!(state.restore().is_ok(), "missing file must not error");
+        assert!(state.registry().is_empty());
+        assert!(state.sidebar().is_empty());
+        assert!(!path.exists(), "restore must not create a file");
+    }
+
+    /// Required: creating a session then restarting shows it in the sidebar.
+    #[test]
+    fn creating_a_session_then_restarting_shows_it_in_the_sidebar() {
+        let path = temp_state_path();
+
+        let mut run1 = WorkspaceState::with_state_path(Some(path.clone()));
+        run1.create_session(SessionKind::Local);
+        run1.create_session(SessionKind::Ssh {
+            target: "web1".to_owned(),
+        });
+
+        let mut run2 = WorkspaceState::with_state_path(Some(path.clone()));
+        run2.restore().expect("state loads on restart");
+
+        assert_eq!(
+            run2.sidebar().rows().len(),
+            2,
+            "both sessions survive the restart"
+        );
+        assert!(!run2.sidebar().is_empty());
+        cleanup_state_file(&path);
+    }
+
+    /// Required: a restored session's status does not claim to be running.
+    #[test]
+    fn restored_sessions_start_at_starting_not_running() {
+        let path = temp_state_path();
+        let mut state = WorkspaceState::with_state_path(Some(path.clone()));
+        let id = state.create_session(SessionKind::Local);
+        state.observe_session(id, SessionStatus::Running);
+
+        let mut restored = WorkspaceState::with_state_path(Some(path.clone()));
+        restored.restore().expect("state loads");
+
+        for descriptor in restored.registry().sessions() {
+            assert_eq!(
+                descriptor.status(),
+                &SessionStatus::Starting,
+                "restored session must not claim to be running"
+            );
+        }
+        let detail = restored
+            .sidebar()
+            .rows()
+            .first()
+            .and_then(|r| r.detail())
+            .unwrap_or_default();
+        assert!(
+            detail.contains("starting"),
+            "detail says starting: {detail}"
+        );
+        assert!(!detail.contains("running"), "detail must not say running");
+        cleanup_state_file(&path);
+    }
+
+    /// Mutation check 1: create persists immediately. If the `persist` call in
+    /// `create_session` is removed, this test fails — the file would not exist.
+    #[test]
+    fn create_session_persists_immediately() {
+        let path = temp_state_path();
+        let mut state = WorkspaceState::with_state_path(Some(path.clone()));
+        state.create_session(SessionKind::Local);
+
+        assert!(path.exists(), "create must persist to the state file");
+        let mut loaded = SessionRegistry::new();
+        load(&path, &mut loaded).expect("file loads");
+        assert_eq!(loaded.len(), 1, "one session was persisted");
+        cleanup_state_file(&path);
+    }
+
+    /// Mutation check 2: close persists the removal. If the `persist` call in
+    /// `close_session` is removed, this test fails — the file would still show
+    /// two sessions.
+    #[test]
+    fn close_session_persists_the_removal() {
+        let path = temp_state_path();
+        let mut state = WorkspaceState::with_state_path(Some(path.clone()));
+        let first = state.create_session(SessionKind::Local);
+        let _second = state.create_session(SessionKind::Local);
+        state.close_session(first).expect("first is live");
+
+        let mut loaded = SessionRegistry::new();
+        load(&path, &mut loaded).expect("file loads");
+        assert_eq!(loaded.len(), 1, "close must persist: one session remains");
+        cleanup_state_file(&path);
+    }
+
+    /// Mutation check 3 (save skipped): observe does NOT rewrite the state
+    /// file. Status is a runtime observation, not a persistable structural
+    /// change. If a `persist` call were incorrectly added to `observe_session`,
+    /// this test fails because the file's modification time would advance.
+    #[test]
+    fn observe_session_does_not_rewrite_the_state_file() {
+        let path = temp_state_path();
+        let mut state = WorkspaceState::with_state_path(Some(path.clone()));
+        let id = state.create_session(SessionKind::Local);
+
+        let before = std::fs::read(&path).expect("file exists after create");
+        let mtime_before = std::fs::metadata(&path)
+            .expect("file exists")
+            .modified()
+            .expect("modification time available");
+        // Sleep past the filesystem's timestamp granularity so a rewrite would
+        // be detectable as a changed mtime.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        state.observe_session(id, SessionStatus::Running);
+        state.observe_session(id, SessionStatus::Exited { code: Some(0) });
+
+        let after = std::fs::read(&path).expect("file still exists");
+        let mtime_after = std::fs::metadata(&path)
+            .expect("file exists")
+            .modified()
+            .expect("modification time available");
+        assert_eq!(before, after, "observe must not change file content");
+        assert_eq!(
+            mtime_before, mtime_after,
+            "observe must not rewrite the state file (mtime changed)"
+        );
+
+        let text = String::from_utf8(after).expect("state is UTF-8");
+        assert!(
+            !text.contains("running") && !text.contains("exited"),
+            "status must not appear in the state file: {text}"
+        );
+        cleanup_state_file(&path);
+    }
+
+    /// Select persists the new selection positionally. If the `persist` call in
+    /// `select_session` is removed, the restored selection does not match.
+    #[test]
+    fn select_session_persists_the_selection() {
+        let path = temp_state_path();
+        let mut state = WorkspaceState::with_state_path(Some(path.clone()));
+        let _first = state.create_session(SessionKind::Local);
+        let second = state.create_session(SessionKind::Ssh {
+            target: "host".to_owned(),
+        });
+        state.select_session(second).expect("second is live");
+
+        let mut restored = WorkspaceState::with_state_path(Some(path.clone()));
+        restored.restore().expect("state loads");
+
+        let selected = restored.registry().selected().expect("selection persisted");
+        assert_eq!(
+            restored.registry().get(selected).expect("resolves").kind(),
+            &SessionKind::Ssh {
+                target: "host".to_owned()
+            },
+        );
+        cleanup_state_file(&path);
+    }
+
+    // ── The quit path ──────────────────────────────────────────────────
+    //
+    // The tests above drive `WorkspaceState` directly and so never traverse
+    // what the app actually does on exit. These go through `NorenApp::teardown`
+    // — the whole of `NorenApp::close` except `event_loop.exit()` — and then
+    // read the file back from disk, which is what the next launch would see.
+
+    /// An app with `path` wired up as its state file, as `load_sidebar_state`
+    /// wires it in `main`.
+    fn app_with_state_path(path: &std::path::Path) -> NorenApp {
+        let mut app = NorenApp::new(AppConfig::default());
+        app.load_sidebar_state(Some(path.to_path_buf()));
+        app
+    }
+
+    /// What the next launch would show: load the file into a fresh workspace.
+    fn sidebar_after_relaunch(path: &std::path::Path) -> WorkspaceState {
+        let mut relaunched = WorkspaceState::with_state_path(Some(path.to_path_buf()));
+        relaunched.restore().expect("state loads on relaunch");
+        relaunched
+    }
+
+    /// THE regression test for the blocker: quitting with one active session
+    /// must not erase it. This is the single most common case — one session,
+    /// quit, relaunch — and the delete-then-save ordering failed it while every
+    /// `WorkspaceState`-level test passed.
+    ///
+    /// Mutation check: restoring the original quit path in `teardown`
+    ///
+    /// ```ignore
+    /// if let Some(id) = self.active_session.take() {
+    ///     let _ = self.workspace.close_session(id);
+    /// }
+    /// self.workspace.persist();
+    /// ```
+    ///
+    /// fails this test — the reloaded registry is empty.
+    #[test]
+    fn quitting_with_an_active_session_keeps_it_for_the_next_launch() {
+        let path = temp_state_path();
+        let mut app = app_with_state_path(&path);
+
+        // Reproduce what `initialize` does when the PTY spawns: create, select,
+        // observe Running, and mark it active.
+        let id = app.workspace.create_session(SessionKind::Local);
+        app.workspace.select_session(id).expect("session is live");
+        app.workspace.observe_session(id, SessionStatus::Running);
+        app.active_session = Some(id);
+
+        // The real quit path.
+        app.teardown();
+
+        assert!(
+            app.active_session.is_none(),
+            "teardown releases the active session"
+        );
+
+        let relaunched = sidebar_after_relaunch(&path);
+        assert_eq!(
+            relaunched.registry().len(),
+            1,
+            "the session the user never asked to close must survive quitting"
+        );
+        assert_eq!(
+            relaunched.registry().sessions()[0].kind(),
+            &SessionKind::Local,
+        );
+        assert_eq!(
+            relaunched.sidebar().rows().len(),
+            1,
+            "the sidebar is not empty after relaunch"
+        );
+        assert!(!relaunched.sidebar().is_empty());
+        cleanup_state_file(&path);
+    }
+
+    /// Quitting must not silently downgrade the session's status claim either:
+    /// the shell is gone, so the restored entry is `Starting`, never `Running`.
+    /// Consistent with `restored_sessions_start_at_starting_not_running`, but
+    /// reached through the quit path rather than a direct workspace mutation.
+    #[test]
+    fn session_restored_after_quitting_is_starting_not_running() {
+        let path = temp_state_path();
+        let mut app = app_with_state_path(&path);
+        let id = app.workspace.create_session(SessionKind::Local);
+        app.workspace.select_session(id).expect("session is live");
+        app.workspace.observe_session(id, SessionStatus::Running);
+        app.active_session = Some(id);
+
+        app.teardown();
+
+        let relaunched = sidebar_after_relaunch(&path);
+        for descriptor in relaunched.registry().sessions() {
+            assert_eq!(
+                descriptor.status(),
+                &SessionStatus::Starting,
+                "a session whose PTY was torn down must not claim to be running"
+            );
+        }
+        let detail = relaunched
+            .sidebar()
+            .rows()
+            .first()
+            .and_then(|r| r.detail())
+            .unwrap_or_default();
+        assert!(
+            detail.contains("starting"),
+            "detail says starting: {detail}"
+        );
+        assert!(!detail.contains("running"), "detail must not say running");
+        cleanup_state_file(&path);
+    }
+
+    /// Quitting preserves the selection made through the palette, including
+    /// when the selected session is the active one. This is the case the
+    /// original `persist()` call was added for; it must keep working.
+    #[test]
+    fn quitting_preserves_the_selection_and_every_other_session() {
+        let path = temp_state_path();
+        let mut app = app_with_state_path(&path);
+        let _first = app.workspace.create_session(SessionKind::Local);
+        let second = app.workspace.create_session(SessionKind::Ssh {
+            target: "ops@bastion".to_owned(),
+        });
+        app.workspace
+            .select_session(second)
+            .expect("second is live");
+        app.active_session = Some(second);
+
+        app.teardown();
+
+        let relaunched = sidebar_after_relaunch(&path);
+        assert_eq!(
+            relaunched.registry().len(),
+            2,
+            "quitting closes no session, active or not"
+        );
+        let selected = relaunched
+            .registry()
+            .selected()
+            .expect("selection survives quitting");
+        assert_eq!(
+            relaunched
+                .registry()
+                .get(selected)
+                .expect("resolves")
+                .kind(),
+            &SessionKind::Ssh {
+                target: "ops@bastion".to_owned()
+            },
+            "the active session is still the selected one after relaunch",
+        );
+        cleanup_state_file(&path);
+    }
+
+    /// A session the user *did* close stays closed: quitting must not resurrect
+    /// it. Guards the opposite direction from the blocker — the fix removes the
+    /// exit-time close, not the user-initiated one.
+    #[test]
+    fn a_session_the_user_closed_does_not_come_back_after_quitting() {
+        let path = temp_state_path();
+        let mut app = app_with_state_path(&path);
+        let first = app.workspace.create_session(SessionKind::Local);
+        let second = app.workspace.create_session(SessionKind::Local);
+        app.active_session = Some(second);
+
+        // The user closes `first` explicitly — this one really is a close.
+        app.workspace.close_session(first).expect("first is live");
+
+        app.teardown();
+
+        let relaunched = sidebar_after_relaunch(&path);
+        assert_eq!(
+            relaunched.registry().len(),
+            1,
+            "the explicitly closed session stays closed; the active one survives"
+        );
+        cleanup_state_file(&path);
+    }
+
+    /// Quitting with no active session still saves. `teardown` must not make
+    /// its `persist` conditional on there being a session to release.
+    #[test]
+    fn quitting_with_no_active_session_still_persists() {
+        let path = temp_state_path();
+        let mut app = app_with_state_path(&path);
+        app.workspace.create_session(SessionKind::Local);
+        assert!(app.active_session.is_none(), "no PTY was ever spawned");
+        cleanup_state_file(&path);
+
+        app.teardown();
+
+        assert!(path.exists(), "quit must write the state file");
+        let relaunched = sidebar_after_relaunch(&path);
+        assert_eq!(relaunched.registry().len(), 1);
+        cleanup_state_file(&path);
+    }
+
+    /// Without a state path (HOME unset), persistence is entirely in-memory:
+    /// create does not touch disk and restore is a no-op.
+    #[test]
+    fn no_state_path_means_in_memory_only() {
+        let mut state = WorkspaceState::with_state_path(None);
+        assert!(state.restore().is_ok(), "no path → no-op restore");
+        state.create_session(SessionKind::Local);
+        assert_eq!(state.registry().len(), 1);
     }
 }
