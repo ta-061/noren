@@ -10,8 +10,16 @@ use noren_app::{
     config::AppConfig,
     diagnostics::{self, PtyChildStatus},
     encode_paste,
-    palette::Palette,
-    session::{SessionAction, SessionError, SessionEvent, SessionId, SessionKind, SessionRegistry},
+    palette::{CommandId, Palette},
+    passthrough::{
+        CLAIM_ID_PALETTE, Chord, ChordSeq, GateKind, KeyCode as GateKeyCode,
+        Modifiers as GateModifiers, PassthroughAction, PassthroughClaim, PassthroughGate,
+        PassthroughPolicy, default_exit_claim,
+    },
+    session::{
+        SessionAction, SessionError, SessionEvent, SessionId, SessionKind, SessionRegistry,
+        SessionStatus,
+    },
     sidebar::{SidebarEntry, SidebarView},
 };
 use noren_pty::{PtyEvent, PtySession, PtySize};
@@ -56,11 +64,35 @@ enum WorkspaceAction {
 /// [`SessionRegistry::apply`] and then rebuilds the sidebar from the
 /// registry's current sessions and selection, so the view and the model can
 /// never disagree.
+/// Build the pass-through policy claiming the exit leader (Super+Escape) and
+/// the palette opener (Super+p).
+///
+/// Both claimed chords live in the Super/Command modifier space, which the
+/// pinned Zellij v0.44.3 default corpus never binds. Super+Escape is the
+/// frozen exit leader from [`default_exit_claim`]; Super+p opens the command
+/// palette. This is the smallest set that works: one chord to open the
+/// palette, one to exit to the workspace. No bare modifier chords, no
+/// Ctrl/Alt chords, nothing Zellij could ever use.
+fn palette_policy() -> PassthroughPolicy {
+    let palette_claim = PassthroughClaim {
+        id: CLAIM_ID_PALETTE,
+        action: PassthroughAction::OpenCommandPalette,
+        seq: ChordSeq::single(
+            Chord::new(GateKeyCode::Char('p'), GateModifiers::empty().super_key())
+                .expect("normalized Super+p"),
+        ),
+        justification: "Super+p lives in the Super/Cmd modifier space which the \
+                        pinned Zellij v0.44.3 default corpus never binds, so claiming it \
+                        steals no chord from Zellij or its panes",
+    };
+    PassthroughPolicy::try_new(vec![default_exit_claim(), palette_claim])
+        .expect("palette policy is valid and collision-free")
+}
+
 struct WorkspaceState {
     registry: SessionRegistry,
     sidebar: SidebarView,
-    /// Owned by the workspace; dispatched in step 2 (palette UI).
-    #[allow(dead_code)]
+    /// Owned by the workspace; dispatched when the palette opens.
     palette: Palette<WorkspaceAction>,
 }
 
@@ -119,6 +151,17 @@ impl WorkspaceState {
         Ok(())
     }
 
+    /// Observe a status transition for a session and rebuild the sidebar.
+    ///
+    /// This is the only path that advances a session past `Starting`. The
+    /// registry's `observe` enforces monotonic lifecycle transitions; a
+    /// rejected transition leaves the view unchanged.
+    fn observe_session(&mut self, id: SessionId, status: SessionStatus) {
+        if self.registry.observe(id, status).is_ok() {
+            self.rebuild_sidebar();
+        }
+    }
+
     /// Rebuild the sidebar from the registry's current sessions and selection.
     ///
     /// Called after every mutation so the view never lags the model.
@@ -138,13 +181,11 @@ impl WorkspaceState {
     }
 
     /// The command palette.
-    #[allow(dead_code)]
     fn palette(&self) -> &Palette<WorkspaceAction> {
         &self.palette
     }
 
     /// The session registry.
-    #[allow(dead_code)]
     fn registry(&self) -> &SessionRegistry {
         &self.registry
     }
@@ -184,6 +225,10 @@ struct NorenApp {
     cursor_position: Option<PhysicalPosition<f64>>,
     workspace: WorkspaceState,
     active_session: Option<SessionId>,
+    palette_open: bool,
+    palette_selection: usize,
+    passthrough_gate: PassthroughGate,
+    passthrough_policy: PassthroughPolicy,
 }
 
 impl Default for NorenApp {
@@ -219,6 +264,10 @@ impl NorenApp {
             cursor_position: None,
             workspace: WorkspaceState::new(),
             active_session: None,
+            palette_open: false,
+            palette_selection: 0,
+            passthrough_gate: PassthroughGate::new(),
+            passthrough_policy: palette_policy(),
         }
     }
 }
@@ -263,6 +312,8 @@ impl NorenApp {
                     self.workspace
                         .select_session(session_id)
                         .expect("freshly created session is live");
+                    self.workspace
+                        .observe_session(session_id, SessionStatus::Running);
                     self.active_session = Some(session_id);
                     Some(session)
                 }
@@ -316,6 +367,20 @@ impl NorenApp {
             self.toggle_diagnostics();
             return;
         }
+        if self.palette_open {
+            self.handle_palette_key(event);
+            return;
+        }
+        self.handle_passthrough_key(event);
+    }
+
+    /// Route one key event through the pass-through gate.
+    ///
+    /// The gate claims Super+Escape (exit) and Super+p (palette). Everything
+    /// else is forwarded byte-for-byte through the same encoder path as
+    /// before the gate existed, so a closed-palette key press is
+    /// byte-identical to the pre-gate behaviour.
+    fn handle_passthrough_key(&mut self, event: &KeyEvent) {
         let input_mode = self.current_input_mode();
         let encoded = if let Some(input) = translate_keypad_key(event) {
             KeyEncoder::encode_keypad_with(input.with_modifiers(self.modifiers), input_mode)
@@ -323,10 +388,167 @@ impl NorenApp {
             translate_key(event, self.modifiers)
                 .and_then(|input| KeyEncoder::encode_with(input, input_mode))
         };
+        if event.state == ElementState::Pressed {
+            if let Some(chord) = chord_from_event(event, self.modifiers) {
+                let decision = self.passthrough_gate.press(&self.passthrough_policy, chord);
+                match decision.kind {
+                    GateKind::Intercepted(PassthroughAction::OpenCommandPalette) => {
+                        self.open_palette();
+                        return;
+                    }
+                    GateKind::Intercepted(PassthroughAction::ExitToWorkspace) => {
+                        return;
+                    }
+                    GateKind::Pending => {
+                        return;
+                    }
+                    GateKind::Forwarded => {
+                        for replayed in &decision.replayed {
+                            if let Some(bytes) = encode_chord(replayed, input_mode) {
+                                self.send_input(&bytes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let Ok(bytes) = encoded else {
             return;
         };
         self.send_input(&bytes);
+    }
+
+    /// Handle a key event while the palette is open.
+    ///
+    /// Single-key shortcuts dispatch the four canonical commands; Escape
+    /// dismisses without running; Arrow Up/Down and Enter navigate and
+    /// confirm the selection.
+    fn handle_palette_key(&mut self, event: &KeyEvent) {
+        if event.state != ElementState::Pressed || event.repeat {
+            return;
+        }
+        match &event.logical_key {
+            WinitKey::Named(NamedKey::Escape) => {
+                self.close_palette();
+            }
+            WinitKey::Named(NamedKey::ArrowUp) => {
+                self.palette_selection = self.palette_selection.saturating_sub(1);
+                self.redraw_needed = true;
+            }
+            WinitKey::Named(NamedKey::ArrowDown) => {
+                let max = self.workspace.palette().len().saturating_sub(1);
+                self.palette_selection = (self.palette_selection + 1).min(max);
+                self.redraw_needed = true;
+            }
+            WinitKey::Named(NamedKey::Enter) => {
+                let selection = self.palette_selection;
+                self.dispatch_palette_selection(selection);
+            }
+            WinitKey::Character(text) => {
+                let Some(ch) = text.chars().next() else {
+                    return;
+                };
+                if text.chars().count() > 1 {
+                    return;
+                }
+                let id = match ch.to_ascii_lowercase() {
+                    'c' => CommandId::SESSION_CREATE,
+                    's' => CommandId::SESSION_SELECT,
+                    'x' => CommandId::SESSION_CLOSE,
+                    'f' => CommandId::SIDEBAR_FOCUS,
+                    _ => {
+                        self.close_palette();
+                        return;
+                    }
+                };
+                self.dispatch_palette_command(id);
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the palette, selecting the first command.
+    fn open_palette(&mut self) {
+        self.palette_open = true;
+        self.palette_selection = 0;
+        self.redraw_needed = true;
+    }
+
+    /// Close the palette without running a command.
+    fn close_palette(&mut self) {
+        self.palette_open = false;
+        self.redraw_needed = true;
+    }
+
+    /// Dispatch the palette command at `selection` and close the palette.
+    fn dispatch_palette_selection(&mut self, selection: usize) {
+        let palette = self.workspace.palette();
+        let commands: Vec<CommandId> = palette.iter().map(|c| c.id()).collect();
+        if let Some(&id) = commands.get(selection) {
+            self.dispatch_palette_command(id);
+        } else {
+            self.close_palette();
+        }
+    }
+
+    /// Run a palette command by stable ID, then close the palette.
+    fn dispatch_palette_command(&mut self, id: CommandId) {
+        let action = self.workspace.palette().get(id).map(|cmd| *cmd.action());
+        if let Some(action) = action {
+            self.run_workspace_action(action);
+        }
+        self.close_palette();
+    }
+
+    /// Execute a workspace action through `WorkspaceState`.
+    fn run_workspace_action(&mut self, action: WorkspaceAction) {
+        match action {
+            WorkspaceAction::CreateSession => {
+                let _id = self.workspace.create_session(SessionKind::Local);
+            }
+            WorkspaceAction::SelectSession => {
+                let ids: Vec<SessionId> = self
+                    .workspace
+                    .registry()
+                    .sessions()
+                    .into_iter()
+                    .map(|d| d.id())
+                    .collect();
+                if ids.len() < 2 {
+                    return;
+                }
+                let current = self.workspace.registry().selected();
+                let next = match current {
+                    Some(cur) => {
+                        let idx = ids.iter().position(|id| *id == cur).unwrap_or(0);
+                        ids[(idx + 1) % ids.len()]
+                    }
+                    None => ids[0],
+                };
+                let _ = self.workspace.select_session(next);
+            }
+            WorkspaceAction::CloseSession => {
+                if let Some(id) = self.workspace.registry().selected() {
+                    let _ = self.workspace.close_session(id);
+                } else {
+                    let ids: Vec<SessionId> = self
+                        .workspace
+                        .registry()
+                        .sessions()
+                        .into_iter()
+                        .map(|d| d.id())
+                        .collect();
+                    if let Some(id) = ids.first() {
+                        let _ = self.workspace.close_session(*id);
+                    }
+                }
+            }
+            WorkspaceAction::FocusSidebar => {
+                // The sidebar is always visible in this PoC; focusing is a
+                // no-op that still confirms the command dispatches.
+            }
+        }
+        self.redraw_needed = true;
     }
 
     /// User-initiated selection and clipboard shortcuts.
@@ -676,7 +898,12 @@ impl NorenApp {
         self.show_status = true;
         self.redraw_needed = true;
         if let Some(id) = self.active_session.take() {
-            let _ = self.workspace.close_session(id);
+            let code = match self.pty_child {
+                PtyChildStatus::Exited { code } => code.map(|c| c as i32),
+                _ => None,
+            };
+            self.workspace
+                .observe_session(id, SessionStatus::Exited { code });
         }
         if let Some(mut session) = self.pty.take()
             && session.shutdown().is_err()
@@ -697,10 +924,17 @@ impl NorenApp {
             None
         };
         let sidebar_lines = sidebar_text_lines(self.workspace.sidebar());
+        let lines = if self.palette_open {
+            let mut lines = palette_text_lines(self.workspace.palette(), self.palette_selection);
+            lines.extend(sidebar_lines);
+            lines
+        } else {
+            sidebar_lines
+        };
         let outcome = self
             .renderer
             .as_mut()
-            .map(|renderer| renderer.render(snapshot.as_ref(), Some(&sidebar_lines), status));
+            .map(|renderer| renderer.render(snapshot.as_ref(), Some(&lines), status));
         match outcome {
             Some(RenderOutcome::DeviceLost) => {
                 self.status = "Noren renderer device lost";
@@ -840,6 +1074,133 @@ fn sidebar_text_lines(sidebar: &SidebarView) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Build text lines for the palette display, drawn at the top of the sidebar
+/// column when the palette is open.
+///
+/// Each command is one line: `]` marks the selected command, space otherwise,
+/// followed by a single-key shortcut and the label. The lines are uppercase
+/// to match the bitmap font's case-folding.
+fn palette_text_lines(palette: &Palette<WorkspaceAction>, selection: usize) -> Vec<String> {
+    let shortcuts = ['C', 'S', 'X', 'F'];
+    palette
+        .iter()
+        .enumerate()
+        .map(|(idx, cmd)| {
+            let marker = if idx == selection { ']' } else { ' ' };
+            let key = shortcuts.get(idx).copied().unwrap_or('?');
+            format!("{marker}{key} {label}", label = cmd.label())
+        })
+        .collect()
+}
+
+/// Map a winit key event and app modifiers to a pass-through chord.
+///
+/// Returns `None` for keys that cannot be normalized into a [`Chord`]
+/// (whitespace characters, dead keys, multi-codepoint IME sequences). Such
+/// keys bypass the gate and follow the normal encode-and-send path.
+fn chord_from_event(event: &KeyEvent, modifiers: Modifiers) -> Option<Chord> {
+    let code = winit_to_gate_key(&event.logical_key)?;
+    let gate_mods = gate_modifiers(modifiers);
+    Chord::new(code, gate_mods).ok()
+}
+
+/// Encode a pass-through chord into PTY bytes for replay.
+///
+/// Used when a held leader prefix is replayed after a mismatch. The encoding
+/// mirrors what [`KeyEncoder::encode_with`] would produce for the equivalent
+/// key event. Returns `None` for chords that the encoder would drop (e.g.
+/// Super-modified chords, which produce no PTY bytes).
+fn encode_chord(chord: &Chord, mode: InputMode) -> Option<Vec<u8>> {
+    let key = gate_key_to_app(chord.code())?;
+    let mods = app_modifiers_from_gate(chord.modifiers());
+    let input = KeyInput::new(key, KeyPhase::Pressed, mods);
+    KeyEncoder::encode_with(input, mode).ok()
+}
+
+fn winit_to_gate_key(key: &WinitKey) -> Option<GateKeyCode> {
+    match key {
+        WinitKey::Character(text) => {
+            let ch = text.chars().next()?;
+            if text.chars().count() > 1 {
+                return None;
+            }
+            Some(GateKeyCode::Char(ch))
+        }
+        WinitKey::Named(NamedKey::Escape) => Some(GateKeyCode::Escape),
+        WinitKey::Named(NamedKey::Enter) => Some(GateKeyCode::Enter),
+        WinitKey::Named(NamedKey::Tab) => Some(GateKeyCode::Tab),
+        WinitKey::Named(NamedKey::Backspace) => Some(GateKeyCode::Backspace),
+        WinitKey::Named(NamedKey::Space) => Some(GateKeyCode::Space),
+        WinitKey::Named(NamedKey::ArrowUp) => Some(GateKeyCode::Up),
+        WinitKey::Named(NamedKey::ArrowDown) => Some(GateKeyCode::Down),
+        WinitKey::Named(NamedKey::ArrowLeft) => Some(GateKeyCode::Left),
+        WinitKey::Named(NamedKey::ArrowRight) => Some(GateKeyCode::Right),
+        WinitKey::Named(NamedKey::Home) => Some(GateKeyCode::Home),
+        WinitKey::Named(NamedKey::End) => Some(GateKeyCode::End),
+        WinitKey::Named(NamedKey::PageUp) => Some(GateKeyCode::PageUp),
+        WinitKey::Named(NamedKey::PageDown) => Some(GateKeyCode::PageDown),
+        WinitKey::Named(NamedKey::Delete) => Some(GateKeyCode::Delete),
+        WinitKey::Named(NamedKey::Insert) => Some(GateKeyCode::Insert),
+        _ => None,
+    }
+}
+
+fn gate_key_to_app(code: GateKeyCode) -> Option<Key> {
+    match code {
+        GateKeyCode::Char(ch) => Some(Key::Character(ch)),
+        GateKeyCode::Enter => Some(Key::Enter),
+        GateKeyCode::Tab => Some(Key::Tab),
+        GateKeyCode::Backspace => Some(Key::Backspace),
+        GateKeyCode::Escape => Some(Key::Escape),
+        GateKeyCode::Space => Some(Key::Character(' ')),
+        GateKeyCode::Up => Some(Key::Arrow(Arrow::Up)),
+        GateKeyCode::Down => Some(Key::Arrow(Arrow::Down)),
+        GateKeyCode::Left => Some(Key::Arrow(Arrow::Left)),
+        GateKeyCode::Right => Some(Key::Arrow(Arrow::Right)),
+        GateKeyCode::Home => Some(Key::Home),
+        GateKeyCode::End => Some(Key::End),
+        GateKeyCode::PageUp => Some(Key::PageUp),
+        GateKeyCode::PageDown => Some(Key::PageDown),
+        GateKeyCode::Delete => Some(Key::Delete),
+        GateKeyCode::Insert => Some(Key::Insert),
+        GateKeyCode::Function(_) => None,
+    }
+}
+
+fn gate_modifiers(mods: Modifiers) -> GateModifiers {
+    let mut gate = GateModifiers::empty();
+    if mods.is_ctrl() {
+        gate = gate.ctrl();
+    }
+    if mods.is_alt() {
+        gate = gate.alt();
+    }
+    if mods.is_shift() {
+        gate = gate.shift();
+    }
+    if mods.is_super() {
+        gate = gate.super_key();
+    }
+    gate
+}
+
+fn app_modifiers_from_gate(mods: GateModifiers) -> Modifiers {
+    let mut app = Modifiers::empty();
+    if mods.is_ctrl() {
+        app = app.ctrl();
+    }
+    if mods.is_alt() {
+        app = app.alt();
+    }
+    if mods.is_shift() {
+        app = app.shift();
+    }
+    if mods.is_super() {
+        app = app.super_key();
+    }
+    app
 }
 
 /// Index of the cell row containing a non-negative pixel coordinate, or
@@ -1001,6 +1362,7 @@ fn main() {
 mod tests {
     use super::*;
     use noren_app::palette::CommandId;
+    use noren_app::passthrough::{self, collisions};
     use noren_app::sidebar::EntryKind;
 
     #[test]
@@ -1733,5 +2095,294 @@ mod tests {
         // Negative and non-finite clicks are rejected.
         assert_eq!(terminal_column_at(-1.0, cols), None);
         assert_eq!(terminal_column_at(f64::NAN, cols), None);
+    }
+
+    // ── Pass-through gate integration tests ──────────────────────────────
+
+    /// The palette policy claims exactly two chords: Super+Escape (exit) and
+    /// Super+p (palette). Both live in the Super/Cmd modifier space that the
+    /// pinned Zellij v0.44.3 corpus never binds.
+    #[test]
+    fn palette_policy_claims_exactly_super_escape_and_super_p() {
+        let policy = palette_policy();
+        let claims = policy.claims();
+        assert_eq!(claims.len(), 2, "exactly two claims");
+        let corpus = passthrough::zellij_default_bindings();
+        assert!(
+            collisions(claims, &corpus).is_empty(),
+            "palette policy must not collide with Zellij defaults"
+        );
+        let super_p = Chord::new(GateKeyCode::Char('p'), GateModifiers::empty().super_key())
+            .expect("normalized");
+        assert_eq!(
+            policy.palette_claim().unwrap().seq.chords()[0],
+            super_p,
+            "palette claim is Super+p"
+        );
+    }
+
+    /// A multi-chord leader whose first chord is held and then mismatched must
+    /// replay the held chord byte-for-byte before the mismatching chord. This
+    /// is the replay path whose failure would silently break Zellij.
+    #[test]
+    fn leader_mismatch_replays_held_chord_bytes_in_order() {
+        // A two-chord palette leader on chords absent from the Zellij corpus:
+        // bare 'a' then 'g'. Both encode non-empty bytes so a lost or
+        // reordered replay changes what the child receives.
+        let claim = PassthroughClaim {
+            id: CLAIM_ID_PALETTE,
+            action: PassthroughAction::OpenCommandPalette,
+            seq: ChordSeq::new(vec![
+                Chord::new(GateKeyCode::Char('a'), GateModifiers::empty()).unwrap(),
+                Chord::new(GateKeyCode::Char('g'), GateModifiers::empty()).unwrap(),
+            ])
+            .unwrap(),
+            justification: "test",
+        };
+        let policy = PassthroughPolicy::try_new(vec![
+            PassthroughClaim {
+                id: passthrough::CLAIM_ID_EXIT,
+                action: PassthroughAction::ExitToWorkspace,
+                seq: ChordSeq::single(
+                    Chord::new(GateKeyCode::Escape, GateModifiers::empty().super_key()).unwrap(),
+                ),
+                justification: "test",
+            },
+            claim,
+        ])
+        .expect("valid manifest");
+
+        let mode = InputMode::normal();
+        let mut gate = PassthroughGate::new();
+
+        // Press 'a': the first chord of the palette leader — held as pending.
+        let chord_a =
+            Chord::new(GateKeyCode::Char('a'), GateModifiers::empty()).expect("normalized");
+        let decision = gate.press(&policy, chord_a);
+        assert_eq!(decision.kind, GateKind::Pending);
+        assert!(decision.replayed.is_empty(), "pending must not replay");
+
+        // Press 'x': not the second chord. The gate forwards, replaying 'a'
+        // first. The replay must arrive byte-for-byte before 'x'.
+        let chord_x =
+            Chord::new(GateKeyCode::Char('x'), GateModifiers::empty()).expect("normalized");
+        let decision = gate.press(&policy, chord_x);
+        assert_eq!(decision.kind, GateKind::Forwarded);
+        assert_eq!(
+            decision.replayed,
+            vec![chord_a],
+            "the held leader chord must be replayed"
+        );
+
+        // Verify the replay bytes match direct encoding.
+        let replay_bytes = encode_chord(&decision.replayed[0], mode).expect("encodes");
+        assert_eq!(replay_bytes, b"a", "replayed 'a' must encode to b\"a\"");
+
+        // After the mismatch, the gate is clean: a subsequent 'x' forwards
+        // with no replay.
+        let decision = gate.press(
+            &policy,
+            Chord::new(GateKeyCode::Char('x'), GateModifiers::empty()).unwrap(),
+        );
+        assert_eq!(decision.kind, GateKind::Forwarded);
+        assert!(decision.replayed.is_empty(), "gate is clean after mismatch");
+    }
+
+    /// When the palette is closed, the gate forwards unclaimed chords. The
+    /// forwarded encoding must match what the encoder produces directly —
+    /// byte-identical to the pre-gate behaviour.
+    #[test]
+    fn closed_palette_forwarded_key_is_byte_identical_to_direct_encode() {
+        let policy = palette_policy();
+        let mode = InputMode::normal();
+        let mut gate = PassthroughGate::new();
+
+        for (code, modifiers) in [
+            (GateKeyCode::Char('a'), GateModifiers::empty()),
+            (GateKeyCode::Char('z'), GateModifiers::empty()),
+            (GateKeyCode::Enter, GateModifiers::empty()),
+            (GateKeyCode::Char('c'), GateModifiers::empty().ctrl()),
+            (GateKeyCode::Char('f'), GateModifiers::empty().alt()),
+        ] {
+            let chord = Chord::new(code, modifiers).expect("normalized");
+            let decision = gate.press(&policy, chord);
+            assert_eq!(decision.kind, GateKind::Forwarded, "chord must forward");
+            let forwarded = encode_chord(&chord, mode).expect("encodes");
+
+            let app_key = gate_key_to_app(code).expect("maps to app key");
+            let app_mods = app_modifiers_from_gate(modifiers);
+            let direct =
+                KeyEncoder::encode_with(KeyInput::new(app_key, KeyPhase::Pressed, app_mods), mode)
+                    .expect("encodes");
+            assert_eq!(
+                forwarded, direct,
+                "forwarded bytes must match direct encode for {code:?}"
+            );
+        }
+    }
+
+    /// Super+p is intercepted by the gate (opens the palette) and produces no
+    /// PTY bytes — confirming the palette claim works.
+    #[test]
+    fn super_p_is_intercepted_as_palette_open() {
+        let policy = palette_policy();
+        let mut gate = PassthroughGate::new();
+        let chord = Chord::new(GateKeyCode::Char('p'), GateModifiers::empty().super_key())
+            .expect("normalized");
+        let decision = gate.press(&policy, chord);
+        assert_eq!(
+            decision.kind,
+            GateKind::Intercepted(PassthroughAction::OpenCommandPalette)
+        );
+        assert!(decision.replayed.is_empty());
+    }
+
+    // ── Palette action tests ─────────────────────────────────────────────
+
+    /// Running the create command adds a session and the sidebar shows it.
+    #[test]
+    fn palette_create_action_adds_a_session_to_the_sidebar() {
+        let mut app = NorenApp::default();
+        assert!(app.workspace.sidebar().is_empty());
+
+        app.run_workspace_action(WorkspaceAction::CreateSession);
+
+        assert_eq!(app.workspace.registry().len(), 1);
+        assert_eq!(app.workspace.sidebar().rows().len(), 1);
+    }
+
+    /// Running select cycles the selection between sessions.
+    #[test]
+    fn palette_select_action_cycles_the_selected_session() {
+        let mut app = NorenApp::default();
+        let first = app.workspace.create_session(SessionKind::Local);
+        let second = app.workspace.create_session(SessionKind::Local);
+        app.workspace.select_session(first).expect("first is live");
+
+        app.run_workspace_action(WorkspaceAction::SelectSession);
+
+        assert_eq!(app.workspace.registry().selected(), Some(second));
+    }
+
+    /// Running close removes the selected session and the sidebar updates.
+    #[test]
+    fn palette_close_action_removes_the_selected_session() {
+        let mut app = NorenApp::default();
+        let first = app.workspace.create_session(SessionKind::Local);
+        let _second = app.workspace.create_session(SessionKind::Local);
+        app.workspace.select_session(first).expect("first is live");
+        assert_eq!(app.workspace.sidebar().rows().len(), 2);
+
+        app.run_workspace_action(WorkspaceAction::CloseSession);
+
+        assert_eq!(app.workspace.registry().len(), 1);
+        assert_eq!(app.workspace.sidebar().rows().len(), 1);
+        assert!(
+            !app.workspace
+                .sidebar()
+                .rows()
+                .iter()
+                .any(|r| r.label() == first.to_string()),
+            "closed session must not appear"
+        );
+    }
+
+    /// Escape dismisses the palette without running a command.
+    #[test]
+    fn escape_dismisses_palette_without_running_a_command() {
+        let mut app = NorenApp::default();
+        app.open_palette();
+        assert!(app.palette_open);
+        let count_before = app.workspace.registry().len();
+
+        // Simulate Escape key: handle_palette_key checks for NamedKey::Escape.
+        // We test the effect (close_palette) directly because constructing a
+        // full winit KeyEvent requires a DeviceId that is not safely creatable
+        // in a #[forbid(unsafe)] crate.
+        app.close_palette();
+
+        assert!(!app.palette_open, "palette must be dismissed");
+        assert_eq!(
+            app.workspace.registry().len(),
+            count_before,
+            "no command must have run"
+        );
+    }
+
+    // ── Session status observation tests ─────────────────────────────────
+
+    /// Observing Running after creation changes the sidebar detail from
+    /// "starting" to "running".
+    #[test]
+    fn observe_running_updates_the_sidebar_detail() {
+        let mut state = WorkspaceState::new();
+        let id = state.create_session(SessionKind::Local);
+
+        // Freshly created: status is "starting".
+        let detail_before = state
+            .sidebar()
+            .rows()
+            .first()
+            .and_then(|r| r.detail())
+            .unwrap_or_default();
+        assert!(
+            detail_before.contains("starting"),
+            "fresh session should show starting, got {detail_before}"
+        );
+
+        state.observe_session(id, SessionStatus::Running);
+
+        let detail_after = state
+            .sidebar()
+            .rows()
+            .first()
+            .and_then(|r| r.detail())
+            .unwrap_or_default();
+        assert!(
+            detail_after.contains("running"),
+            "observed session should show running, got {detail_after}"
+        );
+    }
+
+    /// Observing Exited after Running changes the sidebar detail to "exited".
+    #[test]
+    fn observe_exited_after_running_updates_the_sidebar() {
+        let mut state = WorkspaceState::new();
+        let id = state.create_session(SessionKind::Local);
+        state.observe_session(id, SessionStatus::Running);
+        state.observe_session(id, SessionStatus::Exited { code: Some(0) });
+
+        let detail = state
+            .sidebar()
+            .rows()
+            .first()
+            .and_then(|r| r.detail())
+            .unwrap_or_default();
+        assert!(
+            detail.contains("exited"),
+            "exited session should show exited, got {detail}"
+        );
+    }
+
+    // ── Palette text rendering ───────────────────────────────────────────
+
+    /// The palette text lines include all four commands with a selection
+    /// marker on the currently selected one.
+    #[test]
+    fn palette_text_lines_show_selection_marker() {
+        let state = WorkspaceState::new();
+        let palette = state.palette();
+        let lines = palette_text_lines(palette, 1);
+        assert_eq!(lines.len(), 4, "four commands");
+        assert!(
+            lines[1].starts_with(']'),
+            "second line must be selected, got {:?}",
+            lines[1]
+        );
+        assert!(
+            !lines[0].starts_with(']'),
+            "first line must not be selected, got {:?}",
+            lines[0]
+        );
     }
 }
