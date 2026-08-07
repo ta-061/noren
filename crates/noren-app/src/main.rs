@@ -831,16 +831,19 @@ impl NorenApp {
     ///
     /// Encodes a press or release report for Left/Middle/Right and sends it to
     /// the PTY. Sidebar clicks and unmapped buttons produce no bytes. The held
-    /// button is tracked as early as possible so that subsequent motion events
-    /// carry the correct button parameter — even a press that produced no
-    /// report (e.g. in the sidebar) still updates the tracking state.
+    /// button is recorded only when the press is actually reported — a press
+    /// that produces no bytes (e.g. inside the sidebar) must not seed the
+    /// tracking state, or a later drag into the terminal would emit a motion
+    /// report with no preceding press. A release always clears the held button
+    /// regardless of position, since the physical button is up either way.
     fn handle_tracked_mouse_button(&mut self, state: ElementState, button: MouseButton) {
         let Some(encode_btn) = encode_button(button) else {
             return;
         };
-        match state {
-            ElementState::Pressed => self.held_mouse_button = Some(button),
-            ElementState::Released => self.held_mouse_button = None,
+        // A release clears the held button unconditionally — the physical
+        // button is up even if the release landed outside the terminal grid.
+        if state == ElementState::Released {
+            self.held_mouse_button = None;
         }
         let Some(position) = self.cursor_position else {
             return;
@@ -848,6 +851,10 @@ impl NorenApp {
         let Some((col, row)) = self.mouse_cell_at(position) else {
             return;
         };
+        // Record the held button only when the press is actually reported.
+        if state == ElementState::Pressed {
+            self.held_mouse_button = Some(button);
+        }
         let kind = match state {
             ElementState::Pressed => noren_app::mouse::PointerKind::Press(encode_btn),
             ElementState::Released => noren_app::mouse::PointerKind::Release(encode_btn),
@@ -1487,9 +1494,23 @@ fn encode_button(button: MouseButton) -> Option<EncoderButton> {
 }
 
 /// Convert a winit scroll delta to a sequence of wheel directions (one per
-/// line scrolled). Positive vertical delta means content moves down (wheel
-/// down); negative means wheel up. A non-zero delta that rounds to zero lines
-/// still produces one click so a single-notch wheel is never lost.
+/// line scrolled).
+///
+/// Both `LineDelta` and `PixelDelta` share the same vertical sign convention.
+/// From the winit 0.30 source (`event.rs`, `MouseScrollDelta`):
+///
+///   LineDelta:   "Positive values indicate that the content that is being
+///                 scrolled should move right and down (revealing more content
+///                 left and up)."
+///   PixelDelta:  "Positive values indicate that the content being scrolled
+///                 should move right/down."
+///
+/// Positive y therefore means the user scrolled **up** (content moves down,
+/// revealing earlier content). xterm sends button 4 (`Cb=64`,
+/// `WheelDirection::Up`) for scroll-up; negative y is scroll-down (`Cb=65`).
+///
+/// A non-zero delta that rounds to zero lines still produces one click so a
+/// single-notch wheel is never lost.
 fn wheel_clicks(delta: MouseScrollDelta) -> Vec<WheelDirection> {
     let lines = match delta {
         MouseScrollDelta::LineDelta(_, y) => y,
@@ -1498,9 +1519,9 @@ fn wheel_clicks(delta: MouseScrollDelta) -> Vec<WheelDirection> {
     let count = lines.abs().floor().max(0.0) as usize;
     let count = if count == 0 && lines != 0.0 { 1 } else { count };
     let direction = if lines < 0.0 {
-        WheelDirection::Up
-    } else {
         WheelDirection::Down
+    } else {
+        WheelDirection::Up
     };
     vec![direction; count]
 }
@@ -2932,22 +2953,53 @@ mod tests {
     }
 
     /// Wheel delta sign maps to direction, and magnitude maps to click count.
+    ///
+    /// winit 0.30 `MouseScrollDelta` docs (from the source at
+    /// `winit-0.30.13/src/event.rs`):
+    ///
+    ///   LineDelta:  "Positive values indicate that the content that is being
+    ///                scrolled should move right and down (revealing more
+    ///                content left and up)."
+    ///   PixelDelta: "Positive values indicate that the content being scrolled
+    ///                should move right/down."
+    ///
+    /// Positive y = content moves down = the user scrolled **up** (xterm button
+    /// 4, `Cb=64`). Negative y = scroll down (`Cb=65`). Both variants share the
+    /// same sign convention.
     #[test]
     fn wheel_clicks_direction_and_count() {
-        // LineDelta: negative y = wheel up
-        let up = wheel_clicks(MouseScrollDelta::LineDelta(0.0, -1.0));
+        // LineDelta: positive y = wheel up (content moves down, revealing
+        // earlier content). See the winit sentence quoted above.
+        let up = wheel_clicks(MouseScrollDelta::LineDelta(0.0, 1.0));
         assert_eq!(up, vec![WheelDirection::Up]);
 
-        // Positive y = wheel down
-        let down = wheel_clicks(MouseScrollDelta::LineDelta(0.0, 3.0));
+        // Negative y = wheel down.
+        let down = wheel_clicks(MouseScrollDelta::LineDelta(0.0, -3.0));
         assert_eq!(down, vec![WheelDirection::Down; 3]);
 
-        // PixelDelta: convert by cell height
+        // PixelDelta shares the same sign convention: positive y = wheel up.
         let pixel_up = wheel_clicks(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
             0.0,
-            -f64::from(POC_CELL_HEIGHT) * 2.0,
+            f64::from(POC_CELL_HEIGHT) * 2.0,
         )));
         assert_eq!(pixel_up, vec![WheelDirection::Up; 2]);
+
+        // Pin the full path through the encoder so the emitted bytes are fixed:
+        // wheel up → Cb=64, wheel down → Cb=65 (SGR form, 1-based col/row).
+        let grid = MouseGrid::new(10, 40).expect("grid");
+        let modes = MouseModes::disabled().with_normal(true).with_sgr(true);
+        let up_event = PointerEvent::wheel(up[0], 0, 0, PointerModifiers::empty());
+        assert_eq!(
+            MouseEncoder::encode(up_event, modes, grid).as_deref(),
+            Some(b"\x1b[<64;1;1M".as_slice()),
+            "wheel up must emit Cb=64"
+        );
+        let down_event = PointerEvent::wheel(down[0], 0, 0, PointerModifiers::empty());
+        assert_eq!(
+            MouseEncoder::encode(down_event, modes, grid).as_deref(),
+            Some(b"\x1b[<65;1;1M".as_slice()),
+            "wheel down must emit Cb=65"
+        );
     }
 
     /// A resting trackpad reports `PixelDelta{y:0}`, which is a genuine zero
@@ -3018,8 +3070,11 @@ mod tests {
     }
 
     /// With tracking enabled (no Shift), a press enters the tracking branch
-    /// and sets held_mouse_button — even though grid_point_at returns None
-    /// without a window, the branch is entered and the button is tracked.
+    /// (`handle_tracked_mouse_button` runs) but — without a valid terminal
+    /// position (no window in this harness) — does NOT set
+    /// `held_mouse_button`. The button is recorded only when the press is
+    /// actually reported. `drag_origin` stays None because the selection
+    /// branch was not entered.
     #[test]
     fn tracking_enabled_press_enters_tracking_branch() {
         let terminal = TerminalState::new(4, 8).expect("valid terminal");
@@ -3034,14 +3089,54 @@ mod tests {
         app.cursor_position = Some(PhysicalPosition::new(sidebar_pixel_width(), 0.0));
         app.handle_mouse_button(ElementState::Pressed, MouseButton::Left);
         assert_eq!(
-            app.held_mouse_button,
-            Some(MouseButton::Left),
-            "tracking branch must track the held button"
+            app.held_mouse_button, None,
+            "press with no valid terminal position must not record the button"
+        );
+        // The selection branch was not taken.
+        assert_eq!(app.drag_origin, None);
+
+        // Release is a no-op on held_mouse_button (already None).
+        app.handle_mouse_button(ElementState::Released, MouseButton::Left);
+        assert_eq!(app.held_mouse_button, None);
+    }
+
+    /// A press that produces no report (position outside the terminal grid,
+    /// e.g. inside the sidebar) must not seed `held_mouse_button`. Otherwise a
+    /// subsequent drag into the terminal would emit a motion report with no
+    /// preceding press — outside the xterm model. Without a window,
+    /// `mouse_cell_at` returns None for every position, simulating a
+    /// non-reportable press; the held button must stay None so the motion
+    /// handler has no button to carry.
+    #[test]
+    fn sidebar_press_does_not_produce_orphan_motion_report() {
+        let terminal = TerminalState::new(4, 8).expect("valid terminal");
+        let mut app = NorenApp {
+            terminal: Some(terminal),
+            mouse_modes: MouseModes::disabled()
+                .with_normal(true)
+                .with_button_event(true),
+            ..Default::default()
+        };
+
+        assert!(app.mouse_reportable());
+
+        // Press at a sidebar x-coordinate — `mouse_cell_at` returns None.
+        app.cursor_position = Some(PhysicalPosition::new(0.0, 0.0));
+        app.handle_mouse_button(ElementState::Pressed, MouseButton::Left);
+        assert_eq!(
+            app.held_mouse_button, None,
+            "sidebar press must not record the held button"
         );
 
-        // Release clears it.
-        app.handle_mouse_button(ElementState::Released, MouseButton::Left);
-        assert_eq!(app.held_mouse_button, None, "release must clear the button");
+        // Now move to a terminal position. With no window, `mouse_cell_at`
+        // still returns None, so no motion report is encoded — but even if it
+        // did resolve, the button field would be None because
+        // `held_mouse_button` was never set, so no orphan drag report.
+        app.handle_mouse_move(PhysicalPosition::new(sidebar_pixel_width(), 0.0));
+        assert_eq!(
+            app.held_mouse_button, None,
+            "no orphan motion report: held button is still None"
+        );
     }
 
     // ── mouse_grid() application path ───────────────────────────────────
