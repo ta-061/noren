@@ -1,18 +1,14 @@
 //! Byte-exact verification of the mouse input encoder (`src/mouse.rs`).
 //!
-//! The mouse module is not yet wired into `lib.rs` (export wiring is a
-//! separate serial commit owned by another lane). It is self-contained — no
-//! `crate::` items — so this target compiles it directly from its source path
-//! and exercises the public API the way the future terminal-mode wiring will.
+//! The mouse module is wired into `lib.rs` as `pub mod mouse`. It is
+//! self-contained — no `crate::` items — and these tests exercise the public
+//! API the way the future terminal-mode wiring will.
 //!
 //! Coordinate convention used throughout: `col`/`row` are 0-based cell indices;
 //! the encoder clamps to the grid and emits 1-based `Cx`/`Cy`. A click at
 //! `col=9, row=4` on any grid that contains it resolves to `Cx=10, Cy=5`.
 
-#[path = "../src/mouse.rs"]
-mod mouse;
-
-use mouse::{
+use noren_app::mouse::{
     MODE_ANY_EVENT, MODE_BUTTON_EVENT, MODE_NORMAL, MODE_SGR, MODE_URXVT, MODE_UTF8, MouseButton,
     MouseEncoder, MouseGrid, MouseModes, PointerEvent, PointerModifiers, WheelDirection,
     X10_MAX_COORD,

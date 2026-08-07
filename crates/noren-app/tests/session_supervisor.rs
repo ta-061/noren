@@ -1,11 +1,17 @@
 //! Independent verification of the session-supervisor lane (M3-1b).
 //!
 //! This target is written as an outside-in check of the public contract the
-//! task describes, against a fake/mock process model. The module under review
-//! is **not** wired into `noren-app/src/lib.rs` yet (wiring is a later serial
-//! integration commit), so it is compiled into this test binary via `#[path]`.
-//! `cfg(test)` is enabled for the test binary, which also brings the lane's
-//! `mock` harness into scope.
+//! task describes, against a fake/mock process model. The module is wired into
+//! `noren-app/src/lib.rs` as `pub mod session_supervisor`, but this test also
+//! exercises the lane's `mock` harness, which is `#[cfg(test)]` inside
+//! `src/session_supervisor.rs`. A `#[cfg(test)]` item is only visible when the
+//! crate **itself** is the test target; an integration test is a separate
+//! crate, so `cfg(test)` is not set for the `noren-app` dependency and
+//! `noren_app::session_supervisor::mock` does not resolve here. The module is
+//! therefore still compiled into this test binary directly via `#[path]`, where
+//! `cfg(test)` *is* enabled for the test binary and `mock` is in scope. The
+//! non-`mock` public surface (`SessionSupervisor`, `SessionStatus`, …) is
+//! reachable from outside the crate; only the test-only `mock` harness is not.
 //!
 //! The load-bearing claim under test — the reason this lane exists — is that a
 //! dead child surfaces as `Exited`/`Failed` and never stays `Running`, that

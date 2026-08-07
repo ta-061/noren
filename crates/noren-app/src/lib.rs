@@ -12,7 +12,12 @@ mod clipboard;
 pub mod config;
 pub mod diagnostics;
 mod input;
+pub mod mouse;
+pub mod palette;
+pub mod passthrough;
 pub mod session;
+pub mod session_persistence;
+pub mod session_supervisor;
 pub mod sidebar;
 
 pub use clipboard::{
