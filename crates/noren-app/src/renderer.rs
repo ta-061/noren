@@ -543,15 +543,19 @@ mod tests {
 
     #[test]
     fn glyph_input_is_bounded_to_visible_poc_grid() {
-        let terminal = snapshot(100, 500, &vec![b'A'; 50_000]);
-        let vertices = glyph_vertices(
-            Some(&terminal),
-            None,
-            None,
-            u32::MAX,
-            u32::MAX,
-            poc_metrics(),
-        );
+        // Grid dimensions one past the renderer limits exercise the same
+        // dimension clamps as u32::MAX: visible_rows clamps to
+        // MAX_RENDER_ROWS and terminal_cols clamps to MAX_RENDER_COLS.
+        // No overflow path exists — all dimension arithmetic uses
+        // saturating_add and clamp — so u32::MAX adds no coverage beyond
+        // these values.
+        let rows = MAX_RENDER_ROWS + 1;
+        let cols = MAX_RENDER_COLS + 1;
+        let bytes = vec![b'A'; usize::from(rows) * usize::from(cols)];
+        let terminal = snapshot(rows, cols, &bytes);
+        let width = u32::from(cols) * CELL_WIDTH + CELL_WIDTH;
+        let height = u32::from(rows) * CELL_HEIGHT + CELL_HEIGHT;
+        let vertices = glyph_vertices(Some(&terminal), None, None, width, height, poc_metrics());
         assert!(vertices.len() <= MAX_VERTICES);
     }
 
@@ -578,6 +582,7 @@ mod tests {
     }
 
     const CELL_WIDTH: u32 = noren_app::POC_CELL_WIDTH;
+    const CELL_HEIGHT: u32 = noren_app::POC_CELL_HEIGHT;
 
     fn ndc_left(column: u32) -> f32 {
         (column * CELL_WIDTH) as f32 / 900.0 * 2.0 - 1.0
