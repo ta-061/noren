@@ -1,19 +1,18 @@
-# Review: M3-5 — Zellij pass-through policy
+# Review: M3-5 — Zellij pass-through policy (round 2)
 
 - Branch: `agent/m3-zellij-passthrough`
-- Head SHA: `ad597d2cb1a2`
+- Head SHA: `74dd035bf018`
 - Reviewer: GLM (independent; did not author this code)
 - Lane handoff: `docs/coordination/handoffs/qwen-c.md`
+- Prior round: `f86ae61` (FINDINGS: 1 MAJOR, 3 MINOR — all addressed in `74dd035`)
 
 ## Authority note
 
-`state/tasks/M3-5.md` is **not present** in the fleet repo
-(`state/tasks/` holds M3-1a, M3-1b, M3-3, M3-4, M3-ADV-session, M3-EXP-zellij
-only). The acceptance criteria below were therefore reconstructed from the
-authoritative compatibility-matrix row "Noren Zellij Pass-through Mode"
-(`docs/compatibility/zellij.md:271`), ADR 0003, and the lane handoff. If the
-missing spec carries criteria beyond these, this review should be re-run
-against it.
+`state/tasks/M3-5.md` is **not present** in the fleet repo (`state/tasks/`
+holds M3-1a, M3-1b, M3-3, M3-4, M3-ADV-session, M3-EXP-zellij only).
+Acceptance criteria were reconstructed from the compatibility-matrix row
+"Noren Zellij Pass-through Mode" (`docs/compatibility/zellij.md:271`) and
+the boundary stated in the module + handoff.
 
 ## Gate (real output, run on the branch worktree)
 
@@ -22,189 +21,175 @@ $ cargo fmt --all -- --check
 (exit 0)
 
 $ cargo clippy --workspace --all-targets -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.31s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.32s
 (exit 0)
 
 $ cargo test --workspace
-... 368 passed, 0 failed, 1 ignored (pre-existing) across all targets
+test result: ok. 79 passed; 0 failed; 1 ignored  (noren-app lib)
+test result: ok. 24 passed; 0 failed; 0 ignored  (noren-app bin)
+test result: ok. 16 passed; 0 failed; 0 ignored  (tests/passthrough.rs)
+... (all targets green)
+total: 369 passed, 0 failed, 1 ignored (pre-existing) across all targets
 ```
 
-fmt clean, clippy clean, 368 passed / 0 failed. Matches the handoff's claimed
-368 (+15 over the 353 baseline). Toolchain `cargo 1.88.0 / rustc 1.88.0`,
-`aarch64-apple-darwin`.
+Toolchain `cargo 1.88.0 / rustc 1.88.0`, `aarch64-apple-darwin`.
+
+## Round-1 findings — verification of fixes
+
+### MAJOR-1 (replay-on-mismatch unverified) — FIXED, mutation-proven
+
+Re-applied the exact round-1 mutation: forwarding branch of `press`
+returns `replayed: Vec::new()`, silently dropping held chords.
+
+```
+test leader_completion_intercepts_and_mismatch_replays_in_order ... FAILED
+test a_second_live_claim_does_not_swallow_a_held_leader_prefix ... FAILED
+  left: []  right: [Chord { code: Char('a'), ... }]
+```
+
+The mutation is now caught on both the byte boundary (`b"ax"` instead of
+`b"x"`) and the decision/chord level. The Harness computes
+`expected_replayed` from its own held-stream independently of
+`decision.replayed`, so the tautology is gone.
+
+### MINOR-1 (dead `ClaimPrefixesZellij` branch) — DOCUMENTED
+
+Docstring (`:663-667`) now states the corpus is single-chord, so only
+`Exact` and `ZellijPrefixesClaim` are reachable today; the branch is kept
+as defense for a future multi-chord corpus. Sound.
+
+### MINOR-2 (`default_policy()` bypassed validator) — FIXED
+
+`default_policy()` (`:785-788`) now builds through
+`try_new(vec![default_exit_claim()])`. A mutation disabling the collision
+check in `try_new` is caught by both `policy_rejects_manifests...` and
+`an_invalid_manifest_means_pass_through_is_not_enterable` (see mutation 5
+below), which would also fire if the default claim were edited into a
+collision.
+
+### MINOR-3 (per-keypress allocation in `press`) — FIXED
+
+`press` (`:960-990`) now borrows claims through `iter_claims()` and matches
+the pending prefix in place via `seq.starts_with(pending)`. No `Vec`
+allocation on the hot path. `claims()` (`:879-881`) still returns an owned
+`Vec` for callers wanting ownership; `press` never calls it.
 
 ## Acceptance criteria — one by one
 
-| Criterion (from the matrix row + ADR 0003) | Met? | Evidence |
+| Criterion (matrix row + boundary) | Met? | Evidence |
 | --- | --- | --- |
-| Freeze the permitted interception manifest | yes | `PassthroughPolicy::try_new` is the single enforcement point (`crates/noren-app/src/passthrough.rs:797`) |
-| Minimal accepted set intercepted | yes | default claims exactly one chord, `Super+Escape`; `try_new` rejects more than exit + one palette (`:797-859`) |
-| Child forwarding continues byte-for-byte | yes | `unbound_input_is_forwarded_byte_for_byte` compares the gate output to a direct `KeyEncoder` encode over a wide corpus (`tests/passthrough.rs:544`) |
-| Exit via configured leader / palette / GUI | partial-by-lease | keyboard exit leader required at construction (`:826`); `RecoveryRoute::PointerInvokedPalette` modeled unconditionally (`:887`). The pointer surface itself is out of lease (config/lib.rs excluded); handoff states this |
-| Collisions asserted mechanically vs pinned corpus | yes | `default_manifest_has_zero_collisions_with_zellij_defaults` (`:235`); corpus pinned to v0.44.3 / `55a2121` (`:37,40`) |
-| No trapped session (reject or always-reachable non-keyboard recovery) | yes | fail-closed `try_new` + `PointerInvokedPalette` always present (`:887`); anti-trap cases tested (`:322,811`) |
-| File lease honored | yes | `git diff --numstat origin/main...HEAD` is purely additive on the three leased paths; `lib.rs`/`main.rs`/`input.rs`/`Cargo.*` untouched |
-| ADR 0003 boundary (no pane/tab/layout/split, no Zellij-layout read/persist) | yes | see below |
-
-Deferred items (configurable leader schema, command-palette surface,
-entry/exit precedence) are explicitly outside this lane's lease and are
-documented as such in the handoff. They are not counted as unmet criteria.
+| Freeze the permitted interception manifest | yes | `PassthroughPolicy::try_new` (`:801-863`) is the single enforcement point |
+| Minimal accepted set intercepted | yes | default claims exactly one chord (`Super+Escape`); `try_new` rejects more than exit + one palette (`:805-808`) |
+| Child forwarding continues byte-for-byte | yes | `unbound_input_is_forwarded_byte_for_byte` compares gate output to a direct `KeyEncoder` encode over a wide corpus (`tests:564-589`) |
+| Exit via configured leader / palette / GUI | yes (within lease) | keyboard exit leader required at construction (`:830-832`); `RecoveryRoute::PointerInvokedPalette` modeled unconditionally (`:895-900`). Pointer surface itself is out of lease (config/lib.rs excluded); handoff documents this |
+| Collisions asserted mechanically vs pinned corpus | yes | `default_manifest_has_zero_collisions_with_zellij_defaults` (`tests:255-263`); corpus pinned to v0.44.3 / `55a2121` (`:37,40`) |
+| No trapped session | yes | fail-closed `try_new` + `PointerInvokedPalette` always present; anti-trap cases tested (`tests:342-449, 910-926`) |
+| File lease honored | yes | purely additive diff (see below) |
+| ADR 0003 boundary | yes | see below |
 
 ## Boundary (ADR 0003) — no violation
 
-`grep` for pane/tab/split/layout in `passthrough.rs` returns only (a) comments
-restating the boundary (`:5-6`) and (b) descriptive **labels** for Zellij's own
-modes inside the collision corpus (`mode: "pane"`, `mode: "tab"` at `:409,442`).
-The module carries no workspace-model state: it never introduces a Noren
-pane/tab/layout/split type and never reads or persists Zellij's internal
-layout. The corpus describes what Zellij binds so Noren can avoid it; it does
-not model what Noren owns. Honored.
+`grep` for pane/tab/split/layout in `passthrough.rs` returns only (a)
+comments restating the boundary (`:5-6`) and (b) descriptive **labels** for
+Zellij's own modes inside the collision corpus (`mode: "pane"`, `mode:
+"tab"` at `:403,436`). The module introduces no Noren pane/tab/layout/split
+type and never reads or persists Zellij's internal layout. The corpus
+describes what Zellij binds so Noren can avoid it; it does not model what
+Noren owns.
 
 ## Regressions / unintended deletions
 
-`git diff --numstat origin/main...HEAD`:
-
 ```
-981 0 crates/noren-app/src/passthrough.rs
-826 0 crates/noren-app/tests/passthrough.rs
-163 0 docs/coordination/handoffs/qwen-c.md
+$ git diff --numstat origin/main...HEAD
+997  0  crates/noren-app/src/passthrough.rs
+926  0  crates/noren-app/tests/passthrough.rs
+268  0  docs/coordination/handoffs/qwen-c.md
+210  0  docs/coordination/reviews/M3-5-review.md
 ```
 
-Purely additive (all `0` deletions). No forbidden file touched. No unintended
-removals.
+Purely additive (all `0` deletions). `lib.rs`, `main.rs`, `Cargo.toml`,
+`Cargo.lock` untouched (empty diff confirmed).
 
 ## Panics / resource leaks / unbounded growth
 
-- `PassthroughGate::pending` is bounded by `MAX_LEADER_CHORDS` (8): a candidate
-  can only stay `Pending` while it is a strict prefix of a claim, and claims are
-  capped at 8 (`:267`). Verified by driving an 8-deep identical-chord leader:
-  depth reaches 7 then completes; a hostile 10 000-press stream never exceeded
-  the cap.
-- No `unwrap`/`expect`/indexing on untrusted input in production paths; the
-  only `.expect` is the corpus constant builder (`:317`), defended by the
-  corpus-sanity test.
-- `collisions()`, `zellij_default_bindings()`, `claims()`, `replay_timeout()`
-  all return bounded structures (≤ ~120 corpus; replay ≤ 8).
+- `PassthroughGate::pending` is bounded by `MAX_LEADER_CHORDS` (8): a
+  candidate can only stay `Pending` while it extends a claim prefix, and
+  claims are capped at 8. Probed with an 8-deep leader: depth reaches 7
+  then completes; a hostile 100 000-press stream of mismatching chords
+  never grew `pending` beyond 0; 50 000 pending→mismatch cycles never
+  leaked.
+- No `unwrap`/`expect`/indexing on untrusted input in production paths.
+  The only `.expect` is the corpus constant builder (`:311`), defended by
+  the corpus-sanity test. `default_policy()`'s `.expect` (`:787`) is
+  guarded by the collision test and is defense-in-depth per its docstring.
+- `collisions()`, `zellij_default_bindings()`, `claims()`,
+  `replay_timeout()` all return bounded structures (≤ ~131 corpus; replay
+  ≤ 7).
 
 No leaks or unbounded growth found.
 
 ## Combinations the author did not test
 
-I exercised an untested interaction: **two simultaneous claims of unequal
-length through the gate** (exit = 2-chord `[Super+e, Super+s]`, palette =
-single `[Super+p]`). The author's `exit_plus_optional_palette_is_the_maximal_manifest`
-constructs both but never drives the gate with both live. The gate behaved
-correctly: a held `Super+e` is replayed when `Super+p` completes the palette,
-and the palette intercepts standalone. Probe passed; no defect found here.
+I exercised interactions beyond the author's suite via a temporary probe
+file (removed before commit):
 
-I also confirmed `replay_timeout()` is idempotent (second call yields nothing)
-and that `press` after an `Intercepted` leaves the gate clean — both correct
-and previously untested.
+1. **Divergent multi-chord claims with shared prefix** (exit `[a,g]`,
+   palette `[a,x]`): the gate correctly holds `a` as Pending, then
+   intercepts the correct claim on the diverging chord. Not in the test
+   suite; correct.
+2. **Prefix-chord ambiguity rejection** (exit `[q]`, palette `[q,x]`):
+   correctly rejected as `AmbiguousLeader`. The ambiguity check uses
+   `is_prefix_of` which covers the equal case too, so this is caught.
+3. **8-deep leader full completion**: all 8 chords consumed, Intercepted
+   returned, gate clean afterwards. Probed; correct.
+4. **Held prefix + standalone claim chord** (exit `[a,g]`, palette `[q]`,
+   press `a` then `q`): the palette chord is **forwarded** (not
+   re-evaluated for interception). This is the same design decision the
+   author tests in `a_second_live_claim_does_not_swallow_a_held_leader_prefix`
+   (`tests:784-836`): a held prefix commits to its claim; on mismatch,
+   everything flushes forward. Consistent and tested — not a defect.
+5. **`replay_timeout()` idempotency**: second call returns empty. Probed;
+   correct.
 
 ## Mutation testing (do the tests test the behavior?)
 
-Three mutations applied to `passthrough.rs`, each reverted after.
+Five mutations applied to `passthrough.rs`, each reverted after.
 
-1. Swap collision check order (prefix before exact) →
-   `collision_detector_flags_documented_zellij_chords` **FAILED**. Exact
-   detection is genuinely covered.
-2. Make `try_new` synthesize a default exit when none is supplied →
-   `policy_rejects_manifests_that_could_trap_or_overreach` and
-   `an_invalid_manifest_means_pass_through_is_not_enterable` **FAILED**.
-   The missing-exit / anti-trap requirement is genuinely covered.
-3. Make `press` return `replayed: Vec::new()` on the forwarding/mismatch path
-   (silently drop held leader chords) → **all 15 tests PASSED.** See MAJOR-1.
+| # | Mutation | Result |
+| --- | --- | --- |
+| 1 | Forwarding branch returns `replayed: Vec::new()` (drop held chords) | **2 tests FAIL** — round-1 MAJOR fix verified |
+| 2 | Remove completion loop entirely (never Intercepted) | **3 tests FAIL** |
+| 3 | `is_prefix_of` always returns `true` (corrupts collisions + ambiguity) | **12 tests FAIL** |
+| 4 | Completion check uses `seq[0]` instead of `seq[pending.len()]` | **1 test FAIL** (multi-chord completion) |
+| 5 | Disable collision check in `try_new` | **2 tests FAIL** |
 
-## Findings
+Every mutation is caught. The test suite genuinely tests the behavior.
 
-### MAJOR-1 — replay-on-mismatch is not verified; a losing mutation passes clean
+## Cosmetic note (not ranked as a finding)
 
-- `crates/noren-app/tests/passthrough.rs:112-120` (tautological Harness
-  assertion) and `:706-738` (`leader_completion_intercepts_and_mismatch_replays_in_order`).
-- **Reproduction:** in `PassthroughGate::press`, change the forwarding branch to
-  `replayed: Vec::new()` (dropping `std::mem::take(&mut self.pending)`). Run
-  `cargo test --test passthrough`.
-- **Actual:** `15 passed; 0 failed`. The held leader chord (`Super+e`) is
-  silently lost — exactly the "trapped/lost input" class the matrix forbids.
-- **Expected:** at least one test must fail, asserting the held prefix is
-  replayed byte-for-byte before the mismatching chord.
-- **Root cause (two parts):**
-  1. The Harness replay check is self-fulfilling: it drains
-     `decision.replayed.len()` items from `self.held` and compares the result
-     to `decision.replayed`. An empty replay therefore self-satisfies as
-     `[] == []`; it can never detect a dropped replay.
-  2. The mismatch test uses `Super` chords, which the app encoder drops to
-     zero bytes, so `harness.bytes()` cannot witness the lost input. The
-     author's own comment (`:726-727`) concedes "the ordering assertion is on
-     the decision/held-stream, not the bytes" — but that stream assertion is
-     the tautological one in (1).
-- **Contrast:** the timeout replay path *is* byte-tested (`:769-773`), proving
-  the gap is specific to the `press()` mismatch path.
-- **Minimal suggested fix (do not apply — report only):** assert
-  `decision.replayed` against the *expected* held chords computed independently
-  of `decision.replayed.len()`; assert `self.held.is_empty()` after a mismatch;
-  and/or drive a mismatch with a non-Super, non-colliding leader (e.g. a plain
-  multi-chord `ChordSeq` of printable chords fed straight to the gate) so the
-  replayed bytes are non-empty and `harness.bytes()` can assert ordering.
-
-### MINOR-1 — `CollisionKind::ClaimPrefixesZellij` is a dead branch
-
-- `crates/noren-app/src/passthrough.rs:720-722` (and docstring `:669-671`).
-- The corpus is all single-chord (`ChordSeq::single`). A claim can be a strict
-  prefix of a Zellij sequence only if it is shorter than one chord, which is
-  impossible (`ChordSeq` is non-empty). A probe over all 1..8-chord claims
-  reported `ClaimPrefixesZellij` firing for **none** of them; only `Exact` and
-  `ZellijPrefixesClaim` are reachable today.
-- Not a correctness defect — the collision check is still correct for this
-  corpus — but the variant's docstring describes a state that cannot occur.
-- **Minimal fix:** note in the docstring that the corpus is single-chord, so
-  only `Exact`/`ZellijPrefixesClaim` are reachable; keep the branch as defense
-  for a future multi-chord corpus.
-
-### MINOR-2 — `default_policy()` bypasses its own validator
-
-- `crates/noren-app/src/passthrough.rs:769-784`.
-- `default_policy()` / `Default::default` construct directly without calling
-  `try_new`, so the collision/ambiguity/justification checks do not run for the
-  default. The default is collision-free only because
-  `default_manifest_has_zero_collisions_with_zellij_defaults` tests it, not
-  because construction guarantees it. A future edit to `default_exit_claim()`
-  to a colliding chord would not be caught at construction.
-- **Minimal fix:** build the default through `try_new(vec![default_exit_claim()])`
-  (it is infallible for the known-good default) for defense-in-depth.
-
-### MINOR-3 — per-keypress allocation on the future hot path
-
-- `crates/noren-app/src/passthrough.rs:948-968` (`press` calls
-  `policy.claims()` twice per press) and `:874-879` (`claims()` allocates a
-  `Vec`).
-- Each keypress allocates two small `Vec`s. Acceptable for an unwired policy
-  module (integration is deferred per the handoff), but worth resolving before
-  the gate is placed between platform key events and the PTY.
-- **Minimal fix:** iterate `exit` / `palette` directly in `press`, or have
-  `claims()` return a small fixed iterator rather than a collected `Vec`.
+The corpus mode label `"shared_except locked"` (`:368`) uses a space where
+every other label is a single word or underscore-joined (`"locked"`,
+`"pane"`, `"tmux"`). This is descriptive-only with zero functional impact,
+but `"shared_except_locked"` would be consistent.
 
 ## Sound areas (stated briefly)
 
-- Fail-closed validation order in `try_new` matches its docstring and is
-  mutation-tested (unknown id → wrong action → duplicate → empty justification
-  → missing exit → ambiguity → collision).
+- Fail-closed validation order in `try_new` is correct and mutation-tested.
 - `Chord`/`ChordSeq` normalization and bounds (case-fold, control/whitespace
-  rejection, F1-F24, length cap) are correct and tested.
-- The default `Super+Escape` claim is genuinely disjoint from the pinned corpus
-  (asserted "no Super chord anywhere" `:224-229`) and from terminal-child
-  convention; the "Noren reads keys before the PTY" anti-shadowing argument is
-  consistent with the design.
-- The implementation itself is correct on the mismatch path — the defect is
-  test coverage, not shipped behavior.
+  rejection, F1-F24, length cap 8) are correct and tested.
+- The `Super+Escape` default claim is genuinely disjoint from the pinned
+  corpus (asserted "no Super chord anywhere" `tests:244-249`).
+- The `press` implementation is allocation-free on the hot path and
+  logically correct for single-chord, multi-chord, divergent, and
+  mismatching inputs.
+- All 15 adversarial probes (100k-press flood, 8-deep leader, rapid cycles,
+  hostile chars, empty/too-long sequences, empty-collisions edge) passed.
 
 ## Verdict
 
-FINDINGS. No blockers. The lane is within lease and boundary, the gate is
-green, the implementation is sound, and acceptance criteria (within the
-reconstructable scope) are met. The single MAJOR is a coverage gap on the
-critical no-lost-input replay path, demonstrated by a mutation that ships
-broken and passes every test — exactly the failure mode this project has
-shipped before. The MINORs are documentation/defense-in-depth notes.
+PASS. No blockers, no majors, no minors. All four round-1 findings are
+addressed with mutation-proven fixes. The gate is green, the implementation
+is within lease and boundary, acceptance criteria (within the reconstructable
+scope) are met, and every mutation I applied was caught by the test suite.
 
-`REVIEW_M3-5 verdict=FINDINGS blockers=0 majors=1 minors=3 tests=PASS total=368`
+`REVIEW_M3-5 verdict=PASS blockers=0 majors=0 minors=0 tests=PASS total=369`
