@@ -27,14 +27,17 @@ into the key encoder. PR [#32](https://github.com/ta-061/noren/pull/32)
 (`aa41530`) adds a bounded VT compatibility harness. Escape-intermediate
 sequences and horizontal tab are handled.
 
-This is not a VT100/xterm or vim/tmux/zellij compatibility claim. Known
-non-conformance is tracked as Issues
-[#35](https://github.com/ta-061/noren/issues/35) (renderer and PTY grids
-disagree above 160x60), [#36](https://github.com/ta-061/noren/issues/36)
-(Delete, navigation, function, and modifier keys are not encoded), and
-[#37](https://github.com/ta-061/noren/issues/37) (DECSTBM clamping, embedded C0
-in CSI). Origin mode and query/reply remain deferred, Unicode/CJK width and IME
-remain later, and no hostile-input robustness claim is made yet.
+Those foundation PRs did not by themselves establish VT100/xterm or
+vim/tmux/zellij compatibility. Their tracked follow-ups were subsequently
+closed: PR [#38](https://github.com/ta-061/noren/pull/38) aligned renderer and
+PTY grids (Issue #35), PRs [#40](https://github.com/ta-061/noren/pull/40),
+[#48](https://github.com/ta-061/noren/pull/48), and
+[#60](https://github.com/ta-061/noren/pull/60) completed key encoding (Issue
+#36), and PR [#45](https://github.com/ta-061/noren/pull/45) fixed DECSTBM
+clamping and embedded C0 handling (Issue #37). PR
+[#53](https://github.com/ta-061/noren/pull/53) added Unicode/CJK display width;
+IME, origin mode, and query/reply remain deferred. The completion evidence and
+remaining limits below supersede that earlier foundation-only snapshot.
 
 ## Milestone 2 completion evidence
 

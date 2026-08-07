@@ -31,7 +31,7 @@ ownership, quota-gated dispatch, and failover.
 
 ## GitHub state
 
-Verified on 2026-08-05 with `gh pr list` and `gh issue list`:
+Verified on 2026-08-07 with `gh pr list` and `gh issue list`:
 
 - PR [#29](https://github.com/ta-061/noren/pull/29) is merged as `22c985e` and
   subsumes PRs [#21](https://github.com/ta-061/noren/pull/21),
