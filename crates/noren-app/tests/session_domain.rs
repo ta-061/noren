@@ -1,9 +1,8 @@
 //! Domain tests for the session model (`src/session.rs`).
 //!
-//! The session module is not yet wired into `noren-app`'s `lib.rs` — that
-//! happens in a later serial integration commit — so this target compiles it
-//! standalone with `#[path]`. When the module is re-exported from the crate,
-//! this line is replaced by `use noren_app::session;`.
+//! The session module is wired into `noren-app`'s `lib.rs` as `pub mod session;`
+//! (the M3 integration lane), so this target imports it from the crate rather
+//! than compiling it standalone.
 //!
 //! These tests pin the five invariants the model must hold, and assert that the
 //! public types match the D-M3-001 contract shape:
@@ -14,10 +13,7 @@
 //! 4. repeated create/close does not grow live state;
 //! 5. status never regresses and a terminal session is never resurrected.
 
-#[path = "../src/session.rs"]
-mod session;
-
-use session::{
+use noren_app::session::{
     SelectedSession, SessionAction, SessionDescriptor, SessionError, SessionEvent, SessionKind,
     SessionRegistry, SessionStatus,
 };
