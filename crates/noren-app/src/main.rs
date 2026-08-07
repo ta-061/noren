@@ -947,7 +947,7 @@ impl NorenApp {
     fn mouse_grid(&self) -> Option<MouseGrid> {
         let terminal = self.terminal.as_ref()?;
         let (rows, cols) = terminal.size();
-        MouseGrid::new(rows, cols)
+        MouseGrid::new(cols, rows)
     }
 
     /// Convert the app's current modifier state to mouse pointer modifiers.
@@ -1502,7 +1502,7 @@ fn wheel_clicks(delta: MouseScrollDelta) -> Vec<WheelDirection> {
     } else {
         WheelDirection::Down
     };
-    vec![direction; count.max(1)]
+    vec![direction; count]
 }
 
 /// Number of visible grid rows the renderer will draw: rows up to and
@@ -2950,6 +2950,23 @@ mod tests {
         assert_eq!(pixel_up, vec![WheelDirection::Up; 2]);
     }
 
+    /// A resting trackpad reports `PixelDelta{y:0}`, which is a genuine zero
+    /// delta and must produce no wheel reports. The `handle_mouse_wheel` loop
+    /// consumes the returned vec, so an empty vec means no bytes are written to
+    /// the PTY — a spurious `Down` click would corrupt the application.
+    #[test]
+    fn wheel_clicks_zero_delta_produces_nothing() {
+        // PixelDelta zero — the resting-trackpad case the bug shipped on.
+        let pixel_zero = wheel_clicks(MouseScrollDelta::PixelDelta(PhysicalPosition::new(
+            0.0, 0.0,
+        )));
+        assert!(pixel_zero.is_empty(), "zero PixelDelta must emit nothing");
+
+        // LineDelta zero must likewise emit nothing.
+        let line_zero = wheel_clicks(MouseScrollDelta::LineDelta(0.0, 0.0));
+        assert!(line_zero.is_empty(), "zero LineDelta must emit nothing");
+    }
+
     // ── Selection preservation with tracking disabled ───────────────────
 
     /// With tracking disabled, a left press sets up the same selection state
@@ -3025,5 +3042,61 @@ mod tests {
         // Release clears it.
         app.handle_mouse_button(ElementState::Released, MouseButton::Left);
         assert_eq!(app.held_mouse_button, None, "release must clear the button");
+    }
+
+    // ── mouse_grid() application path ───────────────────────────────────
+
+    /// `mouse_grid()` must pass `terminal.size()` to `MouseGrid::new` in the
+    /// correct order: `MouseGrid::new(cols, rows)` while `size()` returns
+    /// `(rows, cols)`. A transposition swaps the bounds the encoder clamps to.
+    /// The terminal here is deliberately non-square (4 rows × 8 cols) so a
+    /// swap cannot happen to match the intended dimensions.
+    #[test]
+    fn mouse_grid_dimensions_match_terminal_in_order() {
+        let terminal = TerminalState::new(4, 8).expect("valid terminal");
+        assert_eq!(
+            terminal.size(),
+            (4, 8),
+            "fixture is non-square: 4 rows, 8 cols"
+        );
+        let app = NorenApp {
+            terminal: Some(terminal),
+            ..Default::default()
+        };
+
+        let grid = app.mouse_grid().expect("terminal present");
+
+        // cols and rows must follow the terminal, not be swapped.
+        assert_eq!(grid.cols(), 8, "cols must equal terminal cols");
+        assert_eq!(grid.rows(), 4, "rows must equal terminal rows");
+    }
+
+    /// A press near the right edge of a wide, short terminal must report its
+    /// true column. This is the assertion that catches the shipped transpose:
+    /// with the bounds swapped, an 8-column terminal would clamp column 7 to
+    /// column 4 (the 4-row bound minus one), reporting `Cx=4` instead of
+    /// `Cx=8`. Drives the real application path — `NorenApp::mouse_grid` —
+    /// rather than constructing `MouseGrid` directly.
+    #[test]
+    fn mouse_grid_right_edge_click_reports_true_column() {
+        let terminal = TerminalState::new(4, 8).expect("valid terminal");
+        let app = NorenApp {
+            terminal: Some(terminal),
+            mouse_modes: MouseModes::disabled().with_normal(true).with_sgr(true),
+            ..Default::default()
+        };
+
+        let grid = app.mouse_grid().expect("terminal present");
+        // Press the rightmost cell of row 0 (0-based col 7 of 8).
+        let event = PointerEvent::press(EncoderButton::Left, 7, 0, PointerModifiers::empty());
+        let bytes =
+            MouseEncoder::encode(event, app.mouse_modes, grid).expect("tracked: must encode");
+        let report = String::from_utf8(bytes).expect("SGR is ASCII");
+
+        // 1-based column must be 8, not the clamped 4 a transposed grid yields.
+        assert_eq!(
+            report, "\x1b[<0;8;1M",
+            "right-edge press must keep its column"
+        );
     }
 }
