@@ -26,8 +26,9 @@ the [Zellij gap analysis](../compatibility/zellij-gap-analysis.md). Known
 non-conformance is recorded in [reviews](reviews/) and under
 [accepted follow-ups](#accepted-follow-ups) below.
 
-Development now runs as an agent fleet; see [fleet](fleet.md) for lane
-ownership, quota-gated dispatch, and failover.
+Development runs through parallel AI coding lanes with independent verification;
+the rules that apply to every change are in
+[development model](development-model.md).
 
 ## GitHub state
 
