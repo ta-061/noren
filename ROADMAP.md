@@ -8,7 +8,7 @@ Only evidence-backed work is marked complete.
 | 0 — Discovery | Landscape, feature/library matrices, risks, agent inventory and calibration | Complete |
 | 1 — Requirements and design | Independent proposals, critiques, integrated requirements, architecture, threat model, tests, RFCs, ADRs | Complete |
 | 2 — Terminal foundation | Window, PTY, shell, terminal state/rendering, input, resize, scrollback, selection, copy/paste/search, configuration and diagnostics | Complete |
-| 3 — Workspace | External workspace management (sidebar: projects, git worktrees, SSH connections, agents, terminal sessions), single-session view, session lifecycle, sidebar-state persistence, palette, configurable keybindings, Zellij pass-through — no native tabs/panes/layout (delegated to Zellij per [ADR 0003](docs/adr/0003-noren-zellij-responsibility-boundary.md)) | In progress |
+| 3 — Workspace | External workspace management (sidebar: projects, git worktrees, SSH connections, agents, terminal sessions), single-session view, session lifecycle, sidebar-state persistence, palette, configurable keybindings, Zellij pass-through — no native tabs/panes/layout (delegated to Zellij per [ADR 0003](docs/adr/0003-noren-zellij-responsibility-boundary.md)) | In progress — vertical slice landed; see [Milestone 3 status](#milestone-3-status) |
 | 4 — SSH and remote | OpenSSH configuration, connections, reconnect, remote panes, daemon decision/PoC and recovery | Not started |
 | 5 — Agent experience | Launchers, verified adapters, trustworthy state, notifications and jump-to-source | Not started |
 | 6 — Themes and accessibility | Light/dark/high-contrast palettes, contrast checks, IME/CJK/HiDPI and keyboard/accessibility work | Not started |
@@ -74,13 +74,52 @@ and two of its tests are `#[ignore]`d because they document real font defects
 (case-folding in the bitmap font, and every non-ASCII code point falling through
 to the `?` glyph). Key injection into the real window still does not exist, so
 live keyboard input remains unverified by automation; the byte-level input
-contract is covered by tests instead. Mouse reporting is implemented as an input
-encoder (PR #79, `crates/noren-app/src/mouse.rs`). Truecolor is modelled in
-terminal state but not yet wired to drawing. IME and accessibility remain
-deferred.
+contract is covered by tests instead. Mouse reporting is no longer encoder-only:
+`MouseEncoder::encode` (`crates/noren-app/src/mouse.rs`) is now reached from the
+pointer and wheel handlers in `main.rs` through their shared
+`encode_and_send_mouse` helper, which writes the report bytes to the PTY.
+Truecolor is modelled in terminal state but not yet wired to drawing. IME
+and accessibility remain deferred.
 
 No milestone date is promised. Implementation advances through scoped Issues,
 Draft PRs, and current-head CI evidence.
+
+## Milestone 3 status
+
+**In progress, not Complete.** The vertical slice reached the binary: launching
+the build now draws a workspace sidebar, and sessions can be created, selected,
+and closed from a command palette.
+
+The milestone's own scope line is the test, so it is quoted here in full:
+
+> External workspace management (sidebar: projects, git worktrees, SSH
+> connections, agents, terminal sessions), single-session view, session
+> lifecycle, sidebar-state persistence, palette, configurable keybindings,
+> Zellij pass-through — no native tabs/panes/layout (delegated to Zellij per
+> ADR 0003)
+
+Measured against it, item by item:
+
+| Scope item | State | Evidence |
+| --- | --- | --- |
+| Sidebar drawn | Done | `SIDEBAR_COLS` reserved in `renderer.rs`; `glyph_vertices` applies the column offset; `sidebar_text_lines` formats rows |
+| — projects, git worktrees | Modelled, not launchable | `EntryKind::Project`/`Worktree`, `SessionKind::Project`/`Worktree` exist; no creation path constructs them |
+| — SSH connections, agents | Fixture only | `EntryKind::SshConnection`/`Agent` are documented "reserved… no connection is opened", "no agent is launched" |
+| — terminal sessions | Done | `SessionKind::Local` is created, selected, and closed from the running binary |
+| Single-session view | Done | Terminal drawn beside the sidebar, narrowed to the remaining columns |
+| Session lifecycle | Done | `SessionStatus` advances `Starting -> Running -> Exited/Failed` via `SessionRegistry::observe`, wired in `main.rs` |
+| Sidebar-state persistence | Done | `sessions.toml` (`SESSION_STATE_FILE_NAME`) under the `config::default_path` directory, resolved by `session_state_path` |
+| Palette | Done | `Super+p` via `palette_policy`; `Palette::noren`'s four commands dispatched by `handle_palette_key` |
+| Configurable keybindings | **Not started** | `palette_policy` and `handle_palette_key` hard-code the chords; `config.rs` exposes no keymap surface |
+| Zellij pass-through | Done against a pinned corpus | `passthrough.rs` policy claims only Super-space chords that the pinned Zellij `v0.44.3` default corpus (`ZELLIJ_FIXTURE_TAG`) never binds; no test drives a live Zellij |
+
+Two named scope items are unsatisfied: **configurable keybindings do not exist
+at all**, and the sidebar's **SSH-connection and agent kinds are fixtures** that
+open no connection and launch no agent. Since "Only evidence-backed work is
+marked complete" and the scope line names both, Milestone 3 stays **In
+progress**. The SSH and agent session kinds also depend on Milestones 4 and 5;
+whether they are retired from Milestone 3's scope or carried is an open
+scoping decision, not something to settle by relabelling the status.
 
 ## What blocks a public preview
 
@@ -89,11 +128,13 @@ concluded that the current tree cannot honestly be released as "0.1.0-preview of
 the Noren terminal." The reasoning and the decision are recorded in
 [D-M8-001](docs/coordination/decisions/D-M8-001-preview-scope.md). In short:
 
-- **The workspace is landed, not shipped.** The Milestone 3 modules (and the
-  M2 `mouse` module) are files on `main` and declared in `lib.rs` (PR #92), so
-  the library compiles them and CI covers them, but `main.rs` consumes none of
-  them and they are absent from the linked binary (Issue #88). Launching the
-  build still presents no workspace sidebar.
+- **The workspace is a slice, not a product.** The Milestone 3 modules now
+  reach the binary: the sidebar is drawn, the palette opens on `Super+p`,
+  sessions are created/selected/closed, mouse reports reach the PTY, and
+  sidebar state persists across a restart. What is still missing is breadth —
+  no runtime path constructs anything but `SessionKind::Local`, so SSH hosts,
+  git worktrees and agents are modelled but unreachable, and keybindings are not
+  configurable. See [Milestone 3 status](#milestone-3-status).
 - **The renderer is monochrome.** The fragment shader `fs_main` in
   `renderer.rs` returns a constant colour and the vertex layout carries no
   colour channel, so `ls --color`, `vim`, and Zellij's status bar all draw in
