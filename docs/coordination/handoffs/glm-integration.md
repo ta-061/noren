@@ -1,125 +1,73 @@
-# Handoff — M3 integration lane (GLM, `glm-integ`)
+# Handoff — Milestone 3 session-domain wiring
 
-> This lane holds the **integration lease**: the only lane permitted to edit
-> the crate-root export module `crates/noren-app/src/lib.rs`. Every
-> implementation lane was forbidden from editing `lib.rs`, so their modules
-> existed but were unreachable until this commit wired them.
+Status: merge candidate. Updated 2026-08-07.
 
-## Identity
+## Purpose
 
-- **Lane:** `glm-integ` (integration), engine GLM 5.2 via opencode.
-- **Branch:** `agent/m3-integration`, branched from `origin/main` @
-  `1d329a5`.
-- **ADR 0003 honored:** no pane, tab, layout, or split types introduced by the
-  wiring. The merged `session` module carries no such types.
+The session-domain implementation landed separately in PR #74 so its pure
+state model could be reviewed without a crate-root file conflict. This serial
+integration change makes that module reachable through the `noren-app` crate.
 
-## What merged
+## Exact wiring
 
-| Branch | State | Resolution |
-| --- | --- | --- |
-| `origin/agent/m3-session-domain` | **existed** | merged (fast-forward to `a8526b6`) |
-| `origin/agent/m3-session-supervisor` | absent | **skipped** |
-| `origin/agent/m3-sidebar-view` | absent | **skipped** |
-| `origin/agent/m3-adv-fixes` | absent | **skipped** |
+Two code/test edits are intentional:
 
-Only one of the four named M3 branches existed at integration time. The merge
-of `m3-session-domain` was a fast-forward (it only adds new files and does not
-touch `lib.rs`, `Cargo.toml`, or any shared test file), so there were **no
-conflicts** and no test-file collisions to reconcile.
+1. `crates/noren-app/src/lib.rs` adds:
 
-The three absent branches were skipped, not silently dropped: at the time this
-lane ran, `git fetch origin` showed no `m3-session-supervisor`,
-`m3-sidebar-view`, or `m3-adv-fixes` remote ref. They should be merged in a
-later integration pass once they land.
-
-## What was wired (`wired=1`)
-
-Exactly one M3 module landed and needed wiring into the crate root:
-
-- **`session`** (`crates/noren-app/src/session.rs`) — the session domain model
-  (D-M3-001 contract: `SessionRegistry`, `SessionId`, `SessionKind`,
-  `SessionStatus`, `SessionDescriptor`, `SessionAction`, `SessionEvent`,
-  `SelectedSession`, `SessionError`).
-
-### Wiring changes
-
-1. `crates/noren-app/src/lib.rs` — added `pub mod session;` to the module
-   declaration block. **No public API of the `session` module was changed.**
-2. `crates/noren-app/tests/session_domain.rs` — replaced the standalone
-   compilation shim
    ```rust
-   #[path = "../src/session.rs"]
-   mod session;
+   pub mod session;
    ```
-   with the crate import
+
+2. `crates/noren-app/tests/session_domain.rs` imports the module from the
+   crate:
+
    ```rust
-   use noren_app::session::{...};
+   use noren_app::session::{ /* contract types */ };
    ```
-   This is required the moment `pub mod session;` lands: the `#[path]` shim
-   would otherwise compile the module **twice** as two unrelated type sets
-   (the `glm-a` handoff flagged this exact transition). The test bodies are
-   byte-identical; only the import root changed. No test was lost or altered.
 
-These are the only two files this commit changes besides this handoff. The
-session module's public contract is untouched — `noren_app::session::*`
-resolves exactly the types `glm-a` implemented.
+   The previous `#[path = "../src/session.rs"]` shim was valid only while the
+   module was unwired. Keeping it after the crate export would compile a second,
+   unrelated copy and let the integration test pass without exercising the
+   actual public module.
 
-## Conflicts resolved (`conflicts=0`)
+No test body or session-domain implementation is changed by this PR. The merge
+with current `main` preserved PR #74's monotonic lifecycle regression test and
+public [session API](../session-api.md).
 
-None. The single available branch merged as a fast-forward and touched no file
-the crate root already owned. Had two branches collided on a shared test file,
-the standing rule (keep both sides' tests; a lost test is worse than a merge
-conflict) would have applied — it did not come up.
+## Scope and boundary
 
-## Contract conformance (unchanged by this lane)
+- The session module remains the pure, in-memory registry reviewed in PR #74.
+- No supervisor, process launch, sidebar, persistence, SSH, or agent launch path
+  is wired here.
+- No pane, tab, split, or layout type is introduced. The
+  [Noren/Zellij boundary](../../adr/0003-noren-zellij-responsibility-boundary.md)
+  remains intact.
+- The public type shapes and lifecycle rules are unchanged.
 
-This integration lane did **not** re-derive the contract. It re-published the
-`session` module's existing public types verbatim. The two open items the
-`glm-a` handoff escalated remain open and are restated here so the coordinator
-sees them at merge time:
+## Verification
 
-1. **`SessionKind` struct-variant field names** (`root`/`path`/`target`/`name`)
-   were inferred by the implementation lane because `D-M3-001-session-api.md`
-   is not in this repo. Confirm against the canonical fleet file before
-   downstream lanes code against them.
-2. **`SessionRegistry::observe`** is a registry method, not one of the three
-   contract `SessionAction` variants. Whether D-M3-001 should ratify an
-   observation action is unresolved. This lane did not change that seam.
+The merge candidate must pass:
 
-## Gate — real output
-
-macOS arm64, rustc 1.88.0, on `agent/m3-integration`.
-
-```
-$ cargo fmt --all && cargo fmt --all --check   → exit 0 (clean)
-$ cargo clippy --workspace --all-targets -- -D warnings
-    Finished `dev` profile; exit 0, 0 warnings
-$ cargo test --workspace                       → exit 0
+```text
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+python3 scripts/check_docs.py
+python3 -m unittest scripts/test_check_docs.py
 ```
 
-### Test totals (`cargo test --workspace`)
+Expected workspace result after PR #74 is **388 passed, 0 failed, 1
+pre-existing ignored**. Exporting the module places its 5 unit tests in the
+`noren-app` library target, while `session_domain` runs 30 integration tests
+through the crate import; together they provide 35 session-domain tests.
 
-**387 passed, 0 failed, 1 ignored.** This equals the sum reported by the
-landed branch: 353 baseline (main) + 34 from `session_domain` (the domain
-integration test plus the unit tests in `session.rs`) = 387. The 1 ignored
-test is the pre-existing `IGNORED` from main, unchanged.
+Before merge, the diff against current `main` must contain only the crate-root
+export, the import-root switch, and this integration evidence. All four required
+CI checks must pass on the current head, a review must cover that exact head,
+and no review thread may remain unresolved.
 
-No test was lost in wiring. The session module's tests now compile as part of
-`noren-app` (unit tests) and as the `tests/session_domain.rs` integration
-target (which imports `noren_app::session`), rather than via the standalone
-`#[path]` shim.
+## Follow-up
 
-## What could NOT be verified
-
-- The three skipped branches are not merged; their wiring is outstanding.
-- Contract field-name conformance and the `observe` escalation (see above).
-- `noren_app::session` is reachable and compiles, but no production binary path
-  consumes it yet — the sidebar view and supervisor lanes that would call into
-  it have not landed.
-
-## Authorship / conflict of interest
-
-This lane performed the merge and the `lib.rs` wiring only. The `session`
-module code and its tests were authored by the `glm-a` lane; this integration
-lane did not modify any implementation or test logic. Per fleet policy an
-independent lane should review the wiring commit.
+Future supervisor and sidebar modules receive their own implementation and
+integration reviews. Their absence here is deliberate; this PR wires only the
+session domain that is already present on `main`.
