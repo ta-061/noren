@@ -43,13 +43,35 @@
 //! trait, the [`Spawner`] seam, [`SessionSupervisor`] itself, the reaping state
 //! machine, the mock) is this lane's real, non-stub deliverable.
 //!
-//! # Not wired yet
+//! # Wiring status
 //!
-//! This module is intentionally **not** declared in `crates/noren-app/src/lib.rs`
-//! (wiring is a later serial integration commit). The integration test includes
-//! it via `#[path = "../src/session_supervisor.rs"]` so it compiles and runs as
-//! a standalone test target against a fake/mock process model plus a failure
-//! matrix. See `tests/session_supervisor.rs`.
+//! This module is on `main` in three senses, only the last of which is
+//! load-bearing for shipping:
+//!
+//! 1. It is a file in the source tree.
+//! 2. It is declared in `crates/noren-app/src/lib.rs` and compiled into the
+//!    **library** (PR #92), so CI clippy and dead-code checks cover it.
+//! 3. It is **not in the linked binary**: `main.rs` imports none of the M3
+//!    modules (`session_supervisor`, `session`, `sidebar`, `palette`,
+//!    `passthrough`, `session_persistence`, `mouse`), so the linker strips
+//!    them. A reviewer confirmed with `nm` — zero `session_supervisor`
+//!    symbols, against controls (`config`, `diagnostics`, `renderer`) that
+//!    do appear in the binary.
+//!
+//! # Why the integration tests still use `#[path]`
+//!
+//! `mock` is `#[cfg(test)]`, and `cfg(test)` is set only for the crate
+//! under test — not for its dependencies. An integration test is a separate
+//! crate that links the `noren_app` library as a dependency; the library was
+//! compiled *without* `cfg(test)`, so the `mock` module does not exist in it
+//! and the test cannot reach it through the `noren_app::session_supervisor`
+//! path. The integration tests `tests/session_supervisor.rs` and
+//! `tests/session_adversarial.rs` therefore include this file via
+//! `#[path = "../src/session_supervisor.rs"]`, which compiles a private copy
+//! *inside the test crate* where `cfg(test)` **is** set. This is also why
+//! the unit tests below run in three targets (the library's own test build
+//! plus each integration test). The `#[path]` includes are not redundant
+//! with the `lib.rs` declaration — removing them breaks the tests.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -749,10 +771,13 @@ fn shutdown_to_failure(reason: ShutdownError) -> SessionFailure {
 // The mock is a tiny shared-state machine a test drives through a
 // [`mock::MockController`]: flip the child to exited, or toggle poll/shutdown
 // failures. This is what makes the failure matrix deterministic without
-// spawning real processes. It is `pub` under `cfg(test)` so both this module's
-// unit tests and the `tests/session_supervisor.rs` integration target (which
-// includes this file via `#[path]`, and for which `cfg(test)` is also enabled)
-// share one definition. Production never references it.
+// spawning real processes. It is `pub` under `cfg(test)` so this module's
+// unit tests and the `tests/session_supervisor.rs` and
+// `tests/session_adversarial.rs` integration targets (which include this file
+// via `#[path]`, and for which `cfg(test)` is also enabled) share one
+// definition. See the module-level "Why the integration tests still use
+// `#[path]`" section for why the `#[path]` includes cannot be replaced by a
+// library path. Production never references it.
 
 #[cfg(test)]
 pub mod mock {

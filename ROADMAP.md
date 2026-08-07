@@ -64,12 +64,20 @@ direct `zsh` child, and that child's tty reported `30 90` — the 900x600 window
 by the 10x20 cell, so the window to grid to PTY chain agrees. On termination the app
 exited, the child was reaped, and the pty device was gone.
 
-**What this does not establish.** There is still no rendered-frame oracle and no key
-injection into the real window, so glyph correctness and live input remain unverified
-by automation; the byte-level input contract is covered by tests instead. Mouse
-reporting is unimplemented and, per Issue #46, belongs in an input encoder rather than
-output-side parsing. Truecolor is modelled in terminal state but not yet wired to
-drawing. IME and accessibility remain deferred.
+**What this does not establish.** A rendered-frame oracle now exists
+(`crates/noren-app/tests/frame_oracle.rs`, `crates/noren-app/src/renderer_capture.rs`,
+PR #89): it drives the real `wgpu` pipeline offscreen and checks *structural*
+properties — blank cells are dark, distinct glyphs have distinct lit patterns,
+glyphs do not bleed into neighbouring cells, and the drawn grid agrees with the
+terminal-state snapshot. It does **not** verify that an `A` is shaped like an A,
+and two of its tests are `#[ignore]`d because they document real font defects
+(case-folding in the bitmap font, and every non-ASCII code point falling through
+to the `?` glyph). Key injection into the real window still does not exist, so
+live keyboard input remains unverified by automation; the byte-level input
+contract is covered by tests instead. Mouse reporting is implemented as an input
+encoder (PR #79, `crates/noren-app/src/mouse.rs`). Truecolor is modelled in
+terminal state but not yet wired to drawing. IME and accessibility remain
+deferred.
 
 No milestone date is promised. Implementation advances through scoped Issues,
 Draft PRs, and current-head CI evidence.

@@ -24,7 +24,7 @@
 //! enum of its own, so it cannot drift into a parallel vocabulary. At wire-up
 //! (a separate, serial commit owned by another lane) `A` is bound to the shared
 //! action type that reuses `SessionAction` from
-//! `docs/coordination/decisions/D-M3-001-session-api.md`; this module supplies
+//! `docs/coordination/session-api.md`; this module supplies
 //! only the stable IDs, labels, and matching policy.
 //!
 //! # Matching

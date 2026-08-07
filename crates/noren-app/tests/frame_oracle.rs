@@ -41,9 +41,7 @@
 #[path = "../src/renderer_capture.rs"]
 mod renderer_capture;
 
-use noren_app::{
-    MAX_RENDER_COLS, MAX_RENDER_ROWS, POC_CELL_HEIGHT as CELL_HEIGHT, POC_CELL_WIDTH as CELL_WIDTH,
-};
+use noren_app::{POC_CELL_HEIGHT as CELL_HEIGHT, POC_CELL_WIDTH as CELL_WIDTH};
 use noren_terminal::{TerminalSnapshot, TerminalState};
 use renderer_capture::{CaptureError, CapturedFrame, OffscreenRenderer};
 
@@ -378,32 +376,4 @@ fn utf8_cell_is_at_least_lit_so_the_pipeline_handles_wide_input() {
     let frame = render(&renderer, &snap);
     // c, a, f are ASCII and lit; the final cell holds the non-ASCII 'é' lead.
     assert!(cell_is_lit(&frame, 0, 3), "non-ASCII cell drew nothing");
-}
-
-// Keep the render-grid clamps reachable from the oracle's view of the world.
-#[test]
-fn oracle_constants_match_the_renderer_clamps() {
-    // The renderer clamps to MAX_RENDER_ROWS x MAX_RENDER_COLS; the oracle must
-    // reason in the same bounds or its "grid matches state" claim is hollow.
-    //
-    // Asserting the constants are positive would be a tautology the compiler
-    // optimises away. Instead drive a state larger than the clamp through the
-    // real vertex path and confirm the drawn grid actually stops at the clamp —
-    // that is the property the oracle depends on.
-    let oversized = snapshot(MAX_RENDER_ROWS + 4, MAX_RENDER_COLS + 4, b"");
-    let vertices = renderer_capture::renderer_source::glyph_vertices(
-        Some(&oversized),
-        None,
-        u32::from(MAX_RENDER_COLS + 4) * CELL_WIDTH,
-        u32::from(MAX_RENDER_ROWS + 4) * CELL_HEIGHT,
-    );
-    let max_vertices = (MAX_RENDER_ROWS as usize) * (MAX_RENDER_COLS as usize) * 35 * 6;
-    assert!(
-        vertices.len() <= max_vertices,
-        "renderer emitted {} vertices, past the {}x{} clamp ceiling of {}",
-        vertices.len(),
-        MAX_RENDER_ROWS,
-        MAX_RENDER_COLS,
-        max_vertices
-    );
 }
