@@ -101,8 +101,17 @@ fn cell_pattern(frame: &CapturedFrame, row: u32, col: u32) -> Vec<bool> {
 /// State-driven blankness: a cell is blank when the row is absent, the column
 /// is past the line end, or the cell is an ASCII space (the space glyph is the
 /// all-zero row, so it draws nothing).
+///
+/// Reads `display_lines()` — the renderer's coordinate model — not `lines()`.
+/// They agree for ASCII; only `display_lines()` keeps a wide character's
+/// continuation column aligned with the renderer's per-column enumeration, so
+/// the first wide-character fixture is compared against the same columns the
+/// renderer actually draws.
 fn state_cell_blank(snapshot: &TerminalSnapshot, row: u32, col: u32) -> bool {
-    let line = snapshot.lines().get(row as usize).map(String::as_str);
+    let line = snapshot
+        .display_lines()
+        .get(row as usize)
+        .map(String::as_str);
     match line {
         None => true,
         Some(line) => match line.chars().nth(col as usize) {
@@ -196,6 +205,23 @@ fn an_ascii_cell_is_lit_and_its_neighbours_are_blank() {
         !cell_is_lit(&frame2, 1, 0),
         "glyph bled from row 0 into row 1"
     );
+
+    // An interior placement: 'A' at (1,1) in a 3x3 grid, so all four cardinal
+    // neighbours exist and must stay blank. The corner placements above can
+    // only reach rightward and downward; this additionally catches upward and
+    // leftward bleed from a sub-cell origin offset at interior positions.
+    let snap3 = snapshot(3, 3, b"\x1b[2;2HA");
+    let frame3 = render(&renderer, &snap3);
+    assert!(
+        cell_is_lit(&frame3, 1, 1),
+        "interior cell holding 'A' is not lit"
+    );
+    for (nr, nc) in [(0_u32, 1_u32), (2, 1), (1, 0), (1, 2)] {
+        assert!(
+            !cell_is_lit(&frame3, nr, nc),
+            "glyph bled from (1,1) into neighbour ({nr},{nc})"
+        );
+    }
 }
 
 #[test]
@@ -216,28 +242,34 @@ fn drawn_grid_dimensions_match_state_dimensions() {
     let renderer = OffscreenRenderer::new().expect("offscreen renderer");
     let rows = 3_u16;
     let cols = 5_u16;
-    let snap = snapshot(rows, cols, b"ABCDE\r\nFGHIJ\r\nKLMNO");
+    // A deliberately ragged layout: row 0 fills the grid width, row 1 stops at
+    // 4 chars, row 2 stops at 2. Asserting on *drawn pixels* — not on frame
+    // metadata like `frame.width`, which `render()` sets from these same
+    // `rows`/`cols` and which no broken renderer can change — is what gives
+    // this test teeth.
+    //
+    // The ragged rows are the dimension check the old version missed entirely:
+    // a renderer that paints every cell out to `cols` (ignoring per-row content
+    // width) lights the trailing cells the state leaves blank; one that shifts
+    // the column or row origin lights the wrong cell entirely. Both surface as
+    // a lit/blank disagreement below.
+    let snap = snapshot(rows, cols, b"ABCDE\r\nFGHI\r\nKL");
     let frame = render(&renderer, &snap);
 
-    // The frame is exactly cols*CW x rows*CH, so its implied grid equals state.
-    assert_eq!(frame.width, u32::from(cols) * CELL_WIDTH);
-    assert_eq!(frame.height, u32::from(rows) * CELL_HEIGHT);
-    let implied_cols = frame.width / CELL_WIDTH;
-    let implied_rows = frame.height / CELL_HEIGHT;
-    assert_eq!(
-        (implied_rows, implied_cols),
-        (u32::from(rows), u32::from(cols))
-    );
-
-    // Content respects the 3x5 grid: row 2 is full, row 2's cells 0..5 are lit.
-    for col in 0..u32::from(cols) {
-        assert!(
-            cell_is_lit(&frame, 2, col),
-            "expected char in row 2 col {col}"
-        );
+    for row in 0..u32::from(rows) {
+        for col in 0..u32::from(cols) {
+            let state_has_char = !state_cell_blank(&snap, row, col);
+            let drawn_lit = cell_is_lit(&frame, row, col);
+            assert_eq!(
+                state_has_char,
+                drawn_lit,
+                "cell ({row},{col}): state says {}, renderer drew {} \
+                 (drawn grid does not match the state grid)",
+                if state_has_char { "char" } else { "blank" },
+                if drawn_lit { "lit" } else { "blank" },
+            );
+        }
     }
-    // There is no row 3 to light.
-    assert!(frame.height / CELL_HEIGHT <= u32::from(rows));
 }
 
 #[test]

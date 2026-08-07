@@ -41,6 +41,19 @@ fn fs_main() -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Clear colour used by the glyph pipeline's load op.
+///
+/// Exposed as `pub(crate)` so the offscreen frame-oracle
+/// (`renderer_capture.rs`) clears to the exact same colour the shipped binary
+/// uses, rather than a parallel literal that could silently drift. No
+/// behaviour change.
+pub(crate) const CLEAR_COLOR: wgpu::Color = wgpu::Color {
+    r: 0.035,
+    g: 0.045,
+    b: 0.04,
+    a: 1.0,
+};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RendererError {
     SurfaceCreation,
@@ -227,12 +240,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.035,
-                            g: 0.045,
-                            b: 0.04,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(CLEAR_COLOR),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

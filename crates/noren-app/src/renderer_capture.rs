@@ -49,7 +49,7 @@ use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 
 use noren_terminal::TerminalSnapshot;
-use renderer_source::{SHADER, glyph_vertices, vertex_bytes};
+use renderer_source::{CLEAR_COLOR, SHADER, glyph_vertices, vertex_bytes};
 
 /// Linear RGBA8 (non-sRGB) offscreen target.
 ///
@@ -60,14 +60,6 @@ use renderer_source::{SHADER, glyph_vertices, vertex_bytes};
 /// light up, so it does not affect any structural oracle assertion.
 const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
-/// Clear colour, matching `Renderer::render`'s load op exactly.
-const CLEAR_COLOR: wgpu::Color = wgpu::Color {
-    r: 0.035,
-    g: 0.045,
-    b: 0.04,
-    a: 1.0,
-};
-
 /// Why an offscreen capture could not be produced.
 #[derive(Debug)]
 pub(crate) enum CaptureError {
@@ -77,10 +69,13 @@ pub(crate) enum CaptureError {
     DeviceUnavailable,
 }
 
-/// A captured RGBA8 frame plus its pixel dimensions.
+/// A captured RGBA8 frame plus its pixel width (the row stride `pixel` indexes
+/// by). The frame's height is not stored: no oracle assertion reads it, and
+/// `render()` sets it from the same `rows` the caller already knows, so a
+/// stored copy would only invite the tautological `height == rows*CH` checks
+/// the grid-dimension test was rewritten to avoid.
 pub(crate) struct CapturedFrame {
     pub(crate) width: u32,
-    pub(crate) height: u32,
     pub(crate) rgba: Vec<u8>,
 }
 
@@ -323,11 +318,7 @@ impl OffscreenRenderer {
         drop(mapped);
         readback.unmap();
 
-        CapturedFrame {
-            width,
-            height,
-            rgba,
-        }
+        CapturedFrame { width, rgba }
     }
 }
 
