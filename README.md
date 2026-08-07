@@ -6,7 +6,8 @@
 > `main` is a macOS window over a local `zsh` PTY with a tested terminal state
 > core. It renders in a single colour, in a case-insensitive 5x7 ASCII bitmap
 > font, with all non-ASCII shown as `?`, no IME, no accessibility surface, and
-> no workspace sidebar. There are no published binaries. Read
+> no visible workspace sidebar (the view model exists, but nothing draws it).
+> There are no published binaries. Read
 > **[docs/known-limitations.md](docs/known-limitations.md)** first — it is the
 > accurate predictor of what happens when you run the build. Everything below
 > the status block describes **intent**, not current capability.

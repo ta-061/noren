@@ -18,8 +18,8 @@ covers xterm modifier parameters and application cursor/keypad modes. Several of
 those state features are not yet visible on screen — see "What does not work"
 below, which is the more useful list. It is
 **not yet** the workspace product that [ADR
-0003](adr/0003-noren-zellij-responsibility-boundary.md) describes: there is no
-workspace sidebar, and what runs is a single window onto one local shell
+0003](adr/0003-noren-zellij-responsibility-boundary.md) describes: no workspace
+sidebar is drawn, and what runs is a single window onto one local shell
 (`crates/noren-app/src/main.rs:118`). Milestones 3–8 are open on the
 [roadmap](../ROADMAP.md).
 
@@ -64,29 +64,38 @@ Each item states what you would actually see if you ran the build.
   bottom `visible_rows` (`renderer.rs:296`), so you cannot scroll the viewport
   back through it. The data is there; the view onto it is not.
 - **macOS only, one fixed shell.** The renderer requests Metal exclusively
-  (`renderer.rs:70`), so it does not *run* on other platforms — it acquires no
-  adapter and fails at startup. (The app crate has no `cfg(target_os)` gating,
-  so it may well compile elsewhere; compiling is not the barrier, running is.)
+  (`renderer.rs:70`), so it does not *run* on other platforms — on a non-macOS
+  host it acquires no adapter, the renderer fails to start, and the window
+  opens to show "Noren renderer start failed" (`main.rs:132-140`) rather than a
+  usable terminal. (The app crate has no `cfg(target_os)` gating, so it may
+  well compile elsewhere; compiling is not the barrier, running is.)
   The PTY launches `/bin/zsh` with a fixed policy and no caller-controlled
   arguments (`crates/noren-pty/src/lib.rs:33`). Linux support and SSH/remote
   sessions are roadmap intent (Milestones 4 and 6), not current capability.
-- **No workspace sidebar.** Noren's defining feature per ADR 0003 and FR-009
-  (`docs/requirements/v0.1.md:25`) is absent from the build: there is no
-  `sidebar.rs` in `crates/noren-app/src/`. Sidebar-adjacent modules *are* on
-  `main` — `session.rs`, `session_supervisor.rs`, `session_persistence.rs`,
-  `palette.rs`, `passthrough.rs` — but they are models and persistence, not a
-  visible workspace, and `ROADMAP.md:11` still lists Milestone 3 as **Not
-  started**.
+- **No workspace sidebar is drawn.** Noren's defining feature per ADR 0003 and
+  FR-009 (`docs/requirements/v0.1.md:25`) is not yet visible on screen. A
+  renderer-independent sidebar view model exists — `sidebar.rs` (M3-3) defines
+  `EntryKind`, `SidebarRow`, and `SessionViewport`, describing *what* the
+  workspace shows without *how* to paint it — but nothing renders it: the
+  `sidebar` module is declared only in `lib.rs`, and neither `main.rs` nor
+  `renderer.rs` imports it, so the render path still emits only terminal cells
+  plus an optional status line (`renderer.rs:275-326`). Sibling workspace
+  models are present in the tree (`session.rs`, `session_supervisor.rs`,
+  `session_persistence.rs`, `palette.rs`, `passthrough.rs`) but are models and
+  persistence, not a painted workspace, so what runs is still one window on
+  one local shell.
 
 ## What is verified, and how
 
-- **Automated tests.** The workspace commits 546 `#[test]` functions across the
-  three crates (count them: `grep -rc '#\[test\]' crates/`). `ROADMAP.md:44`
-  records **353 workspace tests passing** at the Milestone 2 close (`1d329a5`);
-  the M2-MOUSE and M3-5/6/7 merges since then each passed CI, which is where
-  the remaining tests are witnessed. The suites include a bounded VT
-  compatibility harness and two independent adversarial hostile-input suites
-  (`ROADMAP.md:58-60`).
+- **Automated tests.** The workspace commits **hundreds of `#[test]` functions
+  across three crates**, and the total grows with every merge — reproduce the
+  current count with `grep -rh '#\[test\]' crates/ | wc -l` rather than
+  trusting any number printed here. `ROADMAP.md:44` records **353 workspace
+  tests passing** at the Milestone 2 close (`1d329a5`), a closed-milestone
+  snapshot that does not move; the M2-MOUSE, M3-ADVFIX, M3-5/6/7, and M3-3
+  merges since then each passed CI, which is where the later growth is
+  witnessed. The suites include a bounded VT compatibility harness and two
+  independent adversarial hostile-input suites (`ROADMAP.md:58-60`).
 - **Four CI gates** required by branch protection (`ROADMAP.md:46-47`,
   `.github/workflows/`): the Rust workflow (`cargo fmt --check`, `cargo clippy
   --workspace --all-targets -- -D warnings`, `cargo test --workspace` on macOS
