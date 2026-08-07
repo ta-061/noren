@@ -5,13 +5,14 @@
 //! standalone with `#[path]`. When the module is re-exported from the crate,
 //! this line is replaced by `use noren_app::session;`.
 //!
-//! These tests pin the four invariants the model must hold, and assert that the
+//! These tests pin the five invariants the model must hold, and assert that the
 //! public types match the D-M3-001 contract shape:
 //!
 //! 1. at most one selected session, and closing it never dangles;
 //! 2. the registry spawns no process (the tests run no children);
 //! 3. status is only set from a reported observation, never inferred from create;
-//! 4. repeated create/close does not grow live state.
+//! 4. repeated create/close does not grow live state;
+//! 5. status never regresses and a terminal session is never resurrected.
 
 #[path = "../src/session.rs"]
 mod session;
@@ -199,6 +200,32 @@ fn observe_records_failure_and_exit_statuses_with_payloads() {
 }
 
 #[test]
+fn observe_rejects_regression_and_terminal_resurrection() {
+    let mut registry = SessionRegistry::new();
+    let session = fresh(&mut registry);
+    let id = session.id();
+
+    registry.observe(id, SessionStatus::Running).unwrap();
+    assert_eq!(
+        registry.observe(id, SessionStatus::Starting),
+        Err(SessionError::InvalidStatusTransition)
+    );
+    assert_eq!(registry.get(id).unwrap().status(), &SessionStatus::Running);
+
+    registry
+        .observe(id, SessionStatus::Exited { code: Some(0) })
+        .unwrap();
+    assert_eq!(
+        registry.observe(id, SessionStatus::Running),
+        Err(SessionError::InvalidStatusTransition)
+    );
+    assert_eq!(
+        registry.get(id).unwrap().status(),
+        &SessionStatus::Exited { code: Some(0) }
+    );
+}
+
+#[test]
 fn observing_the_current_status_is_a_no_op() {
     let mut registry = SessionRegistry::new();
     let session = fresh(&mut registry);
@@ -351,9 +378,15 @@ fn observe_emits_status_changed_only_when_it_differs() {
     let mut registry = SessionRegistry::new();
     let id = registry.create(SessionKind::Local);
 
-    // A real change yields the unit StatusChanged event.
+    // A real change yields the contract StatusChanged { id, status } event.
     let changed = registry.observe(id, SessionStatus::Running).unwrap();
-    assert_eq!(changed, Some(SessionEvent::StatusChanged));
+    assert_eq!(
+        changed,
+        Some(SessionEvent::StatusChanged {
+            id,
+            status: SessionStatus::Running,
+        })
+    );
 
     // Re-observing the same status yields nothing.
     let unchanged = registry.observe(id, SessionStatus::Running).unwrap();
@@ -385,30 +418,45 @@ fn apply_against_an_unknown_session_errors() {
 
 #[test]
 fn session_action_has_exactly_the_three_contract_variants() {
-    // D-M3-001 fixes SessionAction to {Create, Select, Close}. These
-    // constructions compile only while that shape holds; if a variant is added
-    // or renamed, this test fails to build.
+    // The exhaustive match fails to compile if a fourth variant is added.
+    fn assert_shape(action: SessionAction) {
+        match action {
+            SessionAction::Create { kind: _ }
+            | SessionAction::Select { id: _ }
+            | SessionAction::Close { id: _ } => {}
+        }
+    }
+
     let mut registry = SessionRegistry::new();
     let id = registry.create(SessionKind::Local);
-    let _create = SessionAction::Create {
+    assert_shape(SessionAction::Create {
         kind: SessionKind::Local,
-    };
-    let _select = SessionAction::Select { id };
-    let _close = SessionAction::Close { id };
+    });
+    assert_shape(SessionAction::Select { id });
+    assert_shape(SessionAction::Close { id });
 }
 
 #[test]
 fn session_event_matches_the_contract_variants() {
-    // D-M3-001 fixes SessionEvent to Created/Selected/StatusChanged/Closed.
-    // These constructors compile only while that shape holds.
+    // The exhaustive match fails to compile if a fifth variant is added.
+    fn assert_shape(event: SessionEvent) {
+        match event {
+            SessionEvent::Created(_)
+            | SessionEvent::Selected(_)
+            | SessionEvent::StatusChanged { id: _, status: _ }
+            | SessionEvent::Closed(_) => {}
+        }
+    }
+
     let mut registry = SessionRegistry::new();
     let id = registry.create(SessionKind::Local);
-    let _ = [
-        SessionEvent::Created(id),
-        SessionEvent::Selected(Some(id)),
-        SessionEvent::StatusChanged,
-        SessionEvent::Closed(id),
-    ];
+    assert_shape(SessionEvent::Created(id));
+    assert_shape(SessionEvent::Selected(Some(id)));
+    assert_shape(SessionEvent::StatusChanged {
+        id,
+        status: SessionStatus::Running,
+    });
+    assert_shape(SessionEvent::Closed(id));
 }
 
 // ── Descriptor and query surface ────────────────────────────────────────

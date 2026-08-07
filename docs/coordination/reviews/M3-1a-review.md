@@ -1,160 +1,206 @@
-# Review — M3-1a session domain model (`glm-a`)
+# Independent review — M3-1a session domain model (`glm-a`) at the StatusChanged fix
 
-Independent review. I did not author this code and did not take the handoff at
-its word: every claim below is backed by a command I ran on this branch.
+> **Post-review correction:** this document records the historical review at
+> `0718f56`, not the final PR #74 head. Its treatment of non-monotonic status as
+> a non-defect was overturned by the later adversarial ADV-S1 reproduction:
+> `Exited -> Running` resurrected a dead session. The merge candidate rejects
+> regressions/resurrections, adds a mutation-sensitive regression test, and
+> publishes the authoritative [session API](../session-api.md). The current-head
+> GitHub review supersedes this verdict for merge purposes.
 
-- Reviewed at: `c2d5963` on `agent/m3-session-domain` (code commit `d31e3ac`),
-  off `origin/main` @ `1d329a5`.
-- Authority: `state/tasks/M3-1a.md` (fleet repo); contract source
-  `state/D-M3-001-session-api.md` (fleet repo — see the MAJOR finding).
-- Scope of diff (`git diff --stat origin/main...HEAD`): 3 files, **+1164 / -0**.
-  Only additions; nothing removed, nothing outside the lease edited.
+Independent review. I did not author this code; I reviewed head from scratch on
+the branch rather than trusting the author handoff. This supersedes the two
+earlier reviews on this branch (first review `b0f61c3`, re-review `6fc1e39`,
+which found the since-fixed `StatusChanged` fork); their substance is re-verified
+below against the current head.
 
-## Gate output (actually run)
+- Reviewed at: `0718f56` on `agent/m3-session-domain`, off `origin/main` @
+  `1d329a5` (macOS arm64).
+- Historical authority: the lane task supplied to the implementer.
+- Contract source: D-M3-001, now published as
+  [session API](../session-api.md), rather than an operations-only artifact.
+- Scope of diff (`git diff --name-status origin/main...HEAD`): 4 files, all `A`
+  (additions only, +1473 / −0). Note: the lane prompt's `git checkout
+  agent/m3-session-domain` was run from a sibling worktree because the branch was
+  already checked out at `pool-m3a` (worktree lock) — same commit, clean tree.
+
+## Gate output (actually run at `0718f56`)
 
 ```
-$ cargo fmt --all -- --check        → exit 0 (clean, no diff)
+$ cargo fmt --all -- --check
+    exit 0 (no diff)
+$ touch src/session.rs tests/session_domain.rs        # force rebuild, not cache
 $ cargo clippy --workspace --all-targets -- -D warnings
-    Finished `dev` profile [unoptimized + debuginfo] target(s)  (exit 0, 0 warnings)
-$ cargo test --workspace            → exit 0
-    PASSED=385 FAILED=0 IGNORED=1
-    (lib 79+1ignored, bin 24, session_domain 32, verify59 19, pty 10,
-     terminal 45 + adversarial/feature suites = 385 total)
+    Checking noren-app v0.1.0 (.../pool-m3a/crates/noren-app)
+    Finished `dev` profile [unoptimized + debuginfo]  → exit 0, 0 warnings
+$ cargo test --workspace
+    PASSED=387 FAILED=0 IGNORED=1
+    (session_domain: running 34 tests → ok. 34 passed; 0 failed)
 ```
 
-Totals reconcile with the handoff's claimed 385 passed / 1 ignored.
+Totals reconcile with the handoff's claim (353 baseline + 34 `session_domain` =
+387). The 34 include 5 `#[cfg(test)]` unit tests compiled standalone into the
+integration target via `#[path]`.
 
-## Acceptance criteria (from `state/tasks/M3-1a.md`), one by one
+## Acceptance criteria (`state/tasks/M3-1a.md`), one by one
 
-1. **"Registry holds sessions with at most one selection, never dangling after
-   close." — MET.** Selection is `Option<SessionId>` (`session.rs:257`);
-   `close_entry` clears it when the closed id was selected
-   (`session.rs:395-405`). Tests `closing_the_selected_session_clears_the_selection`,
-   `closing_a_non_selected_session_keeps_the_selection`,
-   `closing_the_only_session_leaves_no_selection` cover it. I additionally broke
-   this (Mutation 1 below) and a test failed, so the coverage is real.
+1. **"At most one selection, never dangling after close." — MET.** Selection is a
+   single `Option<SessionId>` (`session.rs:276`); `close_events` clears it when
+   the closed id was selected (`session.rs:429-438`). Mutation M1 below removed
+   the clear → 5 tests FAILED.
 2. **"Registry spawns no process; domain tests run without any child." — MET.**
-   No `Command`/`spawn`/process API anywhere in `session.rs`; it is pure
-   `HashMap`/`Option`/`u64` state. The full lifecycle test runs in memory.
+   No `Command`/`spawn`/`std::process` in `session.rs` outside doc comments; the
+   full-lifecycle test (`tests/session_domain.rs:129-143`) runs purely in memory.
+   The crate's real process machinery (`clipboard.rs`, `main.rs`) is untouched and
+   not imported by the leased files.
 3. **"Status is only set from a reported observation, never inferred." — MET.**
-   New entries start `Created` (`session.rs:388`); only `observe_entry`
-   (`session.rs:418-432`) advances status. Mutation 2 (infer `Running` on
-   create) failed 4 tests.
+   `create` records `Starting` (`session.rs:333`); only `observe`
+   (`session.rs:364-381`) advances status. Mutation M2 (infer `Running` on
+   create) → 3 tests FAILED.
 4. **"No pane, tab, or layout type exists anywhere in the module." — MET.**
-   `grep -inE 'pane|\btab\b|layout|split|zellij'` matches only the module doc
-   comment (`session.rs:9-10`) that states the boundary; no such types exist.
-   ADR 0003 boundary respected.
+   `grep -iE 'pane|tab|layout|split|zellij'` over `session.rs` and the test file
+   matches only the boundary doc comment (`session.rs:8-9`). The `Tab` hits in
+   `lib.rs`/`main.rs` are the pre-existing keyboard `Key::Tab`, not this diff.
+   ADR 0003 respected; nothing reads or persists Zellij-internal state.
 
-## Required tests — present, and they actually bite
+## Contract conformance (diffed against canonical D-M3-001)
 
-All four required behaviours have tests, and I confirmed they are not vacuous by
-mutating the implementation and watching tests fail (then reverted):
+| Type | Head location | Conforms? |
+| --- | --- | --- |
+| `SessionId(u64)` | `session.rs:54` | yes |
+| `SessionKind` (5 variants) | `session.rs:80-104` | yes — contract leaves `{..}` payloads unspecified; `root/path/target/name` are an implementation choice flagged for coordinator confirmation |
+| `SessionStatus` incl. `Exited{code:Option<i32>}`, `Failed{reason:String}` | `session.rs:124-141` | yes, exact |
+| `SessionDescriptor {id,kind,status,title:String}` | `session.rs:150-156` | yes |
+| `SessionAction {Create{kind},Select{id},Close{id}}` | `session.rs:191-207` | yes, exact |
+| `SessionEvent` incl. `StatusChanged { id, status }` | `session.rs:216-230` | **yes — previously-forked variant now matches the contract struct shape** |
+| `SelectedSession = Option<SessionId>` | `session.rs:237` | yes |
+| `SessionRegistry { .. }` | unspecified by contract | yes (methods free) |
 
-| Mutation (reverted after) | Result |
+The earlier MAJOR (`StatusChanged` unit fork, `6fc1e39`'s finding) is genuinely
+resolved: head emits the struct variant from `observe` (`session.rs:377-380`) and
+the guard test now constructs the contract shape
+(`tests/session_domain.rs:415-418`). Mutation M5 (revert to a unit variant) fails
+to compile (E0559) — so the guard is no longer inverted; it bites in the correct
+direction. `SessionError` remains an acceptable local addition (D-M3-001 defines
+no error type); `observe` as a registry *method* is conforming (the contract's
+`SessionRegistry { .. }` fixes no methods) and was escalated in the handoff, not
+smuggled into `SessionAction`.
+
+## Required tests — present and effective
+
+- create/select/close incl. closing the selected session:
+  `closing_the_selected_session_clears_the_selection` (`:85`),
+  `apply_close_of_selected_emits_closed_then_selected_none` (`:317`).
+- selection None-or-existing after every operation: covered across
+  `:34`, `:58`, `:85`, `:97`, `:110`.
+- bounded state under repeated create/close:
+  `repeated_create_close_cycles_do_not_accumulate` (`:268`, 1000 cycles).
+- invalid actions rejected without panic: `:58`, `:221`, `:290`, `:370`
+  (unknown id, double close, observe-after-close all return
+  `Err(UnknownSession)`).
+
+## Mutation testing (each reverted; suite green after each revert)
+
+| Mutation | Result |
 | --- | --- |
-| `close_entry` stops clearing selection (dangling id) | `apply_close_of_selected_emits_closed_then_selection_cleared` **FAILED** |
-| `create_entry` infers `Running` instead of `Created` | 4 tests **FAILED** incl. `a_newly_created_session_is_created_not_running` |
-| `close_entry` retains the entry (tombstone leak) | 10 tests **FAILED** incl. `repeated_create_close_cycles_do_not_accumulate` |
+| M1: `close_events` stops clearing the selection | **5 FAILED** (`closing_the_selected_session_clears_the_selection`, etc.) |
+| M2: `create` infers `Running` | **3 FAILED** (`a_newly_created_session_is_starting_not_running`, etc.) |
+| M3: `close` keeps a tombstone instead of removing | **10 FAILED** (`repeated_create_close_cycles_do_not_accumulate`, etc.) |
+| M4: `observe` emits even when status unchanged | **2 FAILED** (`observing_the_current_status_is_a_no_op`) |
+| M5: revert `StatusChanged` to unit variant | **compile failure (E0559)** — guard + `observe` pin the contract shape |
+| M6: re-selecting the selected session re-emits `Selected` | **1 FAILED** (`selecting_the_already_selected_session_is_a_no_op`) |
 
-After reverting, `session_domain` returns to `32 passed; 0 failed`. The suite
-genuinely encodes the invariants.
+The behavioural suite genuinely bites; the conformance guard now bites in the
+right direction. Tests are not vacuous.
 
-## Interactions the author did not test
+## Regressions, boundaries, and combinations the author did not test
 
-I wrote a scratch `#[path]` test target (deleted after running; tree left clean)
-covering combinations not in the suite. All passed:
+I compiled a scratch `#[path]` harness (in a temp dir, then deleted; tree left
+clean) and ran interactions beyond the author's suite — 9 scratch tests + the 5
+module unit tests, `ok. 14 passed; 0 failed`:
 
-- select → observe → read `selected()`: the descriptor is a **fresh** snapshot
-  (`Running` reflected), not stale.
-- interleaved select/observe/close across 3 sessions, reselect, close former
-  selection: selection and statuses stay consistent; `len()==1` at the end.
-- hostile labels: empty string, 1_000_000-char label, emoji/CJK/NUL — no panic,
-  values round-trip intact.
-- full kind×status transition matrix (`Local`/`Ssh`/`Agent` × every status) via
-  `apply`; no panic, `close` leaves `is_empty()`.
-- stale id after close is rejected by `select`/`observe`/`close`/`get`.
-
-```
-test result: ok. 10 passed; 0 failed; 0 ignored  (scratch, then removed)
-```
+- **Cross-registry id aliasing.** Two independent `SessionRegistry::new()` both
+  mint `SessionId(1)`; because `SessionId` is a bare opaque u64 with no registry
+  affinity, registry A *accepts* registry B's id as its own (`a.select(b_id)` is
+  `Ok`). Within one registry the no-aliasing invariant holds (ids are never
+  reused live), and the contract explicitly scopes ids to a single run/single
+  registry, so this is not a contract violation — but it is a real footgun if the
+  app ever recreates a registry mid-run and a stale id survives it. Recorded for
+  the coordinator; see Observations.
+- **Non-monotonic status (later reclassified and fixed).** At this reviewed
+  head, `observe` accepted `Running -> Failed -> Running -> Exited { None }`.
+  ADV-S1 subsequently demonstrated that terminal resurrection violates
+  lifecycle ordering. The merge candidate now rejects lower-ranked reports
+  without mutation while permitting terminal-detail refinement.
+- **Selecting an `Exited`/`Failed` session is allowed**, and closing it
+  afterwards still clears selection. Contract silent; consistent with prior
+  review.
+- **`apply` round-trip over a reserved kind** (`Create{Agent}→Select→observe→
+  Close`) emits exactly `Created / Selected(Some) / StatusChanged / Closed +
+  Selected(None)` in order.
+- **Degenerate payloads:** empty `Ssh.target`/`Agent.name`, empty `Project.root`,
+  NUL/newline/emoji/CJK in `Worktree.path`, and a 1,000,000-char `Failed.reason`
+  all round-trip without panic.
+- **`Exited{code:None}` vs `Exited{code:Some(0)}`** are distinct for the no-op
+  check; re-observing an identical payload is a no-op.
+- **Snapshot isolation:** a `get()` descriptor is a clone — later `observe` does
+  not rewrite it.
+- **Listing stays id-sorted after closing middle ids.**
+- **200k create/close churn:** `len()` stays 0, ids strictly increase and never
+  alias a closed session; `sessions()`/`select`/`close` still work after.
 
 ## Panics, leaks, unbounded growth
 
-- Exactly one panic point, deliberate and reasoned: id-space exhaustion via
-  `.expect("session id space exhausted")` with `checked_add`
-  (`session.rs:381-384`). No other `unwrap`/`expect`/`panic!` in non-test code
-  (`grep` confirmed).
-- `close` **removes** the entry (`session.rs:396`), so repeated create/close
-  cannot accumulate; verified by the 1000-cycle test and by Mutation 3. No
-  event/history buffer is retained. `next_id` is the only monotonic counter and
-  is bounded by `u64`.
-- `sessions()` and `selected()` allocate fresh views per call; nothing grows
-  with call count. No resource handles are held. No leak.
+- One deliberate panic point, reasoned: u64 id-space exhaustion via `checked_add`
+  (`session.rs:326-329`). No other `unwrap`/`expect`/`panic!` in non-test code
+  (`serde`, `unreachable!`, `todo!` absent).
+- No resource handles; the registry owns only `HashMap + Option<SessionId> + u64`.
+- `close` removes the entry; no event history is retained; `next_id` is the sole
+  monotonic counter. Live state is bounded to live sessions + counter + selection;
+  nothing grows with call count. `HashMap` capacity is bounded by peak concurrent
+  sessions (not churn count), which is consistent with "no session count cap is
+  implied."
 
-## Unintended deletions / lease
+## Unintended deletions, lease, and forbidden files
 
-`git diff --name-status origin/main...HEAD` → three `A` (add) entries only:
-`src/session.rs`, `tests/session_domain.rs`, `docs/coordination/handoffs/glm-a.md`.
-Zero deletions. Forbidden files untouched: the combined diff for
-`lib.rs`, `Cargo.toml`, `Cargo.lock`, `status.md` is empty. `lib.rs` is **not**
-wired (as required); the `#[path]` test mechanism is the sole consumer.
+`git diff --name-status origin/main...HEAD` → four `A` entries
+(`src/session.rs`, `tests/session_domain.rs`, the handoff, the prior review);
+**zero deletions**. Combined diff of the forbidden files (`lib.rs`, `main.rs`,
+`Cargo.toml`, `Cargo.lock`, `status.md`) is 0 lines, and `lib.rs` contains no
+`session` — the module is unwired per the lease, reachable only through the
+`#[path]` test. The handoff and review files are lane/reviewer coordination
+artifacts, not a lease violation (the lease forbids `status.md` specifically, not
+handoffs/reviews). The handoff's "when wiring, replace `#[path]` with
+`use noren_app::session;`" note remains correct and necessary.
 
-## Findings
+## Sound areas
 
-### MAJOR — Public types deviate from the D-M3-001 contract
+The behavioural core is solid and mutation-verified: single-selection invariant,
+no-process purity, observed-only status, bounded live state, typed rejection of
+unknown/double-close, and now exact `StatusChanged` conformance pinned by a
+correctly-oriented guard. Escalating `observe` (rather than forking
+`SessionAction`) and keeping `SessionError` local were the right calls under the
+stop conditions.
 
-The task spec's **Public API contract** section says: *"Owns and defines every
-type in D-M3-001. Others import… A lane needing a contract change escalates
-instead of forking it."* The committed types fork the contract in 6 of 8 places:
+## Historical observations — resolved on the merge candidate
 
-| Type | D-M3-001 (fleet `state/D-M3-001-session-api.md`) | Committed (`crates/noren-app/src/session.rs`) | Deviation |
-| --- | --- | --- | --- |
-| `SessionKind` | `Local, Project{..}, Worktree{..}, Ssh{..}, Agent{..}` | `Local, Ssh, Agent` (`session.rs:56-65`) | **missing `Project`, `Worktree`**; struct-variants rendered unit |
-| `SessionStatus` | `Starting, Running, Exited{code:Option<i32>}, Failed{reason:String}` | `Created, Running, Failed, Exited` (`session.rs:84-95`) | `Starting`→`Created`; **dropped `Exited.code` and `Failed.reason` payloads** |
-| `SessionDescriptor` | `{id,kind,status,title:String}` | `{id,kind,status,label:Option<String>}` (`session.rs:102-108`) | `title`→`label`, `String`→`Option<String>` |
-| `SessionAction` | `Create{kind}, Select{id}, Close{id}` | adds `Observe{id,status}`, adds `label` to `Create` (`session.rs:141-167`) | additive |
-| `SessionEvent` | `Created(SessionId), Selected(Option<SessionId>), StatusChanged, Closed(SessionId)` | `Created{id,descriptor}, …, SelectionChanged{selected}` (`session.rs:173-199`) | `Selected`→`SelectionChanged`; `Created` payload widened |
-| `SelectedSession` | `pub type SelectedSession = Option<SessionId>;` | `struct SelectedSession{id,descriptor}` (`session.rs:206-210`) | type alias → struct |
+1. `SessionKind` payload fields (`root`/`path`/`target`/`name`) and concrete
+   types are now recorded in the public contract.
+2. `observe` is ratified as the supervisor-fact registry method, deliberately
+   separate from user/UI `SessionAction` requests.
+3. IDs are explicitly registry-local, one registry is used per app run, and
+   cross-registry IDs must never be mixed.
 
-`SessionId` and `SessionRegistry` conform; `SessionError` is a reasonable
-addition (D-M3-001 defines no error type).
+## Historical verdict
 
-**Why it matters (expected vs actual):** the other four M3 lanes (M3-1b
-supervisor, M3-3, M3-4 dispatch, M3-ADV) are told to *import* these types. A
-lane constructing `SessionKind::Project`, matching `SessionEvent::Selected`, or
-reading `descriptor.title` / `Exited { code }` **will not compile** against this
-branch. Expected: lanes share one contract shape; actual: this branch is the
-contract owner yet diverges from it — exactly the fork the contract exists to
-prevent.
+PASS at `0718f56` — all four then-reviewed acceptance criteria met; all six previously-deviating contract
+types (including the `StatusChanged` struct variant that forked twice) now match
+D-M3-001, verified by direct diff and by a compile-failing mutation; the test
+suite bites under six independent mutations and survived nine adversarial
+interaction/growth scenarios beyond the author's suite. No BLOCKER, MAJOR, or
+MINOR defect found; three coordination observations recorded.
 
-**Root cause / mitigation (recorded for fairness, not as absolution):**
-`git ls-tree -r origin/main` confirms D-M3-001 is **absent from the noren repo**
-(no `docs/coordination/decisions/`). The author's lane pointed at a path that did
-not exist, so the fork was made blind and was explicitly flagged in the handoff
-("A reviewer should diff my types against the real spec the moment it lands").
-The behavioural core is sound and reusable; the fix is shape alignment, not a
-rewrite.
+This historical verdict did not cover ADV-S1 or the public-contract correction;
+the current-head PR review is authoritative for merge.
 
-**Minimal suggested fix:** before the serial wiring commit lands, align the six
-types to D-M3-001 (add `Project`/`Worktree`, restore `Starting` and the
-`Exited{code}`/`Failed{reason}` payloads, rename to `title: String`, restore
-`Selected(Option<SessionId>)` and `pub type SelectedSession = Option<SessionId>`),
-and decide with the coordinator whether the added `Observe` action/`Created.label`
-should be ratified *into* D-M3-001 (escalate, per the stop conditions) rather than
-silently kept. Independently, the coordinator should sync D-M3-001 into the repo
-so downstream lanes are not coding blind.
-
-### No BLOCKER
-
-ADR 0003 is respected (no pane/tab/layout/split type), so the prompt's explicit
-blocker condition is not triggered. The MAJOR above is a contract-shape
-mismatch, recoverable by alignment; it is not an architectural boundary break.
-
-## Verdict
-
-Behavioural acceptance criteria are met and mutation-tested; no panics, leaks,
-unbounded growth, unintended deletions, or boundary violations. The single issue
-is that the owned public types do not match the D-M3-001 contract that four
-downstream lanes import. That must be reconciled before integration.
-
-`REVIEW_M3-1a verdict=FINDINGS blockers=0 majors=1 minors=0 tests=PASS total=385`
+`REVIEW_M3-1a historical_verdict=PASS blockers=0 majors=0 minors=0 tests=PASS total=387`

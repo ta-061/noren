@@ -11,19 +11,18 @@
 //!
 //! # Contract conformance
 //!
-//! The public types conform to decision **D-M3-001** (`session-api`), which is
-//! the contract the other four M3 lanes import. They are fixed here once; a lane
-//! that needs a different shape escalates rather than forking. [`SessionId`],
+//! The public types conform to decision **D-M3-001**, recorded in
+//! `docs/coordination/session-api.md`. They are fixed here once; a lane that
+//! needs a different shape escalates rather than forking. [`SessionId`],
 //! [`SessionKind`], [`SessionStatus`], [`SessionDescriptor`], [`SessionAction`],
 //! [`SessionEvent`], [`SelectedSession`], and [`SessionRegistry`] match that
 //! contract. [`SessionError`] is a local addition (D-M3-001 defines no error
-//! type) and [`SessionRegistry::observe`] is a registry *method* — not a contract
-//! [`SessionAction`] — by which the spawn layer reports observed status; see the
-//! handoff for the open ratification question.
+//! type) and [`SessionRegistry::observe`] is deliberately a registry *method* —
+//! not a user-facing [`SessionAction`] — by which the supervisor reports facts.
 //!
 //! # Invariants
 //!
-//! The registry preserves four invariants that the domain test suite checks:
+//! The registry preserves five invariants that the domain test suite checks:
 //!
 //! 1. **At most one selected session.** [`SessionAction::Select`] replaces any
 //!    prior selection, and closing the selected session clears it rather than
@@ -37,10 +36,9 @@
 //! 4. **Bounded live state.** [`SessionAction::Close`] removes an entry, so
 //!    repeated create/close cycles do not accumulate dead sessions. The registry
 //!    retains no event history.
-//! 5. **Monotonic status.** [`SessionRegistry::observe`] only accepts a status
-//!    of equal or higher [`rank`](SessionStatus::rank). A session never moves
-//!    backwards (`Running` → `Starting`) and is never resurrected once terminal
-//!    (`Exited`/`Failed` → `Running`), so lifecycle order is sound.
+//! 5. **Monotonic lifecycle.** [`SessionRegistry::observe`] rejects a lower
+//!    lifecycle rank. A running session cannot return to starting, and an exited
+//!    or failed session cannot be resurrected as running.
 //!
 //! No persistence format is chosen: the model is in-memory only and derives no
 //! `serde` traits.
@@ -51,9 +49,10 @@ use std::path::PathBuf;
 
 /// Stable, opaque identifier for a session, minted by [`SessionRegistry`].
 ///
-/// Two ids compare equal only when they were minted from the same registry
-/// counter value. The inner value is private so callers cannot fabricate ids;
-/// they receive them from [`SessionEvent::Created`] or [`SessionDescriptor`].
+/// IDs are registry-local and not persistence keys. Independent registries can
+/// mint equal counter values, so callers must never mix their ids. The inner
+/// value is private so callers receive ids only from [`SessionEvent::Created`]
+/// or [`SessionDescriptor`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(u64);
 
@@ -70,10 +69,8 @@ impl fmt::Display for SessionId {
 /// are carried as data so the enum is stable for exhaustive matching — no code
 /// in this module launches any of them.
 ///
-/// The struct-variant field names are inferred from the contract summary (the
-/// full D-M3-001 file is not in this repo; see the handoff): `root`/`path` for
-/// the local-rooted kinds and `target`/`name` for the remote/agent kinds. The
-/// coordinator should confirm the exact names against the canonical file.
+/// D-M3-001 records the concrete payloads used here: `root`/`path` for the
+/// local-rooted kinds and `target`/`name` for the remote/agent kinds.
 ///
 /// [`Local`]: SessionKind::Local
 /// [`Project`]: SessionKind::Project
@@ -124,13 +121,6 @@ impl SessionKind {
 /// [`SessionAction::Create`]: a fresh entry is [`Starting`], and every other
 /// status is set only by an explicit [`SessionRegistry::observe`] report.
 ///
-/// Status transitions are **monotonic**: [`observe`](SessionRegistry::observe)
-/// only accepts a status whose [`rank`](Self::rank) is greater than or equal to
-/// the current one. A session can therefore advance (`Starting` → `Running` → a
-/// terminal status, or refine one terminal report into another) but can never
-/// regress (e.g. `Running` back to `Starting`) and can never be resurrected
-/// once terminal (a dead session stays dead). See [`Self::rank`].
-///
 /// [`Starting`]: SessionStatus::Starting
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum SessionStatus {
@@ -152,16 +142,13 @@ pub enum SessionStatus {
 }
 
 impl SessionStatus {
-    /// Lifecycle rank used to enforce monotonic, forward-only observations.
+    /// Lifecycle rank used to reject backwards observations.
     ///
-    /// `Starting` (0) < `Running` (1) < terminal `Exited`/`Failed` (2). An
-    /// observation may move a session to an equal or higher rank — so it can
-    /// advance, or refine one terminal report into another (e.g. `Failed` →
-    /// `Exited` once a real exit code arrives) — but never to a lower rank.
-    /// That single rule forbids both a backwards slide (`Running` → `Starting`)
-    /// and a resurrection (`Exited` → `Running`).
+    /// `Starting` (0) < `Running` (1) < terminal `Exited`/`Failed` (2).
+    /// Equal-rank terminal observations may refine their payload or variant,
+    /// but a terminal session can never return to a live status.
     #[must_use]
-    pub fn rank(&self) -> u8 {
+    pub const fn rank(&self) -> u8 {
         match self {
             Self::Starting => 0,
             Self::Running => 1,
@@ -238,12 +225,10 @@ pub enum SessionAction {
 
 /// The result of reducing a [`SessionAction`] or an observation.
 ///
-/// Conforms to D-M3-001: tuple-variant shape. Events describe what actually
-/// changed; a no-op (selecting the already-selected session) emits nothing.
-/// [`StatusChanged`] is intentionally payload-free — a consumer that needs the
-/// new value queries the registry.
-///
-/// [`StatusChanged`]: SessionEvent::StatusChanged
+/// Conforms to D-M3-001: `Created`, `Selected`, and `Closed` are tuple
+/// variants; `StatusChanged` carries the id and new status as named fields.
+/// Events describe what actually changed; a no-op (selecting the
+/// already-selected session, observing the current status) emits nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionEvent {
     /// A new session entry was recorded.
@@ -251,7 +236,12 @@ pub enum SessionEvent {
     /// The selection changed: set, replaced, or cleared.
     Selected(Option<SessionId>),
     /// A session's observed status changed.
-    StatusChanged,
+    StatusChanged {
+        /// The session whose status changed.
+        id: SessionId,
+        /// The newly observed status.
+        status: SessionStatus,
+    },
     /// A session entry was removed.
     Closed(SessionId),
 }
@@ -266,7 +256,7 @@ pub type SelectedSession = Option<SessionId>;
 /// Typed failure of a [`SessionAction`] (or observation) against the registry.
 ///
 /// D-M3-001 defines no error type; this is a local addition so callers handle
-/// unknown-session and invalid-transition cases without panicking.
+/// unknown sessions and invalid lifecycle transitions without panicking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionError {
     /// The action named a session the registry does not know.
@@ -274,13 +264,7 @@ pub enum SessionError {
     /// A closed id is unknown because [`SessionAction::Close`] removes the
     /// entry entirely rather than retaining a tombstone.
     UnknownSession,
-    /// The observation would regress the status.
-    ///
-    /// Status transitions are monotonic (see [`SessionStatus::rank`]): an
-    /// [`SessionRegistry::observe`] may advance or laterally refine a status
-    /// but never lower its rank. A regression (`Running` → `Starting`) or a
-    /// resurrection of a dead session (`Exited`/`Failed` → `Running`) is
-    /// rejected so any consumer reasoning about lifecycle order is sound.
+    /// The observation would move a session backwards or resurrect it.
     InvalidStatusTransition,
 }
 
@@ -305,8 +289,8 @@ impl std::error::Error for SessionError {}
 /// Created entries start at [`SessionStatus::Starting`]; a status advances only
 /// when the spawn layer reports an observation through
 /// [`observe`](Self::observe). That method is a registry operation, not a
-/// contract [`SessionAction`]; whether it should be ratified into D-M3-001 is an
-/// open escalation (see the handoff).
+/// contract [`SessionAction`]. D-M3-001 keeps supervisor observations separate
+/// from user requests such as create, select, and close.
 pub struct SessionRegistry {
     sessions: HashMap<SessionId, SessionDescriptor>,
     selected: Option<SessionId>,
@@ -395,15 +379,10 @@ impl SessionRegistry {
     /// Observing the current status is a no-op and returns `Ok(None)`. Returns
     /// [`SessionError::UnknownSession`] when `id` is not live.
     ///
-    /// Transitions are **monotonic** (see [`SessionStatus::rank`]): an
-    /// observation may advance the status or refine one terminal report into
-    /// another, but never lower its rank. A regression such as `Running` →
-    /// `Starting`, or a resurrection such as `Exited` → `Running`, is rejected
-    /// with [`SessionError::InvalidStatusTransition`] — a dead session stays
-    /// dead, so consumers can rely on lifecycle order.
-    ///
-    /// This is a registry method, not a contract [`SessionAction`]; see the
-    /// module and handoff for the open ratification question.
+    /// Lifecycle transitions are monotonic. A lower-ranked report, including
+    /// `Running -> Starting` or `Exited/Failed -> Running`, returns
+    /// [`SessionError::InvalidStatusTransition`] without mutating the entry.
+    /// Equal-rank terminal reports may refine the terminal detail.
     pub fn observe(
         &mut self,
         id: SessionId,
@@ -420,7 +399,10 @@ impl SessionRegistry {
             return Err(SessionError::InvalidStatusTransition);
         }
         descriptor.status = status;
-        Ok(Some(SessionEvent::StatusChanged))
+        Ok(Some(SessionEvent::StatusChanged {
+            id,
+            status: descriptor.status.clone(),
+        }))
     }
 
     /// The descriptor for `id`, if it is live.
@@ -535,6 +517,10 @@ mod tests {
     #[test]
     fn session_error_renders_a_message() {
         assert_eq!(SessionError::UnknownSession.to_string(), "unknown session");
+        assert_eq!(
+            SessionError::InvalidStatusTransition.to_string(),
+            "invalid status transition"
+        );
     }
 
     #[test]
