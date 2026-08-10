@@ -135,7 +135,7 @@ fn round_trip_preserves_every_entry_kind_and_the_selection() {
 }
 
 #[test]
-fn restored_entries_reenter_as_starting_with_generated_titles() {
+fn restored_entries_reenter_as_restored_with_generated_titles() {
     // Restoration re-spawns domain entries, not runtime facts: every entry
     // comes back through SessionRegistry::create, so it is Starting with a
     // generated display title, and the selected entry resolves live.
@@ -149,7 +149,7 @@ fn restored_entries_reenter_as_starting_with_generated_titles() {
     let mut restored = SessionRegistry::new();
     load(&path, &mut restored).expect("state loads");
     for (index, descriptor) in restored.sessions().iter().enumerate() {
-        assert_eq!(descriptor.status(), &SessionStatus::Starting);
+        assert_eq!(descriptor.status(), &SessionStatus::Restored);
         assert_eq!(descriptor.title(), format!("session-{}", index + 1));
     }
     let selected = registry_selected_descriptor(&restored);

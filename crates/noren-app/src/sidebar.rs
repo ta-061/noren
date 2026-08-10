@@ -187,8 +187,9 @@ impl SessionViewport {
 ///
 /// 1. `empty_state` is `Some` exactly when there are no rows.
 /// 2. At most one row has [`SidebarRow::is_selected`] set.
-/// 3. `viewport` is `Some` exactly when one session row is selected, and it
-///    names that same session. Unselected sessions describe no viewport.
+/// 3. `viewport` is `Some` exactly when one non-restored session row is
+///    selected, and it names that same session. A restored entry has no live
+///    process to attach to, so selecting it does not create a viewport.
 /// 4. A selection that matches no entry is dropped, never rendered dangling.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidebarView {
@@ -208,6 +209,7 @@ impl SidebarView {
     #[must_use]
     pub fn build(entries: &[SidebarEntry], selected: Option<SessionId>) -> Self {
         let mut viewport: Option<SessionViewport> = None;
+        let mut selected_row = false;
         let mut rows: Vec<SidebarRow> = Vec::with_capacity(entries.len());
         for entry in entries {
             rows.push(match entry {
@@ -236,8 +238,11 @@ impl SidebarView {
                     selected: false,
                 },
                 SidebarEntry::Session(descriptor) => {
-                    let is_selected = viewport.is_none() && selected == Some(descriptor.id());
+                    let is_selected = !selected_row && selected == Some(descriptor.id());
                     if is_selected {
+                        selected_row = true;
+                    }
+                    if is_selected && !matches!(descriptor.status(), SessionStatus::Restored) {
                         viewport = Some(SessionViewport {
                             session: descriptor.clone(),
                         });
@@ -321,6 +326,7 @@ fn session_kind_text(kind: &SessionKind) -> &'static str {
 fn session_status_text(status: &SessionStatus) -> &'static str {
     match status {
         SessionStatus::Starting => "starting",
+        SessionStatus::Restored => "restored (not running)",
         SessionStatus::Running => "running",
         SessionStatus::Exited { .. } => "exited",
         SessionStatus::Failed { .. } => "failed",

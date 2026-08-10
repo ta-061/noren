@@ -1297,9 +1297,8 @@ impl NorenApp {
         // entry rather than marking it stopped, so closing here would persist
         // a deletion and hand back an empty sidebar on the next launch. The
         // session stays in the registry; only its PTY goes away. On the next
-        // launch it is restored as `SessionStatus::Starting`, which is what
-        // this PR already decided a restored session means: a visible entry
-        // whose shell is not running.
+        // launch it is restored as `SessionStatus::Restored`: a visible entry
+        // whose shell is not running and cannot be reattached implicitly.
         //
         // This also protects the non-quit caller: `redraw` invokes `close` on
         // `RenderOutcome::DeviceLost`. A lost GPU device must not delete the
@@ -3600,9 +3599,11 @@ mod tests {
         cleanup_state_file(&path);
     }
 
-    /// Required: a restored session's status does not claim to be running.
+    /// Required: a restored session is distinct from a shell that is starting.
+    /// Mutation check for Issue #110: changing `load_snapshot`'s restoration
+    /// path back to `create` makes the status and sidebar assertions fail.
     #[test]
-    fn restored_sessions_start_at_starting_not_running() {
+    fn restored_sessions_are_restored_not_starting_or_running() {
         let path = temp_state_path();
         let mut state = WorkspaceState::with_state_path(Some(path.clone()));
         let id = state.create_session(SessionKind::Local);
@@ -3614,8 +3615,8 @@ mod tests {
         for descriptor in restored.registry().sessions() {
             assert_eq!(
                 descriptor.status(),
-                &SessionStatus::Starting,
-                "restored session must not claim to be running"
+                &SessionStatus::Restored,
+                "restored session must identify its no-process state"
             );
         }
         let detail = restored
@@ -3625,10 +3626,17 @@ mod tests {
             .and_then(|r| r.detail())
             .unwrap_or_default();
         assert!(
-            detail.contains("starting"),
-            "detail says starting: {detail}"
+            detail.contains("restored") && detail.contains("not running"),
+            "detail identifies a restored, non-running session: {detail}"
         );
-        assert!(!detail.contains("running"), "detail must not say running");
+        assert!(
+            !detail.ends_with("· running"),
+            "detail must not claim running: {detail}"
+        );
+        assert!(
+            restored.sidebar().viewport().is_none(),
+            "selecting a restored session must not imply an attachment"
+        );
         cleanup_state_file(&path);
     }
 
@@ -3807,11 +3815,11 @@ mod tests {
     }
 
     /// Quitting must not silently downgrade the session's status claim either:
-    /// the shell is gone, so the restored entry is `Starting`, never `Running`.
-    /// Consistent with `restored_sessions_start_at_starting_not_running`, but
+    /// the shell is gone, so the restored entry is `Restored`, never `Running`.
+    /// Consistent with `restored_sessions_are_restored_not_starting_or_running`, but
     /// reached through the quit path rather than a direct workspace mutation.
     #[test]
-    fn session_restored_after_quitting_is_starting_not_running() {
+    fn session_restored_after_quitting_is_restored_not_running() {
         let path = temp_state_path();
         let mut app = app_with_state_path(&path);
         let id = app.workspace.create_session(SessionKind::Local);
@@ -3825,7 +3833,7 @@ mod tests {
         for descriptor in relaunched.registry().sessions() {
             assert_eq!(
                 descriptor.status(),
-                &SessionStatus::Starting,
+                &SessionStatus::Restored,
                 "a session whose PTY was torn down must not claim to be running"
             );
         }
