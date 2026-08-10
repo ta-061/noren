@@ -17,6 +17,17 @@ pub const MAX_INCLUDE_DEPTH: usize = 16;
 const MAX_FILE_BYTES: usize = 1024 * 1024;
 const MAX_INCLUDED_FILES: usize = 256;
 
+/// Maximum conservative work estimate for resolving aliases against blocks
+/// that cannot use the literal index.
+///
+/// Before resolving any host, every alias/pattern pair is charged
+/// `(alias_bytes + 1) * (pattern_bytes + 1)` units. This covers conversion to
+/// characters and the iterative glob matcher's polynomial worst case. Every
+/// fallback block and setting visit is charged separately. Sixteen mebi-units
+/// leaves ample room for realistic configurations while rejecting hostile
+/// alias x wildcard-block products before that cross-product is evaluated.
+const MAX_RESOLUTION_WORK: u128 = 16 * 1024 * 1024;
+
 /// Parsed SSH host facts. Values are the first values obtained for the alias,
 /// following OpenSSH's per-keyword precedence rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,7 +113,7 @@ impl SshConfig {
     /// for normal file loading.
     pub fn parse(text: &str) -> Result<Self, SshConfigError> {
         let blocks = parse_text(text, 0)?;
-        Ok(Self::from_blocks(&blocks))
+        Self::from_blocks(&blocks)
     }
 
     /// The concrete hosts discovered from literal `Host` patterns.
@@ -127,42 +138,76 @@ impl SshConfig {
             current: &mut current,
         };
         parse_file(text, source, root, 0, &mut state)?;
-        Ok(Self::from_blocks(&blocks))
+        Self::from_blocks(&blocks)
     }
 
-    fn from_blocks(blocks: &[Block]) -> Self {
+    fn from_blocks(blocks: &[Block]) -> Result<Self, SshConfigError> {
         let mut aliases = Vec::new();
         let mut seen_aliases = HashSet::new();
         let mut literal_blocks = HashMap::<String, Vec<usize>>::new();
         let mut fallback_blocks = Vec::new();
+        let mut fallback_pattern_work = 0_u128;
+        let mut fallback_settings = 0_u128;
 
         // Literal-only blocks can be looked up by alias. Blocks with a wildcard
         // (and global blocks) remain in their original order for every alias.
+        // All of this indexing is linear in the parsed input; no alias is
+        // matched against a fallback block until the budget check below passes.
         for (block_index, block) in blocks.iter().enumerate() {
             let Some(patterns) = &block.patterns else {
                 fallback_blocks.push(block_index);
+                fallback_settings = fallback_settings.saturating_add(block.settings.len() as u128);
                 continue;
             };
 
             for pattern in patterns {
-                if !pattern.starts_with('!')
-                    && !has_wildcard(pattern)
-                    && seen_aliases.insert(pattern.clone())
-                {
-                    aliases.push(pattern.clone());
+                if !pattern.starts_with('!') && !has_wildcard(pattern) {
+                    let key = pattern.to_ascii_lowercase();
+                    if seen_aliases.insert(key) {
+                        aliases.push(pattern.clone());
+                    }
                 }
             }
 
             if patterns.iter().all(|pattern| !has_wildcard(pattern)) {
+                // An all-literal block is known to have a positive match when
+                // reached through this index. Remove entries cancelled by a
+                // case-insensitive negation now, so resolving one alias never
+                // scans all patterns in a multi-alias literal block.
+                let negated: HashSet<String> = patterns
+                    .iter()
+                    .filter_map(|pattern| pattern.strip_prefix('!'))
+                    .map(str::to_ascii_lowercase)
+                    .collect();
+                let mut indexed_in_block = HashSet::new();
                 for pattern in patterns.iter().filter(|pattern| !pattern.starts_with('!')) {
-                    literal_blocks
-                        .entry(pattern.to_ascii_lowercase())
-                        .or_default()
-                        .push(block_index);
+                    let key = pattern.to_ascii_lowercase();
+                    if !negated.contains(&key) && indexed_in_block.insert(key.clone()) {
+                        literal_blocks.entry(key).or_default().push(block_index);
+                    }
                 }
             } else {
                 fallback_blocks.push(block_index);
+                fallback_settings = fallback_settings.saturating_add(block.settings.len() as u128);
+                for pattern in patterns {
+                    fallback_pattern_work =
+                        fallback_pattern_work.saturating_add(pattern.len() as u128 + 1);
+                }
             }
+        }
+
+        let alias_count = aliases.len() as u128;
+        let alias_work = aliases.iter().fold(0_u128, |work, alias| {
+            work.saturating_add(alias.len() as u128 + 1)
+        });
+        let fallback_visits = (fallback_blocks.len() as u128)
+            .saturating_add(fallback_settings)
+            .saturating_mul(alias_count);
+        let resolution_work = alias_work
+            .saturating_mul(fallback_pattern_work)
+            .saturating_add(fallback_visits);
+        if resolution_work > MAX_RESOLUTION_WORK {
+            return Err(error(0, SshConfigErrorKind::ResolutionComplexityExceeded));
         }
 
         let hosts = aliases
@@ -185,30 +230,30 @@ impl SshConfig {
                 // precedence remains identical to scanning all blocks.
                 while indexed_position < indexed.len() || fallback_position < fallback_blocks.len()
                 {
-                    let block_index = match (
+                    let (block_index, needs_match) = match (
                         indexed.get(indexed_position),
                         fallback_blocks.get(fallback_position),
                     ) {
                         (Some(indexed), Some(fallback)) if indexed < fallback => {
                             indexed_position += 1;
-                            *indexed
+                            (*indexed, false)
                         }
                         (Some(_), Some(fallback)) => {
                             fallback_position += 1;
-                            *fallback
+                            (*fallback, true)
                         }
                         (Some(indexed), None) => {
                             indexed_position += 1;
-                            *indexed
+                            (*indexed, false)
                         }
                         (None, Some(fallback)) => {
                             fallback_position += 1;
-                            *fallback
+                            (*fallback, true)
                         }
                         (None, None) => unreachable!(),
                     };
                     let block = &blocks[block_index];
-                    if !block.applies_to(&alias) {
+                    if needs_match && !block.applies_to(&alias) {
                         continue;
                     }
                     apply_settings(&mut host, block);
@@ -216,7 +261,7 @@ impl SshConfig {
                 host
             })
             .collect();
-        Self { hosts }
+        Ok(Self { hosts })
     }
 }
 
@@ -272,6 +317,9 @@ pub enum SshConfigErrorKind {
     InvalidUtf8,
     /// The bounded input size was exceeded.
     FileTooLarge,
+    /// Resolving all literal aliases against fallback patterns would exceed
+    /// the parser's deterministic preflight work budget.
+    ResolutionComplexityExceeded,
     /// A quoted or escaped argument was not terminated.
     UnterminatedArgument,
 }
@@ -556,7 +604,8 @@ fn has_wildcard(pattern: &str) -> bool {
 
 fn wildcard_match(pattern: &str, candidate: &str) -> bool {
     // Greedily consume characters and retry only from the latest star. This
-    // keeps matching iterative and linear in the pattern/candidate lengths.
+    // keeps matching iterative and non-exponential. The resolver's preflight
+    // budget charges the possible pattern-by-candidate polynomial work.
     let pattern: Vec<char> = pattern.chars().collect();
     let candidate: Vec<char> = candidate.chars().collect();
     let mut pattern_index = 0;
@@ -677,7 +726,8 @@ fn expand_owned_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::fmt::Write as _;
+    use std::io::Write as _;
 
     struct Fixture {
         root: PathBuf,
@@ -832,6 +882,152 @@ mod tests {
     }
 
     #[test]
+    fn accepted_mixed_config_preserves_precedence_defaults_negation_and_case() {
+        let config = SshConfig::parse(
+            "Port 2022\n\
+             Host Alpha ALPHA alpha\n\
+               HostName alpha-first.example\n\
+               User alpha-user\n\
+             Host PROD-* !prod-admin\n\
+               HostName wildcard.example\n\
+               User wildcard-user\n\
+             Host prod-Web\n\
+               HostName literal-web.example\n\
+               User literal-web\n\
+             Host PROD-ADMIN\n\
+               HostName admin.example\n\
+             Host * !SKIP\n\
+               HostName default.example\n\
+               User default-user\n\
+             Host skip\n\
+               HostName skip.example\n\
+               User skip-user\n\
+             Host alpha\n\
+               HostName alpha-late.example\n\
+               User alpha-late\n",
+        )
+        .expect("bounded mixed config parses");
+
+        assert_eq!(
+            config.hosts(),
+            &[
+                SshHost {
+                    alias: "Alpha".to_owned(),
+                    host_name: Some("alpha-first.example".to_owned()),
+                    user: Some("alpha-user".to_owned()),
+                    port: Some(2022),
+                },
+                SshHost {
+                    alias: "prod-Web".to_owned(),
+                    host_name: Some("wildcard.example".to_owned()),
+                    user: Some("wildcard-user".to_owned()),
+                    port: Some(2022),
+                },
+                SshHost {
+                    alias: "PROD-ADMIN".to_owned(),
+                    host_name: Some("admin.example".to_owned()),
+                    user: Some("default-user".to_owned()),
+                    port: Some(2022),
+                },
+                SshHost {
+                    alias: "skip".to_owned(),
+                    host_name: Some("skip.example".to_owned()),
+                    user: Some("skip-user".to_owned()),
+                    port: Some(2022),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn near_one_mib_mixed_alias_wildcard_product_is_fast_reject() {
+        let mut text = String::new();
+        for index in 0..14_189 {
+            writeln!(text, "Host literal-alias-{index:05}").expect("write to string");
+            text.push_str("HostName x\n");
+            writeln!(text, "Host impossible-{index:05}*").expect("write to string");
+            text.push_str("HostName y\n");
+        }
+        assert!((900 * 1024..=1024 * 1024).contains(&text.len()));
+
+        let started = std::time::Instant::now();
+        let error = SshConfig::parse(&text).expect_err("hostile product must be rejected");
+        let elapsed = started.elapsed();
+
+        assert_eq!(error.line(), 0);
+        assert_eq!(
+            error.kind(),
+            &SshConfigErrorKind::ResolutionComplexityExceeded
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "mixed preflight rejection took {elapsed:?}"
+        );
+        eprintln!("mixed 1 MiB preflight rejection: {elapsed:?}");
+    }
+
+    #[test]
+    fn mixed_budget_does_not_assume_literal_blocks_prefill_fallback_keyword() {
+        let mut text = String::new();
+        for index in 0..3_000 {
+            writeln!(text, "Host unset-alias-{index:04}").expect("write to string");
+            writeln!(text, "Host impossible-{index:04}*").expect("write to string");
+            text.push_str("User fallback\n");
+        }
+
+        let error = SshConfig::parse(&text)
+            .expect_err("unset User must not expose alias by fallback-block work");
+
+        assert_eq!(error.line(), 0);
+        assert_eq!(
+            error.kind(),
+            &SshConfigErrorKind::ResolutionComplexityExceeded
+        );
+    }
+
+    #[test]
+    fn near_one_mib_all_literal_config_remains_fast_and_complete() {
+        let mut text = String::new();
+        for index in 0..20_000 {
+            writeln!(text, "Host literal-alias-{index:05}").expect("write to string");
+            text.push_str("HostName target.example\n");
+        }
+        assert!((900 * 1024..=1024 * 1024).contains(&text.len()));
+
+        let started = std::time::Instant::now();
+        let config = SshConfig::parse(&text).expect("large literal config parses");
+        let elapsed = started.elapsed();
+
+        assert_eq!(config.hosts().len(), 20_000);
+        assert_eq!(config.hosts()[0].alias(), "literal-alias-00000");
+        assert_eq!(config.hosts()[19_999].host_name(), Some("target.example"));
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "one MiB literal config parsing took {elapsed:?}"
+        );
+        eprintln!("literal 1 MiB parsing: {elapsed:?}");
+    }
+
+    #[test]
+    fn all_literal_multi_alias_block_uses_the_index_without_cross_scanning() {
+        let mut text = String::from("Host");
+        for index in 0..8_000 {
+            write!(text, " alias-{index:04}").expect("write to string");
+        }
+        text.push_str("\nHostName shared.example\n");
+
+        let config = SshConfig::parse(&text).expect("multi-alias literal block parses");
+
+        assert_eq!(config.hosts().len(), 8_000);
+        assert!(
+            config
+                .hosts()
+                .iter()
+                .all(|host| host.host_name() == Some("shared.example"))
+        );
+    }
+
+    #[test]
     fn thousands_of_literal_aliases_parse_within_a_generous_bound() {
         let mut text = String::new();
         for index in 0..8_000 {
@@ -910,6 +1106,35 @@ mod tests {
         assert_eq!(config.hosts().len(), 2);
         assert_eq!(config.hosts()[0].host_name(), Some("included.example"));
         assert_eq!(config.hosts()[1].user(), Some("included-user"));
+    }
+
+    #[test]
+    fn include_assembled_alias_wildcard_product_is_rejected_by_same_preflight() {
+        let fixture = Fixture::new("include-complexity");
+        let config_path = fixture.write(
+            "config",
+            "Include parts/aliases.conf\nInclude parts/wildcards.conf\n",
+        );
+        let mut aliases = String::new();
+        let mut wildcards = String::new();
+        for index in 0..1_000 {
+            writeln!(aliases, "Host included-alias-{index:04}").expect("write to string");
+            writeln!(wildcards, "Host no-include-match-{index:04}*").expect("write to string");
+            wildcards.push_str("User included-fallback\n");
+        }
+        fixture.write("parts/aliases.conf", &aliases);
+        fixture.write("parts/wildcards.conf", &wildcards);
+
+        let error = SshConfig::read(&config_path)
+            .expect_err("included hostile product must use the same complexity budget");
+
+        assert_eq!(error.line(), 0);
+        assert_eq!(
+            error.kind(),
+            &SshConfigErrorKind::ResolutionComplexityExceeded
+        );
+        assert!(!error.to_string().contains("included-alias"));
+        assert!(!format!("{error:?}").contains("included-alias"));
     }
 
     #[test]
