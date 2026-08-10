@@ -290,12 +290,14 @@ impl WorkspaceState {
             .map(SidebarEntry::Session)
             .collect();
         let mut entries = entries;
-        entries.extend(self.ssh_hosts.iter().map(|kind| match kind {
-            SessionKind::Ssh { target } => SidebarEntry::SshConnection {
+        entries.extend(self.ssh_hosts.iter().filter_map(|kind| {
+            let SessionKind::Ssh { target } = kind else {
+                return None;
+            };
+            Some(SidebarEntry::SshConnection {
                 label: format!("SSH {target}"),
                 host: "not connected".to_string(),
-            },
-            _ => unreachable!("ssh host store only contains SessionKind::Ssh"),
+            })
         }));
         self.sidebar = SidebarView::build(&entries, self.registry.selected());
     }
@@ -1033,12 +1035,13 @@ impl NorenApp {
         let Some(row_index) = self.sidebar_row_index(position) else {
             return false;
         };
-        if self.workspace.select_ssh_sidebar_row(row_index) {
+        let selected = self.workspace.select_ssh_sidebar_row(row_index);
+        if selected {
             self.status = "Noren SSH host selected; connection not started";
             self.show_status = true;
             self.redraw_needed = true;
         }
-        true
+        selected
     }
 
     fn sidebar_row_index(&self, position: PhysicalPosition<f64>) -> Option<usize> {
@@ -3728,6 +3731,32 @@ mod tests {
             "SSH selection must not claim a connected viewport"
         );
         cleanup_ssh_config(&path);
+    }
+
+    #[test]
+    fn local_sidebar_press_falls_through_instead_of_being_swallowed() {
+        let mut app = NorenApp::default();
+        app.workspace.create_session(SessionKind::Local);
+        app.cursor_position = Some(PhysicalPosition::new(5.0, 1.0));
+        let initial_status = app.status;
+
+        assert!(
+            !app.handle_sidebar_click(ElementState::Pressed, MouseButton::Left),
+            "a local session row is not handled by the SSH sidebar path"
+        );
+        assert_eq!(app.workspace.selected_ssh_target(), None);
+        assert_eq!(app.workspace.registry().selected(), None);
+        assert_eq!(app.status, initial_status);
+    }
+
+    #[test]
+    fn rebuild_sidebar_skips_non_ssh_host_facts_without_panicking() {
+        let mut workspace = WorkspaceState::default();
+        workspace.ssh_hosts.push(SessionKind::Local);
+
+        workspace.rebuild_sidebar();
+
+        assert!(workspace.sidebar().rows().is_empty());
     }
 
     #[test]
