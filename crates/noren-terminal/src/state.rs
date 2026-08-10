@@ -1662,6 +1662,12 @@ fn visible_display_lines(screen: &ScreenBuffer) -> Vec<String> {
         lines.push(cells_to_display_line(&screen.cells[start..end]));
     }
     while lines.last().is_some_and(String::is_empty) {
+        let row = lines.len() - 1;
+        let start = row * usize::from(screen.cols);
+        let end = start + usize::from(screen.cols);
+        if !row_is_display_blank(&screen.cells[start..end]) {
+            break;
+        }
         lines.pop();
     }
     lines
@@ -1689,14 +1695,15 @@ fn cells_to_display_line(cells: &[Cell]) -> String {
 ///
 /// This is exactly the condition under which
 /// [`visible_display_lines`] drops a trailing row: every cell contributes
-/// only spaces (blank cells) or placeholders (continuation cells). Keeping
-/// the predicate here — next to the line builder it mirrors — is what lets
-/// [`TerminalSnapshot::display_cells`] select the same rows as
-/// [`TerminalSnapshot::display_lines`].
+/// only spaces (blank cells) or placeholders (continuation cells), and no cell
+/// carries an explicit background. Keeping the predicate here — next to the
+/// line builder it mirrors — is what lets [`TerminalSnapshot::display_cells`]
+/// select the same rows as [`TerminalSnapshot::display_lines`] while retaining
+/// background-only rows for rendering.
 fn row_is_display_blank(cells: &[Cell]) -> bool {
-    cells
-        .iter()
-        .all(|cell| cell.is_blank() || cell.is_continuation())
+    cells.iter().all(|cell| {
+        (cell.is_blank() || cell.is_continuation()) && cell.attributes().background().is_default()
+    })
 }
 
 #[cfg(test)]
@@ -1986,6 +1993,23 @@ mod tests {
         assert_eq!(
             snapshot.display_cells().len(),
             snapshot.display_lines().len()
+        );
+    }
+
+    #[test]
+    fn display_rows_retain_a_background_only_space() {
+        let mut state = TerminalState::new(1, 1).expect("valid terminal");
+        state.feed_bytes(b"\x1b[48;2;73;18;146m ");
+        let snapshot = state.snapshot();
+
+        assert_eq!(snapshot.display_lines(), [""]);
+        assert_eq!(snapshot.display_cells().len(), 1);
+        assert_eq!(snapshot.display_cells().next().unwrap()[0].text(), " ");
+        assert!(
+            !snapshot.display_cells().next().unwrap()[0]
+                .attributes()
+                .background()
+                .is_default()
         );
     }
 
