@@ -264,6 +264,7 @@ pub struct TerminalModes {
     mouse_normal_tracking: bool,
     mouse_button_event_tracking: bool,
     mouse_any_event_tracking: bool,
+    mouse_utf8_encoding: bool,
     mouse_sgr_encoding: bool,
     mouse_urxvt_encoding: bool,
 }
@@ -319,6 +320,12 @@ impl TerminalModes {
     #[must_use]
     pub const fn is_mouse_sgr_encoding_enabled(self) -> bool {
         self.mouse_sgr_encoding
+    }
+
+    /// Whether DEC private mode 1005 (UTF-8 mouse encoding) is enabled.
+    #[must_use]
+    pub const fn is_mouse_utf8_encoding_enabled(self) -> bool {
+        self.mouse_utf8_encoding
     }
 
     /// Whether DEC private mode 1015 (urxvt mouse encoding) is enabled.
@@ -937,6 +944,15 @@ impl TerminalState {
                 self.modes.application_keypad = enabled;
             }
             Action::SetPrivateMode { mode, enabled } => self.set_private_mode(mode, enabled),
+            Action::SetPrivateModes {
+                modes,
+                enabled,
+                len,
+            } => {
+                for mode in modes[..len].iter().flatten() {
+                    self.set_private_mode(*mode, enabled);
+                }
+            }
         }
         debug_assert!(self.active.screen.wide_cells_intact());
         if let Some(primary) = &self.primary_screen {
@@ -1262,6 +1278,9 @@ impl TerminalState {
             }
             (PrivateMode::MouseTrackingAnyEvent, enabled) => {
                 self.modes.mouse_any_event_tracking = enabled;
+            }
+            (PrivateMode::MouseEncodingUtf8, enabled) => {
+                self.modes.mouse_utf8_encoding = enabled;
             }
             (PrivateMode::MouseEncodingSgr, enabled) => {
                 self.modes.mouse_sgr_encoding = enabled;

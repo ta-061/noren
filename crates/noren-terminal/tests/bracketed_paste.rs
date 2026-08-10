@@ -45,3 +45,20 @@ fn bracketed_paste_is_independent_of_cursor_and_screen_modes() {
     assert!(state.modes().is_bracketed_paste_enabled());
     assert!(!state.modes().is_alternate_screen_active());
 }
+
+#[test]
+fn multi_param_private_modes_preserve_existing_mode_behavior() {
+    let mut state = TerminalState::new(2, 4).expect("valid terminal");
+
+    state.feed_bytes(b"\x1b[?1;1049;2004h");
+    let modes = state.modes();
+    assert!(modes.is_application_cursor_key_mode());
+    assert!(modes.is_alternate_screen_active());
+    assert!(modes.is_bracketed_paste_enabled());
+
+    state.feed_bytes(b"\x1b[?1;1049;2004l");
+    let modes = state.modes();
+    assert!(!modes.is_application_cursor_key_mode());
+    assert!(!modes.is_alternate_screen_active());
+    assert!(!modes.is_bracketed_paste_enabled());
+}
