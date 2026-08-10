@@ -2272,8 +2272,15 @@ mod tests {
     /// arbitrary vertices would count that bleed as a drawn column and over-
     /// count by one. Each rect is emitted as a 6-vertex fan whose first vertex
     /// is its top-left corner, so the left edges are read from every 6th group.
-    fn rendered_terminal_columns(vertices: &[[f32; 2]], width: u32, cell_width: u32) -> usize {
-        let rect_lefts: Vec<f32> = vertices.chunks_exact(6).map(|rect| rect[0][0]).collect();
+    fn rendered_terminal_columns(
+        vertices: &[renderer::Vertex],
+        width: u32,
+        cell_width: u32,
+    ) -> usize {
+        let rect_lefts: Vec<f32> = vertices
+            .chunks_exact(6)
+            .map(|rect| rect[0].position[0])
+            .collect();
         let mut drawn = 0;
         for col in renderer::SIDEBAR_COLS..usize::from(MAX_RENDER_COLS) {
             let edge = ((col as u32) * cell_width) as f32 / width as f32 * 2.0 - 1.0;

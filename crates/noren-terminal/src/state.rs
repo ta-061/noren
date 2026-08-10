@@ -1508,6 +1508,30 @@ impl TerminalSnapshot {
         &self.display_lines
     }
 
+    /// Display-positioned cell rows of the visible screen, parallel to
+    /// [`display_lines`](Self::display_lines).
+    ///
+    /// Rows are contiguous slices of exactly [`cols`](Self::cols) cells,
+    /// selected exactly like `display_lines` (trailing all-blank rows are
+    /// dropped, so both accessors always agree on the row count and on which
+    /// screen row each entry represents). Enumerating a row yields one cell
+    /// per display column: a width-two character's continuation cell keeps
+    /// its own column with empty text ([`Cell::is_continuation`]), encoding
+    /// the same column rule that `display_lines` encodes with one placeholder
+    /// character — so both accessors agree where every following glyph lands.
+    /// Within a row, trailing blank cells are retained (only whole rows are
+    /// dropped) so per-cell attributes stay addressable to the end of the
+    /// row.
+    #[must_use]
+    pub fn display_cells(&self) -> impl ExactSizeIterator<Item = &[Cell]> {
+        let cols = usize::from(self.screen.cols);
+        let mut rows: Vec<&[Cell]> = self.screen.cells.chunks_exact(cols).collect();
+        while rows.last().is_some_and(|row| row_is_display_blank(row)) {
+            rows.pop();
+        }
+        rows.into_iter()
+    }
+
     /// Retained scrollback rows in eviction order (oldest first, newest last).
     ///
     /// Each row is the full cell content of a primary-screen line that scrolled
@@ -1640,6 +1664,20 @@ fn cells_to_display_line(cells: &[Cell]) -> String {
         line.pop();
     }
     line
+}
+
+/// Whether a cell row renders as a blank display line.
+///
+/// This is exactly the condition under which
+/// [`visible_display_lines`] drops a trailing row: every cell contributes
+/// only spaces (blank cells) or placeholders (continuation cells). Keeping
+/// the predicate here — next to the line builder it mirrors — is what lets
+/// [`TerminalSnapshot::display_cells`] select the same rows as
+/// [`TerminalSnapshot::display_lines`].
+fn row_is_display_blank(cells: &[Cell]) -> bool {
+    cells
+        .iter()
+        .all(|cell| cell.is_blank() || cell.is_continuation())
 }
 
 #[cfg(test)]
@@ -1859,6 +1897,77 @@ mod tests {
         assert_eq!(row_widths(&state, 0), vec![1, 2, 0, 2, 0, 1, 1, 1, 1, 1]);
         assert_eq!(state.snapshot().lines(), ["a日😀b"]);
         assert_eq!(state.cursor(), Cursor { row: 0, column: 6 });
+    }
+
+    #[test]
+    fn display_cells_match_display_lines_column_positions() {
+        let mut state = TerminalState::new(2, 6).expect("valid terminal");
+        state.feed_bytes("a日b".as_bytes());
+        let snapshot = state.snapshot();
+
+        // One cell per display column: the continuation keeps column 2, so
+        // the cell index equals the placeholder character index of
+        // display_lines and `b` sits at display column 3 in both.
+        let cells: &[Cell] = snapshot.display_cells().next().expect("row");
+        assert_eq!(
+            cells.iter().map(|cell| cell.text()).collect::<Vec<_>>(),
+            ["a", "日", "", "b", " ", " "]
+        );
+        assert!(!cells[0].is_continuation());
+        assert!(!cells[1].is_continuation());
+        assert!(cells[2].is_continuation());
+        assert_eq!(snapshot.display_lines()[0].chars().count(), 4);
+        assert_eq!(
+            snapshot.display_lines()[0].chars().nth(3),
+            Some('b'),
+            "the cell index and the display-line character index agree"
+        );
+        // Row selection matches display_lines: identical counts at every
+        // trailing-blank height.
+        assert_eq!(
+            snapshot.display_cells().len(),
+            snapshot.display_lines().len()
+        );
+        let mut more = TerminalState::new(3, 6).expect("valid terminal");
+        more.feed_bytes("x\r\n\r\n".as_bytes());
+        assert_eq!(
+            more.snapshot().display_cells().len(),
+            more.snapshot().display_lines().len()
+        );
+    }
+
+    #[test]
+    fn display_cells_keep_attributes_through_continuations_and_trailing_blanks() {
+        let mut state = TerminalState::new(3, 6).expect("valid terminal");
+        // A printed blank keeps the pen's background; display_lines would
+        // trim it, so cell access is the only way to see it.
+        state.feed_bytes("\x1b[42ma日 \r\nX".as_bytes());
+        let snapshot = state.snapshot();
+
+        let row: Vec<CellAttributes> = snapshot
+            .display_cells()
+            .next()
+            .expect("row")
+            .iter()
+            .map(|cell| *cell.attributes())
+            .collect();
+        // The green background covers the lead, its continuation, and the
+        // printed blank, but not the untouched blanks ahead of the cursor.
+        let green_background =
+            CellAttributes::default().with_background(Color::Ansi(AnsiColor::Green));
+        assert_eq!(row[0], green_background);
+        assert_eq!(row[1], green_background);
+        assert_eq!(row[2], green_background);
+        assert_eq!(row[3], green_background);
+        assert_eq!(row[4], CellAttributes::default());
+        assert_eq!(row[5], CellAttributes::default());
+        assert_eq!(snapshot.display_lines(), ["a日", "X"]);
+        // Trailing blank cells within a row stay addressable, and row
+        // selection still matches display_lines.
+        assert_eq!(
+            snapshot.display_cells().len(),
+            snapshot.display_lines().len()
+        );
     }
 
     #[test]

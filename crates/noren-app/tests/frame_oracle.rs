@@ -19,7 +19,21 @@
 //!   likely real defect;
 //! - the drawn grid dimensions match the state's dimensions;
 //! - per-cell, lit/blank agrees with `TerminalSnapshot` across the FR-005
-//!   fixture classes (prompt, ASCII, UTF-8, control, scrolling).
+//!   fixture classes (prompt, ASCII, UTF-8, control, scrolling);
+//! - two cells carrying different SGR foreground colours draw *different*
+//!   pixel colours, each matching the palette; a cell with no SGR colour keeps
+//!   the unchanged default; truecolor and 256-colour both resolve to their
+//!   expected values (issue #107).
+//!
+//! ## The lit/blank gate
+//!
+//! `is_background` originally thresholded on brightness, which was sufficient
+//! only while every glyph was one bright-green constant — as the earlier
+//! version of this file noted. It now compares against the renderer's
+//! `CLEAR_COLOR` instead. That is strictly stronger, not weaker: a dark
+//! foreground (ANSI black, a dark truecolor shade) is correctly read as lit
+//! where the threshold would have called it background and thereby agreed with
+//! a renderer that dropped the cell.
 //!
 //! ## Faithfulness
 //!
@@ -43,7 +57,9 @@ mod renderer_capture;
 
 use noren_app::{GridGeometry, POC_CELL_HEIGHT as CELL_HEIGHT, POC_CELL_WIDTH as CELL_WIDTH};
 use noren_terminal::{TerminalSnapshot, TerminalState};
-use renderer_capture::renderer_source::SIDEBAR_COLS;
+use renderer_capture::renderer_source::{
+    CLEAR_COLOR, DEFAULT_ANSI_PALETTE, DEFAULT_FOREGROUND, DEFAULT_PALETTE, SIDEBAR_COLS,
+};
 use renderer_capture::{CaptureError, CapturedFrame, OffscreenRenderer};
 
 /// The PoC default cell metrics, used by every frame-oracle capture call so
@@ -66,12 +82,47 @@ fn render(renderer: &OffscreenRenderer, snapshot: &TerminalSnapshot) -> Captured
     renderer.capture(Some(snapshot), None, None, width, height, poc_metrics())
 }
 
-/// A pixel counts as "background" when it is close to the clear colour. Glyph
-/// pixels are drawn at the fragment shader's constant `0.80/0.92/0.82` (bright
-/// green), the clear at `0.035/0.045/0.04` (near-black), so a brightness gate
-/// is robust across minor driver rounding.
+/// The clear colour as captured bytes, derived from the renderer's own
+/// [`CLEAR_COLOR`] rather than a literal, so a change to the clear colour
+/// cannot silently invalidate every lit/blank assertion below.
+fn clear_rgb() -> [u8; 3] {
+    [CLEAR_COLOR.r, CLEAR_COLOR.g, CLEAR_COLOR.b].map(|channel| (channel * 255.0).round() as u8)
+}
+
+/// Per-channel tolerance for comparing a captured pixel to an expected colour.
+///
+/// The offscreen target is linear `Rgba8Unorm` and the shader writes the
+/// colour through unchanged, so the only error is float-to-byte rounding in
+/// the GPU's blend/store stage: at most one unit. Two units gives a margin for
+/// driver rounding-mode differences while staying far tighter than the gap
+/// between any two palette entries (the closest pair differs by 10).
+const CHANNEL_TOLERANCE: u8 = 2;
+
+/// Whether two colours match within [`CHANNEL_TOLERANCE`] on every channel.
+fn colors_match(actual: [u8; 3], expected: [u8; 3]) -> bool {
+    actual
+        .iter()
+        .zip(expected.iter())
+        .all(|(a, e)| a.abs_diff(*e) <= CHANNEL_TOLERANCE)
+}
+
+/// A pixel counts as "background" when it is exactly the clear colour.
+///
+/// This is deliberately an *equality* test against the clear colour, not the
+/// brightness threshold this oracle used before colour existed. That gate
+/// (`all channels < 48`) assumed every glyph was the shader's bright-green
+/// constant; it was flagged in this file as insufficient once colour landed,
+/// and it is: a cell drawn in ANSI black or in a dark truecolor shade is lit
+/// but has every channel under 48, so the brightness gate would report it
+/// blank and the lit/blank agreement checks would silently pass on a renderer
+/// that dropped those cells entirely.
+///
+/// Comparing to the clear colour instead is strictly stronger — it accepts
+/// only the one byte colour nothing was drawn in — and it is what lets
+/// [`cell_colors`] below distinguish *which* colour a lit cell holds rather
+/// than merely that something is lit.
 fn is_background(rgba: [u8; 4]) -> bool {
-    rgba[0] < 48 && rgba[1] < 48 && rgba[2] < 48
+    [rgba[0], rgba[1], rgba[2]] == clear_rgb()
 }
 
 /// Whether any lit (non-background) pixel falls inside cell `(row, col)`.
@@ -101,6 +152,52 @@ fn cell_pattern(frame: &CapturedFrame, row: u32, col: u32) -> Vec<bool> {
         }
     }
     pattern
+}
+
+/// The distinct lit (non-background) colours inside cell `(row, col)`.
+///
+/// This is the colour-aware counterpart of [`cell_pattern`]: where that
+/// records only *which* pixels are lit, this records *what colour* they are,
+/// which is what makes "two cells with different SGR colours differ" an
+/// assertion about colour rather than about glyph shape.
+fn cell_colors(frame: &CapturedFrame, row: u32, col: u32) -> Vec<[u8; 3]> {
+    let mut colors: Vec<[u8; 3]> = Vec::new();
+    for y in 0..CELL_HEIGHT {
+        for x in 0..CELL_WIDTH {
+            let pixel = frame.pixel(col * CELL_WIDTH + x, row * CELL_HEIGHT + y);
+            if is_background(pixel) {
+                continue;
+            }
+            let rgb = [pixel[0], pixel[1], pixel[2]];
+            if !colors.iter().any(|seen| colors_match(*seen, rgb)) {
+                colors.push(rgb);
+            }
+        }
+    }
+    colors
+}
+
+/// The single colour a cell's glyph is drawn in.
+///
+/// Panics if the cell is unlit or holds more than one distinct colour — a
+/// glyph is drawn in exactly one foreground colour, so either case means the
+/// renderer is not doing what the test assumes and the test must fail loudly
+/// rather than silently pick a colour.
+fn cell_color(frame: &CapturedFrame, row: u32, col: u32) -> [u8; 3] {
+    let colors = cell_colors(frame, row, col);
+    assert_eq!(
+        colors.len(),
+        1,
+        "cell ({row},{col}) should hold exactly one lit colour, found {colors:?}"
+    );
+    colors[0]
+}
+
+/// The default foreground as captured bytes, derived from the renderer's own
+/// [`DEFAULT_FOREGROUND`] so the "unstyled cells are unchanged" assertion
+/// tracks the renderer rather than a literal copied here.
+fn default_foreground_rgb() -> [u8; 3] {
+    DEFAULT_FOREGROUND.map(|channel| (channel * 255.0).round() as u8)
 }
 
 /// State-driven blankness: a cell is blank when the row is absent, the column
@@ -310,6 +407,181 @@ fn state_and_render_agree_across_the_fr005_fixtures() {
     assert!(
         checked >= 4 * 2 * 6,
         "agreement checks covered {checked} cells"
+    );
+}
+
+// ===========================================================================
+// Colour (issue #107): colour was modelled in terminal state but never reached
+// drawing, so every cell rendered in one shade of green. These assertions read
+// the *colour* of drawn pixels, not merely whether they are lit — the
+// distinction the brightness gate above could not make.
+// ===========================================================================
+
+#[test]
+fn cells_with_different_sgr_foregrounds_render_different_colours() {
+    // The headline defect: before colour was wired, these two cells drew the
+    // same green and this test could not exist. Both cells hold 'A', so the
+    // glyph shape is identical and only the colour can differ.
+    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let snap = snapshot(1, 4, b"\x1b[31mA\x1b[32mA");
+    let frame = render(&renderer, &snap);
+
+    let red_cell = cell_color(&frame, 0, 0);
+    let green_cell = cell_color(&frame, 0, 1);
+
+    // Not merely both lit — actually different colours.
+    assert!(
+        !colors_match(red_cell, green_cell),
+        "SGR 31 and SGR 32 cells rendered the same colour {red_cell:?} — \
+         colour is not reaching the renderer (issue #107)"
+    );
+    // And each is the colour the palette says it is.
+    assert!(
+        colors_match(red_cell, DEFAULT_ANSI_PALETTE[1]),
+        "SGR 31 should draw palette red {:?}, drew {red_cell:?}",
+        DEFAULT_ANSI_PALETTE[1]
+    );
+    assert!(
+        colors_match(green_cell, DEFAULT_ANSI_PALETTE[2]),
+        "SGR 32 should draw palette green {:?}, drew {green_cell:?}",
+        DEFAULT_ANSI_PALETTE[2]
+    );
+}
+
+#[test]
+fn a_cell_with_no_sgr_colour_keeps_the_default_appearance() {
+    // The compatibility half of issue #107: wiring colour must not change how
+    // an unstyled prompt looks.
+    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let snap = snapshot(1, 4, b"$ A");
+    let frame = render(&renderer, &snap);
+
+    let expected = default_foreground_rgb();
+    for col in [0_u32, 2] {
+        let drawn = cell_color(&frame, 0, col);
+        assert!(
+            colors_match(drawn, expected),
+            "unstyled cell ({col}) drew {drawn:?}, expected the unchanged \
+             default foreground {expected:?}"
+        );
+    }
+    // Pin the default to the exact shade the fragment shader returned as a
+    // constant before colour existed: 0.80/0.92/0.82 -> 204/235/209.
+    assert_eq!(expected, [204, 235, 209]);
+}
+
+#[test]
+fn truecolor_and_256_colour_both_resolve_to_their_expected_pixels() {
+    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+
+    // Truecolor: SGR 38;2;R;G;B must produce exactly those channels. The
+    // value is deliberately not a palette entry, so only a real truecolor
+    // path can produce it.
+    let truecolor = snapshot(1, 4, b"\x1b[38;2;17;119;221mA");
+    let truecolor_frame = render(&renderer, &truecolor);
+    let drawn = cell_color(&truecolor_frame, 0, 0);
+    assert!(
+        colors_match(drawn, [17, 119, 221]),
+        "truecolor 38;2;17;119;221 drew {drawn:?}, expected [17, 119, 221] \
+         within ±{CHANNEL_TOLERANCE} per channel"
+    );
+
+    // 256-colour: index 196 is the colour cube's pure red (5,0,0).
+    let indexed = snapshot(1, 4, b"\x1b[38;5;196mA");
+    let indexed_frame = render(&renderer, &indexed);
+    let drawn_indexed = cell_color(&indexed_frame, 0, 0);
+    assert!(
+        colors_match(drawn_indexed, DEFAULT_PALETTE[196]),
+        "256-colour index 196 drew {drawn_indexed:?}, expected {:?}",
+        DEFAULT_PALETTE[196]
+    );
+    assert_eq!(DEFAULT_PALETTE[196], [255, 0, 0]);
+
+    // A grayscale-ramp index resolves too, and differs from both above.
+    let gray = snapshot(1, 4, b"\x1b[38;5;244mA");
+    let gray_frame = render(&renderer, &gray);
+    let drawn_gray = cell_color(&gray_frame, 0, 0);
+    assert!(
+        colors_match(drawn_gray, DEFAULT_PALETTE[244]),
+        "256-colour index 244 drew {drawn_gray:?}, expected {:?}",
+        DEFAULT_PALETTE[244]
+    );
+    assert!(!colors_match(drawn_gray, drawn_indexed));
+}
+
+#[test]
+fn the_16_colour_and_256_colour_forms_of_one_colour_agree() {
+    // `SGR 31` and `SGR 38;5;1` name the same colour. If they resolved through
+    // different tables they could drift apart; both must reach one palette.
+    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let snap = snapshot(1, 4, b"\x1b[31mA\x1b[38;5;1mA");
+    let frame = render(&renderer, &snap);
+
+    let ansi_form = cell_color(&frame, 0, 0);
+    let indexed_form = cell_color(&frame, 0, 1);
+    assert!(
+        colors_match(ansi_form, indexed_form),
+        "SGR 31 drew {ansi_form:?} but SGR 38;5;1 drew {indexed_form:?} — \
+         the two forms of ANSI red must resolve through one palette"
+    );
+}
+
+#[test]
+fn a_dark_coloured_cell_is_still_seen_as_lit() {
+    // This is the case the old brightness gate got wrong: ANSI black is a
+    // legitimate foreground whose channels are all far below the old `< 48`
+    // threshold, so a threshold-based oracle would call the cell blank and
+    // agree with a renderer that dropped it. `is_background` now compares to
+    // the clear colour, so the cell reads as lit and the colour is checked.
+    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let snap = snapshot(1, 4, b"\x1b[30mA");
+    let frame = render(&renderer, &snap);
+
+    assert!(
+        cell_is_lit(&frame, 0, 0),
+        "an ANSI-black 'A' must count as lit — it is drawn, just dark"
+    );
+    let drawn = cell_color(&frame, 0, 0);
+    assert!(
+        colors_match(drawn, DEFAULT_ANSI_PALETTE[0]),
+        "SGR 30 should draw palette black {:?}, drew {drawn:?}",
+        DEFAULT_ANSI_PALETTE[0]
+    );
+    // The old gate would have mistaken this for background; the new one must not.
+    assert!(drawn.iter().all(|channel| *channel < 48));
+}
+
+#[test]
+fn colour_follows_the_cell_across_wide_characters_and_rows() {
+    // Colour must be addressed per cell in the renderer's coordinate model,
+    // not per character of a flattened string: a wide lead's continuation
+    // column must not shift the colour of the glyph that follows it.
+    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    // 'a' default, then a red wide char (columns 1-2), then green 'b' at
+    // display column 3.
+    let snap = snapshot(2, 6, "a\x1b[31m日\x1b[32mb\r\n\x1b[34mc".as_bytes());
+    let frame = render(&renderer, &snap);
+
+    assert!(
+        colors_match(cell_color(&frame, 0, 0), default_foreground_rgb()),
+        "the unstyled 'a' must keep the default foreground"
+    );
+    assert!(
+        colors_match(cell_color(&frame, 0, 1), DEFAULT_ANSI_PALETTE[1]),
+        "the wide lead at column 1 must be red"
+    );
+    assert!(
+        !cell_is_lit(&frame, 0, 2),
+        "the wide continuation column must stay unlit"
+    );
+    assert!(
+        colors_match(cell_color(&frame, 0, 3), DEFAULT_ANSI_PALETTE[2]),
+        "'b' at display column 3 must be green — colour tracked the cell \
+         across the continuation column"
+    );
+    assert!(
+        colors_match(cell_color(&frame, 1, 0), DEFAULT_ANSI_PALETTE[4]),
+        "'c' on row 1 must be blue"
     );
 }
 
