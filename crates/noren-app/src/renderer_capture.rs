@@ -50,7 +50,9 @@ use std::thread;
 
 use noren_app::CellMetrics;
 use noren_terminal::TerminalSnapshot;
-use renderer_source::{CLEAR_COLOR, SHADER, glyph_vertices, vertex_bytes};
+use renderer_source::{
+    CLEAR_COLOR, SHADER, VERTEX_ATTRIBUTES, VERTEX_BYTES, glyph_vertices, vertex_bytes,
+};
 
 /// Linear RGBA8 (non-sRGB) offscreen target.
 ///
@@ -146,14 +148,15 @@ impl OffscreenRenderer {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
+                // The shipped renderer's own layout constants, not a parallel
+                // copy: a stride or attribute-offset change in `renderer.rs`
+                // reaches the oracle's pipeline automatically, so the oracle
+                // cannot keep passing against a layout the binary no longer
+                // uses.
                 buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: 8,
+                    array_stride: VERTEX_BYTES as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[wgpu::VertexAttribute {
-                        format: wgpu::VertexFormat::Float32x2,
-                        offset: 0,
-                        shader_location: 0,
-                    }],
+                    attributes: &VERTEX_ATTRIBUTES,
                 })],
             },
             primitive: wgpu::PrimitiveState::default(),
