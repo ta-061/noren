@@ -428,35 +428,44 @@ fn tokenize(line: &str, line_number: usize) -> Result<Vec<String>, SshConfigErro
     let mut token = String::new();
     let mut quoted = false;
     let mut escaped = false;
+    let mut token_started = false;
     let mut boundary = true;
     for character in line.chars() {
         if escaped {
             token.push(character);
             escaped = false;
+            token_started = true;
             boundary = false;
             continue;
         }
         match character {
-            '\\' => escaped = true,
+            '\\' => {
+                escaped = true;
+                token_started = true;
+            }
             '"' => {
                 quoted = !quoted;
+                token_started = true;
                 boundary = false;
             }
             '#' if !quoted && boundary => break,
             '=' if !quoted => {
-                if !token.is_empty() {
+                if token_started {
                     tokens.push(std::mem::take(&mut token));
                 }
+                token_started = false;
                 boundary = true;
             }
             character if character.is_whitespace() && !quoted => {
-                if !token.is_empty() {
+                if token_started {
                     tokens.push(std::mem::take(&mut token));
                 }
+                token_started = false;
                 boundary = true;
             }
             character => {
                 token.push(character);
+                token_started = true;
                 boundary = false;
             }
         }
@@ -464,7 +473,7 @@ fn tokenize(line: &str, line_number: usize) -> Result<Vec<String>, SshConfigErro
     if escaped || quoted {
         return Err(error(line_number, SshConfigErrorKind::UnterminatedArgument));
     }
-    if !token.is_empty() {
+    if token_started {
         tokens.push(token);
     }
     Ok(tokens)
@@ -488,29 +497,39 @@ fn has_wildcard(pattern: &str) -> bool {
 }
 
 fn wildcard_match(pattern: &str, candidate: &str) -> bool {
-    fn matches(pattern: &[char], candidate: &[char]) -> bool {
-        match pattern.split_first() {
-            None => candidate.is_empty(),
-            Some(('*', rest)) => {
-                matches(rest, candidate)
-                    || candidate
-                        .split_first()
-                        .is_some_and(|(_, rest_candidate)| matches(pattern, rest_candidate))
-            }
-            Some((pattern_character, rest)) => {
-                candidate
-                    .split_first()
-                    .is_some_and(|(candidate_character, rest_candidate)| {
-                        (pattern_character == &'?'
-                            || pattern_character.eq_ignore_ascii_case(candidate_character))
-                            && matches(rest, rest_candidate)
-                    })
-            }
-        }
-    }
+    // Greedily consume characters and retry only from the latest star. This
+    // keeps matching iterative and linear in the pattern/candidate lengths.
     let pattern: Vec<char> = pattern.chars().collect();
     let candidate: Vec<char> = candidate.chars().collect();
-    matches(&pattern, &candidate)
+    let mut pattern_index = 0;
+    let mut candidate_index = 0;
+    let mut star_index = None;
+    let mut star_candidate_index = 0;
+
+    while candidate_index < candidate.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '?'
+                || pattern[pattern_index].eq_ignore_ascii_case(&candidate[candidate_index]))
+        {
+            pattern_index += 1;
+            candidate_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            star_index = Some(pattern_index);
+            pattern_index += 1;
+            star_candidate_index = candidate_index;
+        } else if let Some(star_index) = star_index {
+            pattern_index = star_index + 1;
+            star_candidate_index += 1;
+            candidate_index = star_candidate_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
 }
 
 fn canonicalize_within(path: &Path, root: &Path) -> Option<PathBuf> {
@@ -720,6 +739,47 @@ mod tests {
             .find(|host| host.alias() == "api.example")
             .expect("api host");
         assert_eq!(api.host_name(), Some("example-host"));
+    }
+
+    #[test]
+    fn pathological_nonmatching_wildcard_completes_quickly() {
+        let pattern = "*a*a*a*a*a*a*a*a*a*a*b";
+        let alias = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let text = format!("Host {alias}\nHostName target\nHost {pattern}\n");
+        let started = std::time::Instant::now();
+
+        for _ in 0..3 {
+            let config = SshConfig::parse(&text).expect("pathological config parses");
+            assert_eq!(config.hosts().len(), 1);
+            assert_eq!(config.hosts()[0].host_name(), Some("target"));
+        }
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "pathological wildcard matching took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn very_long_host_pattern_parses_without_recursion() {
+        let pattern = "a".repeat(300_000);
+        let text = format!("Host {pattern}\nHostName long.example\n");
+
+        let config = SshConfig::parse(&text).expect("long Host pattern parses");
+
+        assert_eq!(config.hosts().len(), 1);
+        assert_eq!(config.hosts()[0].alias(), pattern);
+        assert_eq!(config.hosts()[0].host_name(), Some("long.example"));
+    }
+
+    #[test]
+    fn empty_quoted_values_are_preserved() {
+        let config = SshConfig::parse("Host empty\nHostName \"\"\nUser \"\" realuser\n")
+            .expect("empty quoted values parse");
+
+        assert_eq!(config.hosts()[0].host_name(), Some(""));
+        assert_eq!(config.hosts()[0].user(), Some(""));
     }
 
     #[test]
