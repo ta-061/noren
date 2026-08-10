@@ -19,6 +19,7 @@ pub mod session;
 pub mod session_persistence;
 pub mod session_supervisor;
 pub mod sidebar;
+pub mod ssh_config;
 
 pub use clipboard::{
     BRACKET_PASTE_BEGIN, BRACKET_PASTE_END, ClipboardError, PasteReject, SystemClipboard,
