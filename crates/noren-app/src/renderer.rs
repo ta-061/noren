@@ -778,23 +778,13 @@ mod tests {
         GridGeometry::poc().cell_metrics()
     }
 
-    #[test]
-    fn glyph_input_is_bounded_to_visible_poc_grid() {
-        // Grid dimensions one past the renderer limits exercise the same
-        // dimension clamps as u32::MAX: visible_rows clamps to
-        // MAX_RENDER_ROWS and terminal_cols clamps to MAX_RENDER_COLS.
-        // No overflow path exists — all dimension arithmetic uses
-        // saturating_add and clamp — so u32::MAX adds no coverage beyond
-        // these values.
-        let rows = MAX_RENDER_ROWS + 1;
-        let cols = MAX_RENDER_COLS + 1;
-        let bytes = vec![b'A'; usize::from(rows) * usize::from(cols)];
-        let terminal = snapshot(rows, cols, &bytes);
-        let width = u32::from(cols) * CELL_WIDTH + CELL_WIDTH;
-        let height = u32::from(rows) * CELL_HEIGHT + CELL_HEIGHT;
-        let vertices = glyph_vertices(Some(&terminal), None, None, width, height, poc_metrics());
-        assert!(vertices.len() <= MAX_VERTICES);
-    }
+    // NOTE: the renderer's row/column clamp coverage used to live here as
+    // `glyph_input_is_bounded_to_visible_poc_grid`, a count-based test that
+    // could not distinguish the clamps from the `MAX_VERTICES` backstop (issue
+    // #109). It is replaced by `frame_oracle::glyphs_stay_inside_the_render_clamp_grid`,
+    // which reads pixels back from the real pipeline and asserts on *where*
+    // glyphs land — the property a vertex-count assertion is structurally
+    // unable to pin.
 
     #[test]
     fn empty_and_zero_sized_inputs_have_no_vertices() {
@@ -900,7 +890,6 @@ mod tests {
     }
 
     const CELL_WIDTH: u32 = noren_app::POC_CELL_WIDTH;
-    const CELL_HEIGHT: u32 = noren_app::POC_CELL_HEIGHT;
 
     fn ndc_left(column: u32) -> f32 {
         (column * CELL_WIDTH) as f32 / 900.0 * 2.0 - 1.0
