@@ -890,10 +890,11 @@ fn open_regular_file(path: &Path) -> Option<File> {
         // Callers pass a path that fs::canonicalize already resolved to a
         // symlink-free in-root location, so legitimate in-root symlinks have
         // collapsed to their regular-file targets before this point. The
-        // confinement flags below make a single open(2) both traverse and
-        // validate, closing the TOCTOU window between canonicalization and
-        // open: the kernel refuses any symlink it meets on the way. See
-        // [`open_confinement_flags`] for what each platform guarantees.
+        // confinement flag below participates in that same open(2), closing
+        // the post-canonicalization final-component race on every Unix target.
+        // Apple also rejects symlinks in ancestor components atomically; other
+        // Unix targets continue to rely on the canonical root checks for
+        // ancestor confinement. See [`open_confinement_flags`] for details.
         //
         // O_NONBLOCK prevents a FIFO or similar special source from stalling
         // before any byte budget can apply. Inspect the opened descriptor, not
@@ -914,9 +915,9 @@ fn open_regular_file(path: &Path) -> Option<File> {
     }
 }
 
-/// Symlink-confinement flags ORed into the single `open(2)` call so the kernel
-/// refuses any symlink it encounters while resolving the path, leaving no gap
-/// between canonicalization and open for an attacker to exploit.
+/// Symlink-confinement flags ORed into the single `open(2)` call. Apple rejects
+/// symlinks in any path component atomically. Other Unix targets reject only a
+/// final-component symlink and rely on the canonical root checks for ancestors.
 #[cfg(unix)]
 fn open_confinement_flags() -> libc::c_int {
     // Apple (Noren's supported macOS target): `O_NOFOLLOW_ANY` makes the kernel
@@ -1348,18 +1349,27 @@ mod tests {
     }
 
     #[cfg(unix)]
-    const FIFO_CHILD_MARKER: &str = "NOREN_SSH_CONFIG_FIFO_TEST_CHILD";
+    const FIFO_HELPER_TEST: &str = "ssh_config::tests::fifo_subprocess_helper";
     #[cfg(unix)]
-    const FIFO_CHILD_PATH: &str = "NOREN_SSH_CONFIG_FIFO_TEST_PATH";
-
+    const FIFO_HELPER_MODE_ENV: &str = "NOREN_SSH_CONFIG_FIFO_HELPER_MODE";
     #[cfg(unix)]
-    fn fifo_child_config() -> Option<SshConfig> {
-        env::var_os(FIFO_CHILD_MARKER)?;
-        let path = PathBuf::from(
-            env::var_os(FIFO_CHILD_PATH).expect("FIFO child path accompanies child marker"),
-        );
-        Some(SshConfig::read(&path).expect("FIFO source is ignored without an error"))
-    }
+    const FIFO_HELPER_PATH_ENV: &str = "NOREN_SSH_CONFIG_FIFO_HELPER_PATH";
+    #[cfg(unix)]
+    const FIFO_HELPER_EXPECTED_ENV: &str = "NOREN_SSH_CONFIG_FIFO_HELPER_EXPECTED";
+    #[cfg(unix)]
+    const FIFO_HELPER_NONCE_ENV: &str = "NOREN_SSH_CONFIG_FIFO_HELPER_NONCE";
+    #[cfg(unix)]
+    const FIFO_HELPER_ACK_ENV: &str = "NOREN_SSH_CONFIG_FIFO_HELPER_ACK";
+    #[cfg(unix)]
+    const FIFO_HELPER_MODE_OPEN_REGULAR_FILE: &str = "open-regular-file";
+    #[cfg(unix)]
+    const FIFO_HELPER_MODE_READ_CONFIG: &str = "read-config";
+    #[cfg(unix)]
+    const FIFO_HELPER_EXPECTED_NONE: &str = "none";
+    #[cfg(unix)]
+    const FIFO_HELPER_EXPECTED_EMPTY: &str = "empty";
+    #[cfg(unix)]
+    const FIFO_HELPER_EXPECTED_AFTER_FIFOS: &str = "after-fifos";
 
     #[cfg(unix)]
     fn create_fifo(path: &Path) {
@@ -1374,32 +1384,164 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn assert_fifo_test_completes(test_name: &str, config_path: &Path) {
+    fn fifo_helper_nonce() -> String {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{}-{timestamp}-{sequence}", std::process::id())
+    }
+
+    #[cfg(unix)]
+    fn fifo_helper_acknowledgement(nonce: &str, mode: &str, path: &Path, expected: &str) -> String {
+        format!(
+            "noren-fifo-helper-v1\nnonce={nonce:?}\nmode={mode:?}\npath={path:?}\nexpected={expected:?}\n"
+        )
+    }
+
+    #[cfg(unix)]
+    fn remove_fifo_helper_acknowledgement(path: &Path) -> std::io::Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_fifo_helper_completes(
+        mode: &str,
+        path: &Path,
+        expected: &str,
+        acknowledgement_path: &Path,
+    ) {
+        assert!(
+            !acknowledgement_path.exists(),
+            "FIFO helper acknowledgement must start absent"
+        );
+        let nonce = fifo_helper_nonce();
+        let expected_acknowledgement = fifo_helper_acknowledgement(&nonce, mode, path, expected);
         let mut child = std::process::Command::new(
             env::current_exe().expect("locate the current unit-test executable"),
         )
         .arg("--exact")
-        .arg(test_name)
+        .arg(FIFO_HELPER_TEST)
+        .arg("--ignored")
         .arg("--nocapture")
-        .env(FIFO_CHILD_MARKER, "1")
-        .env(FIFO_CHILD_PATH, config_path)
+        .env_remove("NOREN_SSH_CONFIG_FIFO_TEST_CHILD")
+        .env_remove("NOREN_SSH_CONFIG_FIFO_TEST_PATH")
+        .env(FIFO_HELPER_MODE_ENV, mode)
+        .env(FIFO_HELPER_PATH_ENV, path)
+        .env(FIFO_HELPER_EXPECTED_ENV, expected)
+        .env(FIFO_HELPER_NONCE_ENV, &nonce)
+        .env(FIFO_HELPER_ACK_ENV, acknowledgement_path)
         .spawn()
         .expect("spawn bounded FIFO regression subprocess");
         let timeout = std::time::Duration::from_secs(2);
         let deadline = std::time::Instant::now() + timeout;
 
-        loop {
-            if let Some(status) = child.try_wait().expect("poll FIFO regression subprocess") {
-                assert!(status.success(), "FIFO regression subprocess failed");
-                return;
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("FIFO regression subprocess exceeded {timeout:?}");
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    break child
+                        .wait()
+                        .expect("reap completed FIFO regression subprocess");
+                }
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let kill_result = child.kill();
+                    let reap_result = child.wait();
+                    let cleanup_result = remove_fifo_helper_acknowledgement(acknowledgement_path);
+                    panic!(
+                        "FIFO regression subprocess exceeded {timeout:?}; \
+                         kill={kill_result:?}, reap={reap_result:?}, \
+                         acknowledgement_cleanup={cleanup_result:?}"
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let kill_result = child.kill();
+                    let reap_result = child.wait();
+                    let cleanup_result = remove_fifo_helper_acknowledgement(acknowledgement_path);
+                    panic!(
+                        "could not poll FIFO regression subprocess: {error}; \
+                         kill={kill_result:?}, reap={reap_result:?}, \
+                         acknowledgement_cleanup={cleanup_result:?}"
+                    );
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        let acknowledgement = fs::read_to_string(acknowledgement_path);
+        let cleanup_result = remove_fifo_helper_acknowledgement(acknowledgement_path);
+        assert!(
+            status.success(),
+            "FIFO regression subprocess failed with {status}; \
+             acknowledgement={acknowledgement:?}, cleanup={cleanup_result:?}"
+        );
+        cleanup_result.expect("remove FIFO helper acknowledgement");
+        let acknowledgement = acknowledgement
+            .expect("FIFO helper must acknowledge the exact invoked test and protocol");
+        assert_eq!(
+            acknowledgement, expected_acknowledgement,
+            "FIFO helper acknowledgement must match its nonce and invocation"
+        );
+        assert!(
+            !acknowledgement_path.exists(),
+            "FIFO helper acknowledgement must be removed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "invoked only by bounded FIFO parent tests"]
+    fn fifo_subprocess_helper() {
+        let mode = env::var(FIFO_HELPER_MODE_ENV).expect("FIFO helper mode is supplied by parent");
+        let path = PathBuf::from(
+            env::var_os(FIFO_HELPER_PATH_ENV).expect("FIFO helper path is supplied by parent"),
+        );
+        let expected = env::var(FIFO_HELPER_EXPECTED_ENV)
+            .expect("FIFO helper expected result is supplied by parent");
+        let nonce =
+            env::var(FIFO_HELPER_NONCE_ENV).expect("FIFO helper nonce is supplied by parent");
+        let acknowledgement_path = PathBuf::from(
+            env::var_os(FIFO_HELPER_ACK_ENV)
+                .expect("FIFO helper acknowledgement path is supplied by parent"),
+        );
+
+        match (mode.as_str(), expected.as_str()) {
+            (FIFO_HELPER_MODE_OPEN_REGULAR_FILE, FIFO_HELPER_EXPECTED_NONE) => {
+                assert!(
+                    open_regular_file(&path).is_none(),
+                    "FIFO descriptor must be rejected by opened-descriptor metadata"
+                );
+            }
+            (FIFO_HELPER_MODE_READ_CONFIG, FIFO_HELPER_EXPECTED_EMPTY) => {
+                let config =
+                    SshConfig::read(&path).expect("FIFO source is ignored without an error");
+                assert!(config.hosts().is_empty());
+            }
+            (FIFO_HELPER_MODE_READ_CONFIG, FIFO_HELPER_EXPECTED_AFTER_FIFOS) => {
+                let config =
+                    SshConfig::read(&path).expect("included FIFO sources are ignored promptly");
+                assert_eq!(config.hosts().len(), 1);
+                assert_eq!(config.hosts()[0].alias(), "after-fifos");
+                assert_eq!(config.hosts()[0].user(), Some("parsed"));
+            }
+            _ => panic!("unsupported FIFO helper protocol: mode={mode:?}, expected={expected:?}"),
         }
+
+        let acknowledgement = fifo_helper_acknowledgement(&nonce, &mode, &path, &expected);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&acknowledgement_path)
+            .expect("create fresh FIFO helper acknowledgement");
+        file.write_all(acknowledgement.as_bytes())
+            .expect("write FIFO helper acknowledgement");
     }
 
     fn components_through_first_wildcard(path: &Path) -> usize {
@@ -2843,11 +2985,13 @@ mod tests {
         }
     }
 
-    /// Direct production-seam coverage for [`open_regular_file`], exercising each
-    /// independent confinement backstop in isolation. The paths are built from a
-    /// `canonicalize`-resolved fixture root so the only symlink on each path is
-    /// the one the test controls, keeping the assertions deterministic regardless
-    /// of the host temp directory's own ancestor symlinks.
+    /// Production-seam coverage for [`open_regular_file`], exercising each
+    /// independent confinement backstop in isolation. The paths are built from
+    /// a `canonicalize`-resolved fixture root so the only symlink on each path
+    /// is the one the test controls, keeping the assertions deterministic
+    /// regardless of the host temp directory's own ancestor symlinks. The FIFO
+    /// seam is invoked by the bounded subprocess helper so losing `O_NONBLOCK`
+    /// cannot hang the main test process.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn open_regular_file_rejects_ancestor_symlink_atomically() {
@@ -2896,37 +3040,35 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn open_regular_file_rejects_fifo_descriptor_via_metadata() {
-        // O_NONBLOCK lets open(2) return a FIFO descriptor promptly; the
-        // opened-descriptor metadata check must then reject it. This pins the
-        // is_file() guard independently of the path-based checks: bypassing the
-        // descriptor metadata check makes open_regular_file return Some(File)
-        // for the FIFO and fails this test. A directory-only assertion would be
-        // vacuous (read_to_end on a directory errors regardless), so a FIFO is
-        // used as the representative non-regular special file.
+        // The helper invokes open_regular_file directly. O_NONBLOCK lets
+        // open(2) return a FIFO descriptor promptly, and the opened-descriptor
+        // metadata check must then reject it. Bypassing is_file() fails in the
+        // child; removing O_NONBLOCK times out, after which the parent kills
+        // and reaps the child. A directory-only assertion would be vacuous
+        // because read_to_end on a directory errors regardless.
         let fixture = Fixture::new("fifo-descriptor");
         create_fifo(&fixture.root.join("source.fifo"));
         let canonical_root = fs::canonicalize(&fixture.root).expect("canonical fixture root");
         let path = canonical_root.join("source.fifo");
-        assert!(
-            open_regular_file(&path).is_none(),
-            "FIFO descriptor must be rejected by the opened-descriptor metadata check"
+        assert_fifo_helper_completes(
+            FIFO_HELPER_MODE_OPEN_REGULAR_FILE,
+            &path,
+            FIFO_HELPER_EXPECTED_NONE,
+            &fixture.root.join("helper.ack"),
         );
     }
 
     #[cfg(unix)]
     #[test]
     fn top_level_fifo_returns_promptly() {
-        if let Some(config) = fifo_child_config() {
-            assert!(config.hosts().is_empty());
-            return;
-        }
-
         let fixture = Fixture::new("top-level-fifo");
         let fifo_path = fixture.root.join("config.fifo");
         create_fifo(&fifo_path);
-        assert_fifo_test_completes(
-            "ssh_config::tests::top_level_fifo_returns_promptly",
+        assert_fifo_helper_completes(
+            FIFO_HELPER_MODE_READ_CONFIG,
             &fifo_path,
+            FIFO_HELPER_EXPECTED_EMPTY,
+            &fixture.root.join("helper.ack"),
         );
     }
 
@@ -2935,19 +3077,16 @@ mod tests {
     fn top_level_symlink_to_fifo_returns_promptly() {
         use std::os::unix::fs::symlink;
 
-        if let Some(config) = fifo_child_config() {
-            assert!(config.hosts().is_empty());
-            return;
-        }
-
         let fixture = Fixture::new("top-level-fifo-symlink");
         let fifo_path = fixture.root.join("target.fifo");
         let symlink_path = fixture.root.join("config");
         create_fifo(&fifo_path);
         symlink("target.fifo", &symlink_path).expect("create top-level FIFO symlink");
-        assert_fifo_test_completes(
-            "ssh_config::tests::top_level_symlink_to_fifo_returns_promptly",
+        assert_fifo_helper_completes(
+            FIFO_HELPER_MODE_READ_CONFIG,
             &symlink_path,
+            FIFO_HELPER_EXPECTED_EMPTY,
+            &fixture.root.join("helper.ack"),
         );
     }
 
@@ -2955,12 +3094,6 @@ mod tests {
     #[test]
     fn included_fifo_sources_return_promptly() {
         use std::os::unix::fs::symlink;
-
-        if let Some(config) = fifo_child_config() {
-            assert_eq!(config.hosts().len(), 1);
-            assert_eq!(config.hosts()[0].alias(), "after-fifos");
-            return;
-        }
 
         let fixture = Fixture::new("included-fifos");
         let config_path = fixture.write(
@@ -2971,9 +3104,11 @@ mod tests {
         create_fifo(&fifo_path);
         symlink("literal.fifo", fixture.root.join("parts/link.fifo"))
             .expect("create included FIFO symlink");
-        assert_fifo_test_completes(
-            "ssh_config::tests::included_fifo_sources_return_promptly",
+        assert_fifo_helper_completes(
+            FIFO_HELPER_MODE_READ_CONFIG,
             &config_path,
+            FIFO_HELPER_EXPECTED_AFTER_FIFOS,
+            &fixture.root.join("helper.ack"),
         );
     }
 
