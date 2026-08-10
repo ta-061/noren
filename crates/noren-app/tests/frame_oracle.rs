@@ -55,7 +55,10 @@
 #[path = "../src/renderer_capture.rs"]
 mod renderer_capture;
 
-use noren_app::{GridGeometry, POC_CELL_HEIGHT as CELL_HEIGHT, POC_CELL_WIDTH as CELL_WIDTH};
+use noren_app::{
+    GridGeometry, MAX_RENDER_COLS, MAX_RENDER_ROWS, POC_CELL_HEIGHT as CELL_HEIGHT,
+    POC_CELL_WIDTH as CELL_WIDTH,
+};
 use noren_terminal::{TerminalSnapshot, TerminalState};
 use renderer_capture::renderer_source::{
     CLEAR_COLOR, DEFAULT_ANSI_PALETTE, DEFAULT_FOREGROUND, DEFAULT_PALETTE, SIDEBAR_COLS,
@@ -408,6 +411,92 @@ fn state_and_render_agree_across_the_fr005_fixtures() {
         checked >= 4 * 2 * 6,
         "agreement checks covered {checked} cells"
     );
+}
+
+// ===========================================================================
+// Render clamps (issue #109): the renderer's `MAX_RENDER_ROWS` and
+// `MAX_RENDER_COLS` clamps must keep every glyph inside the drawable grid.
+//
+// The old guard — `renderer.rs::glyph_input_is_bounded_to_visible_poc_grid` —
+// asserted `vertices.len() <= MAX_VERTICES`. That cannot tell a clamp from the
+// `MAX_VERTICES` early-return backstop: both cap vertex output at the same
+// ceiling, and the fixture only ever reached ~half the cap (1,036,800 of
+// 2,016,000), so deleting any one guard left it green — confirmed by deletion
+// before this test was written. A count-based test is structurally unable to
+// pin this property.
+//
+// What needs guarding is *where glyphs land*, so this test reads pixels back
+// from the real pipeline and asserts directly that no cell past either clamp
+// boundary is lit. The fixture places three single-cell markers via CUP on a
+// grid one past each clamp limit, rather than filling it: a row detector at the
+// overflow display row, a column detector at the overflow column, and a stable
+// interior marker. Three glyphs keep the capture at small-grid cost (the full
+// 61×161 fill took ~4.5s; this takes ~0.1s).
+//
+// Mutation protocol (run before trusting this test): removing the row clamp
+// lights grid row `MAX_RENDER_ROWS`; removing the column clamp lights grid
+// column `MAX_RENDER_COLS`. The `MAX_VERTICES` backstop cannot produce a visual
+// change while the clamps hold (it is a memory guard, not a geometry guard), so
+// this test does not catch its removal — see the report line.
+// ===========================================================================
+
+#[test]
+fn glyphs_stay_inside_the_render_clamp_grid() {
+    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+
+    // A grid one past each clamp limit in both dimensions. Three CUP-placed
+    // markers carry the only lit content:
+    //   - row detector  at display (60, 0):   maps to grid row 59 with the row
+    //                                         clamp, grid row 60 (out of bounds)
+    //                                         without it;
+    //   - column detector at display (30, 160): column 160 is inside the grid
+    //                                         but past the MAX_RENDER_COLS cut,
+    //                                         so it draws only without the
+    //                                         column clamp;
+    //   - interior marker at display (30, 30): always drawn in bounds, at grid
+    //                                         row 29 or 30 depending on the row
+    //                                         clamp — a stable positive control.
+    let rows = MAX_RENDER_ROWS + 1;
+    let cols = MAX_RENDER_COLS + 1;
+    let bytes = "\x1b[61;1HA\x1b[31;161HA\x1b[31;31HA".as_bytes().to_vec();
+    let snap = snapshot(rows, cols, &bytes);
+    // Rendered at the terminal's own grid size: one cell larger than the clamp
+    // grid each way, so overflow content has pixel room to land in.
+    let frame = render(&renderer, &snap);
+
+    let max_row = u32::from(MAX_RENDER_ROWS);
+    let max_col = u32::from(MAX_RENDER_COLS);
+
+    // Positive control: the interior marker lands at grid row 29 or 30
+    // (depending on the row clamp), never outside the budget. If neither is
+    // lit the renderer drew nothing and the boundary checks below are vacuous.
+    assert!(
+        cell_is_lit(&frame, 29, 30) || cell_is_lit(&frame, 30, 30),
+        "interior marker must light grid (29,30) or (30,30) — \
+         otherwise the render produced nothing and the boundary checks are vacuous"
+    );
+
+    // Row clamp: no lit cell at row MAX_RENDER_ROWS. With the clamp the row
+    // detector sits at grid row 59; without it, it spills into row max_row.
+    // Neither the column clamp nor the MAX_VERTICES backstop can light this
+    // row, so a lit cell here pins a row-clamp regression.
+    for col in 0..max_col {
+        assert!(
+            !cell_is_lit(&frame, max_row, col),
+            "cell ({max_row},{col}) is lit at MAX_RENDER_ROWS — \
+             the row clamp failed to contain the grid"
+        );
+    }
+
+    // Column clamp: no lit cell at column MAX_RENDER_COLS. Symmetric to the
+    // row check; only a column-clamp regression lights any cell here.
+    for row in 0..max_row {
+        assert!(
+            !cell_is_lit(&frame, row, max_col),
+            "cell ({row},{max_col}) is lit at MAX_RENDER_COLS — \
+             the column clamp failed to contain the grid"
+        );
+    }
 }
 
 // ===========================================================================
