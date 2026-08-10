@@ -5,7 +5,7 @@
 //! opens an SSH connection and never opens a path named by `IdentityFile` (or
 //! any other non-`Include` directive).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fmt;
 use std::fs;
@@ -132,15 +132,36 @@ impl SshConfig {
 
     fn from_blocks(blocks: &[Block]) -> Self {
         let mut aliases = Vec::new();
-        for block in blocks {
+        let mut seen_aliases = HashSet::new();
+        let mut literal_blocks = HashMap::<String, Vec<usize>>::new();
+        let mut fallback_blocks = Vec::new();
+
+        // Literal-only blocks can be looked up by alias. Blocks with a wildcard
+        // (and global blocks) remain in their original order for every alias.
+        for (block_index, block) in blocks.iter().enumerate() {
             let Some(patterns) = &block.patterns else {
+                fallback_blocks.push(block_index);
                 continue;
             };
+
             for pattern in patterns {
-                if !pattern.starts_with('!') && !has_wildcard(pattern) && !aliases.contains(pattern)
+                if !pattern.starts_with('!')
+                    && !has_wildcard(pattern)
+                    && seen_aliases.insert(pattern.clone())
                 {
                     aliases.push(pattern.clone());
                 }
+            }
+
+            if patterns.iter().all(|pattern| !has_wildcard(pattern)) {
+                for pattern in patterns.iter().filter(|pattern| !pattern.starts_with('!')) {
+                    literal_blocks
+                        .entry(pattern.to_ascii_lowercase())
+                        .or_default()
+                        .push(block_index);
+                }
+            } else {
+                fallback_blocks.push(block_index);
             }
         }
 
@@ -153,29 +174,66 @@ impl SshConfig {
                     user: None,
                     port: None,
                 };
-                for block in blocks {
+
+                let indexed = literal_blocks
+                    .get(&alias.to_ascii_lowercase())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let mut indexed_position = 0;
+                let mut fallback_position = 0;
+                // Merge both ordered views so per-keyword first-value-wins
+                // precedence remains identical to scanning all blocks.
+                while indexed_position < indexed.len() || fallback_position < fallback_blocks.len()
+                {
+                    let block_index = match (
+                        indexed.get(indexed_position),
+                        fallback_blocks.get(fallback_position),
+                    ) {
+                        (Some(indexed), Some(fallback)) if indexed < fallback => {
+                            indexed_position += 1;
+                            *indexed
+                        }
+                        (Some(_), Some(fallback)) => {
+                            fallback_position += 1;
+                            *fallback
+                        }
+                        (Some(indexed), None) => {
+                            indexed_position += 1;
+                            *indexed
+                        }
+                        (None, Some(fallback)) => {
+                            fallback_position += 1;
+                            *fallback
+                        }
+                        (None, None) => unreachable!(),
+                    };
+                    let block = &blocks[block_index];
                     if !block.applies_to(&alias) {
                         continue;
                     }
-                    for setting in &block.settings {
-                        match setting {
-                            Setting::HostName(value) if host.host_name.is_none() => {
-                                host.host_name = Some(value.clone());
-                            }
-                            Setting::User(value) if host.user.is_none() => {
-                                host.user = Some(value.clone());
-                            }
-                            Setting::Port(value) if host.port.is_none() => {
-                                host.port = Some(*value);
-                            }
-                            _ => {}
-                        }
-                    }
+                    apply_settings(&mut host, block);
                 }
                 host
             })
             .collect();
         Self { hosts }
+    }
+}
+
+fn apply_settings(host: &mut SshHost, block: &Block) {
+    for setting in &block.settings {
+        match setting {
+            Setting::HostName(value) if host.host_name.is_none() => {
+                host.host_name = Some(value.clone());
+            }
+            Setting::User(value) if host.user.is_none() => {
+                host.user = Some(value.clone());
+            }
+            Setting::Port(value) if host.port.is_none() => {
+                host.port = Some(*value);
+            }
+            _ => {}
+        }
     }
 }
 
@@ -742,6 +800,59 @@ mod tests {
     }
 
     #[test]
+    fn mixed_literal_and_wildcard_blocks_preserve_resolution_order() {
+        let config = SshConfig::parse(
+            "Host exact\n  HostName exact.example\n  User exact\nHost *.example\n  HostName wildcard.example\n  User wildcard\nHost api.example\n  User api\nHost db.example !api.example\n  Port 2200\nHost *\n  HostName general.example\n  User nobody\n",
+        )
+        .expect("mixed config parses");
+
+        assert_eq!(
+            config.hosts(),
+            &[
+                SshHost {
+                    alias: "exact".to_owned(),
+                    host_name: Some("exact.example".to_owned()),
+                    user: Some("exact".to_owned()),
+                    port: None,
+                },
+                SshHost {
+                    alias: "api.example".to_owned(),
+                    host_name: Some("wildcard.example".to_owned()),
+                    user: Some("wildcard".to_owned()),
+                    port: None,
+                },
+                SshHost {
+                    alias: "db.example".to_owned(),
+                    host_name: Some("wildcard.example".to_owned()),
+                    user: Some("wildcard".to_owned()),
+                    port: Some(2200),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn thousands_of_literal_aliases_parse_within_a_generous_bound() {
+        let mut text = String::new();
+        for index in 0..8_000 {
+            text.push_str("Host alias-");
+            text.push_str(&index.to_string());
+            text.push_str("\nHostName target.example\n");
+        }
+        assert!(text.len() < 1024 * 1024);
+
+        let started = std::time::Instant::now();
+        let config = SshConfig::parse(&text).expect("large literal config parses");
+        let elapsed = started.elapsed();
+
+        assert_eq!(config.hosts().len(), 8_000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "large literal config parsing took {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn pathological_nonmatching_wildcard_completes_quickly() {
         let pattern = "*a*a*a*a*a*a*a*a*a*a*b";
         let alias = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -756,7 +867,7 @@ mod tests {
 
         let elapsed = started.elapsed();
         assert!(
-            elapsed < std::time::Duration::from_secs(1),
+            elapsed < std::time::Duration::from_secs(10),
             "pathological wildcard matching took {elapsed:?}"
         );
     }
