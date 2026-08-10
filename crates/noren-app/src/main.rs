@@ -26,6 +26,7 @@ use noren_app::{
     },
     session_persistence::{SESSION_STATE_FILE_NAME, SessionPersistenceError, load, save},
     sidebar::{SidebarEntry, SidebarView},
+    ssh_config::SshConfig,
 };
 use noren_pty::{PtyEvent, PtySession, PtySize};
 use noren_terminal::{Cell, GridPoint, Selection, SelectionMode, TerminalEngine, TerminalState};
@@ -43,6 +44,9 @@ use winit::window::{Window, WindowId};
 const WINDOW_WIDTH: u32 = 900;
 const WINDOW_HEIGHT: u32 = 600;
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
+/// The renderer has no sidebar scrolling surface yet. Keep enough configured
+/// hosts for a normal window while leaving the local session visible.
+const MAX_SSH_SIDEBAR_HOSTS: usize = 24;
 
 /// The dispatchable intent behind each palette command.
 ///
@@ -112,6 +116,11 @@ fn session_state_path() -> Option<PathBuf> {
 struct WorkspaceState {
     registry: SessionRegistry,
     sidebar: SidebarView,
+    /// Configured SSH targets represented by the shared session vocabulary.
+    /// They are sidebar facts only: no registry entry or connection exists.
+    ssh_hosts: Vec<SessionKind>,
+    ssh_hosts_omitted: usize,
+    selected_ssh_target: Option<String>,
     /// Owned by the workspace; dispatched when the palette opens.
     palette: Palette<WorkspaceAction>,
     /// Where sidebar state is persisted. `None` in tests and when `HOME` is
@@ -140,6 +149,9 @@ impl WorkspaceState {
         Self {
             registry: SessionRegistry::new(),
             sidebar: SidebarView::build(&[], None),
+            ssh_hosts: Vec::new(),
+            ssh_hosts_omitted: 0,
+            selected_ssh_target: None,
             palette: Palette::noren(
                 WorkspaceAction::CreateSession,
                 WorkspaceAction::SelectSession,
@@ -221,6 +233,36 @@ impl WorkspaceState {
         Ok(())
     }
 
+    /// Replace the configured SSH host facts without creating sessions.
+    /// Returns the number omitted by the bounded sidebar policy.
+    fn load_ssh_config(&mut self, config: &SshConfig) -> usize {
+        self.ssh_hosts = config
+            .hosts()
+            .iter()
+            .take(MAX_SSH_SIDEBAR_HOSTS)
+            .map(|host| SessionKind::Ssh {
+                target: host.alias().to_owned(),
+            })
+            .collect();
+        self.ssh_hosts_omitted = config.hosts().len().saturating_sub(self.ssh_hosts.len());
+        self.selected_ssh_target = None;
+        self.rebuild_sidebar();
+        self.ssh_hosts_omitted
+    }
+
+    /// Select an SSH row as a pending UI choice, never as a live session.
+    fn select_ssh_sidebar_row(&mut self, row_index: usize) -> bool {
+        let session_rows = self.registry.sessions().len();
+        let host_index = row_index.checked_sub(session_rows);
+        let Some(Some(SessionKind::Ssh { target })) =
+            host_index.map(|index| self.ssh_hosts.get(index))
+        else {
+            return false;
+        };
+        self.selected_ssh_target = Some(target.clone());
+        true
+    }
+
     /// Observe a status transition for a session and rebuild the sidebar.
     ///
     /// This is the only path that advances a session past `Starting`. The
@@ -247,6 +289,14 @@ impl WorkspaceState {
             .into_iter()
             .map(SidebarEntry::Session)
             .collect();
+        let mut entries = entries;
+        entries.extend(self.ssh_hosts.iter().map(|kind| match kind {
+            SessionKind::Ssh { target } => SidebarEntry::SshConnection {
+                label: format!("SSH {target}"),
+                host: "not connected".to_string(),
+            },
+            _ => unreachable!("ssh host store only contains SessionKind::Ssh"),
+        }));
         self.sidebar = SidebarView::build(&entries, self.registry.selected());
     }
 
@@ -263,6 +313,18 @@ impl WorkspaceState {
     /// The session registry.
     fn registry(&self) -> &SessionRegistry {
         &self.registry
+    }
+
+    /// The configured host that was selected, if any. Selection is a pending
+    /// UI choice and deliberately does not imply a connection or viewport.
+    #[cfg(test)]
+    fn selected_ssh_target(&self) -> Option<&str> {
+        self.selected_ssh_target.as_deref()
+    }
+
+    #[cfg(test)]
+    fn ssh_hosts_omitted(&self) -> usize {
+        self.ssh_hosts_omitted
     }
 }
 
@@ -387,6 +449,7 @@ struct NorenApp {
     show_status: bool,
     diagnostics_visible: bool,
     diagnostics_line: String,
+    ssh_diagnostic: Option<String>,
     redraw_needed: bool,
     // User-initiated selection state. The renderer does not highlight it yet;
     // copy still extracts it. Any PTY output or resize invalidates it because
@@ -438,6 +501,7 @@ impl NorenApp {
             show_status: true,
             diagnostics_visible: false,
             diagnostics_line: String::new(),
+            ssh_diagnostic: None,
             redraw_needed: true,
             selection: None,
             drag_origin: None,
@@ -469,6 +533,45 @@ impl NorenApp {
             eprintln!("Noren could not restore sidebar state: {error}");
             eprintln!("starting with an empty sidebar; the existing file was left in place");
         }
+    }
+
+    /// Load the conventional `~/.ssh/config` through the bounded parser.
+    /// Missing/unreadable input is an empty host list; malformed readable
+    /// input becomes a content-free diagnostics/status line and never stops
+    /// startup.
+    fn load_ssh_hosts(&mut self) {
+        match SshConfig::read_default() {
+            Ok(config) => self.apply_ssh_config(&config),
+            Err(error) => self.report_ssh_diagnostic(error.to_string()),
+        }
+    }
+
+    /// Deterministic explicit-path seam used by tests and future reload UI.
+    #[cfg(test)]
+    fn load_ssh_hosts_from(&mut self, path: &std::path::Path) {
+        match SshConfig::read(path) {
+            Ok(config) => self.apply_ssh_config(&config),
+            Err(error) => self.report_ssh_diagnostic(error.to_string()),
+        }
+    }
+
+    fn apply_ssh_config(&mut self, config: &SshConfig) {
+        let omitted = self.workspace.load_ssh_config(config);
+        if omitted == 0 {
+            self.ssh_diagnostic = None;
+        } else {
+            self.report_ssh_diagnostic(format!(
+                "SSH host list truncated: showing first {MAX_SSH_SIDEBAR_HOSTS}; {omitted} omitted"
+            ));
+        }
+        self.redraw_needed = true;
+    }
+
+    fn report_ssh_diagnostic(&mut self, detail: String) {
+        let line = format!("Noren diagnostics: {detail}");
+        eprintln!("{line}");
+        self.ssh_diagnostic = Some(line);
+        self.redraw_needed = true;
     }
 }
 
@@ -876,6 +979,9 @@ impl NorenApp {
     }
 
     fn handle_mouse_button(&mut self, state: ElementState, button: MouseButton) {
+        if self.handle_sidebar_click(state, button) {
+            return;
+        }
         if self.mouse_reportable() {
             self.handle_tracked_mouse_button(state, button);
             return;
@@ -912,6 +1018,38 @@ impl NorenApp {
                 self.drag_origin = None;
             }
         }
+    }
+
+    /// Sidebar clicks are intentionally narrow until the sidebar owns a full
+    /// selection model. SSH rows show a truthful pending-selection notice and
+    /// never launch or select a terminal session.
+    fn handle_sidebar_click(&mut self, state: ElementState, button: MouseButton) -> bool {
+        if self.palette_open || button != MouseButton::Left || state != ElementState::Pressed {
+            return false;
+        }
+        let Some(position) = self.cursor_position else {
+            return false;
+        };
+        let Some(row_index) = self.sidebar_row_index(position) else {
+            return false;
+        };
+        if self.workspace.select_ssh_sidebar_row(row_index) {
+            self.status = "Noren SSH host selected; connection not started";
+            self.show_status = true;
+            self.redraw_needed = true;
+        }
+        true
+    }
+
+    fn sidebar_row_index(&self, position: PhysicalPosition<f64>) -> Option<usize> {
+        if position.x < 0.0
+            || position.y < 0.0
+            || position.x >= sidebar_pixel_width(self.geometry.cell_width())
+        {
+            return None;
+        }
+        let row = pixel_row_index(position.y, self.geometry.cell_height())?;
+        (row < self.workspace.sidebar().rows().len()).then_some(row)
     }
 
     /// Handle a mouse button event while tracking is active (no Shift bypass).
@@ -1251,7 +1389,9 @@ impl NorenApp {
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let snapshot = self.terminal.as_ref().map(TerminalEngine::snapshot);
-        let status = if self.show_status
+        let status = if let Some(diagnostic) = self.ssh_diagnostic.as_deref() {
+            Some(diagnostic)
+        } else if self.show_status
             || snapshot
                 .as_ref()
                 .is_none_or(|snapshot| snapshot.lines().is_empty())
@@ -1768,6 +1908,7 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = NorenApp::new(config);
     app.load_sidebar_state(session_state_path());
+    app.load_ssh_hosts();
     if event_loop.run_app(&mut app).is_err() {
         eprintln!("Noren event loop failed");
     }
@@ -3462,6 +3603,152 @@ mod tests {
             report, "\x1b[<0;8;1M",
             "right-edge press must keep its column"
         );
+    }
+
+    // ── SSH host discovery and deferred selection (Milestone 4 step 2) ──
+
+    static SSH_CASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn temp_ssh_config_path() -> PathBuf {
+        let unique = SSH_CASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "noren-ssh-config-test-{}-{unique}",
+            std::process::id()
+        ));
+        path
+    }
+
+    fn cleanup_ssh_config(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn configured_ssh_hosts_appear_as_distinct_sidebar_rows() {
+        let path = temp_ssh_config_path();
+        std::fs::write(
+            &path,
+            b"Host build\n  HostName build.example\n  User alice\n  Port 2222\nHost db\n  HostName db.example\n",
+        )
+        .expect("write SSH fixture");
+
+        let mut app = NorenApp::default();
+        app.load_ssh_hosts_from(&path);
+
+        let rows = app.workspace.sidebar().rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].kind(), EntryKind::SshConnection);
+        assert_eq!(rows[0].label(), "SSH build");
+        assert_eq!(rows[0].detail(), Some("not connected"));
+        assert_eq!(rows[1].kind(), EntryKind::SshConnection);
+        assert_eq!(rows[1].label(), "SSH db");
+        assert_eq!(
+            app.workspace.ssh_hosts,
+            vec![
+                SessionKind::Ssh {
+                    target: "build".to_owned()
+                },
+                SessionKind::Ssh {
+                    target: "db".to_owned()
+                },
+            ]
+        );
+        cleanup_ssh_config(&path);
+    }
+
+    #[test]
+    fn missing_ssh_config_is_silent_and_adds_no_rows() {
+        let path = temp_ssh_config_path();
+        let mut app = NorenApp::default();
+        app.load_ssh_hosts_from(&path);
+
+        assert!(app.workspace.sidebar().rows().is_empty());
+        assert!(app.ssh_diagnostic.is_none());
+    }
+
+    #[test]
+    fn malformed_ssh_config_starts_with_content_free_diagnostic() {
+        let path = temp_ssh_config_path();
+        let secret = "DO_NOT_LEAK_ssh_config_fixture";
+        std::fs::write(&path, format!("Host broken\nPort nope # {secret}\n"))
+            .expect("write malformed SSH fixture");
+
+        let mut app = NorenApp::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            app.load_ssh_hosts_from(&path);
+        }));
+        assert!(result.is_ok(), "malformed config must not panic");
+        assert!(app.workspace.sidebar().rows().is_empty());
+        let diagnostic = app.ssh_diagnostic.as_deref().expect("diagnostic surfaced");
+        assert!(diagnostic.contains("SSH configuration error"));
+        assert!(!diagnostic.contains(secret));
+        assert!(!diagnostic.contains("nope"));
+        cleanup_ssh_config(&path);
+    }
+
+    #[test]
+    fn ssh_rows_stay_distinguishable_from_local_rows() {
+        let path = temp_ssh_config_path();
+        std::fs::write(&path, b"Host staging\n").expect("write SSH fixture");
+
+        let mut app = NorenApp::default();
+        app.load_ssh_hosts_from(&path);
+        app.workspace.create_session(SessionKind::Local);
+
+        let rows = app.workspace.sidebar().rows();
+        assert_eq!(rows[0].kind(), EntryKind::Session);
+        assert_eq!(rows[0].detail(), Some("local · starting"));
+        assert_eq!(rows[1].kind(), EntryKind::SshConnection);
+        assert_eq!(rows[1].label(), "SSH staging");
+        assert_eq!(rows[1].detail(), Some("not connected"));
+        cleanup_ssh_config(&path);
+    }
+
+    #[test]
+    fn selecting_an_ssh_row_only_records_a_pending_non_connection_choice() {
+        let path = temp_ssh_config_path();
+        std::fs::write(&path, b"Host staging\n").expect("write SSH fixture");
+
+        let mut app = NorenApp::default();
+        app.load_ssh_hosts_from(&path);
+        app.workspace.create_session(SessionKind::Local);
+        app.cursor_position = Some(PhysicalPosition::new(5.0, 25.0));
+
+        assert!(app.handle_sidebar_click(ElementState::Pressed, MouseButton::Left));
+        assert_eq!(app.workspace.selected_ssh_target(), Some("staging"));
+        assert_eq!(app.workspace.registry().selected(), None);
+        assert_eq!(app.workspace.registry().len(), 1);
+        assert!(app.pty.is_none(), "SSH selection must not open a PTY");
+        assert_eq!(
+            app.status,
+            "Noren SSH host selected; connection not started"
+        );
+        assert!(
+            app.workspace.sidebar().viewport().is_none(),
+            "SSH selection must not claim a connected viewport"
+        );
+        cleanup_ssh_config(&path);
+    }
+
+    #[test]
+    fn many_ssh_hosts_are_bounded_and_report_the_omitted_count() {
+        let path = temp_ssh_config_path();
+        let config: String = (0..30)
+            .map(|index| format!("Host host-{index}\n"))
+            .collect();
+        std::fs::write(&path, config).expect("write many-host SSH fixture");
+
+        let mut app = NorenApp::default();
+        app.load_ssh_hosts_from(&path);
+
+        assert_eq!(app.workspace.sidebar().rows().len(), MAX_SSH_SIDEBAR_HOSTS);
+        assert_eq!(app.workspace.ssh_hosts_omitted(), 6);
+        assert!(
+            app.ssh_diagnostic
+                .as_deref()
+                .is_some_and(|line| line.contains("showing first 24; 6 omitted"))
+        );
+        cleanup_ssh_config(&path);
     }
 
     // ── Sidebar state persistence (Milestone 3 final piece) ────────────
