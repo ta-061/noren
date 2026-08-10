@@ -10,9 +10,11 @@
 >
 > It still renders in a single colour, in a case-insensitive 5x7 ASCII bitmap
 > font, with all non-ASCII shown as `?`, no visible cursor, no IME, and no
-> accessibility surface. Only local sessions can be launched — SSH hosts, git
-> worktrees, and agents are modelled but unreachable — and keybindings are not
-> configurable. There are no published binaries. Read
+> accessibility surface. Only local sessions can be launched. Configured SSH
+> hosts are discovered, displayed in the sidebar, and selectable as pending
+> targets without opening an SSH connection or PTY; git worktrees and agents
+> remain modelled but unreachable. Keybindings are not configurable. There are
+> no published binaries. Read
 > **[docs/known-limitations.md](docs/known-limitations.md)** first — it is the
 > accurate predictor of what happens when you run the build. Everything below
 > the status block describes **intent**, not current capability.
@@ -47,7 +49,8 @@ Milestones 0–2 (discovery, requirements/design, terminal foundation) are
 complete on the evidence recorded in [ROADMAP.md](ROADMAP.md). Milestone 3
 (workspace) is **in progress**: the vertical slice — sidebar, palette, session
 lifecycle, persistence, Zellij pass-through — has landed, while configurable
-keybindings and the SSH/agent session kinds have not; the reasoning is in
+keybindings, SSH connection launching, and agent launching have not; the
+reasoning is in
 [Milestone 3 status](ROADMAP.md#milestone-3-status). The SSH,
 agent-experience, theming/accessibility, quality, and preview milestones are
 open. The required sequence remains:

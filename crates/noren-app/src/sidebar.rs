@@ -15,26 +15,27 @@
 //!
 //! Sessions are described by the shared contract types (`SessionDescriptor`
 //! and friends, owned by the sibling `session` module per D-M3-001); this
-//! module imports them and never redefines them. Sidebar entries that are
-//! not live sessions (projects, worktrees, reserved SSH and agent
-//! connections) are plain text facts, and the bundled fixtures construct
-//! everything without launching a process, an SSH connection, or an agent.
+//! module imports them and never redefines them. Sidebar entries that are not
+//! live sessions (projects, worktrees, configured SSH targets, and reserved
+//! agent entries) are plain text facts. Constructing them, including through
+//! the bundled fixtures, never launches a process, opens an SSH connection, or
+//! launches an agent.
 
 use crate::session::{SessionDescriptor, SessionId, SessionKind, SessionStatus};
 
 /// The entry classes the sidebar can list.
 ///
 /// This view-level taxonomy is deliberately wider than [`SessionKind`]:
-/// projects and worktrees are workspace anchors rather than launch shapes,
-/// and an SSH connection or agent entry is a reserved fixture that may exist
-/// in the sidebar before any session of that shape runs.
+/// projects and worktrees are workspace anchors rather than launch shapes, a
+/// configured SSH target may appear without a running session, and agent
+/// entries remain reserved fixtures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EntryKind {
     /// A project anchored at a directory.
     Project,
     /// A git worktree anchored at a branch checkout.
     Worktree,
-    /// A reserved SSH connection. Fixture only: no connection is opened.
+    /// A configured SSH target. It is not a live connection or PTY.
     SshConnection,
     /// A reserved agent. Fixture only: no agent is launched.
     Agent,
@@ -86,7 +87,7 @@ impl SidebarRow {
 ///
 /// Session entries carry the shared contract descriptor; the other kinds are
 /// plain text facts describing workspace items that are not live sessions.
-/// Construction is fixture-only: no variant opens a connection or launches a
+/// Construction is data-only: no variant opens a connection or launches a
 /// process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SidebarEntry {
@@ -104,11 +105,11 @@ pub enum SidebarEntry {
         /// The branch checked out in this worktree.
         branch: String,
     },
-    /// A reserved SSH connection to `host`.
+    /// A configured SSH target displayed in the sidebar.
     SshConnection {
-        /// Display name of the connection.
+        /// Display name of the target.
         label: String,
-        /// The host the connection targets, as display text.
+        /// Secondary display text, such as a host or connection status.
         host: String,
     },
     /// A reserved agent entry.
@@ -187,8 +188,9 @@ impl SessionViewport {
 ///
 /// 1. `empty_state` is `Some` exactly when there are no rows.
 /// 2. At most one row has [`SidebarRow::is_selected`] set.
-/// 3. `viewport` is `Some` exactly when one session row is selected, and it
-///    names that same session. Unselected sessions describe no viewport.
+/// 3. `viewport` is `Some` exactly when one non-restored session row is
+///    selected, and it names that same session. A restored entry has no live
+///    process to attach to, so selecting it does not create a viewport.
 /// 4. A selection that matches no entry is dropped, never rendered dangling.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidebarView {
@@ -208,6 +210,7 @@ impl SidebarView {
     #[must_use]
     pub fn build(entries: &[SidebarEntry], selected: Option<SessionId>) -> Self {
         let mut viewport: Option<SessionViewport> = None;
+        let mut selected_row = false;
         let mut rows: Vec<SidebarRow> = Vec::with_capacity(entries.len());
         for entry in entries {
             rows.push(match entry {
@@ -236,8 +239,11 @@ impl SidebarView {
                     selected: false,
                 },
                 SidebarEntry::Session(descriptor) => {
-                    let is_selected = viewport.is_none() && selected == Some(descriptor.id());
+                    let is_selected = !selected_row && selected == Some(descriptor.id());
                     if is_selected {
+                        selected_row = true;
+                    }
+                    if is_selected && !matches!(descriptor.status(), SessionStatus::Restored) {
                         viewport = Some(SessionViewport {
                             session: descriptor.clone(),
                         });
@@ -321,6 +327,7 @@ fn session_kind_text(kind: &SessionKind) -> &'static str {
 fn session_status_text(status: &SessionStatus) -> &'static str {
     match status {
         SessionStatus::Starting => "starting",
+        SessionStatus::Restored => "restored (not running)",
         SessionStatus::Running => "running",
         SessionStatus::Exited { .. } => "exited",
         SessionStatus::Failed { .. } => "failed",
@@ -360,9 +367,8 @@ pub mod fixtures {
             .expect("fixture observes ids the same fixture registry created");
     }
 
-    /// One entry of each kind, in sidebar order: a project, a git worktree, a
-    /// reserved SSH connection, a reserved agent, and every session in
-    /// `registry`.
+    /// One entry of each kind, in sidebar order: a project, a git worktree, an
+    /// SSH-target fixture, a reserved agent, and every session in `registry`.
     #[must_use]
     pub fn entries(registry: &SessionRegistry) -> Vec<SidebarEntry> {
         let mut entries = vec![

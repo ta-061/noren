@@ -5,8 +5,7 @@ mod renderer;
 use noren_app::{
     Arrow, CellMetrics, CursorKeyMode, FunctionKey, GridGeometry, GridSize, InputMode, Key,
     KeyDropReason, KeyEncoder, KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode,
-    MAX_RENDER_COLS, MAX_RENDER_ROWS, Modifiers, PARSE_BUDGET_BYTES_PER_TURN, PasteReject, Resize,
-    SystemClipboard,
+    MAX_RENDER_COLS, Modifiers, PARSE_BUDGET_BYTES_PER_TURN, PasteReject, Resize, SystemClipboard,
     config::AppConfig,
     diagnostics::{self, PtyChildStatus},
     encode_paste,
@@ -24,12 +23,14 @@ use noren_app::{
         SessionAction, SessionError, SessionEvent, SessionId, SessionKind, SessionRegistry,
         SessionStatus,
     },
-    session_persistence::{SESSION_STATE_FILE_NAME, SessionPersistenceError, load, save},
+    session_persistence::{
+        SESSION_STATE_FILE_NAME, SessionPersistenceError, load_snapshot, save, snapshot,
+    },
     sidebar::{SidebarEntry, SidebarView},
     ssh_config::SshConfig,
 };
 use noren_pty::{PtyEvent, PtySession, PtySize};
-use noren_terminal::{Cell, GridPoint, Selection, SelectionMode, TerminalEngine, TerminalState};
+use noren_terminal::{GridPoint, Selection, SelectionMode, TerminalEngine, TerminalState};
 use renderer::{RenderOutcome, Renderer};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -47,6 +48,41 @@ const POLL_INTERVAL: Duration = Duration::from_millis(16);
 /// The renderer has no sidebar scrolling surface yet. Keep enough configured
 /// hosts for a normal window while leaving the local session visible.
 const MAX_SSH_SIDEBAR_HOSTS: usize = 24;
+/// Sidebar rows begin with a selection marker and one separating space.
+const SIDEBAR_ROW_PREFIX_CHARS: usize = 2;
+const SSH_SIDEBAR_LABEL_PREFIX: &str = "SSH ";
+const SSH_SIDEBAR_LABEL_PREFIX_CHARS: usize = 4;
+const SSH_SIDEBAR_TRUNCATION_MARKER: &str = "...";
+const SSH_SIDEBAR_TRUNCATION_MARKER_CHARS: usize = 3;
+const SSH_SIDEBAR_LABEL_CHARS: usize = renderer::SIDEBAR_COLS - SIDEBAR_ROW_PREFIX_CHARS;
+const SSH_SIDEBAR_TARGET_CHARS: usize = SSH_SIDEBAR_LABEL_CHARS - SSH_SIDEBAR_LABEL_PREFIX_CHARS;
+const SSH_SIDEBAR_TRUNCATED_TARGET_CHARS: usize =
+    SSH_SIDEBAR_TARGET_CHARS - SSH_SIDEBAR_TRUNCATION_MARKER_CHARS;
+const SSH_SIDEBAR_DETAIL: &str = "not connected";
+
+/// Build the bounded display label for an SSH target without copying or even
+/// scanning the complete target. The renderer counts Unicode scalar values,
+/// so this helper does the same and looks at one scalar beyond the untruncated
+/// target budget solely to decide whether the ASCII marker is needed.
+fn ssh_sidebar_label(target: &str) -> String {
+    let inspected: Vec<char> = target
+        .chars()
+        .take(SSH_SIDEBAR_TARGET_CHARS.saturating_add(1))
+        .collect();
+    let truncated = inspected.len() > SSH_SIDEBAR_TARGET_CHARS;
+    let visible_target_chars = if truncated {
+        SSH_SIDEBAR_TRUNCATED_TARGET_CHARS
+    } else {
+        inspected.len()
+    };
+    let mut label = String::with_capacity(SSH_SIDEBAR_LABEL_CHARS.saturating_mul(4));
+    label.push_str(SSH_SIDEBAR_LABEL_PREFIX);
+    label.extend(inspected.into_iter().take(visible_target_chars));
+    if truncated {
+        label.push_str(SSH_SIDEBAR_TRUNCATION_MARKER);
+    }
+    label
+}
 
 /// The dispatchable intent behind each palette command.
 ///
@@ -127,6 +163,12 @@ struct WorkspaceState {
     /// unset; in both cases the workspace is in-memory only and [`persist`]
     /// is a no-op.
     state_path: Option<PathBuf>,
+    /// Exact state-file bytes observed at restore or after the last save.
+    /// `None` also represents a normally absent first-run file.
+    loaded_snapshot: Option<Vec<u8>>,
+    /// Sticky warning for the diagnostics overlay when another instance has
+    /// replaced the file since this workspace loaded it.
+    persistence_conflict: bool,
 }
 
 impl Default for WorkspaceState {
@@ -159,6 +201,8 @@ impl WorkspaceState {
                 WorkspaceAction::FocusSidebar,
             ),
             state_path,
+            loaded_snapshot: None,
+            persistence_conflict: false,
         }
     }
 
@@ -175,7 +219,7 @@ impl WorkspaceState {
         let Some(path) = &self.state_path else {
             return Ok(());
         };
-        load(path, &mut self.registry)?;
+        self.loaded_snapshot = load_snapshot(path, &mut self.registry)?;
         self.rebuild_sidebar();
         Ok(())
     }
@@ -187,13 +231,30 @@ impl WorkspaceState {
     /// never bypasses it. A failure is surfaced through stderr and swallowed
     /// so the app keeps running — losing a save is preferable to crashing the
     /// terminal.
-    fn persist(&self) {
+    fn persist(&mut self) {
         let Some(path) = &self.state_path else {
             return;
         };
+        match snapshot(path) {
+            Ok(current) if current != self.loaded_snapshot => {
+                self.persistence_conflict = true;
+            }
+            Err(error) => {
+                eprintln!("Noren could not inspect sidebar state before saving: {error}");
+            }
+            _ => {}
+        }
         if let Err(error) = save(path, &self.registry) {
             eprintln!("Noren could not save sidebar state: {error}");
+        } else if let Ok(current) = snapshot(path) {
+            self.loaded_snapshot = current;
         }
+    }
+
+    /// Whether a save observed state written by another instance since the
+    /// last restore or successful save.
+    fn persistence_conflict(&self) -> bool {
+        self.persistence_conflict
     }
 
     /// Create a new session and rebuild the sidebar.
@@ -295,8 +356,8 @@ impl WorkspaceState {
                 return None;
             };
             Some(SidebarEntry::SshConnection {
-                label: format!("SSH {target}"),
-                host: "not connected".to_string(),
+                label: ssh_sidebar_label(target),
+                host: SSH_SIDEBAR_DETAIL.to_string(),
             })
         }));
         self.sidebar = SidebarView::build(&entries, self.registry.selected());
@@ -477,6 +538,29 @@ struct NorenApp {
     passthrough_policy: PassthroughPolicy,
 }
 
+/// Which application-owned line, if any, occupies the renderer's status row.
+///
+/// Runtime statuses are newer than startup SSH diagnostics and therefore take
+/// precedence while `show_status` is set. An SSH diagnostic otherwise stays
+/// visible until a clean configuration application clears it. Falling back to
+/// the runtime source preserves the existing empty-terminal status line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusRowSource {
+    Runtime,
+    SshDiagnostic,
+}
+
+impl StatusRowSource {
+    fn text<'a>(self, runtime: &'a str, ssh_diagnostic: Option<&'a str>) -> &'a str {
+        match self {
+            Self::Runtime => runtime,
+            Self::SshDiagnostic => {
+                ssh_diagnostic.expect("SSH diagnostic source requires diagnostic text")
+            }
+        }
+    }
+}
+
 impl Default for NorenApp {
     fn default() -> Self {
         Self::new(AppConfig::default())
@@ -518,6 +602,23 @@ impl NorenApp {
             palette_selection: 0,
             passthrough_gate: PassthroughGate::new(),
             passthrough_policy: palette_policy(),
+        }
+    }
+
+    /// Single status-row decision shared by rendering and pointer mapping.
+    fn status_row(&self) -> Option<StatusRowSource> {
+        if self.show_status {
+            Some(StatusRowSource::Runtime)
+        } else if self.ssh_diagnostic.is_some() {
+            Some(StatusRowSource::SshDiagnostic)
+        } else if self
+            .terminal
+            .as_ref()
+            .is_none_or(|terminal| terminal.screen().display_row_count() == 0)
+        {
+            Some(StatusRowSource::Runtime)
+        } else {
+            None
         }
     }
 
@@ -578,6 +679,19 @@ impl NorenApp {
 }
 
 impl NorenApp {
+    fn record_pty_started(&mut self) {
+        self.status = "Noren PoC ready";
+        self.show_status = false;
+        self.pty_child = PtyChildStatus::Running;
+        let session_id = self.workspace.create_session(SessionKind::Local);
+        self.workspace
+            .select_session(session_id)
+            .expect("freshly created session is live");
+        self.workspace
+            .observe_session(session_id, SessionStatus::Running);
+        self.active_session = Some(session_id);
+    }
+
     fn initialize(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -610,16 +724,7 @@ impl NorenApp {
         self.pty =
             match pty_size(grid.rows(), terminal_cols(grid.cols())).and_then(PtySession::spawn) {
                 Ok(session) => {
-                    self.status = "Noren PoC ready";
-                    self.show_status = false;
-                    self.pty_child = PtyChildStatus::Running;
-                    let session_id = self.workspace.create_session(SessionKind::Local);
-                    self.workspace
-                        .select_session(session_id)
-                        .expect("freshly created session is live");
-                    self.workspace
-                        .observe_session(session_id, SessionStatus::Running);
-                    self.active_session = Some(session_id);
+                    self.record_pty_started();
                     Some(session)
                 }
                 Err(_) => {
@@ -1026,13 +1131,28 @@ impl NorenApp {
     /// selection model. SSH rows show a truthful pending-selection notice and
     /// never launch or select a terminal session.
     fn handle_sidebar_click(&mut self, state: ElementState, button: MouseButton) -> bool {
+        let Some(frame_size) = self.window.as_ref().map(|window| window.inner_size()) else {
+            return false;
+        };
+        self.handle_sidebar_click_in_frame(state, button, frame_size)
+    }
+
+    /// Window-independent seam for the sidebar event path. Production passes
+    /// the live inner size; tests can supply a synthetic frame without creating
+    /// a platform window.
+    fn handle_sidebar_click_in_frame(
+        &mut self,
+        state: ElementState,
+        button: MouseButton,
+        frame_size: PhysicalSize<u32>,
+    ) -> bool {
         if self.palette_open || button != MouseButton::Left || state != ElementState::Pressed {
             return false;
         }
         let Some(position) = self.cursor_position else {
             return false;
         };
-        let Some(row_index) = self.sidebar_row_index(position) else {
+        let Some(row_index) = self.sidebar_row_index(position, frame_size) else {
             return false;
         };
         let selected = self.workspace.select_ssh_sidebar_row(row_index);
@@ -1044,15 +1164,25 @@ impl NorenApp {
         selected
     }
 
-    fn sidebar_row_index(&self, position: PhysicalPosition<f64>) -> Option<usize> {
-        if position.x < 0.0
+    fn sidebar_row_index(
+        &self,
+        position: PhysicalPosition<f64>,
+        frame_size: PhysicalSize<u32>,
+    ) -> Option<usize> {
+        if !position.x.is_finite()
+            || !position.y.is_finite()
+            || position.x < 0.0
             || position.y < 0.0
+            || position.x >= f64::from(frame_size.width)
+            || position.y >= f64::from(frame_size.height)
             || position.x >= sidebar_pixel_width(self.geometry.cell_width())
         {
             return None;
         }
         let row = pixel_row_index(position.y, self.geometry.cell_height())?;
-        (row < self.workspace.sidebar().rows().len()).then_some(row)
+        let fully_drawable_rows =
+            renderer::fully_drawable_rows(frame_size.height, self.geometry.cell_metrics());
+        (row < fully_drawable_rows && row < self.workspace.sidebar().rows().len()).then_some(row)
     }
 
     /// Handle a mouse button event while tracking is active (no Shift bypass).
@@ -1112,16 +1242,31 @@ impl NorenApp {
         }
     }
 
-    /// Map a window pixel position to grid coordinates, mirroring the
-    /// renderer's bottom-aligned layout of the trimmed visible lines and the
-    /// optional status row. Returns `None` outside the rendered content.
+    /// Map a window pixel position to grid coordinates using the renderer's
+    /// shared top-aligned row layout. Returns `None` outside rendered terminal
+    /// content, including status chrome and unused underfill rows.
     fn grid_point_at(&self, position: PhysicalPosition<f64>) -> Option<GridPoint> {
-        if position.x < 0.0 || position.y < 0.0 {
+        let frame_size = self.window.as_ref()?.inner_size();
+        self.grid_point_in_frame(position, frame_size)
+    }
+
+    /// Window-independent seam shared by selection and mouse reporting through
+    /// [`grid_point_at`](Self::grid_point_at).
+    fn grid_point_in_frame(
+        &self,
+        position: PhysicalPosition<f64>,
+        frame_size: PhysicalSize<u32>,
+    ) -> Option<GridPoint> {
+        if !position.x.is_finite()
+            || !position.y.is_finite()
+            || position.x < 0.0
+            || position.y < 0.0
+            || position.x >= f64::from(frame_size.width)
+            || position.y >= f64::from(frame_size.height)
+        {
             return None;
         }
         let terminal = self.terminal.as_ref()?;
-        let window = self.window.as_ref()?;
-        let physical = window.inner_size();
         let cell_width = self.geometry.cell_width();
         let cell_height = self.geometry.cell_height();
         // The sidebar occupies the leftmost SIDEBAR_COLS cell columns; clicks
@@ -1129,22 +1274,15 @@ impl NorenApp {
         if position.x < sidebar_pixel_width(cell_width) {
             return None;
         }
-        let visible_rows = usize::try_from(physical.height / cell_height)
-            .unwrap_or(0)
-            .clamp(1, usize::from(MAX_RENDER_ROWS));
-        let content_rows = visible_content_rows(terminal);
-        let total_lines = content_rows + usize::from(self.show_status);
-        let displayed = total_lines.min(visible_rows);
-        let top_blank_rows = visible_rows - displayed;
-        let first_line = total_lines - displayed;
+        let content_rows = terminal.screen().display_row_count();
+        let layout = renderer::FrameRowLayout::new(
+            frame_size.height,
+            self.geometry.cell_metrics(),
+            content_rows,
+            self.status_row().is_some(),
+        )?;
         let row = pixel_row_index(position.y, cell_height)?;
-        if row < top_blank_rows {
-            return None;
-        }
-        let line_index = first_line + (row - top_blank_rows);
-        if line_index >= content_rows {
-            return None;
-        }
+        let line_index = layout.content_line_at(row)?;
         let (rows, cols) = terminal.size();
         if line_index >= usize::from(rows) {
             return None;
@@ -1165,13 +1303,21 @@ impl NorenApp {
     }
 
     /// Map a pixel position to 0-based `(col, row)` cell indices suitable for
-    /// the mouse encoder. Delegates to [`grid_point_at`](Self::grid_point_at)
-    /// which already excludes sidebar clicks and accounts for the bottom-aligned
-    /// content layout, then converts the absolute scrollback line to a
-    /// 0-based visible row.
+    /// the mouse encoder. Uses the same frame mapper as local selection, then
+    /// converts the absolute scrollback line to a 0-based visible row.
     fn mouse_cell_at(&self, position: PhysicalPosition<f64>) -> Option<(u32, u32)> {
+        let frame_size = self.window.as_ref()?.inner_size();
+        self.mouse_cell_in_frame(position, frame_size)
+    }
+
+    /// Window-independent seam for the mouse-reporting path.
+    fn mouse_cell_in_frame(
+        &self,
+        position: PhysicalPosition<f64>,
+        frame_size: PhysicalSize<u32>,
+    ) -> Option<(u32, u32)> {
         let terminal = self.terminal.as_ref()?;
-        let point = self.grid_point_at(position)?;
+        let point = self.grid_point_in_frame(position, frame_size)?;
         let visible_row = point.line().checked_sub(terminal.scrollback_len())?;
         let col = u32::try_from(point.column()).ok()?;
         let row = u32::try_from(visible_row).ok()?;
@@ -1242,7 +1388,8 @@ impl NorenApp {
             return;
         }
         let snapshot = self.terminal.as_ref().map(TerminalEngine::snapshot);
-        let input = diagnostics::from_snapshot(snapshot.as_ref(), self.pty_child);
+        let input = diagnostics::from_snapshot(snapshot.as_ref(), self.pty_child)
+            .with_persistence_conflict(self.workspace.persistence_conflict());
         let line = diagnostics::report(&input);
         eprintln!("{line}");
         if let Some(window) = &self.window {
@@ -1392,17 +1539,9 @@ impl NorenApp {
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let snapshot = self.terminal.as_ref().map(TerminalEngine::snapshot);
-        let status = if let Some(diagnostic) = self.ssh_diagnostic.as_deref() {
-            Some(diagnostic)
-        } else if self.show_status
-            || snapshot
-                .as_ref()
-                .is_none_or(|snapshot| snapshot.lines().is_empty())
-        {
-            Some(self.status)
-        } else {
-            None
-        };
+        let status_row = self.status_row();
+        let status =
+            status_row.map(|source| source.text(self.status, self.ssh_diagnostic.as_deref()));
         let sidebar_lines = sidebar_text_lines(self.workspace.sidebar());
         let lines = if self.palette_open {
             let mut lines = palette_text_lines(self.workspace.palette(), self.palette_selection);
@@ -1440,9 +1579,8 @@ impl NorenApp {
         // entry rather than marking it stopped, so closing here would persist
         // a deletion and hand back an empty sidebar on the next launch. The
         // session stays in the registry; only its PTY goes away. On the next
-        // launch it is restored as `SessionStatus::Starting`, which is what
-        // this PR already decided a restored session means: a visible entry
-        // whose shell is not running.
+        // launch it is restored as `SessionStatus::Restored`: a visible entry
+        // whose shell is not running and cannot be reattached implicitly.
         //
         // This also protects the non-quit caller: `redraw` invokes `close` on
         // `RenderOutcome::DeviceLost`. A lost GPU device must not delete the
@@ -1790,24 +1928,6 @@ fn wheel_clicks(delta: MouseScrollDelta, metrics: CellMetrics) -> Vec<WheelDirec
     vec![direction; count]
 }
 
-/// Number of visible grid rows the renderer will draw: rows up to and
-/// including the last row with non-blank content. Mirrors the snapshot
-/// `lines` trimming without cloning the grid (or the scrollback), so mouse
-/// mapping never pays for an immutable snapshot per event.
-fn visible_content_rows(terminal: &TerminalState) -> usize {
-    let screen = terminal.screen();
-    let cols = usize::from(screen.cols());
-    let cells = screen.cells();
-    (0..usize::from(screen.rows()))
-        .filter(|row| {
-            !cells[row * cols..(row + 1) * cols]
-                .iter()
-                .all(Cell::is_blank)
-        })
-        .next_back()
-        .map_or(0, |row| row + 1)
-}
-
 fn translate_key(event: &KeyEvent, modifiers: Modifiers) -> Result<KeyInput, KeyDropReason> {
     translate_logical_key(&event.logical_key, key_phase(event), modifiers)
 }
@@ -1922,6 +2042,7 @@ mod tests {
     use super::*;
     use noren_app::palette::CommandId;
     use noren_app::passthrough::{self, collisions};
+    use noren_app::session_persistence::load;
     use noren_app::sidebar::EntryKind;
 
     #[test]
@@ -2040,13 +2161,210 @@ mod tests {
     }
 
     #[test]
-    fn visible_content_rows_counts_through_the_last_non_blank_row() {
+    fn display_row_count_counts_through_the_last_non_blank_row() {
         let mut terminal = TerminalState::new(4, 8).expect("valid terminal");
         terminal.feed_bytes(b"ab\r\ncd");
-        assert_eq!(visible_content_rows(&terminal), 2);
+        assert_eq!(terminal.screen().display_row_count(), 2);
 
         terminal.feed_bytes(b"\r\n\r\nef");
-        assert_eq!(visible_content_rows(&terminal), 4);
+        assert_eq!(terminal.screen().display_row_count(), 4);
+        assert_eq!(
+            terminal.screen().display_row_count(),
+            terminal.snapshot().display_cells().len(),
+            "live hit testing and snapshot rendering must select the same rows"
+        );
+    }
+
+    #[test]
+    fn shared_row_layout_maps_selection_and_mouse_paths() {
+        let metrics = GridGeometry::poc().cell_metrics();
+        let frame_size = PhysicalSize::new(
+            (renderer::SIDEBAR_COLS as u32 + 8) * metrics.width(),
+            30 * metrics.height(),
+        );
+        let x = sidebar_pixel_width(metrics.width());
+        let position_at =
+            |row: u32| PhysicalPosition::new(x, f64::from(row * metrics.height()) + 1.0);
+        let mapped_line = |app: &NorenApp, row| {
+            app.grid_point_in_frame(position_at(row), frame_size)
+                .map(GridPoint::line)
+        };
+        let mouse_cell =
+            |app: &NorenApp, row| app.mouse_cell_in_frame(position_at(row), frame_size);
+
+        // Underfilled: content and status remain at rows 0 and 1, with blank
+        // space below. This is the 30-row form of the reviewed mismatch.
+        let mut underfilled = TerminalState::new(30, 8).expect("valid terminal");
+        underfilled.feed_bytes(b"A");
+        let underfilled = NorenApp {
+            terminal: Some(underfilled),
+            show_status: true,
+            ..Default::default()
+        };
+        assert_eq!(mapped_line(&underfilled, 0), Some(0));
+        assert_eq!(mouse_cell(&underfilled, 0), Some((0, 0)));
+        assert_eq!(mapped_line(&underfilled, 1), None, "row 1 is status");
+        assert_eq!(
+            mouse_cell(&underfilled, 1),
+            None,
+            "status is not reportable"
+        );
+        assert_eq!(mapped_line(&underfilled, 29), None, "underfill stays blank");
+
+        // Exact fit: all 30 terminal rows occupy the 30 frame rows.
+        let mut full = TerminalState::new(30, 8).expect("valid terminal");
+        full.feed_bytes(b"\x1b[30;1HZ");
+        let exact = NorenApp {
+            terminal: Some(full),
+            show_status: false,
+            ..Default::default()
+        };
+        assert_eq!(mapped_line(&exact, 0), Some(0));
+        assert_eq!(mapped_line(&exact, 29), Some(29));
+        assert_eq!(mouse_cell(&exact, 29), Some((0, 29)));
+
+        // Status-only: row zero is chrome and no pixel row addresses terminal
+        // content.
+        let status_only = NorenApp {
+            terminal: Some(TerminalState::new(30, 8).expect("valid terminal")),
+            show_status: true,
+            ..Default::default()
+        };
+        assert_eq!(mapped_line(&status_only, 0), None);
+        assert_eq!(mouse_cell(&status_only, 0), None);
+        assert_eq!(mapped_line(&status_only, 29), None);
+
+        // One row clipped: adding status to 30 content rows clips terminal row
+        // zero at the top; frame row zero maps to terminal row one and the last
+        // frame row is status chrome.
+        let mut full = TerminalState::new(30, 8).expect("valid terminal");
+        full.feed_bytes(b"\x1b[30;1HZ");
+        let clipped = NorenApp {
+            terminal: Some(full),
+            show_status: true,
+            ..Default::default()
+        };
+        assert_eq!(mapped_line(&clipped, 0), Some(1));
+        assert_eq!(mouse_cell(&clipped, 0), Some((0, 1)));
+        assert_eq!(mapped_line(&clipped, 28), Some(29));
+        assert_eq!(mapped_line(&clipped, 29), None, "last row is status");
+    }
+
+    #[test]
+    fn horizontal_frame_bounds_are_shared_by_selection_and_mouse_paths() {
+        let mut terminal = TerminalState::new(1, 8).expect("valid terminal");
+        terminal.feed_bytes(b"A");
+        let app = NorenApp {
+            terminal: Some(terminal),
+            show_status: false,
+            ..Default::default()
+        };
+        let metrics = app.geometry.cell_metrics();
+        // Deliberately leave two extra terminal-side cells in the frame. A
+        // position there is still in-frame and retains the historical clamp to
+        // the terminal's last logical column.
+        let frame_size = PhysicalSize::new(
+            (renderer::SIDEBAR_COLS as u32 + 10) * metrics.width(),
+            metrics.height(),
+        );
+        let terminal_x = sidebar_pixel_width(metrics.width());
+        let mapped = |position, size| {
+            (
+                app.grid_point_in_frame(position, size),
+                app.mouse_cell_in_frame(position, size),
+            )
+        };
+
+        assert_eq!(
+            mapped(PhysicalPosition::new(terminal_x, 1.0), frame_size),
+            (Some(GridPoint::new(0, 0)), Some((0, 0))),
+            "a valid in-frame position maps through both seams"
+        );
+        assert_eq!(
+            mapped(
+                PhysicalPosition::new(f64::from(frame_size.width) - 1.0, 1.0),
+                frame_size,
+            ),
+            (Some(GridPoint::new(0, 7)), Some((7, 0))),
+            "in-frame space past the logical grid still clamps to its last column"
+        );
+        assert_eq!(
+            mapped(
+                PhysicalPosition::new(f64::from(frame_size.width), 1.0),
+                frame_size,
+            ),
+            (None, None),
+            "the right frame edge is exclusive"
+        );
+        assert_eq!(
+            mapped(
+                PhysicalPosition::new(f64::from(frame_size.width) + 1.0, 1.0),
+                frame_size,
+            ),
+            (None, None),
+            "a position beyond the right frame edge is rejected"
+        );
+        assert_eq!(
+            mapped(
+                PhysicalPosition::new(0.0, 1.0),
+                PhysicalSize::new(0, frame_size.height),
+            ),
+            (None, None),
+            "a zero-width frame has no addressable position"
+        );
+        assert_eq!(
+            mapped(
+                PhysicalPosition::new(terminal_x, 0.0),
+                PhysicalSize::new(frame_size.width, 0),
+            ),
+            (None, None),
+            "a zero-height frame has no addressable position"
+        );
+
+        for invalid in [
+            PhysicalPosition::new(f64::NAN, 1.0),
+            PhysicalPosition::new(terminal_x, f64::INFINITY),
+            PhysicalPosition::new(-1.0, 1.0),
+            PhysicalPosition::new(terminal_x, -1.0),
+        ] {
+            assert_eq!(mapped(invalid, frame_size), (None, None));
+        }
+    }
+
+    #[test]
+    fn background_only_row_is_content_for_status_and_hit_testing() {
+        let mut terminal = TerminalState::new(4, 8).expect("valid terminal");
+        terminal.feed_bytes(b"\x1b[48;2;73;18;146m ");
+        assert_eq!(terminal.screen().display_row_count(), 1);
+        assert_eq!(terminal.snapshot().display_cells().len(), 1);
+
+        let app = NorenApp {
+            terminal: Some(terminal),
+            show_status: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            app.status_row(),
+            None,
+            "a rendered background-only row prevents empty-terminal fallback"
+        );
+
+        let metrics = app.geometry.cell_metrics();
+        let frame_size = PhysicalSize::new(
+            (renderer::SIDEBAR_COLS as u32 + 8) * metrics.width(),
+            4 * metrics.height(),
+        );
+        let position = PhysicalPosition::new(sidebar_pixel_width(metrics.width()), 1.0);
+        assert_eq!(
+            app.grid_point_in_frame(position, frame_size),
+            Some(GridPoint::new(0, 0)),
+            "the same background-only row must remain selectable"
+        );
+        assert_eq!(
+            app.mouse_cell_in_frame(position, frame_size),
+            Some((0, 0)),
+            "the same background-only row must remain mouse-reportable"
+        );
     }
 
     #[test]
@@ -3660,6 +3978,67 @@ mod tests {
     }
 
     #[test]
+    fn ssh_sidebar_label_preserves_short_targets() {
+        assert_eq!(ssh_sidebar_label("staging"), "SSH staging");
+        assert_eq!(ssh_sidebar_label("abcdefghij"), "SSH abcdefghij");
+        assert_eq!(ssh_sidebar_label("abcdefghijk"), "SSH abcdefg...");
+    }
+
+    #[test]
+    fn ssh_sidebar_label_truncates_multibyte_targets_on_a_scalar_boundary() {
+        let label = ssh_sidebar_label("東京大阪京都札幌仙台横浜");
+
+        assert_eq!(label, "SSH 東京大阪京都札...");
+        assert_eq!(label.chars().count(), SSH_SIDEBAR_LABEL_CHARS);
+    }
+
+    #[test]
+    fn near_one_mib_ssh_alias_keeps_full_identity_and_bounded_display_text() {
+        let path = temp_ssh_config_path();
+        let target = "a".repeat(1024 * 1024 - "Host \n".len());
+        let mut fixture = String::with_capacity(1024 * 1024);
+        fixture.push_str("Host ");
+        fixture.push_str(&target);
+        fixture.push('\n');
+        assert_eq!(fixture.len(), 1024 * 1024);
+        std::fs::write(&path, fixture).expect("write near-one-MiB SSH fixture");
+
+        let mut workspace = WorkspaceState::new();
+        let config = SshConfig::read(&path).expect("near-one-MiB SSH fixture parses");
+        assert_eq!(workspace.load_ssh_config(&config), 0);
+
+        let SessionKind::Ssh { target: cached } = &workspace.ssh_hosts[0] else {
+            panic!("configured target remains an SSH identity");
+        };
+        assert!(
+            cached == &target,
+            "the full connection target remains intact"
+        );
+
+        let row = &workspace.sidebar().rows()[0];
+        assert_eq!(row.label(), "SSH aaaaaaa...");
+        assert_eq!(row.label().chars().count(), SSH_SIDEBAR_LABEL_CHARS);
+
+        let redraw_lines = sidebar_text_lines(workspace.sidebar());
+        assert_eq!(redraw_lines.len(), 1);
+        assert_eq!(
+            redraw_lines[0].chars().count(),
+            SIDEBAR_ROW_PREFIX_CHARS
+                + SSH_SIDEBAR_LABEL_CHARS
+                + 1
+                + SSH_SIDEBAR_DETAIL.chars().count(),
+            "redraw text stays bounded independently of target length"
+        );
+
+        assert!(workspace.select_ssh_sidebar_row(0));
+        assert!(
+            workspace.selected_ssh_target() == Some(target.as_str()),
+            "pending selection retains the full connection target"
+        );
+        cleanup_ssh_config(&path);
+    }
+
+    #[test]
     fn missing_ssh_config_is_silent_and_adds_no_rows() {
         let path = temp_ssh_config_path();
         let mut app = NorenApp::default();
@@ -3686,6 +4065,167 @@ mod tests {
         assert!(diagnostic.contains("SSH configuration error"));
         assert!(!diagnostic.contains(secret));
         assert!(!diagnostic.contains("nope"));
+        cleanup_ssh_config(&path);
+    }
+
+    #[test]
+    fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_runtime() {
+        let path = temp_ssh_config_path();
+        let secret = "DO_NOT_LEAK_post_startup_ssh_fixture";
+        std::fs::write(&path, format!("Host broken\nPort nope # {secret}\n"))
+            .expect("write malformed SSH fixture");
+
+        let mut app = NorenApp::default();
+        app.load_ssh_hosts_from(&path);
+        let diagnostic = app
+            .ssh_diagnostic
+            .as_deref()
+            .expect("diagnostic surfaced")
+            .to_owned();
+        assert!(!diagnostic.contains("nope"));
+        assert!(!diagnostic.contains(secret));
+
+        let mut terminal = TerminalState::new(30, 8).expect("valid terminal");
+        // Put a marker in the last terminal row so all 30 rows are part of the
+        // displayed snapshot. `record_pty_started` exercises the production
+        // lifecycle transition without launching a process or opening SSH.
+        terminal.feed_bytes(b"\x1b[30;8HZ");
+        app.terminal = Some(terminal);
+        assert!(app.pty.is_none());
+        app.record_pty_started();
+        assert!(app.pty.is_none(), "the lifecycle seam must not start a PTY");
+
+        assert!(!app.show_status, "successful startup hides the ready line");
+        let source = app
+            .status_row()
+            .expect("the retained SSH diagnostic still renders after startup");
+        assert_eq!(source, StatusRowSource::SshDiagnostic);
+        assert_eq!(
+            source.text(app.status, app.ssh_diagnostic.as_deref()),
+            diagnostic
+        );
+
+        let content_rows = app
+            .terminal
+            .as_ref()
+            .expect("terminal present")
+            .screen()
+            .display_row_count();
+        assert_eq!(content_rows, 30);
+        let metrics = app.geometry.cell_metrics();
+        let frame_width = (renderer::SIDEBAR_COLS as u32 + 8) * metrics.width();
+        let frame_height = 30 * metrics.height();
+        let frame_size = PhysicalSize::new(frame_width, frame_height);
+        let layout = renderer::FrameRowLayout::new(
+            frame_height,
+            metrics,
+            content_rows,
+            app.status_row().is_some(),
+        )
+        .expect("non-zero frame");
+        assert_eq!(layout.row_at(0), Some(renderer::FrameRow::Terminal(1)));
+        assert_eq!(layout.row_at(28), Some(renderer::FrameRow::Terminal(29)));
+        assert_eq!(layout.row_at(29), Some(renderer::FrameRow::Status));
+        let snapshot = app.terminal.as_ref().expect("terminal present").snapshot();
+        let status = source.text(app.status, app.ssh_diagnostic.as_deref());
+        let vertices = renderer::glyph_vertices(
+            Some(&snapshot),
+            Some(&[]),
+            Some(status),
+            frame_width,
+            frame_height,
+            metrics,
+        );
+        assert!(
+            !vertices.is_empty(),
+            "terminal content and the diagnostic must render"
+        );
+        let contains = |row: usize, col: usize| {
+            let left = col as f32 * metrics.width() as f32 / frame_width as f32 * 2.0 - 1.0;
+            let right =
+                (col as f32 + 1.0) * metrics.width() as f32 / frame_width as f32 * 2.0 - 1.0;
+            let top = 1.0 - row as f32 * metrics.height() as f32 / frame_height as f32 * 2.0;
+            let bottom =
+                1.0 - (row as f32 + 1.0) * metrics.height() as f32 / frame_height as f32 * 2.0;
+            vertices.iter().any(|vertex| {
+                vertex.position[0] >= left
+                    && vertex.position[0] < right
+                    && vertex.position[1] <= top
+                    && vertex.position[1] > bottom
+            })
+        };
+        assert!(
+            contains(28, renderer::SIDEBAR_COLS + 7),
+            "terminal line 29's marker must be top-clipped into frame row 28"
+        );
+        assert!(
+            contains(29, renderer::SIDEBAR_COLS),
+            "the retained diagnostic's first glyph must render in the last frame row"
+        );
+
+        let terminal_x = sidebar_pixel_width(metrics.width());
+        assert_eq!(
+            app.grid_point_in_frame(PhysicalPosition::new(terminal_x, 1.0), frame_size),
+            Some(GridPoint::new(1, 0)),
+            "top clipping maps frame row 0 to terminal line 1"
+        );
+        assert_eq!(
+            app.mouse_cell_in_frame(PhysicalPosition::new(terminal_x, 1.0), frame_size),
+            Some((0, 1)),
+            "mouse mapping must share the top-clipped terminal line"
+        );
+        assert_eq!(
+            app.grid_point_in_frame(
+                PhysicalPosition::new(terminal_x, f64::from(28 * metrics.height()) + 1.0),
+                frame_size,
+            ),
+            Some(GridPoint::new(29, 0)),
+            "frame row 28 maps to the last terminal line"
+        );
+        assert_eq!(
+            app.mouse_cell_in_frame(
+                PhysicalPosition::new(terminal_x, f64::from(28 * metrics.height()) + 1.0),
+                frame_size,
+            ),
+            Some((0, 29)),
+            "mouse mapping reaches the same last terminal line"
+        );
+        assert_eq!(
+            app.grid_point_in_frame(
+                PhysicalPosition::new(terminal_x, f64::from(29 * metrics.height()) + 1.0,),
+                frame_size,
+            ),
+            None,
+            "the last frame row is diagnostic chrome, not selectable"
+        );
+        assert_eq!(
+            app.mouse_cell_in_frame(
+                PhysicalPosition::new(terminal_x, f64::from(29 * metrics.height()) + 1.0),
+                frame_size,
+            ),
+            None,
+            "the diagnostic row is not mouse-reportable"
+        );
+
+        app.finish_pty("Noren PTY operation failed");
+        let source = app
+            .status_row()
+            .expect("the newer runtime failure renders a status row");
+        assert_eq!(source, StatusRowSource::Runtime);
+        assert_eq!(
+            source.text(app.status, app.ssh_diagnostic.as_deref()),
+            "Noren PTY operation failed",
+            "a retained startup diagnostic must not mask a newer runtime status"
+        );
+        assert_eq!(app.ssh_diagnostic.as_deref(), Some(diagnostic.as_str()));
+
+        std::fs::write(&path, b"Host recovered\n").expect("replace with valid SSH fixture");
+        app.load_ssh_hosts_from(&path);
+        assert!(
+            app.ssh_diagnostic.is_none(),
+            "a clean configuration application ends the diagnostic lifetime"
+        );
+
         cleanup_ssh_config(&path);
     }
 
@@ -3717,7 +4257,11 @@ mod tests {
         app.workspace.create_session(SessionKind::Local);
         app.cursor_position = Some(PhysicalPosition::new(5.0, 25.0));
 
-        assert!(app.handle_sidebar_click(ElementState::Pressed, MouseButton::Left));
+        assert!(app.handle_sidebar_click_in_frame(
+            ElementState::Pressed,
+            MouseButton::Left,
+            PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+        ));
         assert_eq!(app.workspace.selected_ssh_target(), Some("staging"));
         assert_eq!(app.workspace.registry().selected(), None);
         assert_eq!(app.workspace.registry().len(), 1);
@@ -3734,6 +4278,62 @@ mod tests {
     }
 
     #[test]
+    fn partial_undrawn_sidebar_row_cannot_select_a_hidden_ssh_entry() {
+        let path = temp_ssh_config_path();
+        std::fs::write(&path, b"Host visible\nHost hidden\n").expect("write SSH fixture");
+
+        let mut app = NorenApp::default();
+        app.load_ssh_hosts_from(&path);
+        assert_eq!(app.workspace.sidebar().rows().len(), 2);
+
+        let cell_height = app.geometry.cell_height();
+        let frame_size = PhysicalSize::new(
+            (renderer::SIDEBAR_COLS as u32) * app.geometry.cell_width(),
+            cell_height + cell_height / 2,
+        );
+        let partial_row = PhysicalPosition::new(5.0, f64::from(cell_height) + 1.0);
+        assert_eq!(
+            app.sidebar_row_index(partial_row, frame_size),
+            None,
+            "the partial second cell row is not among the renderer's fully drawable rows"
+        );
+        app.cursor_position = Some(partial_row);
+        assert!(!app.handle_sidebar_click_in_frame(
+            ElementState::Pressed,
+            MouseButton::Left,
+            frame_size,
+        ));
+        assert_eq!(
+            app.workspace.selected_ssh_target(),
+            None,
+            "the hidden SSH entry must remain unselected"
+        );
+
+        let outside_window = PhysicalPosition::new(5.0, f64::from(frame_size.height));
+        assert_eq!(
+            app.sidebar_row_index(outside_window, frame_size),
+            None,
+            "the bottom window edge is exclusive"
+        );
+
+        let visible_row = PhysicalPosition::new(5.0, 1.0);
+        assert_eq!(app.sidebar_row_index(visible_row, frame_size), Some(0));
+        app.cursor_position = Some(visible_row);
+        assert!(app.handle_sidebar_click_in_frame(
+            ElementState::Pressed,
+            MouseButton::Left,
+            frame_size,
+        ));
+        assert_eq!(app.workspace.selected_ssh_target(), Some("visible"));
+        assert!(
+            app.pty.is_none(),
+            "SSH selection must remain non-connecting"
+        );
+
+        cleanup_ssh_config(&path);
+    }
+
+    #[test]
     fn local_sidebar_press_falls_through_instead_of_being_swallowed() {
         let mut app = NorenApp::default();
         app.workspace.create_session(SessionKind::Local);
@@ -3741,7 +4341,11 @@ mod tests {
         let initial_status = app.status;
 
         assert!(
-            !app.handle_sidebar_click(ElementState::Pressed, MouseButton::Left),
+            !app.handle_sidebar_click_in_frame(
+                ElementState::Pressed,
+                MouseButton::Left,
+                PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+            ),
             "a local session row is not handled by the SSH sidebar path"
         );
         assert_eq!(app.workspace.selected_ssh_target(), None);
@@ -3763,14 +4367,28 @@ mod tests {
     fn many_ssh_hosts_are_bounded_and_report_the_omitted_count() {
         let path = temp_ssh_config_path();
         let config: String = (0..30)
-            .map(|index| format!("Host host-{index}\n"))
+            .map(|index| format!("Host configured-host-{index:02}-with-long-alias\n"))
             .collect();
         std::fs::write(&path, config).expect("write many-host SSH fixture");
 
         let mut app = NorenApp::default();
         app.load_ssh_hosts_from(&path);
 
-        assert_eq!(app.workspace.sidebar().rows().len(), MAX_SSH_SIDEBAR_HOSTS);
+        let rows = app.workspace.sidebar().rows();
+        assert_eq!(rows.len(), MAX_SSH_SIDEBAR_HOSTS);
+        assert!(rows.iter().all(|row| {
+            row.label().chars().count() == SSH_SIDEBAR_LABEL_CHARS
+                && row.label().ends_with(SSH_SIDEBAR_TRUNCATION_MARKER)
+        }));
+        let redraw_lines = sidebar_text_lines(app.workspace.sidebar());
+        assert_eq!(redraw_lines.len(), MAX_SSH_SIDEBAR_HOSTS);
+        assert!(redraw_lines.iter().all(|line| {
+            line.chars().count()
+                == SIDEBAR_ROW_PREFIX_CHARS
+                    + SSH_SIDEBAR_LABEL_CHARS
+                    + 1
+                    + SSH_SIDEBAR_DETAIL.chars().count()
+        }));
         assert_eq!(app.workspace.ssh_hosts_omitted(), 6);
         assert!(
             app.ssh_diagnostic
@@ -3916,9 +4534,11 @@ mod tests {
         cleanup_state_file(&path);
     }
 
-    /// Required: a restored session's status does not claim to be running.
+    /// Required: a restored session is distinct from a shell that is starting.
+    /// Mutation check for Issue #110: changing `load_snapshot`'s restoration
+    /// path back to `create` makes the status and sidebar assertions fail.
     #[test]
-    fn restored_sessions_start_at_starting_not_running() {
+    fn restored_sessions_are_restored_not_starting_or_running() {
         let path = temp_state_path();
         let mut state = WorkspaceState::with_state_path(Some(path.clone()));
         let id = state.create_session(SessionKind::Local);
@@ -3930,8 +4550,8 @@ mod tests {
         for descriptor in restored.registry().sessions() {
             assert_eq!(
                 descriptor.status(),
-                &SessionStatus::Starting,
-                "restored session must not claim to be running"
+                &SessionStatus::Restored,
+                "restored session must identify its no-process state"
             );
         }
         let detail = restored
@@ -3941,10 +4561,17 @@ mod tests {
             .and_then(|r| r.detail())
             .unwrap_or_default();
         assert!(
-            detail.contains("starting"),
-            "detail says starting: {detail}"
+            detail.contains("restored") && detail.contains("not running"),
+            "detail identifies a restored, non-running session: {detail}"
         );
-        assert!(!detail.contains("running"), "detail must not say running");
+        assert!(
+            !detail.ends_with("· running"),
+            "detail must not claim running: {detail}"
+        );
+        assert!(
+            restored.sidebar().viewport().is_none(),
+            "selecting a restored session must not imply an attachment"
+        );
         cleanup_state_file(&path);
     }
 
@@ -4123,11 +4750,11 @@ mod tests {
     }
 
     /// Quitting must not silently downgrade the session's status claim either:
-    /// the shell is gone, so the restored entry is `Starting`, never `Running`.
-    /// Consistent with `restored_sessions_start_at_starting_not_running`, but
+    /// the shell is gone, so the restored entry is `Restored`, never `Running`.
+    /// Consistent with `restored_sessions_are_restored_not_starting_or_running`, but
     /// reached through the quit path rather than a direct workspace mutation.
     #[test]
-    fn session_restored_after_quitting_is_starting_not_running() {
+    fn session_restored_after_quitting_is_restored_not_running() {
         let path = temp_state_path();
         let mut app = app_with_state_path(&path);
         let id = app.workspace.create_session(SessionKind::Local);
@@ -4141,7 +4768,7 @@ mod tests {
         for descriptor in relaunched.registry().sessions() {
             assert_eq!(
                 descriptor.status(),
-                &SessionStatus::Starting,
+                &SessionStatus::Restored,
                 "a session whose PTY was torn down must not claim to be running"
             );
         }
@@ -4152,10 +4779,17 @@ mod tests {
             .and_then(|r| r.detail())
             .unwrap_or_default();
         assert!(
-            detail.contains("starting"),
-            "detail says starting: {detail}"
+            detail.contains("restored") && detail.contains("not running"),
+            "detail identifies a restored, non-running session: {detail}"
         );
-        assert!(!detail.contains("running"), "detail must not say running");
+        assert!(
+            !detail.ends_with("· running"),
+            "detail must not claim running: {detail}"
+        );
+        assert!(
+            relaunched.sidebar().viewport().is_none(),
+            "a restored selected session must not imply an attachment"
+        );
         cleanup_state_file(&path);
     }
 
@@ -4252,5 +4886,48 @@ mod tests {
         assert!(state.restore().is_ok(), "no path → no-op restore");
         state.create_session(SessionKind::Local);
         assert_eq!(state.registry().len(), 1);
+    }
+
+    /// Mutation check for Issue #111: removing the baseline comparison makes
+    /// this cross-instance overwrite pass without setting the diagnostics
+    /// warning.
+    #[test]
+    fn second_instance_overwrite_is_detected_and_reported_by_diagnostics() {
+        let path = temp_state_path();
+        let mut first = WorkspaceState::with_state_path(Some(path.clone()));
+        first.create_session(SessionKind::Local);
+
+        let mut second = app_with_state_path(&path);
+        first.create_session(SessionKind::Local);
+        second.workspace.create_session(SessionKind::Local);
+
+        assert!(second.workspace.persistence_conflict());
+        second.toggle_diagnostics();
+        assert!(
+            second.diagnostics_line.contains("state=changed-underneath"),
+            "diagnostics: {}",
+            second.diagnostics_line
+        );
+        cleanup_state_file(&path);
+    }
+
+    #[test]
+    fn single_instance_save_has_no_persistence_false_alarm() {
+        let path = temp_state_path();
+        let mut app = app_with_state_path(&path);
+        app.workspace.create_session(SessionKind::Local);
+
+        app.toggle_diagnostics();
+        assert!(
+            app.diagnostics_line.contains("state=ok"),
+            "diagnostics: {}",
+            app.diagnostics_line
+        );
+        assert!(
+            !app.diagnostics_line.contains("changed-underneath"),
+            "diagnostics: {}",
+            app.diagnostics_line
+        );
+        cleanup_state_file(&path);
     }
 }

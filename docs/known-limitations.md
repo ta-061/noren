@@ -4,11 +4,12 @@ This document exists so that the first thing a reader meets is what Noren
 **cannot** do today, not what it hopes to do. Decision D-M8-001 settled that the
 first artifact is an explicitly dated developer preview, not a
 `0.1.0-preview` of the product; this page is the substance behind that framing.
-Every claim below was verified against the tree on 2026-08-08; citations point
-at the file, function, type, constant, or test that establishes them. Names are
-used rather than line numbers, which rot; where a count is genuinely needed the
-command that reproduces it is given instead. If anything here has drifted,
-treat the code as correct and this page as a bug.
+This page retains a 2026-08-08 verification baseline. The SSH/sidebar and
+renderer claims changed for PR 120 were verified against the candidate tree on
+2026-08-12. Citations point at the file, function, type, constant, or test that
+establishes them. Names are used rather than line numbers, which rot; where a
+count is genuinely needed the command that reproduces it is given instead. If
+anything here has drifted, treat the code as correct and this page as a bug.
 
 ## What Noren is today
 
@@ -56,9 +57,10 @@ binary. What now actually happens on screen:
 
 It is still **not** the full workspace product that [ADR
 0003](adr/0003-noren-zellij-responsibility-boundary.md) describes — one local
-shell at a time, and the non-local session kinds are modelled but unreachable.
-See "What does not work" below, which remains the more useful list. Milestones
-3–8 are open on the [roadmap](../ROADMAP.md).
+shell at a time; configured SSH targets are now discovered and selectable in
+the sidebar, but no non-local session can launch. See "What does not work"
+below, which remains the more useful list. Milestones 3–8 are open on the
+[roadmap](../ROADMAP.md).
 
 ## What does not work
 
@@ -107,10 +109,11 @@ Each item states what you would actually see if you ran the build.
   tracked and copy extracts it, yet the renderer does not highlight the selected
   region — the comment on the `selection` field in `main.rs` says so in the
   source itself ("The renderer does not highlight it yet"). Scrollback is
-  bounded and searchable, but `glyph_vertices` always roots the layout at
-  `total_lines.saturating_sub(visible_rows)` with no scroll offset, so the
-  viewport always draws the bottom `visible_rows` and you cannot scroll it
-  back through it. The data is there; the view onto it is not.
+  bounded and searchable, but `FrameRowLayout::new` derives
+  `terminal_row_count` from `content_rows.min(terminal_capacity)`, then
+  `first_terminal_line` as `content_rows - terminal_row_count`. There is no
+  scroll-offset input, so rendering stays on the newest suffix and you cannot
+  scroll back through it. The data is there; the view onto it is not.
 - **macOS only, one fixed shell.**   `Renderer::new` requests Metal exclusively
   (`instance_descriptor.backends = wgpu::Backends::METAL` in
   `crates/noren-app/src/renderer.rs`), so it does not *run* on other platforms —
@@ -125,13 +128,15 @@ Each item states what you would actually see if you ran the build.
 - **Only local sessions can actually be launched.** `SessionKind` models
   `Local`, `Project`, `Worktree`, `Ssh`, and `Agent`, and `EntryKind` in
   `sidebar.rs` can describe project, worktree, SSH-connection, and agent rows —
-  but every creation path in the running binary passes `SessionKind::Local`
-  (the other variants are constructed only in `main.rs`'s tests, never on a
-  runtime path). The doc comments on the `Ssh` and
-  `Agent` variants say so directly: *reserved*, *fixture only — no connection is
-  opened*, *no agent is launched*. In practice: the palette's "New Session"
-  gives you another local `zsh`, and there is no way to open an SSH host, a git
-  worktree, or an agent from the workspace. Milestones 4 and 5 own those.
+  but only `Local` has a launch path. The running binary now reads bounded
+  OpenSSH configuration facts, constructs `SessionKind::Ssh`, and displays
+  configured targets as `SidebarEntry::SshConnection` rows. Clicking one only
+  records a pending target; it opens neither an SSH connection nor a PTY.
+  Project and worktree kinds remain modelled, while agent entries remain
+  reserved fixtures and no agent is launched. In practice: the palette's "New
+  Session" gives you another local `zsh`, and there is no way to open an SSH
+  host, a git worktree, or an agent from the workspace. Milestones 4 and 5 own
+  the remaining work.
 - **One session is visible at a time.** The sidebar lists sessions and selection
   moves between them, but a single terminal viewport is drawn beside it; there
   is no split, tiled, or multi-session view. Panes and layout *inside* a session
