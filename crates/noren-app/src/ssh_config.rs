@@ -12,6 +12,11 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 /// Maximum include nesting. Cycles are also stopped by the active recursion
 /// stack, so a file may be included again once its prior invocation returns.
 pub const MAX_INCLUDE_DEPTH: usize = 16;
@@ -866,9 +871,8 @@ fn read_text_file(
     line: usize,
     limit: usize,
 ) -> Result<Option<String>, SshConfigError> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => return Ok(None),
+    let Some(file) = open_regular_file(path) else {
+        return Ok(None);
     };
     let bytes = match read_bounded(file, limit) {
         Ok(bytes) => bytes,
@@ -878,6 +882,30 @@ fn read_text_file(
         }
     };
     decode_file(bytes, line, limit).map(Some)
+}
+
+fn open_regular_file(path: &Path) -> Option<File> {
+    #[cfg(unix)]
+    {
+        // Callers pass a canonical path, so O_NOFOLLOW rejects only a final
+        // component swapped to a symlink after canonicalization; legitimate
+        // symlinks have already resolved to their in-root targets. O_NONBLOCK
+        // prevents a FIFO or similar special source from stalling before any
+        // byte budget can apply. Inspect the opened descriptor, not the path,
+        // and read from that same descriptor only when it is a regular file.
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(path)
+            .ok()?;
+        file.metadata().ok()?.is_file().then_some(file)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let file = File::open(path).ok()?;
+        file.metadata().ok()?.is_file().then_some(file)
+    }
 }
 
 fn decode_file(bytes: Vec<u8>, line: usize, limit: usize) -> Result<String, SshConfigError> {
@@ -1026,6 +1054,13 @@ fn wildcard_match(pattern: &str, candidate: &str) -> bool {
     pattern_index == pattern.len()
 }
 
+fn include_component_matches(pattern: &str, candidate: &str) -> bool {
+    // OpenSSH pathname expansion does not let a wildcard implicitly consume a
+    // leading dot. Keep this separate from Host matching, where `Host *` must
+    // continue to match aliases that begin with `.`.
+    (!candidate.starts_with('.') || pattern.starts_with('.')) && wildcard_match(pattern, candidate)
+}
+
 fn canonicalize_within(path: &Path, root: &Path) -> Option<PathBuf> {
     let canonical = fs::canonicalize(path).ok()?;
     canonical.starts_with(root).then_some(canonical)
@@ -1168,7 +1203,7 @@ fn expand_include(
                             .saturating_add(1)
                             .saturating_mul(file_name.len().saturating_add(1));
                         budget.charge(match_cost, line)?;
-                        if wildcard_match(&pattern, file_name) {
+                        if include_component_matches(&pattern, file_name) {
                             // The logical path copy is `current` plus the matched
                             // name; charge those bytes before constructing the
                             // PathBuf. Overflow rejects, never bypasses.
@@ -1275,6 +1310,61 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    const FIFO_CHILD_MARKER: &str = "NOREN_SSH_CONFIG_FIFO_TEST_CHILD";
+    #[cfg(unix)]
+    const FIFO_CHILD_PATH: &str = "NOREN_SSH_CONFIG_FIFO_TEST_PATH";
+
+    #[cfg(unix)]
+    fn fifo_child_config() -> Option<SshConfig> {
+        env::var_os(FIFO_CHILD_MARKER)?;
+        let path = PathBuf::from(
+            env::var_os(FIFO_CHILD_PATH).expect("FIFO child path accompanies child marker"),
+        );
+        Some(SshConfig::read(&path).expect("FIFO source is ignored without an error"))
+    }
+
+    #[cfg(unix)]
+    fn create_fifo(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create FIFO fixture parent");
+        }
+        let status = std::process::Command::new("/usr/bin/mkfifo")
+            .arg(path)
+            .status()
+            .expect("run mkfifo for regression fixture");
+        assert!(status.success(), "mkfifo failed with {status}");
+    }
+
+    #[cfg(unix)]
+    fn assert_fifo_test_completes(test_name: &str, config_path: &Path) {
+        let mut child = std::process::Command::new(
+            env::current_exe().expect("locate the current unit-test executable"),
+        )
+        .arg("--exact")
+        .arg(test_name)
+        .arg("--nocapture")
+        .env(FIFO_CHILD_MARKER, "1")
+        .env(FIFO_CHILD_PATH, config_path)
+        .spawn()
+        .expect("spawn bounded FIFO regression subprocess");
+        let timeout = std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + timeout;
+
+        loop {
+            if let Some(status) = child.try_wait().expect("poll FIFO regression subprocess") {
+                assert!(status.success(), "FIFO regression subprocess failed");
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("FIFO regression subprocess exceeded {timeout:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -1858,6 +1948,81 @@ mod tests {
         assert_eq!(config.hosts().len(), 1);
         assert_eq!(config.hosts()[0].alias(), "ordered");
         assert_eq!(config.hosts()[0].host_name(), Some("first.example"));
+    }
+
+    #[test]
+    fn include_wildcard_ignores_dotfiles_and_keeps_visible_lexical_order() {
+        let fixture = Fixture::new("include-dotfile");
+        let config_path = fixture.write("config", "Include parts/*.conf\n");
+        fixture.write(
+            "parts/.secret.conf",
+            "Host secret\n  HostName must-not-load.example\n",
+        );
+        fixture.write(
+            "parts/z-last.conf",
+            "Host ordered\n  HostName last.example\n",
+        );
+        fixture.write(
+            "parts/a-first.conf",
+            "Host ordered\n  HostName first.example\n",
+        );
+
+        let config = SshConfig::read(&config_path).expect("visible Include glob parses");
+        assert_eq!(config.hosts().len(), 1);
+        assert_eq!(config.hosts()[0].alias(), "ordered");
+        assert_eq!(config.hosts()[0].host_name(), Some("first.example"));
+    }
+
+    #[test]
+    fn include_wildcard_does_not_traverse_an_implicit_hidden_directory() {
+        let fixture = Fixture::new("include-hidden-directory");
+        let config_path = fixture.write("config", "Include parts/*/*.conf\n");
+        fixture.write(
+            "parts/.hidden/secret.conf",
+            "Host secret\n  HostName must-not-load.example\n",
+        );
+        fixture.write(
+            "parts/visible/public.conf",
+            "Host public\n  HostName public.example\n",
+        );
+
+        let config = SshConfig::read(&config_path).expect("nested visible Include glob parses");
+        assert_eq!(config.hosts().len(), 1);
+        assert_eq!(config.hosts()[0].alias(), "public");
+        assert_eq!(config.hosts()[0].host_name(), Some("public.example"));
+    }
+
+    #[test]
+    fn explicitly_dot_prefixed_include_components_match_hidden_paths() {
+        let fixture = Fixture::new("include-explicit-dot");
+        let config_path = fixture.write(
+            "config",
+            "Include parts/.secret*.conf parts/.hidden*/*.conf\n",
+        );
+        fixture.write(
+            "parts/.secret-one.conf",
+            "Host hidden-file\n  HostName hidden-file.example\n",
+        );
+        fixture.write(
+            "parts/.hidden-dir/nested.conf",
+            "Host hidden-directory\n  HostName hidden-directory.example\n",
+        );
+
+        let config = SshConfig::read(&config_path).expect("explicit hidden Includes parse");
+        let aliases: Vec<&str> = config.hosts().iter().map(SshHost::alias).collect();
+        assert_eq!(aliases, vec!["hidden-file", "hidden-directory"]);
+    }
+
+    #[test]
+    fn host_wildcard_still_matches_a_dot_prefixed_alias() {
+        let config = SshConfig::parse(
+            "Host .dot-alias\n  HostName dot.example\nHost *\n  User wildcard-user\n",
+        )
+        .expect("Host wildcard fixture parses");
+
+        assert_eq!(config.hosts().len(), 1);
+        assert_eq!(config.hosts()[0].alias(), ".dot-alias");
+        assert_eq!(config.hosts()[0].user(), Some("wildcard-user"));
     }
 
     #[test]
@@ -2623,6 +2788,89 @@ mod tests {
         let config = SshConfig::read(&config_path).expect("nested symlink glob parses");
         let names: Vec<&str> = config.hosts().iter().map(SshHost::alias).collect();
         assert_eq!(names, vec!["alpha-host", "beta-host"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn regular_config_and_in_root_symlink_still_parse() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new("regular-and-symlink");
+        let config_path =
+            fixture.write("regular.conf", "Host regular\n  HostName regular.example\n");
+        let symlink_path = fixture.root.join("symlink.conf");
+        symlink("regular.conf", &symlink_path).expect("create in-root config symlink");
+
+        for source in [&config_path, &symlink_path] {
+            let config = SshConfig::read(source).expect("regular config source parses");
+            assert_eq!(config.hosts().len(), 1);
+            assert_eq!(config.hosts()[0].alias(), "regular");
+            assert_eq!(config.hosts()[0].host_name(), Some("regular.example"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn top_level_fifo_returns_promptly() {
+        if let Some(config) = fifo_child_config() {
+            assert!(config.hosts().is_empty());
+            return;
+        }
+
+        let fixture = Fixture::new("top-level-fifo");
+        let fifo_path = fixture.root.join("config.fifo");
+        create_fifo(&fifo_path);
+        assert_fifo_test_completes(
+            "ssh_config::tests::top_level_fifo_returns_promptly",
+            &fifo_path,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn top_level_symlink_to_fifo_returns_promptly() {
+        use std::os::unix::fs::symlink;
+
+        if let Some(config) = fifo_child_config() {
+            assert!(config.hosts().is_empty());
+            return;
+        }
+
+        let fixture = Fixture::new("top-level-fifo-symlink");
+        let fifo_path = fixture.root.join("target.fifo");
+        let symlink_path = fixture.root.join("config");
+        create_fifo(&fifo_path);
+        symlink("target.fifo", &symlink_path).expect("create top-level FIFO symlink");
+        assert_fifo_test_completes(
+            "ssh_config::tests::top_level_symlink_to_fifo_returns_promptly",
+            &symlink_path,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn included_fifo_sources_return_promptly() {
+        use std::os::unix::fs::symlink;
+
+        if let Some(config) = fifo_child_config() {
+            assert_eq!(config.hosts().len(), 1);
+            assert_eq!(config.hosts()[0].alias(), "after-fifos");
+            return;
+        }
+
+        let fixture = Fixture::new("included-fifos");
+        let config_path = fixture.write(
+            "config",
+            "Include parts/literal.fifo parts/link.fifo\nHost after-fifos\n  User parsed\n",
+        );
+        let fifo_path = fixture.root.join("parts/literal.fifo");
+        create_fifo(&fifo_path);
+        symlink("literal.fifo", fixture.root.join("parts/link.fifo"))
+            .expect("create included FIFO symlink");
+        assert_fifo_test_completes(
+            "ssh_config::tests::included_fifo_sources_return_promptly",
+            &config_path,
+        );
     }
 
     #[test]

@@ -683,6 +683,7 @@ dependencies = [
 name = "noren-app"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "noren-app",
  "noren-pty",
  "noren-terminal",
