@@ -887,15 +887,21 @@ fn read_text_file(
 fn open_regular_file(path: &Path) -> Option<File> {
     #[cfg(unix)]
     {
-        // Callers pass a canonical path, so O_NOFOLLOW rejects only a final
-        // component swapped to a symlink after canonicalization; legitimate
-        // symlinks have already resolved to their in-root targets. O_NONBLOCK
-        // prevents a FIFO or similar special source from stalling before any
-        // byte budget can apply. Inspect the opened descriptor, not the path,
-        // and read from that same descriptor only when it is a regular file.
+        // Callers pass a path that fs::canonicalize already resolved to a
+        // symlink-free in-root location, so legitimate in-root symlinks have
+        // collapsed to their regular-file targets before this point. The
+        // confinement flags below make a single open(2) both traverse and
+        // validate, closing the TOCTOU window between canonicalization and
+        // open: the kernel refuses any symlink it meets on the way. See
+        // [`open_confinement_flags`] for what each platform guarantees.
+        //
+        // O_NONBLOCK prevents a FIFO or similar special source from stalling
+        // before any byte budget can apply. Inspect the opened descriptor, not
+        // the path, and read from that same descriptor only when it is a
+        // regular file.
         let file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .custom_flags(open_confinement_flags() | libc::O_NONBLOCK)
             .open(path)
             .ok()?;
         file.metadata().ok()?.is_file().then_some(file)
@@ -905,6 +911,34 @@ fn open_regular_file(path: &Path) -> Option<File> {
     {
         let file = File::open(path).ok()?;
         file.metadata().ok()?.is_file().then_some(file)
+    }
+}
+
+/// Symlink-confinement flags ORed into the single `open(2)` call so the kernel
+/// refuses any symlink it encounters while resolving the path, leaving no gap
+/// between canonicalization and open for an attacker to exploit.
+#[cfg(unix)]
+fn open_confinement_flags() -> libc::c_int {
+    // Apple (Noren's supported macOS target): `O_NOFOLLOW_ANY` makes the kernel
+    // reject, atomically during one `open(2)`, a symlink in ANY component,
+    // including ancestors. This closes the post-canonicalization race where an
+    // ancestor directory is swapped for a symlink between `canonicalize()` and
+    // `open()`; `O_NOFOLLOW` alone would protect only the final component. It
+    // is a strict superset of `O_NOFOLLOW`'s final-component guarantee, so the
+    // two flags are not combined here.
+    #[cfg(target_vendor = "apple")]
+    {
+        libc::O_NOFOLLOW_ANY
+    }
+    // Non-Apple Unix: no portable single-syscall primitive rejects ancestor
+    // symlinks atomically, so `O_NOFOLLOW` protects only the final component.
+    // Ancestor confinement continues to rely on the caller's canonical root
+    // checks (`canonicalize_within`). This keeps compilation valid on these
+    // platforms without claiming the unsupported ancestor confinement that the
+    // Apple primitive provides.
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        libc::O_NOFOLLOW
     }
 }
 
@@ -2807,6 +2841,76 @@ mod tests {
             assert_eq!(config.hosts()[0].alias(), "regular");
             assert_eq!(config.hosts()[0].host_name(), Some("regular.example"));
         }
+    }
+
+    /// Direct production-seam coverage for [`open_regular_file`], exercising each
+    /// independent confinement backstop in isolation. The paths are built from a
+    /// `canonicalize`-resolved fixture root so the only symlink on each path is
+    /// the one the test controls, keeping the assertions deterministic regardless
+    /// of the host temp directory's own ancestor symlinks.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn open_regular_file_rejects_ancestor_symlink_atomically() {
+        use std::os::unix::fs::symlink;
+
+        // Models the exact post-canonicalization race from the review: a path
+        // that canonicalize() resolved is now reached through an ancestor
+        // component that an attacker swapped for a symlink. A single open(2)
+        // with O_NOFOLLOW_ANY must reject any ancestor symlink atomically.
+        // Removing O_NOFOLLOW_ANY (leaving only final-component O_NOFOLLOW)
+        // lets the open follow the ancestor symlink and succeed, so this test
+        // fails under that mutation.
+        let fixture = Fixture::new("ancestor-symlink-race");
+        fixture.write("realdir/target.conf", "Host outside-race\n");
+        symlink("realdir", fixture.root.join("linkdir")).expect("create ancestor symlink");
+        let canonical_root = fs::canonicalize(&fixture.root).expect("canonical fixture root");
+        let path = canonical_root.join("linkdir/target.conf");
+        assert!(
+            open_regular_file(&path).is_none(),
+            "ancestor symlink must be rejected atomically by one open(2)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_file_rejects_final_component_symlink() {
+        use std::os::unix::fs::symlink;
+
+        // A final-component symlink to a regular file must be rejected. On
+        // Apple this is covered by O_NOFOLLOW_ANY (a strict superset); on
+        // other Unix it is the O_NOFOLLOW contract. Removing that final-
+        // component protection lets the open follow the symlink and succeed,
+        // so this test fails under that mutation on any Unix that lacks the
+        // Apple primitive.
+        let fixture = Fixture::new("final-symlink");
+        fixture.write("target.conf", "Host via-symlink\n");
+        symlink("target.conf", fixture.root.join("link.conf")).expect("create final symlink");
+        let canonical_root = fs::canonicalize(&fixture.root).expect("canonical fixture root");
+        let path = canonical_root.join("link.conf");
+        assert!(
+            open_regular_file(&path).is_none(),
+            "final-component symlink must be rejected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_regular_file_rejects_fifo_descriptor_via_metadata() {
+        // O_NONBLOCK lets open(2) return a FIFO descriptor promptly; the
+        // opened-descriptor metadata check must then reject it. This pins the
+        // is_file() guard independently of the path-based checks: bypassing the
+        // descriptor metadata check makes open_regular_file return Some(File)
+        // for the FIFO and fails this test. A directory-only assertion would be
+        // vacuous (read_to_end on a directory errors regardless), so a FIFO is
+        // used as the representative non-regular special file.
+        let fixture = Fixture::new("fifo-descriptor");
+        create_fifo(&fixture.root.join("source.fifo"));
+        let canonical_root = fs::canonicalize(&fixture.root).expect("canonical fixture root");
+        let path = canonical_root.join("source.fifo");
+        assert!(
+            open_regular_file(&path).is_none(),
+            "FIFO descriptor must be rejected by the opened-descriptor metadata check"
+        );
     }
 
     #[cfg(unix)]
