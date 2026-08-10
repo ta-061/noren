@@ -24,7 +24,9 @@ use noren_app::{
         SessionAction, SessionError, SessionEvent, SessionId, SessionKind, SessionRegistry,
         SessionStatus,
     },
-    session_persistence::{SESSION_STATE_FILE_NAME, SessionPersistenceError, load, save},
+    session_persistence::{
+        SESSION_STATE_FILE_NAME, SessionPersistenceError, load_snapshot, save, snapshot,
+    },
     sidebar::{SidebarEntry, SidebarView},
 };
 use noren_pty::{PtyEvent, PtySession, PtySize};
@@ -118,6 +120,12 @@ struct WorkspaceState {
     /// unset; in both cases the workspace is in-memory only and [`persist`]
     /// is a no-op.
     state_path: Option<PathBuf>,
+    /// Exact state-file bytes observed at restore or after the last save.
+    /// `None` also represents a normally absent first-run file.
+    loaded_snapshot: Option<Vec<u8>>,
+    /// Sticky warning for the diagnostics overlay when another instance has
+    /// replaced the file since this workspace loaded it.
+    persistence_conflict: bool,
 }
 
 impl Default for WorkspaceState {
@@ -147,6 +155,8 @@ impl WorkspaceState {
                 WorkspaceAction::FocusSidebar,
             ),
             state_path,
+            loaded_snapshot: None,
+            persistence_conflict: false,
         }
     }
 
@@ -163,7 +173,7 @@ impl WorkspaceState {
         let Some(path) = &self.state_path else {
             return Ok(());
         };
-        load(path, &mut self.registry)?;
+        self.loaded_snapshot = load_snapshot(path, &mut self.registry)?;
         self.rebuild_sidebar();
         Ok(())
     }
@@ -175,13 +185,30 @@ impl WorkspaceState {
     /// never bypasses it. A failure is surfaced through stderr and swallowed
     /// so the app keeps running — losing a save is preferable to crashing the
     /// terminal.
-    fn persist(&self) {
+    fn persist(&mut self) {
         let Some(path) = &self.state_path else {
             return;
         };
+        match snapshot(path) {
+            Ok(current) if current != self.loaded_snapshot => {
+                self.persistence_conflict = true;
+            }
+            Err(error) => {
+                eprintln!("Noren could not inspect sidebar state before saving: {error}");
+            }
+            _ => {}
+        }
         if let Err(error) = save(path, &self.registry) {
             eprintln!("Noren could not save sidebar state: {error}");
+        } else if let Ok(current) = snapshot(path) {
+            self.loaded_snapshot = current;
         }
+    }
+
+    /// Whether a save observed state written by another instance since the
+    /// last restore or successful save.
+    fn persistence_conflict(&self) -> bool {
+        self.persistence_conflict
     }
 
     /// Create a new session and rebuild the sidebar.
@@ -1101,7 +1128,8 @@ impl NorenApp {
             return;
         }
         let snapshot = self.terminal.as_ref().map(TerminalEngine::snapshot);
-        let input = diagnostics::from_snapshot(snapshot.as_ref(), self.pty_child);
+        let input = diagnostics::from_snapshot(snapshot.as_ref(), self.pty_child)
+            .with_persistence_conflict(self.workspace.persistence_conflict());
         let line = diagnostics::report(&input);
         eprintln!("{line}");
         if let Some(window) = &self.window {
@@ -1777,6 +1805,7 @@ mod tests {
     use super::*;
     use noren_app::palette::CommandId;
     use noren_app::passthrough::{self, collisions};
+    use noren_app::session_persistence::load;
     use noren_app::sidebar::EntryKind;
 
     #[test]
@@ -3844,10 +3873,17 @@ mod tests {
             .and_then(|r| r.detail())
             .unwrap_or_default();
         assert!(
-            detail.contains("starting"),
-            "detail says starting: {detail}"
+            detail.contains("restored") && detail.contains("not running"),
+            "detail identifies a restored, non-running session: {detail}"
         );
-        assert!(!detail.contains("running"), "detail must not say running");
+        assert!(
+            !detail.ends_with("· running"),
+            "detail must not claim running: {detail}"
+        );
+        assert!(
+            relaunched.sidebar().viewport().is_none(),
+            "a restored selected session must not imply an attachment"
+        );
         cleanup_state_file(&path);
     }
 
@@ -3944,5 +3980,48 @@ mod tests {
         assert!(state.restore().is_ok(), "no path → no-op restore");
         state.create_session(SessionKind::Local);
         assert_eq!(state.registry().len(), 1);
+    }
+
+    /// Mutation check for Issue #111: removing the baseline comparison makes
+    /// this cross-instance overwrite pass without setting the diagnostics
+    /// warning.
+    #[test]
+    fn second_instance_overwrite_is_detected_and_reported_by_diagnostics() {
+        let path = temp_state_path();
+        let mut first = WorkspaceState::with_state_path(Some(path.clone()));
+        first.create_session(SessionKind::Local);
+
+        let mut second = app_with_state_path(&path);
+        first.create_session(SessionKind::Local);
+        second.workspace.create_session(SessionKind::Local);
+
+        assert!(second.workspace.persistence_conflict());
+        second.toggle_diagnostics();
+        assert!(
+            second.diagnostics_line.contains("state=changed-underneath"),
+            "diagnostics: {}",
+            second.diagnostics_line
+        );
+        cleanup_state_file(&path);
+    }
+
+    #[test]
+    fn single_instance_save_has_no_persistence_false_alarm() {
+        let path = temp_state_path();
+        let mut app = app_with_state_path(&path);
+        app.workspace.create_session(SessionKind::Local);
+
+        app.toggle_diagnostics();
+        assert!(
+            app.diagnostics_line.contains("state=ok"),
+            "diagnostics: {}",
+            app.diagnostics_line
+        );
+        assert!(
+            !app.diagnostics_line.contains("changed-underneath"),
+            "diagnostics: {}",
+            app.diagnostics_line
+        );
+        cleanup_state_file(&path);
     }
 }

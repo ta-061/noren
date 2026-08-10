@@ -209,12 +209,39 @@ pub fn save(path: &Path, registry: &SessionRegistry) -> Result<(), SessionPersis
 /// [`SessionRegistry::restore`], so they start at `Restored` with generated
 /// titles; this module spawns nothing.
 pub fn load(path: &Path, registry: &mut SessionRegistry) -> Result<(), SessionPersistenceError> {
+    load_snapshot(path, registry).map(drop)
+}
+
+/// Load the sidebar state and return the exact bounded bytes that were read.
+///
+/// The returned snapshot is a caller-owned baseline for detecting a later
+/// external replacement. It is captured from the same read that is decoded,
+/// so the baseline does not require a second filesystem observation during
+/// restore.
+pub fn load_snapshot(
+    path: &Path,
+    registry: &mut SessionRegistry,
+) -> Result<Option<Vec<u8>>, SessionPersistenceError> {
     let bytes = match read_bounded(path) {
         Ok(bytes) => bytes,
-        Err(SessionPersistenceError::NotFound) => return Ok(()),
+        Err(SessionPersistenceError::NotFound) => return Ok(None),
         Err(error) => return Err(error),
     };
-    load_bytes(&bytes, registry)
+    load_bytes(&bytes, registry)?;
+    Ok(Some(bytes))
+}
+
+/// Read the current bounded state-file bytes without decoding them.
+///
+/// A missing file is represented as `Ok(None)`, matching [`load`]. This is
+/// used only for the best-effort external-change check; the atomic save path
+/// remains responsible for writing the document.
+pub fn snapshot(path: &Path) -> Result<Option<Vec<u8>>, SessionPersistenceError> {
+    match read_bounded(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(SessionPersistenceError::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Decode raw state file bytes and apply them to `registry`.
