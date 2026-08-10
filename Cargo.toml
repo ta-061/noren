@@ -24,6 +24,7 @@ unsafe_code = "deny"
 # is a single reviewed change. The `=` pins are intentional: ADR 0001 records
 # these as the measured PoC candidates, not floating ranges.
 [workspace.dependencies]
+libc = { version = "=0.2.189" }
 portable-pty = { version = "=0.9.0" }
 # Already resolved transitively in the lockfile; the app crate reads the
 # optional configuration file with it. Parsing only: default features are
