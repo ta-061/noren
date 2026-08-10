@@ -8,8 +8,8 @@
 //! shade the shader previously returned as a constant — so unstyled output is
 //! unchanged.
 //!
-//! Background colour is not drawn yet: that needs a filled rect behind each
-//! glyph rather than colour on the glyph's own vertices. See issue #107.
+//! Explicit SGR backgrounds emit one filled cell rectangle immediately before
+//! that cell's glyph, so the glyph remains legible over the background.
 
 use std::borrow::Cow;
 use std::future::Future;
@@ -25,7 +25,14 @@ use noren_app::{CellMetrics, MAX_RENDER_COLS, MAX_RENDER_ROWS};
 use noren_terminal::{CellAttributes, Color, TerminalSnapshot};
 const GLYPH_SCALE: u32 = 2;
 const GLYPH_TOP: u32 = 3;
-const MAX_VERTICES: usize = (MAX_RENDER_ROWS as usize) * (MAX_RENDER_COLS as usize) * 35 * 6;
+const MAX_GLYPH_PIXELS: usize = 35;
+const VERTICES_PER_RECT: usize = 6;
+/// One cell can emit one background rectangle plus the largest 5x7 glyph.
+/// The bound is `MAX_RENDER_ROWS * MAX_RENDER_COLS * (1 + 35) * 6`.
+const MAX_VERTICES: usize = (MAX_RENDER_ROWS as usize)
+    * (MAX_RENDER_COLS as usize)
+    * (1 + MAX_GLYPH_PIXELS)
+    * VERTICES_PER_RECT;
 
 /// Width of the left sidebar in cell columns. The terminal occupies the
 /// remaining columns to the right, drawn at a pixel offset of
@@ -105,6 +112,11 @@ pub(crate) const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 2] = [
 /// would shift the default shade slightly, and an unstyled prompt must look
 /// identical to how it looked before colour existed (issue #107).
 pub(crate) const DEFAULT_FOREGROUND: [f32; 3] = [0.80, 0.92, 0.82];
+
+/// Default terminal background as shader colour. Explicit backgrounds resolve
+/// through [`resolve_color`]; `Color::Default` emits no rectangle and leaves
+/// the render target's clear colour untouched.
+pub(crate) const DEFAULT_BACKGROUND: [f32; 3] = [0.035, 0.045, 0.04];
 
 /// The sixteen ANSI colours of the default theme as `(red, green, blue)` in
 /// palette-index order: standard colours `0..=7`, bright colours `8..=15`.
@@ -195,15 +207,20 @@ pub(crate) fn resolve_color(color: Color, default: [f32; 3]) -> [f32; 3] {
 }
 
 /// The colour a cell's glyph is drawn in.
-///
-/// Background rectangles are deliberately out of scope for this foreground
-/// pass. In particular, do not resolve reverse video to the background here:
-/// without a rectangle behind it that would draw the glyph in the clear colour
-/// and make reversed text disappear. Reverse/background composition belongs in
-/// the later background pass.
 #[must_use]
 pub(crate) fn resolve_foreground(attributes: &CellAttributes) -> [f32; 3] {
     resolve_color(attributes.foreground(), DEFAULT_FOREGROUND)
+}
+
+/// Resolve an explicit cell background through the same palette/truecolor path
+/// as foreground. `None` is intentional: an unstyled cell must remain exactly
+/// the clear colour, with no rectangle changing its rasterisation.
+#[must_use]
+pub(crate) fn resolve_background(attributes: &CellAttributes) -> Option<[f32; 3]> {
+    match attributes.background() {
+        Color::Default => None,
+        background => Some(resolve_color(background, DEFAULT_BACKGROUND)),
+    }
 }
 
 /// Clear colour used by the glyph pipeline's load op.
@@ -543,8 +560,23 @@ pub(crate) fn glyph_vertices(
     for (row, line_index) in (first_line..total_lines).enumerate() {
         if let Some(cells) = rows.get(line_index) {
             for (col, cell) in cells.iter().take(terminal_cols).enumerate() {
-                // A continuation cell draws nothing but still owns its column,
-                // exactly as the placeholder space did in `display_lines`.
+                if let Some(color) = resolve_background(cell.attributes()) {
+                    push_rect(
+                        &mut vertices,
+                        u32::try_from(col_offset + col).unwrap_or(u32::MAX) * cell_width,
+                        u32::try_from(row).unwrap_or(u32::MAX) * cell_height,
+                        cell_width,
+                        cell_height,
+                        color,
+                        target,
+                    );
+                }
+                if vertices.len() >= MAX_VERTICES {
+                    return vertices;
+                }
+                // A continuation cell draws no glyph but still owns its
+                // column, exactly as the placeholder space did in
+                // `display_lines`.
                 if cell.is_continuation() {
                     continue;
                 }
@@ -624,7 +656,7 @@ fn push_glyph(
             let y = u32::try_from(row).unwrap_or(u32::MAX) * cell_height
                 + GLYPH_TOP
                 + u32::try_from(glyph_y).unwrap_or(0) * GLYPH_SCALE;
-            push_rect(vertices, x, y, GLYPH_SCALE, color, target);
+            push_rect(vertices, x, y, GLYPH_SCALE, GLYPH_SCALE, color, target);
         }
     }
 }
@@ -633,15 +665,16 @@ fn push_rect(
     vertices: &mut Vec<Vertex>,
     x: u32,
     y: u32,
-    size: u32,
+    width: u32,
+    height: u32,
     color: [f32; 3],
     target: Target,
 ) {
-    let (width, height) = (target.width, target.height);
-    let left = x as f32 / width as f32 * 2.0 - 1.0;
-    let right = x.saturating_add(size) as f32 / width as f32 * 2.0 - 1.0;
-    let top = 1.0 - y as f32 / height as f32 * 2.0;
-    let bottom = 1.0 - y.saturating_add(size) as f32 / height as f32 * 2.0;
+    let (target_width, target_height) = (target.width, target.height);
+    let left = x as f32 / target_width as f32 * 2.0 - 1.0;
+    let right = x.saturating_add(width) as f32 / target_width as f32 * 2.0 - 1.0;
+    let top = 1.0 - y as f32 / target_height as f32 * 2.0;
+    let bottom = 1.0 - y.saturating_add(height) as f32 / target_height as f32 * 2.0;
     vertices.extend_from_slice(&[
         Vertex {
             position: [left, top],
@@ -778,23 +811,13 @@ mod tests {
         GridGeometry::poc().cell_metrics()
     }
 
-    #[test]
-    fn glyph_input_is_bounded_to_visible_poc_grid() {
-        // Grid dimensions one past the renderer limits exercise the same
-        // dimension clamps as u32::MAX: visible_rows clamps to
-        // MAX_RENDER_ROWS and terminal_cols clamps to MAX_RENDER_COLS.
-        // No overflow path exists — all dimension arithmetic uses
-        // saturating_add and clamp — so u32::MAX adds no coverage beyond
-        // these values.
-        let rows = MAX_RENDER_ROWS + 1;
-        let cols = MAX_RENDER_COLS + 1;
-        let bytes = vec![b'A'; usize::from(rows) * usize::from(cols)];
-        let terminal = snapshot(rows, cols, &bytes);
-        let width = u32::from(cols) * CELL_WIDTH + CELL_WIDTH;
-        let height = u32::from(rows) * CELL_HEIGHT + CELL_HEIGHT;
-        let vertices = glyph_vertices(Some(&terminal), None, None, width, height, poc_metrics());
-        assert!(vertices.len() <= MAX_VERTICES);
-    }
+    // NOTE: the renderer's row/column clamp coverage used to live here as
+    // `glyph_input_is_bounded_to_visible_poc_grid`, a count-based test that
+    // could not distinguish the clamps from the `MAX_VERTICES` backstop (issue
+    // #109). It is replaced by `frame_oracle::glyphs_stay_inside_the_render_clamp_grid`,
+    // which reads pixels back from the real pipeline and asserts on *where*
+    // glyphs land — the property a vertex-count assertion is structurally
+    // unable to pin.
 
     #[test]
     fn empty_and_zero_sized_inputs_have_no_vertices() {
@@ -856,6 +879,87 @@ mod tests {
     }
 
     #[test]
+    fn explicit_background_emits_a_full_rect_before_the_glyph() {
+        let terminal = snapshot(1, 1, b"\x1b[38;2;241;207;33;48;2;12;98;201mA");
+        let vertices = glyph_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
+        let background = channels_to_floats([12, 98, 201]);
+        let foreground = channels_to_floats([241, 207, 33]);
+
+        assert!(
+            vertices.len() > VERTICES_PER_RECT,
+            "background and glyph missing"
+        );
+        assert!(
+            vertices[..VERTICES_PER_RECT]
+                .iter()
+                .all(|vertex| vertex.color == background),
+            "the first primitive must be the cell background"
+        );
+        assert_eq!(
+            vertices[VERTICES_PER_RECT].color, foreground,
+            "the glyph must follow its background"
+        );
+        assert_eq!(
+            vertices[0].position,
+            [-1.0, 1.0],
+            "the background must start at the cell's top-left"
+        );
+        assert_eq!(
+            vertices[2].position,
+            [(-1.0 + 20.0 / 900.0), 1.0 - 40.0 / 600.0],
+            "the background must cover one configured cell"
+        );
+    }
+
+    #[test]
+    fn default_background_emits_no_extra_vertices() {
+        let terminal = snapshot(1, 1, b"A");
+        let vertices = glyph_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
+        let glyph_pixels = glyph_rows('A')
+            .iter()
+            .map(|row| row.count_ones() as usize)
+            .sum::<usize>();
+
+        assert_eq!(
+            vertices.len(),
+            glyph_pixels * VERTICES_PER_RECT,
+            "a default-background cell must keep the historical glyph vertex count"
+        );
+    }
+
+    #[test]
+    fn clamp_coordinates_keep_markers_inside_the_render_grid() {
+        let terminal = snapshot(
+            MAX_RENDER_ROWS + 1,
+            MAX_RENDER_COLS + 1,
+            b"\x1b[61;1HA\x1b[31;161HA\x1b[31;31HA",
+        );
+        let width = u32::from(MAX_RENDER_COLS + 1) * 10;
+        let height = u32::from(MAX_RENDER_ROWS + 1) * 20;
+        let vertices = glyph_vertices(Some(&terminal), None, None, width, height, poc_metrics());
+
+        let contains = |row: usize, col: usize| {
+            let left = col as f32 * 10.0 / width as f32 * 2.0 - 1.0;
+            let right = (col as f32 + 1.0) * 10.0 / width as f32 * 2.0 - 1.0;
+            let top = 1.0 - row as f32 * 20.0 / height as f32 * 2.0;
+            let bottom = 1.0 - (row as f32 + 1.0) * 20.0 / height as f32 * 2.0;
+            vertices.iter().any(|vertex| {
+                vertex.position[0] >= left
+                    && vertex.position[0] < right
+                    && vertex.position[1] <= top
+                    && vertex.position[1] > bottom
+            })
+        };
+
+        assert!(
+            contains(29, 30) || contains(30, 30),
+            "interior marker vanished"
+        );
+        assert!(!contains(usize::from(MAX_RENDER_ROWS), 0));
+        assert!(!contains(29, usize::from(MAX_RENDER_COLS)));
+    }
+
+    #[test]
     fn ascii_glyphs_are_distinct_and_unknown_is_question_mark() {
         assert_ne!(glyph_rows('A'), glyph_rows('B'));
         assert_eq!(glyph_rows('a'), glyph_rows('A'));
@@ -900,7 +1004,6 @@ mod tests {
     }
 
     const CELL_WIDTH: u32 = noren_app::POC_CELL_WIDTH;
-    const CELL_HEIGHT: u32 = noren_app::POC_CELL_HEIGHT;
 
     fn ndc_left(column: u32) -> f32 {
         (column * CELL_WIDTH) as f32 / 900.0 * 2.0 - 1.0
