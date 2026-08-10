@@ -1,4 +1,4 @@
-//! DEC private mouse tracking (1000/1002/1003) and encoding (1006/1015)
+//! DEC private mouse tracking (1000/1002/1003) and encoding (1005/1006/1015)
 //! mode tracking in terminal state.
 //!
 //! The terminal holds the mode state only; generating mouse reports stays in
@@ -16,6 +16,7 @@ fn mouse_modes_default_to_disabled() {
     assert!(!modes.is_mouse_normal_tracking_enabled());
     assert!(!modes.is_mouse_button_event_tracking_enabled());
     assert!(!modes.is_mouse_any_event_tracking_enabled());
+    assert!(!modes.is_mouse_utf8_encoding_enabled());
     assert!(!modes.is_mouse_sgr_encoding_enabled());
     assert!(!modes.is_mouse_urxvt_encoding_enabled());
 }
@@ -59,6 +60,44 @@ fn mouse_encoding_modes_toggle_with_decset_and_decrst() {
 
     state.feed_bytes(b"\x1b[?1015l");
     assert!(!state.modes().is_mouse_urxvt_encoding_enabled());
+
+    state.feed_bytes(b"\x1b[?1005h");
+    assert!(state.modes().is_mouse_utf8_encoding_enabled());
+    state.feed_bytes(b"\x1b[?1005l");
+    assert!(!state.modes().is_mouse_utf8_encoding_enabled());
+}
+
+#[test]
+fn multi_param_mouse_modes_set_and_clear_in_order() {
+    let mut state = TerminalState::new(2, 4).expect("valid terminal");
+
+    state.feed_bytes(b"\x1b[?1002;1006h");
+    assert!(state.modes().is_mouse_button_event_tracking_enabled());
+    assert!(state.modes().is_mouse_sgr_encoding_enabled());
+
+    state.feed_bytes(b"\x1b[?1002;1006l");
+    assert!(!state.modes().is_mouse_button_event_tracking_enabled());
+    assert!(!state.modes().is_mouse_sgr_encoding_enabled());
+}
+
+#[test]
+fn multi_param_private_modes_keep_known_modes_when_unknown_is_mixed_in() {
+    let mut state = TerminalState::new(2, 4).expect("valid terminal");
+
+    state.feed_bytes(b"\x1b[?9999;1002h");
+    assert!(state.modes().is_mouse_button_event_tracking_enabled());
+}
+
+#[test]
+fn multi_param_sequence_split_across_feed_bytes_calls_still_applies() {
+    let mut state = TerminalState::new(2, 4).expect("valid terminal");
+
+    state.feed_bytes(b"\x1b[?1002;");
+    assert!(!state.modes().is_mouse_button_event_tracking_enabled());
+    state.feed_bytes(b"1006h");
+
+    assert!(state.modes().is_mouse_button_event_tracking_enabled());
+    assert!(state.modes().is_mouse_sgr_encoding_enabled());
 }
 
 #[test]
