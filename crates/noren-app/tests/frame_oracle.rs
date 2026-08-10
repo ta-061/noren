@@ -27,13 +27,13 @@
 //!
 //! ## The lit/blank gate
 //!
-//! `is_background` originally thresholded on brightness, which was sufficient
-//! only while every glyph was one bright-green constant — as the earlier
-//! version of this file noted. It now compares against the renderer's
-//! `CLEAR_COLOR` instead. That is strictly stronger, not weaker: a dark
-//! foreground (ANSI black, a dark truecolor shade) is correctly read as lit
-//! where the threshold would have called it background and thereby agreed with
-//! a renderer that dropped the cell.
+//! The oracle distinguishes an untouched clear pixel from a terminal-painted
+//! background pixel. `is_clear` is exact and drives lit/blank and neighbour
+//! assertions; `is_background` means that a pixel matches the specific
+//! expected terminal background for its cell (or the clear colour when the
+//! cell has no explicit background). Neither predicate accepts arbitrary dark
+//! pixels, so dropping a glyph, leaking into a neighbour, or skipping a
+//! background rectangle remains observable.
 //!
 //! ## Faithfulness
 //!
@@ -109,23 +109,19 @@ fn colors_match(actual: [u8; 3], expected: [u8; 3]) -> bool {
         .all(|(a, e)| a.abs_diff(*e) <= CHANNEL_TOLERANCE)
 }
 
-/// A pixel counts as "background" when it is exactly the clear colour.
-///
-/// This is deliberately an *equality* test against the clear colour, not the
-/// brightness threshold this oracle used before colour existed. That gate
-/// (`all channels < 48`) assumed every glyph was the shader's bright-green
-/// constant; it was flagged in this file as insufficient once colour landed,
-/// and it is: a cell drawn in ANSI black or in a dark truecolor shade is lit
-/// but has every channel under 48, so the brightness gate would report it
-/// blank and the lit/blank agreement checks would silently pass on a renderer
-/// that dropped those cells entirely.
-///
-/// Comparing to the clear colour instead is strictly stronger — it accepts
-/// only the one byte colour nothing was drawn in — and it is what lets
-/// [`cell_colors`] below distinguish *which* colour a lit cell holds rather
-/// than merely that something is lit.
-fn is_background(rgba: [u8; 4]) -> bool {
+/// Whether a pixel is untouched by every draw primitive.
+fn is_clear(rgba: [u8; 4]) -> bool {
     [rgba[0], rgba[1], rgba[2]] == clear_rgb()
+}
+
+/// Whether a pixel matches the expected background of its cell.
+///
+/// `None` means the cell has no SGR background, so the only valid background
+/// is the exact clear colour. `Some` names one concrete terminal colour and is
+/// compared with the same tight tolerance used for shader output.
+fn is_background(rgba: [u8; 4], expected: Option<[u8; 3]>) -> bool {
+    let actual = [rgba[0], rgba[1], rgba[2]];
+    expected.map_or_else(|| is_clear(rgba), |color| colors_match(actual, color))
 }
 
 /// Whether any lit (non-background) pixel falls inside cell `(row, col)`.
@@ -134,7 +130,7 @@ fn cell_is_lit(frame: &CapturedFrame, row: u32, col: u32) -> bool {
     let y0 = row * CELL_HEIGHT;
     for y in y0..y0 + CELL_HEIGHT {
         for x in x0..x0 + CELL_WIDTH {
-            if !is_background(frame.pixel(x, y)) {
+            if !is_clear(frame.pixel(x, y)) {
                 return true;
             }
         }
@@ -149,7 +145,7 @@ fn cell_pattern(frame: &CapturedFrame, row: u32, col: u32) -> Vec<bool> {
     let mut pattern = Vec::with_capacity((CELL_WIDTH * CELL_HEIGHT) as usize);
     for y in 0..CELL_HEIGHT {
         for x in 0..CELL_WIDTH {
-            pattern.push(!is_background(
+            pattern.push(!is_clear(
                 frame.pixel(col * CELL_WIDTH + x, row * CELL_HEIGHT + y),
             ));
         }
@@ -168,7 +164,7 @@ fn cell_colors(frame: &CapturedFrame, row: u32, col: u32) -> Vec<[u8; 3]> {
     for y in 0..CELL_HEIGHT {
         for x in 0..CELL_WIDTH {
             let pixel = frame.pixel(col * CELL_WIDTH + x, row * CELL_HEIGHT + y);
-            if is_background(pixel) {
+            if is_clear(pixel) {
                 continue;
             }
             let rgb = [pixel[0], pixel[1], pixel[2]];
@@ -612,6 +608,96 @@ fn the_16_colour_and_256_colour_forms_of_one_colour_agree() {
         colors_match(ansi_form, indexed_form),
         "SGR 31 drew {ansi_form:?} but SGR 38;5;1 drew {indexed_form:?} — \
          the two forms of ANSI red must resolve through one palette"
+    );
+}
+
+#[test]
+fn truecolor_background_paints_the_whole_cell_and_keeps_glyph_foreground() {
+    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let background = [12, 98, 201];
+    let foreground = [241, 207, 33];
+    let snap = snapshot(1, 1, b"\x1b[38;2;241;207;33;48;2;12;98;201mA");
+    let frame = render(&renderer, &snap);
+
+    let mut background_pixels = 0;
+    let mut foreground_pixels = 0;
+    for y in 0..CELL_HEIGHT {
+        for x in 0..CELL_WIDTH {
+            let pixel = frame.pixel(x, y);
+            if is_background(pixel, Some(background)) {
+                background_pixels += 1;
+            } else if colors_match([pixel[0], pixel[1], pixel[2]], foreground) {
+                foreground_pixels += 1;
+            } else {
+                panic!("cell pixel ({x},{y}) is neither background nor foreground: {pixel:?}");
+            }
+        }
+    }
+
+    assert!(
+        background_pixels > 0,
+        "the cell rectangle must paint pixels outside glyph strokes"
+    );
+    assert!(
+        foreground_pixels > 0,
+        "the glyph must remain visible over its background"
+    );
+    // The glyph starts three pixels below the cell top and never reaches the
+    // final row, so these corners must be painted by the full-cell rectangle.
+    for (x, y) in [
+        (0, 0),
+        (CELL_WIDTH - 1, 0),
+        (0, CELL_HEIGHT - 1),
+        (CELL_WIDTH - 1, CELL_HEIGHT - 1),
+    ] {
+        assert!(
+            is_background(frame.pixel(x, y), Some(background)),
+            "cell corner ({x},{y}) was not painted by the background rectangle"
+        );
+    }
+}
+
+#[test]
+fn background_on_a_space_paints_even_without_glyph_strokes() {
+    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let background = [73, 18, 146];
+    let snap = snapshot(1, 1, b"\x1b[48;2;73;18;146m ");
+    let frame = render(&renderer, &snap);
+
+    for y in 0..CELL_HEIGHT {
+        for x in 0..CELL_WIDTH {
+            assert!(
+                is_background(frame.pixel(x, y), Some(background)),
+                "background-painted space leaked clear colour at ({x},{y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn indexed_background_matches_its_truecolor_palette_entry() {
+    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let truecolor = snapshot(1, 1, b"\x1b[48;2;255;0;0mA");
+    let indexed = snapshot(1, 1, b"\x1b[48;5;196mA");
+
+    let truecolor_frame = render(&renderer, &truecolor);
+    let indexed_frame = render(&renderer, &indexed);
+    assert_eq!(
+        truecolor_frame.rgba, indexed_frame.rgba,
+        "truecolor red and indexed palette entry 196 must render identically"
+    );
+    assert_eq!(DEFAULT_PALETTE[196], [255, 0, 0]);
+}
+
+#[test]
+fn no_background_keeps_the_existing_pixel_exact_appearance() {
+    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let plain = render(&renderer, &snapshot(1, 1, b"A"));
+    let reset_background = render(&renderer, &snapshot(1, 1, b"\x1b[49mA"));
+
+    assert_eq!(
+        plain.rgba, reset_background.rgba,
+        "default background must not alter the historical glyph frame"
     );
 }
 
