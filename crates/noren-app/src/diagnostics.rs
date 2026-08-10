@@ -57,6 +57,7 @@ pub struct DiagnosticsInput {
     scrollback_len: usize,
     scrollback_cap: usize,
     pty: PtyChildStatus,
+    persistence_conflict: bool,
 }
 
 /// Build diagnostics input from the live terminal snapshot.
@@ -75,6 +76,7 @@ pub fn from_snapshot(snapshot: Option<&TerminalSnapshot>, pty: PtyChildStatus) -
             scrollback_len: snapshot.scrollback().len(),
             scrollback_cap: MAX_SCROLLBACK_LINES,
             pty,
+            persistence_conflict: false,
         },
         None => DiagnosticsInput {
             grid_rows: None,
@@ -83,7 +85,17 @@ pub fn from_snapshot(snapshot: Option<&TerminalSnapshot>, pty: PtyChildStatus) -
             scrollback_len: 0,
             scrollback_cap: MAX_SCROLLBACK_LINES,
             pty,
+            persistence_conflict: false,
         },
+    }
+}
+
+impl DiagnosticsInput {
+    /// Add the workspace's best-effort external-state warning to the report.
+    #[must_use]
+    pub const fn with_persistence_conflict(mut self, conflict: bool) -> Self {
+        self.persistence_conflict = conflict;
+        self
     }
 }
 
@@ -116,8 +128,15 @@ pub fn report(input: &DiagnosticsInput) -> String {
     }
     let _ = write!(
         out,
-        " scrollback={}/{} child={}",
-        input.scrollback_len, input.scrollback_cap, input.pty
+        " scrollback={}/{} child={} state={}",
+        input.scrollback_len,
+        input.scrollback_cap,
+        input.pty,
+        if input.persistence_conflict {
+            "changed-underneath"
+        } else {
+            "ok"
+        }
     );
     out
 }

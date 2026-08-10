@@ -46,8 +46,8 @@
 //! Per D-M3-001, [`SessionId`]s are registry-local and are **not**
 //! persistence keys, so no id is written. Entries are stored in registry
 //! order and the selection is stored as a positional index into that list.
-//! Restoration runs each loaded kind through [`SessionRegistry::create`],
-//! which records it as [`SessionStatus::Starting`] with a generated title;
+//! Restoration runs each loaded kind through [`SessionRegistry::restore`],
+//! which records it as [`SessionStatus::Restored`] with a generated title;
 //! runtime status is an observed fact and is never persisted. Titles are
 //! derived facts today (a rename feature may change that in a later format
 //! version), so they are not persisted either.
@@ -58,7 +58,7 @@
 //! nothing.
 //!
 //! [`SessionId`]: crate::session::SessionId
-//! [`SessionStatus::Starting`]: crate::session::SessionStatus::Starting
+//! [`SessionStatus::Restored`]: crate::session::SessionStatus::Restored
 
 use crate::session::{SessionKind, SessionRegistry};
 use std::fmt;
@@ -206,15 +206,42 @@ pub fn save(path: &Path, registry: &SessionRegistry) -> Result<(), SessionPersis
 /// returns `Ok`. Any file that exists must read, decode, and validate or the
 /// call errors — and because decoding validates before creating, an error
 /// also leaves `registry` exactly as it was. Entries re-enter through
-/// [`SessionRegistry::create`], so they start at `Starting` with generated
+/// [`SessionRegistry::restore`], so they start at `Restored` with generated
 /// titles; this module spawns nothing.
 pub fn load(path: &Path, registry: &mut SessionRegistry) -> Result<(), SessionPersistenceError> {
+    load_snapshot(path, registry).map(drop)
+}
+
+/// Load the sidebar state and return the exact bounded bytes that were read.
+///
+/// The returned snapshot is a caller-owned baseline for detecting a later
+/// external replacement. It is captured from the same read that is decoded,
+/// so the baseline does not require a second filesystem observation during
+/// restore.
+pub fn load_snapshot(
+    path: &Path,
+    registry: &mut SessionRegistry,
+) -> Result<Option<Vec<u8>>, SessionPersistenceError> {
     let bytes = match read_bounded(path) {
         Ok(bytes) => bytes,
-        Err(SessionPersistenceError::NotFound) => return Ok(()),
+        Err(SessionPersistenceError::NotFound) => return Ok(None),
         Err(error) => return Err(error),
     };
-    load_bytes(&bytes, registry)
+    load_bytes(&bytes, registry)?;
+    Ok(Some(bytes))
+}
+
+/// Read the current bounded state-file bytes without decoding them.
+///
+/// A missing file is represented as `Ok(None)`, matching [`load`]. This is
+/// used only for the best-effort external-change check; the atomic save path
+/// remains responsible for writing the document.
+pub fn snapshot(path: &Path) -> Result<Option<Vec<u8>>, SessionPersistenceError> {
+    match read_bounded(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(SessionPersistenceError::NotFound) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// Decode raw state file bytes and apply them to `registry`.
@@ -468,7 +495,7 @@ fn apply(
     }
     let created: Vec<_> = kinds
         .into_iter()
-        .map(|kind| registry.create(kind))
+        .map(|kind| registry.restore(kind))
         .collect();
     if let Some(index) = selected {
         registry
