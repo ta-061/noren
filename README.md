@@ -14,8 +14,11 @@
 > default palette and theme are not user-configurable. The renderer still uses
 > a case-insensitive 5x7 ASCII bitmap font, with all non-ASCII shown as `?`, no
 > visible cursor, no IME, and no accessibility surface. Only local sessions can
-> be launched. Configured SSH hosts are discovered, displayed in the sidebar,
-> and selectable as pending targets without opening an SSH connection or PTY;
+> be launched. A bounded, explicitly partial list of positive literal aliases
+> from the user's OpenSSH config is displayed in the sidebar (at most 24 rows),
+> and selecting one shows its root-relative config source without opening an
+> SSH connection or PTY. Wildcard-only and dynamic OpenSSH destinations are not
+> a complete browseable list;
 > git worktrees and agents remain modelled but unreachable. Keybindings are not
 > configurable. There are no published binaries. Read
 > **[docs/known-limitations.md](docs/known-limitations.md)** first — it is the

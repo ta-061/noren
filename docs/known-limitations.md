@@ -6,7 +6,7 @@ first artifact is an explicitly dated developer preview, not a
 `0.1.0-preview` of the product; this page is the substance behind that framing.
 This page retains a 2026-08-08 verification baseline. The SSH/sidebar and
 renderer claims changed for PR 120 were verified against the candidate tree on
-2026-08-12. Citations point at the file, function, type, constant, or test that
+2026-08-13. Citations point at the file, function, type, constant, or test that
 establishes them. Names are used rather than line numbers, which rot; where a
 count is genuinely needed the command that reproduces it is given instead. If
 anything here has drifted, treat the code as correct and this page as a bug.
@@ -54,6 +54,17 @@ binary. What now actually happens on screen:
   `Starting -> Running -> Exited/Failed` through `SessionRegistry::observe`
   rather than sitting at a permanent "starting"; `main.rs` observes `Running` on
   spawn and `Exited { code }` on child exit.
+- **The SSH sidebar is bounded and explicitly partial.** `SshConfig` labels its
+  scope as `HostDiscoveryKind::PartialLiteralPatterns`: only positive literal
+  aliases written in `Host` directives become browseable targets. `HostName`,
+  `User`, and `Port` participate in bounded first-value resolution, and
+  root-relative `Include` files are followed in lexical order only when their
+  canonical targets remain below the top-level config directory. `Match`,
+  wildcard-only destinations, system configuration, token expansion, and other
+  dynamic OpenSSH behaviour cannot make this a complete host inventory. The UI
+  says `partial literal aliases`, retains at most `MAX_SSH_SIDEBAR_HOSTS` (24),
+  and shows the selected alias's stable source tag plus a bounded root-relative
+  label; it never retains or displays the canonical HOME prefix.
 
 It is still **not** the full workspace product that [ADR
 0003](adr/0003-noren-zellij-responsibility-boundary.md) describes — one local
@@ -138,6 +149,16 @@ Each item states what you would actually see if you ran the build.
   Session" gives you another local `zsh`, and there is no way to open an SSH
   host, a git worktree, or an agent from the workspace. Milestones 4 and 5 own
   the remaining work.
+- **The SSH list is not OpenSSH-equivalent discovery.** A readable config can
+  legitimately name destinations that do not appear: wildcard or negated
+  patterns are matching policy rather than concrete aliases, `Match` and token
+  expansion are not evaluated into destinations, and includes outside the
+  top-level configuration directory are deliberately ignored even though
+  OpenSSH may accept them. The status row therefore never calls the rows a
+  complete host list. It shows only the first 24 literal aliases and reports an
+  omitted count; selecting a row shows where its first literal declaration came
+  from, but does not prove the effective configuration that a future connection
+  will use.
 - **One session is visible at a time.** The sidebar lists sessions and selection
   moves between them, but a single terminal viewport is drawn beside it; there
   is no split, tiled, or multi-session view. Panes and layout *inside* a session

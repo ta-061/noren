@@ -95,6 +95,16 @@ Favorites and connection history are user/host/topology metadata: keep them
 user-scoped, redact them from diagnostics, provide deletion, and test migration
 and corruption behavior in SSH-11.
 
+The Milestone 4 sidebar slice implemented on 2026-08-13 deliberately stops at
+that partial-browser boundary. It lists at most 24 positive literal aliases,
+labels the result as partial literal discovery, and attributes each retained
+alias to the first declaring source with a bounded root-relative label and
+stable parse-local tag. Successfully read duplicate or cyclic includes reuse
+their canonical source identity. No DNS lookup, `ssh -G`, system-configuration
+evaluation, connection, or remote PTY occurs. This is honest discovery metadata,
+not an OpenSSH-equivalent effective configuration; the SSH-01–SSH-05 gates below
+still apply before any connection path.
+
 ## Process and command boundaries
 
 There are two different command-construction boundaries:

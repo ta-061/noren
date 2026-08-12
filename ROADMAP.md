@@ -9,7 +9,7 @@ Only evidence-backed work is marked complete.
 | 1 — Requirements and design | Independent proposals, critiques, integrated requirements, architecture, threat model, tests, RFCs, ADRs | Complete |
 | 2 — Terminal foundation | Window, PTY, shell, terminal state/rendering, input, resize, scrollback, selection, copy/paste/search, configuration and diagnostics | Complete |
 | 3 — Workspace | External workspace management (sidebar: projects, git worktrees, SSH connections, agents, terminal sessions), single-session view, session lifecycle, sidebar-state persistence, palette, configurable keybindings, Zellij pass-through — no native tabs/panes/layout (delegated to Zellij per [ADR 0003](docs/adr/0003-noren-zellij-responsibility-boundary.md)) | In progress — vertical slice landed; see [Milestone 3 status](#milestone-3-status) |
-| 4 — SSH and remote | OpenSSH configuration, connections, reconnect, remote panes, daemon decision/PoC and recovery | In progress — bounded OpenSSH configuration discovery and sidebar target selection landed; no connection or remote PTY |
+| 4 — SSH and remote | OpenSSH configuration, connections, reconnect, remote panes, daemon decision/PoC and recovery | In progress — bounded, explicitly partial literal-alias discovery and source-attributed sidebar selection landed; no connection or remote PTY |
 | 5 — Agent experience | Launchers, verified adapters, trustworthy state, notifications and jump-to-source | Not started |
 | 6 — Themes and accessibility | Light/dark/high-contrast palettes, contrast checks, IME/CJK/HiDPI and keyboard/accessibility work | Not started |
 | 7 — Quality | Unit/integration/compatibility/fault/security/visual tests, fuzzing, soak tests and benchmarks | Not started |
@@ -110,7 +110,7 @@ Measured against it, item by item:
 | --- | --- | --- |
 | Sidebar drawn | Done | `SIDEBAR_COLS` reserved in `renderer.rs`; `glyph_vertices` applies the column offset; `sidebar_text_lines` formats rows |
 | — projects, git worktrees | Modelled, not launchable | `EntryKind::Project`/`Worktree`, `SessionKind::Project`/`Worktree` exist; no creation path constructs them |
-| — SSH connections, agents | Configured targets listed, not connected; agents fixture only | Bounded OpenSSH facts become `SessionKind::Ssh` and `SidebarEntry::SshConnection` rows; clicking records a pending target but opens no SSH connection or PTY; agent entries remain reserved |
+| — SSH connections, agents | Partial configured-target list, not connected; agents fixture only | At most 24 positive literal OpenSSH aliases become `SessionKind::Ssh` and `SidebarEntry::SshConnection` rows; the status identifies partial discovery, and clicking shows bounded root-relative source provenance while opening no SSH connection or PTY; agent entries remain reserved |
 | — terminal sessions | Done | `SessionKind::Local` is created, selected, and closed from the running binary |
 | Single-session view | Done | Terminal drawn beside the sidebar, narrowed to the remaining columns |
 | Session lifecycle | Done | `SessionStatus` advances `Starting -> Running -> Exited/Failed` via `SessionRegistry::observe`, wired in `main.rs` |
@@ -120,10 +120,12 @@ Measured against it, item by item:
 | Zellij pass-through | Done against a pinned corpus | `passthrough.rs` policy claims only Super-space chords that the pinned Zellij `v0.44.3` default corpus (`ZELLIJ_FIXTURE_TAG`) never binds; no test drives a live Zellij |
 
 Two named scope items remain unsatisfied: **configurable keybindings do not
-exist at all**, and **SSH connections and agents do not run**. Configured SSH
-targets now appear in the sidebar and a click records a pending target, but
-opens no SSH connection or PTY; agent entries remain fixtures and launch no
-agent. Since "Only evidence-backed work is marked complete" and the scope line
+exist at all**, and **SSH connections and agents do not run**. Positive literal
+aliases now appear in a bounded sidebar list and a click records a
+source-attributed pending target, but opens no SSH connection or PTY; wildcard
+or dynamic destinations are not presented as a complete host inventory, and
+agent entries remain fixtures and launch no agent. Since "Only evidence-backed
+work is marked complete" and the scope line
 names both, Milestone 3 stays **In progress**. The SSH and agent session kinds
 also depend on Milestones 4 and 5; whether they are retired from Milestone 3's
 scope or carried is an open scoping decision, not something to settle by
@@ -140,9 +142,12 @@ the Noren terminal." The reasoning and the decision are recorded in
   reach the binary: the sidebar is drawn, the palette opens on `Super+p`,
   sessions are created/selected/closed, mouse reports reach the PTY, and
   sidebar state persists across a restart. What is still missing is breadth —
-  bounded OpenSSH configuration now produces `SessionKind::Ssh` values and
-  `SidebarEntry::SshConnection` rows, but selecting one only records a pending
-  target and opens no connection or PTY. Only `SessionKind::Local` reaches a
+  bounded OpenSSH configuration now produces an explicitly partial list of at
+  most 24 positive literal aliases as `SessionKind::Ssh` values and
+  `SidebarEntry::SshConnection` rows. The UI labels the discovery scope and
+  shows bounded root-relative source provenance on selection, but selecting one
+  only records a pending target and opens no connection or PTY. Only
+  `SessionKind::Local` reaches a
   launch path; git worktrees remain unreachable, agents remain fixture-only,
   and keybindings are not configurable. See [Milestone 3 status](#milestone-3-status).
 - **Colour rendering exists, but themes are fixed.** `renderer.rs` resolves

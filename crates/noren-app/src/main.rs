@@ -27,7 +27,7 @@ use noren_app::{
         SESSION_STATE_FILE_NAME, SessionPersistenceError, load_snapshot, save, snapshot,
     },
     sidebar::{SidebarEntry, SidebarView},
-    ssh_config::SshConfig,
+    ssh_config::{HostDiscoveryKind, SshConfig},
 };
 use noren_pty::{PtyEvent, PtySession, PtySize};
 use noren_terminal::{GridPoint, Selection, SelectionMode, TerminalEngine, TerminalState};
@@ -60,6 +60,10 @@ const SSH_SIDEBAR_TARGET_CHARS: usize = SSH_SIDEBAR_LABEL_CHARS - SSH_SIDEBAR_LA
 const SSH_SIDEBAR_TRUNCATED_TARGET_CHARS: usize =
     SSH_SIDEBAR_TARGET_CHARS - SSH_SIDEBAR_TRUNCATION_MARKER_CHARS;
 const SSH_SIDEBAR_DETAIL: &str = "not connected";
+/// Keep the complete source identity and the partial-discovery warning visible
+/// together on ordinary terminal widths. The stable source tag is placed first
+/// so path truncation cannot make two retained sources indistinguishable.
+const SSH_STATUS_SOURCE_CHARS: usize = 40;
 
 /// Build the bounded display label for an SSH target without copying or even
 /// scanning the complete target. The renderer counts Unicode scalar values,
@@ -83,6 +87,37 @@ fn ssh_sidebar_label(target: &str) -> String {
         label.push_str(SSH_SIDEBAR_TRUNCATION_MARKER);
     }
     label
+}
+
+fn ssh_status_source_label(label: &str) -> String {
+    let (path, tag) = label
+        .rsplit_once(' ')
+        .filter(|(_, tag)| tag.starts_with('#'))
+        .unwrap_or((label, "#?"));
+    let prefix = format!("{tag} ");
+    let path_budget = SSH_STATUS_SOURCE_CHARS.saturating_sub(prefix.chars().count());
+    let inspected: Vec<char> = path.chars().take(path_budget.saturating_add(1)).collect();
+    let truncated = inspected.len() > path_budget;
+    let visible_chars = if truncated {
+        path_budget.saturating_sub(SSH_SIDEBAR_TRUNCATION_MARKER_CHARS)
+    } else {
+        inspected.len()
+    };
+    let mut result = prefix;
+    result.extend(inspected.into_iter().take(visible_chars));
+    if truncated {
+        result.push_str(SSH_SIDEBAR_TRUNCATION_MARKER);
+    }
+    result
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConfiguredSshHost {
+    /// Shared session vocabulary used for target identity; this is still only
+    /// a configured fact and is never inserted into the live registry.
+    kind: SessionKind,
+    /// Bounded, root-relative provenance supplied by `SshConfig`.
+    source_label: String,
 }
 
 /// The dispatchable intent behind each palette command.
@@ -155,9 +190,10 @@ struct WorkspaceState {
     sidebar: SidebarView,
     /// Configured SSH targets represented by the shared session vocabulary.
     /// They are sidebar facts only: no registry entry or connection exists.
-    ssh_hosts: Vec<SessionKind>,
+    ssh_hosts: Vec<ConfiguredSshHost>,
     ssh_hosts_omitted: usize,
     selected_ssh_target: Option<String>,
+    selected_ssh_source_label: Option<String>,
     /// Owned by the workspace; dispatched when the palette opens.
     palette: Palette<WorkspaceAction>,
     /// Where sidebar state is persisted. `None` in tests and when `HOME` is
@@ -195,6 +231,7 @@ impl WorkspaceState {
             ssh_hosts: Vec::new(),
             ssh_hosts_omitted: 0,
             selected_ssh_target: None,
+            selected_ssh_source_label: None,
             palette: Palette::noren(
                 WorkspaceAction::CreateSession,
                 WorkspaceAction::SelectSession,
@@ -280,6 +317,7 @@ impl WorkspaceState {
     fn select_session(&mut self, id: SessionId) -> Result<(), SessionError> {
         self.registry.apply(SessionAction::Select { id })?;
         self.selected_ssh_target = None;
+        self.selected_ssh_source_label = None;
         self.rebuild_sidebar();
         self.persist();
         Ok(())
@@ -303,12 +341,19 @@ impl WorkspaceState {
             .hosts()
             .iter()
             .take(MAX_SSH_SIDEBAR_HOSTS)
-            .map(|host| SessionKind::Ssh {
-                target: host.alias().to_owned(),
+            .filter_map(|host| {
+                let source = config.source(host.declared_source())?;
+                Some(ConfiguredSshHost {
+                    kind: SessionKind::Ssh {
+                        target: host.alias().to_owned(),
+                    },
+                    source_label: source.label().to_owned(),
+                })
             })
             .collect();
         self.ssh_hosts_omitted = config.hosts().len().saturating_sub(self.ssh_hosts.len());
         self.selected_ssh_target = None;
+        self.selected_ssh_source_label = None;
         self.rebuild_sidebar();
         self.ssh_hosts_omitted
     }
@@ -317,12 +362,15 @@ impl WorkspaceState {
     fn select_ssh_sidebar_row(&mut self, row_index: usize) -> bool {
         let session_rows = self.registry.len();
         let host_index = row_index.checked_sub(session_rows);
-        let Some(Some(SessionKind::Ssh { target })) =
-            host_index.map(|index| self.ssh_hosts.get(index))
+        let Some(Some(ConfiguredSshHost {
+            kind: SessionKind::Ssh { target },
+            source_label,
+        })) = host_index.map(|index| self.ssh_hosts.get(index))
         else {
             return false;
         };
         self.selected_ssh_target = Some(target.clone());
+        self.selected_ssh_source_label = Some(source_label.clone());
         self.rebuild_sidebar();
         true
     }
@@ -375,8 +423,8 @@ impl WorkspaceState {
             .collect();
         let mut entries = entries;
         let mut pending_marked = false;
-        entries.extend(self.ssh_hosts.iter().filter_map(|kind| {
-            let SessionKind::Ssh { target } = kind else {
+        entries.extend(self.ssh_hosts.iter().filter_map(|host| {
+            let SessionKind::Ssh { target } = &host.kind else {
                 return None;
             };
             let selected =
@@ -411,6 +459,10 @@ impl WorkspaceState {
     #[cfg(test)]
     fn selected_ssh_target(&self) -> Option<&str> {
         self.selected_ssh_target.as_deref()
+    }
+
+    fn selected_ssh_source_label(&self) -> Option<&str> {
+        self.selected_ssh_source_label.as_deref()
     }
 
     #[cfg(test)]
@@ -541,6 +593,7 @@ struct NorenApp {
     diagnostics_visible: bool,
     diagnostics_line: String,
     ssh_diagnostic: Option<String>,
+    ssh_selection_status: Option<String>,
     redraw_needed: bool,
     // User-initiated selection state. The renderer does not highlight it yet;
     // copy still extracts it. Any PTY output or resize invalidates it because
@@ -570,20 +623,30 @@ struct NorenApp {
 
 /// Which application-owned line, if any, occupies the renderer's status row.
 ///
-/// Runtime statuses are newer than startup SSH diagnostics and therefore take
-/// precedence while `show_status` is set. An SSH diagnostic otherwise stays
-/// visible until a clean configuration application clears it. Falling back to
-/// the runtime source preserves the existing empty-terminal status line.
+/// Runtime statuses take precedence while `show_status` is set. A pending SSH
+/// selection then exposes its bounded provenance; otherwise a readable config
+/// keeps the partial-discovery notice (or a parse failure keeps its content-free
+/// diagnostic). Falling back to the runtime source preserves the existing
+/// empty-terminal status line.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StatusRowSource {
     Runtime,
+    SshSelection,
     SshDiagnostic,
 }
 
 impl StatusRowSource {
-    fn text<'a>(self, runtime: &'a str, ssh_diagnostic: Option<&'a str>) -> &'a str {
+    fn text<'a>(
+        self,
+        runtime: &'a str,
+        ssh_selection_status: Option<&'a str>,
+        ssh_diagnostic: Option<&'a str>,
+    ) -> &'a str {
         match self {
             Self::Runtime => runtime,
+            Self::SshSelection => {
+                ssh_selection_status.expect("SSH selection source requires a provenance status")
+            }
             Self::SshDiagnostic => {
                 ssh_diagnostic.expect("SSH diagnostic source requires diagnostic text")
             }
@@ -618,6 +681,7 @@ impl NorenApp {
             diagnostics_visible: false,
             diagnostics_line: String::new(),
             ssh_diagnostic: None,
+            ssh_selection_status: None,
             redraw_needed: true,
             selection: None,
             drag_origin: None,
@@ -640,6 +704,8 @@ impl NorenApp {
     fn status_row(&self) -> Option<StatusRowSource> {
         if self.show_status {
             Some(StatusRowSource::Runtime)
+        } else if self.ssh_selection_status.is_some() {
+            Some(StatusRowSource::SshSelection)
         } else if self.ssh_diagnostic.is_some() {
             Some(StatusRowSource::SshDiagnostic)
         } else if self
@@ -672,7 +738,7 @@ impl NorenApp {
     /// Load the conventional `~/.ssh/config` through the bounded parser.
     /// Missing/unreadable input is an empty host list; malformed readable
     /// input becomes a content-free diagnostics/status line and never stops
-    /// startup.
+    /// startup. A readable config gets an explicit partial-discovery notice.
     fn load_ssh_hosts(&mut self) {
         match SshConfig::read_default() {
             Ok(config) => self.apply_ssh_config(&config),
@@ -691,12 +757,19 @@ impl NorenApp {
 
     fn apply_ssh_config(&mut self, config: &SshConfig) {
         let omitted = self.workspace.load_ssh_config(config);
-        if omitted == 0 {
+        self.ssh_selection_status = None;
+        if config.sources().is_empty() {
             self.ssh_diagnostic = None;
         } else {
-            self.report_ssh_diagnostic(format!(
-                "SSH host list truncated: showing first {MAX_SSH_SIDEBAR_HOSTS}; {omitted} omitted"
-            ));
+            self.ssh_diagnostic = Some(match config.discovery_kind() {
+                HostDiscoveryKind::PartialLiteralPatterns if omitted == 0 => {
+                    "Noren SSH: partial literal aliases; select one for source".to_owned()
+                }
+                HostDiscoveryKind::PartialLiteralPatterns => format!(
+                    "Noren SSH: partial literal aliases; showing first \
+                     {MAX_SSH_SIDEBAR_HOSTS}; {omitted} omitted"
+                ),
+            });
         }
         self.redraw_needed = true;
     }
@@ -704,6 +777,7 @@ impl NorenApp {
     fn report_ssh_diagnostic(&mut self, detail: String) {
         let line = format!("Noren diagnostics: {detail}");
         eprintln!("{line}");
+        self.ssh_selection_status = None;
         self.ssh_diagnostic = Some(line);
         self.redraw_needed = true;
     }
@@ -718,6 +792,7 @@ impl NorenApp {
         self.workspace
             .select_session(session_id)
             .expect("freshly created session is live");
+        self.ssh_selection_status = None;
         self.workspace
             .observe_session(session_id, SessionStatus::Running);
         self.active_session = Some(session_id);
@@ -966,7 +1041,9 @@ impl NorenApp {
                     }
                     None => ids[0],
                 };
-                let _ = self.workspace.select_session(next);
+                if self.workspace.select_session(next).is_ok() {
+                    self.ssh_selection_status = None;
+                }
             }
             WorkspaceAction::CloseSession => {
                 if let Some(id) = self.workspace.registry().selected() {
@@ -1187,12 +1264,18 @@ impl NorenApp {
             return false;
         };
         if self.workspace.select_local_sidebar_row(row_index) {
+            self.ssh_selection_status = None;
             self.redraw_needed = true;
             return true;
         }
         if self.workspace.select_ssh_sidebar_row(row_index) {
-            self.status = "Noren SSH host selected; connection not started";
-            self.show_status = true;
+            let source = self
+                .workspace
+                .selected_ssh_source_label()
+                .map(ssh_status_source_label)
+                .unwrap_or_else(|| "#? source unavailable".to_owned());
+            self.ssh_selection_status = Some(format!("SSH partial source {source}; offline"));
+            self.show_status = false;
             self.redraw_needed = true;
             return true;
         }
@@ -1661,8 +1744,6 @@ impl NorenApp {
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         let snapshot = self.terminal.as_ref().map(TerminalEngine::snapshot);
         let status_row = self.status_row();
-        let status =
-            status_row.map(|source| source.text(self.status, self.ssh_diagnostic.as_deref()));
         let visible_rows = self
             .window
             .as_ref()
@@ -1686,6 +1767,13 @@ impl NorenApp {
         } else {
             sidebar_lines
         };
+        let status = status_row.map(|source| {
+            source.text(
+                self.status,
+                self.ssh_selection_status.as_deref(),
+                self.ssh_diagnostic.as_deref(),
+            )
+        });
         let outcome = self
             .renderer
             .as_mut()
@@ -1835,6 +1923,7 @@ fn terminal_cols(window_cols: u16) -> u16 {
 /// the label and optional detail — using [`SidebarRow::label`] and
 /// [`SidebarRow::detail`] verbatim. When the sidebar is empty the
 /// empty-state message is returned as the sole line.
+#[cfg(test)]
 fn sidebar_text_lines(sidebar: &SidebarView) -> Vec<String> {
     visible_sidebar_text_lines(sidebar, 0, usize::MAX)
 }
@@ -4087,6 +4176,7 @@ mod tests {
     struct SshConfigFixture {
         root: PathBuf,
         path: PathBuf,
+        extra_files: std::cell::RefCell<Vec<PathBuf>>,
     }
 
     impl SshConfigFixture {
@@ -4104,7 +4194,11 @@ mod tests {
                 match builder.create(&root) {
                     Ok(()) => {
                         let path = root.join("config");
-                        return Self { root, path };
+                        return Self {
+                            root,
+                            path,
+                            extra_files: std::cell::RefCell::new(Vec::new()),
+                        };
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                     Err(error) => panic!("create private SSH fixture directory: {error}"),
@@ -4135,6 +4229,30 @@ mod tests {
                 .expect("create exclusive SSH config fixture");
         }
 
+        fn write_sibling_new(&self, name: &str, bytes: impl AsRef<[u8]>) {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let relative = std::path::Path::new(name);
+            let mut components = relative.components();
+            assert!(
+                matches!(components.next(), Some(std::path::Component::Normal(_)))
+                    && components.next().is_none(),
+                "fixture sibling must be one normal path component"
+            );
+            let path = self.root.join(relative);
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&path)
+                .expect("create exclusive SSH include fixture");
+            self.extra_files.borrow_mut().push(path);
+            file.write_all(bytes.as_ref())
+                .expect("write SSH include fixture");
+        }
+
         fn replace(&self, bytes: impl AsRef<[u8]>) {
             use std::io::Write;
             use std::os::unix::fs::OpenOptionsExt;
@@ -4152,8 +4270,11 @@ mod tests {
 
     impl Drop for SshConfigFixture {
         fn drop(&mut self) {
-            // There is only one fixture file. Avoid recursive deletion so a
-            // surprising replacement can never make cleanup follow a tree.
+            // Avoid recursive deletion so a surprising replacement can never
+            // make cleanup follow a tree.
+            for path in self.extra_files.get_mut().drain(..) {
+                let _ = std::fs::remove_file(path);
+            }
             let _ = std::fs::remove_file(&self.path);
             let _ = std::fs::remove_dir(&self.root);
         }
@@ -4177,7 +4298,11 @@ mod tests {
         assert_eq!(rows[1].kind(), EntryKind::SshConnection);
         assert_eq!(rows[1].label(), "SSH-OFF db");
         assert_eq!(
-            app.workspace.ssh_hosts,
+            app.workspace
+                .ssh_hosts
+                .iter()
+                .map(|host| host.kind.clone())
+                .collect::<Vec<_>>(),
             vec![
                 SessionKind::Ssh {
                     target: "build".to_owned()
@@ -4186,6 +4311,45 @@ mod tests {
                     target: "db".to_owned()
                 },
             ]
+        );
+        assert!(
+            app.workspace
+                .ssh_hosts
+                .iter()
+                .all(|host| host.source_label == "config #0")
+        );
+        assert_eq!(
+            app.ssh_diagnostic.as_deref(),
+            Some("Noren SSH: partial literal aliases; select one for source")
+        );
+    }
+
+    #[test]
+    fn included_ssh_host_selection_shows_bounded_root_relative_provenance() {
+        let fixture = SshConfigFixture::new();
+        fixture.write_new(b"Include included.conf\nHost root-only\n");
+        fixture.write_sibling_new("included.conf", b"Host remote\n");
+
+        let mut app = NorenApp::default();
+        app.load_ssh_hosts_from(fixture.path());
+        assert_eq!(app.workspace.ssh_hosts[0].source_label, "included.conf #1");
+        app.cursor_position = Some(PhysicalPosition::new(5.0, 1.0));
+
+        assert!(app.handle_sidebar_click_in_frame(
+            ElementState::Pressed,
+            MouseButton::Left,
+            PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+        ));
+        assert_eq!(
+            app.ssh_selection_status.as_deref(),
+            Some("SSH partial source #1 included.conf; offline")
+        );
+        assert!(
+            !app.ssh_selection_status
+                .as_deref()
+                .expect("selection provenance")
+                .contains(fixture.root.to_string_lossy().as_ref()),
+            "the retained UI label must not expose the absolute config root"
         );
     }
 
@@ -4202,6 +4366,16 @@ mod tests {
 
         assert_eq!(label, "SSH-OFF 東京大...");
         assert_eq!(label.chars().count(), SSH_SIDEBAR_LABEL_CHARS);
+    }
+
+    #[test]
+    fn ssh_status_source_keeps_tag_first_and_bounds_unicode_path() {
+        let label = format!("parts/{} #12", "東京大阪京都札幌仙台横浜".repeat(4));
+        let status_source = ssh_status_source_label(&label);
+
+        assert!(status_source.starts_with("#12 "));
+        assert!(status_source.ends_with(SSH_SIDEBAR_TRUNCATION_MARKER));
+        assert!(status_source.chars().count() <= SSH_STATUS_SOURCE_CHARS);
     }
 
     #[test]
@@ -4296,7 +4470,7 @@ mod tests {
         let config = SshConfig::read(ssh_fixture.path()).expect("near-one-MiB SSH fixture parses");
         assert_eq!(workspace.load_ssh_config(&config), 0);
 
-        let SessionKind::Ssh { target: cached } = &workspace.ssh_hosts[0] else {
+        let SessionKind::Ssh { target: cached } = &workspace.ssh_hosts[0].kind else {
             panic!("configured target remains an SSH identity");
         };
         assert!(
@@ -4386,7 +4560,11 @@ mod tests {
             .expect("the retained SSH diagnostic still renders after startup");
         assert_eq!(source, StatusRowSource::SshDiagnostic);
         assert_eq!(
-            source.text(app.status, app.ssh_diagnostic.as_deref()),
+            source.text(
+                app.status,
+                app.ssh_selection_status.as_deref(),
+                app.ssh_diagnostic.as_deref(),
+            ),
             diagnostic
         );
 
@@ -4412,7 +4590,11 @@ mod tests {
         assert_eq!(layout.row_at(28), Some(renderer::FrameRow::Terminal(29)));
         assert_eq!(layout.row_at(29), Some(renderer::FrameRow::Status));
         let snapshot = app.terminal.as_ref().expect("terminal present").snapshot();
-        let status = source.text(app.status, app.ssh_diagnostic.as_deref());
+        let status = source.text(
+            app.status,
+            app.ssh_selection_status.as_deref(),
+            app.ssh_diagnostic.as_deref(),
+        );
         let vertices = renderer::glyph_vertices(
             Some(&snapshot),
             Some(&[]),
@@ -4498,7 +4680,11 @@ mod tests {
             .expect("the newer runtime failure renders a status row");
         assert_eq!(source, StatusRowSource::Runtime);
         assert_eq!(
-            source.text(app.status, app.ssh_diagnostic.as_deref()),
+            source.text(
+                app.status,
+                app.ssh_selection_status.as_deref(),
+                app.ssh_diagnostic.as_deref(),
+            ),
             "Noren PTY operation failed",
             "a retained startup diagnostic must not mask a newer runtime status"
         );
@@ -4506,10 +4692,15 @@ mod tests {
 
         fixture.replace(b"Host recovered\n");
         app.load_ssh_hosts_from(fixture.path());
+        let discovery_notice = app
+            .ssh_diagnostic
+            .as_deref()
+            .expect("a readable config keeps the partial-discovery notice");
         assert!(
-            app.ssh_diagnostic.is_none(),
-            "a clean configuration application ends the diagnostic lifetime"
+            discovery_notice.contains("partial literal aliases"),
+            "a clean application replaces the error with an honest scope notice"
         );
+        assert!(!discovery_notice.contains("configuration error"));
     }
 
     #[test]
@@ -4548,9 +4739,18 @@ mod tests {
         assert_eq!(app.workspace.registry().selected(), None);
         assert_eq!(app.workspace.registry().len(), 1);
         assert!(app.pty.is_none(), "SSH selection must not open a PTY");
+        assert!(!app.show_status, "the provenance status owns the row");
+        let source = app
+            .status_row()
+            .expect("pending SSH selection renders provenance");
+        assert_eq!(source, StatusRowSource::SshSelection);
         assert_eq!(
-            app.status,
-            "Noren SSH host selected; connection not started"
+            source.text(
+                app.status,
+                app.ssh_selection_status.as_deref(),
+                app.ssh_diagnostic.as_deref(),
+            ),
+            "SSH partial source #0 config; offline"
         );
         assert!(
             app.workspace.sidebar().viewport().is_none(),
@@ -4618,7 +4818,7 @@ mod tests {
         fixture.write_new(b"Host alpha\nHost beta\nHost gamma\n");
         let mut app = NorenApp::default();
         for _ in 0..3 {
-            app.workspace.registry.restore(SessionKind::Local);
+            let _ = app.workspace.registry.restore(SessionKind::Local);
         }
         app.workspace.create_session(SessionKind::Local);
         app.workspace.rebuild_sidebar();
@@ -4683,11 +4883,15 @@ mod tests {
         app.workspace
             .select_session(local)
             .expect("created local session is selectable");
-        app.workspace.ssh_hosts.push(SessionKind::Ssh {
-            target: "staging".to_owned(),
+        app.workspace.ssh_hosts.push(ConfiguredSshHost {
+            kind: SessionKind::Ssh {
+                target: "staging".to_owned(),
+            },
+            source_label: "inline #0".to_owned(),
         });
         app.workspace.rebuild_sidebar();
         assert!(app.workspace.select_ssh_sidebar_row(1));
+        app.ssh_selection_status = Some("SSH partial source #0 inline; offline".to_owned());
         assert_eq!(app.workspace.selected_ssh_target(), Some("staging"));
         app.cursor_position = Some(PhysicalPosition::new(5.0, 1.0));
 
@@ -4700,6 +4904,7 @@ mod tests {
             "a visible local row is consumed by the sidebar"
         );
         assert_eq!(app.workspace.selected_ssh_target(), None);
+        assert!(app.ssh_selection_status.is_none());
         assert_eq!(app.workspace.registry().selected(), Some(local));
         assert!(app.workspace.sidebar().rows()[0].is_selected());
         assert_eq!(app.workspace.sidebar().selected_row_count(), 1);
@@ -4715,7 +4920,10 @@ mod tests {
     #[test]
     fn rebuild_sidebar_skips_non_ssh_host_facts_without_panicking() {
         let mut workspace = WorkspaceState::default();
-        workspace.ssh_hosts.push(SessionKind::Local);
+        workspace.ssh_hosts.push(ConfiguredSshHost {
+            kind: SessionKind::Local,
+            source_label: "inline #0".to_owned(),
+        });
 
         workspace.rebuild_sidebar();
 
