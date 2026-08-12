@@ -93,8 +93,9 @@ Draft PRs, and current-head CI evidence.
 ## Milestone 3 status
 
 **In progress, not Complete.** The vertical slice reached the binary: launching
-the build now draws a workspace sidebar, and sessions can be created, selected,
-and closed from a command palette.
+the build now draws a workspace sidebar and starts one local PTY. The command
+palette operates on the session registry, but its additional rows are
+model-only and cannot take the live PTY's input ownership.
 
 The milestone's own scope line is the test, so it is quoted here in full:
 
@@ -111,8 +112,8 @@ Measured against it, item by item:
 | Sidebar drawn | Done | `SIDEBAR_COLS` reserved in `renderer.rs`; `glyph_vertices` applies the column offset; `sidebar_text_lines` formats rows |
 | — projects, git worktrees | Modelled, not launchable | `EntryKind::Project`/`Worktree`, `SessionKind::Project`/`Worktree` exist; no creation path constructs them |
 | — SSH connections, agents | Partial configured-target list, not connected; agents fixture only | At most 24 positive literal OpenSSH aliases become `SessionKind::Ssh` and `SidebarEntry::SshConnection` rows; the status identifies partial discovery, and clicking shows bounded root-relative source provenance while opening no SSH connection or PTY; agent entries remain reserved |
-| — terminal sessions | Done | `SessionKind::Local` is created, selected, and closed from the running binary |
-| Single-session view | Done | Terminal drawn beside the sidebar, narrowed to the remaining columns |
+| — terminal sessions | Partial runtime | The running binary starts one `SessionKind::Local` PTY; palette-created rows are model entries only until supervisor-backed switching lands |
+| Single-session view | Done | The one live terminal is drawn beside the sidebar, narrowed to the remaining columns; inactive rows cannot claim its selection or input owner |
 | Session lifecycle | Done | `SessionStatus` advances `Starting -> Running -> Exited/Failed` via `SessionRegistry::observe`, wired in `main.rs` |
 | Sidebar-state persistence | Done | `sessions.toml` (`SESSION_STATE_FILE_NAME`) under the `config::default_path` directory, resolved by `session_state_path` |
 | Palette | Done | `Super+p` via `palette_policy`; `Palette::noren`'s four commands dispatched by `handle_palette_key` |
@@ -140,8 +141,9 @@ the Noren terminal." The reasoning and the decision are recorded in
 
 - **The workspace is a slice, not a product.** The Milestone 3 modules now
   reach the binary: the sidebar is drawn, the palette opens on `Super+p`,
-  sessions are created/selected/closed, mouse reports reach the PTY, and
-  sidebar state persists across a restart. What is still missing is breadth —
+  one startup session owns the live PTY while palette-created rows remain
+  model-only, mouse reports reach that PTY, and sidebar state persists across a
+  restart. What is still missing is breadth and real session switching —
   bounded OpenSSH configuration now produces an explicitly partial list of at
   most 24 positive literal aliases as `SessionKind::Ssh` values and
   `SidebarEntry::SshConnection` rows. The UI labels the discovery scope and

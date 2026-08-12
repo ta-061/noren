@@ -29,12 +29,12 @@ binary. What now actually happens on screen:
   `glyph_vertices` in `renderer.rs`, which takes a `sidebar` argument and
   applies `col_offset`, and `sidebar_text_lines` in `main.rs`, which formats the
   rows.
-- **Sessions can be created, selected, and closed.** `Super+p` opens a command
-  palette (claimed by `palette_policy` in `main.rs` as
-  `PassthroughAction::OpenCommandPalette`), and `c`/`s`/`x`/`f` dispatch new
-  session, switch session, close session, and focus sidebar — the four commands
-  built by `Palette::noren`, routed through `handle_palette_key`. Arrow keys and
-  Enter navigate the same list; Escape dismisses it.
+- **The session palette is present, but only one PTY is live.** `Super+p` opens
+  the command palette (claimed by `palette_policy` in `main.rs` as
+  `PassthroughAction::OpenCommandPalette`). Its `c` command adds a model row;
+  it does not start another shell. The `s` and `x` commands cannot move or
+  remove the startup PTY's input owner, while `f` focuses the sidebar. Arrow
+  keys and Enter navigate the same command list; Escape dismisses it.
 - **Mouse reporting reaches the program.** `handle_mouse_button`,
   `handle_mouse_move`, and `handle_mouse_wheel` in `main.rs` each call
   `encode_and_send_mouse`, the helper that invokes `MouseEncoder::encode` and
@@ -137,7 +137,7 @@ Each item states what you would actually see if you ran the build.
   The PTY launches `/bin/zsh` with a fixed policy and no caller-controlled
   arguments (`ZSH_PROGRAM` in `crates/noren-pty/src/lib.rs`). Linux support and SSH/remote
   sessions are roadmap intent (Milestones 4 and 6), not current capability.
-- **Only local sessions can actually be launched.** `SessionKind` models
+- **Only the startup local session is actually launched.** `SessionKind` models
   `Local`, `Project`, `Worktree`, `Ssh`, and `Agent`, and `EntryKind` in
   `sidebar.rs` can describe project, worktree, SSH-connection, and agent rows —
   but only `Local` has a launch path. The running binary now reads bounded
@@ -145,8 +145,10 @@ Each item states what you would actually see if you ran the build.
   configured targets as `SidebarEntry::SshConnection` rows. Clicking one only
   records a pending target; it opens neither an SSH connection nor a PTY.
   Project and worktree kinds remain modelled, while agent entries remain
-  reserved fixtures and no agent is launched. In practice: the palette's "New
-  Session" gives you another local `zsh`, and there is no way to open an SSH
+  reserved fixtures and no agent is launched. In practice: startup owns exactly
+  one local `zsh`. The palette's "New Session" currently records another local
+  model row but does not spawn a PTY, and an inactive or restored row cannot
+  take the live PTY's selection/input ownership. There is no way to open an SSH
   host, a git worktree, or an agent from the workspace. Milestones 4 and 5 own
   the remaining work.
 - **The SSH list is not OpenSSH-equivalent discovery.** A readable config can
@@ -159,17 +161,19 @@ Each item states what you would actually see if you ran the build.
   omitted count; selecting a row shows where its first literal declaration came
   from, but does not prove the effective configuration that a future connection
   will use.
-- **One session is visible at a time.** The sidebar lists sessions and selection
-  moves between them, but a single terminal viewport is drawn beside it; there
-  is no split, tiled, or multi-session view. Panes and layout *inside* a session
-  are delegated to Zellij by design — see "What is deliberately delegated".
+- **There is one live session, not session switching.** The sidebar may list
+  restored or palette-created model entries, but only the startup session owns
+  the terminal viewport and input. Clicking an inactive row cannot move that
+  ownership. There is no split, tiled, or multi-session view. Panes and layout
+  *inside* the live session are delegated to Zellij by design — see "What is
+  deliberately delegated".
 - **Keybindings are not configurable.** The palette opener (`Super+p`), the exit
   leader (`Super+Escape`), and the `c`/`s`/`x`/`f` command keys are compiled in:
   `palette_policy` and `handle_palette_key` in `main.rs` hard-code them, and the
   config parser (`config.rs`) exposes no keybinding or keymap surface. Rebinding
   requires editing source.
 - **A restored session's shell is not running.** Sidebar state persists across a
-  restart, but a restored entry comes back as `SessionStatus::Starting` — a
+  restart, but a restored entry comes back as `SessionStatus::Restored` — a
   visible row whose PTY does not exist yet. The comment on `teardown` in
   `main.rs` records this as the deliberate meaning of a restored session.
 
@@ -240,9 +244,9 @@ When Zellij is running, correct input pass-through takes priority over Noren
 shortcuts. Please do not file the absence of native tabs or panes as a bug —
 but do hold Noren to its side of the boundary: a workspace *outside* the
 terminal. That side now has a first vertical slice — a drawn sidebar, a command
-palette, session create/select/close, and state that survives a restart — and
-the gaps that remain there (non-local session kinds, configurable keybindings)
-are legitimate things to report.
+palette over model rows, one live local PTY, and state that survives a restart
+— and the gaps that remain there (real session switching, non-local session
+kinds, configurable keybindings) are legitimate things to report.
 
 ## What this preview is not
 

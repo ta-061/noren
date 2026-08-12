@@ -5,7 +5,7 @@
 > **Current state: a first workspace slice on a terminal foundation.** What
 > exists on `main` is a macOS window over a local `zsh` PTY with a tested
 > terminal state core, plus a drawn workspace sidebar, a `Super+p` command
-> palette that creates/selects/closes local sessions, mouse reporting that
+> palette over the session registry, mouse reporting that
 > reaches the program inside, and sidebar state that survives a restart.
 >
 > Per-cell SGR foreground and explicit background colours now reach drawing:
@@ -13,8 +13,9 @@
 > through as direct truecolor, with the resolved colour carried per vertex. The
 > default palette and theme are not user-configurable. The renderer still uses
 > a case-insensitive 5x7 ASCII bitmap font, with all non-ASCII shown as `?`, no
-> visible cursor, no IME, and no accessibility surface. Only local sessions can
-> be launched. A bounded, explicitly partial list of positive literal aliases
+> visible cursor, no IME, and no accessibility surface. Startup launches
+> exactly one local session; additional palette rows do not launch or switch
+> PTYs yet. A bounded, explicitly partial list of positive literal aliases
 > from the user's OpenSSH config is displayed in the sidebar (at most 24 rows),
 > and selecting one shows its root-relative config source without opening an
 > SSH connection or PTY. Wildcard-only and dynamic OpenSSH destinations are not

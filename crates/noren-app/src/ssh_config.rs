@@ -107,6 +107,9 @@ pub enum HostDiscoveryKind {
 /// Zero is the top-level source (or the synthetic inline source used by
 /// [`SshConfig::parse`]); successfully read included files receive increasing
 /// ordinals on first encounter. Repeated includes reuse the same identity.
+/// IDs are ordinal tokens, not globally unique: an ID must only be resolved
+/// through the [`SshConfig`] that produced it. The same ordinal from a different
+/// parse may identify a different source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SshSourceId(usize);
 
@@ -335,8 +338,12 @@ impl SshConfig {
         self.discovery_kind
     }
 
-    /// Bounded provenance for `id`, or `None` when the ID belongs to another
-    /// parse result.
+    /// Bounded provenance for a parse-local `id` produced by this config.
+    ///
+    /// IDs are ordinal tokens, so an ID from another parse with the same
+    /// ordinal may resolve to an unrelated source here. Callers must pair IDs
+    /// with the [`SshConfig`] that produced them. Returns `None` only when this
+    /// config has no source at the ID's ordinal.
     #[must_use]
     pub fn source(&self, id: SshSourceId) -> Option<&SshSource> {
         self.sources
