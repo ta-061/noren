@@ -5,13 +5,22 @@
 > **Current state: a first workspace slice on a terminal foundation.** What
 > exists on `main` is a macOS window over a local `zsh` PTY with a tested
 > terminal state core, plus a drawn workspace sidebar, a `Super+p` command
-> palette that creates/selects/closes local sessions, mouse reporting that
+> palette over the session registry, mouse reporting that
 > reaches the program inside, and sidebar state that survives a restart.
 >
-> It still renders in a single colour, in a case-insensitive 5x7 ASCII bitmap
-> font, with all non-ASCII shown as `?`, no visible cursor, no IME, and no
-> accessibility surface. Only local sessions can be launched — SSH hosts, git
-> worktrees, and agents are modelled but unreachable — and keybindings are not
+> Per-cell SGR foreground and explicit background colours now reach drawing:
+> ANSI and 256-colour values resolve through a fixed palette, while RGB passes
+> through as direct truecolor, with the resolved colour carried per vertex. The
+> default palette and theme are not user-configurable. The renderer still uses
+> a case-insensitive 5x7 ASCII bitmap font, with all non-ASCII shown as `?`, no
+> visible cursor, no IME, and no accessibility surface. Startup launches
+> exactly one local session; additional palette rows do not launch or switch
+> PTYs yet. A bounded, explicitly partial list of positive literal aliases
+> from the user's OpenSSH config is displayed in the sidebar (at most 24 rows),
+> and selecting one shows its root-relative config source without opening an
+> SSH connection or PTY. Wildcard-only and dynamic OpenSSH destinations are not
+> a complete browseable list;
+> git worktrees and agents remain modelled but unreachable. Keybindings are not
 > configurable. There are no published binaries. Read
 > **[docs/known-limitations.md](docs/known-limitations.md)** first — it is the
 > accurate predictor of what happens when you run the build. Everything below
@@ -47,7 +56,8 @@ Milestones 0–2 (discovery, requirements/design, terminal foundation) are
 complete on the evidence recorded in [ROADMAP.md](ROADMAP.md). Milestone 3
 (workspace) is **in progress**: the vertical slice — sidebar, palette, session
 lifecycle, persistence, Zellij pass-through — has landed, while configurable
-keybindings and the SSH/agent session kinds have not; the reasoning is in
+keybindings, SSH connection launching, and agent launching have not; the
+reasoning is in
 [Milestone 3 status](ROADMAP.md#milestone-3-status). The SSH,
 agent-experience, theming/accessibility, quality, and preview milestones are
 open. The required sequence remains:

@@ -371,6 +371,19 @@ impl ScreenBuffer {
         &self.cells
     }
 
+    /// Number of leading screen rows retained by the display model.
+    ///
+    /// Trailing rows made only of baseline blanks and wide-character
+    /// continuations are omitted. A row containing an explicit background is
+    /// retained even when every cell contains only a space, because renderers
+    /// still draw that background. This is the row-selection rule used by
+    /// [`TerminalSnapshot::display_lines`] and
+    /// [`TerminalSnapshot::display_cells`].
+    #[must_use]
+    pub fn display_row_count(&self) -> usize {
+        visible_display_row_count(self)
+    }
+
     /// The cells of one zero-based row, as a contiguous slice.
     ///
     /// Narrow accessor shared by the screen and scrollback search so neither
@@ -1544,11 +1557,10 @@ impl TerminalSnapshot {
     #[must_use]
     pub fn display_cells(&self) -> impl ExactSizeIterator<Item = &[Cell]> {
         let cols = usize::from(self.screen.cols);
-        let mut rows: Vec<&[Cell]> = self.screen.cells.chunks_exact(cols).collect();
-        while rows.last().is_some_and(|row| row_is_display_blank(row)) {
-            rows.pop();
-        }
-        rows.into_iter()
+        self.screen
+            .cells
+            .chunks_exact(cols)
+            .take(self.screen.display_row_count())
     }
 
     /// Retained scrollback rows in eviction order (oldest first, newest last).
@@ -1655,22 +1667,13 @@ fn cells_to_line(cells: &[Cell]) -> String {
 }
 
 fn visible_display_lines(screen: &ScreenBuffer) -> Vec<String> {
-    let mut lines = Vec::with_capacity(usize::from(screen.rows));
-    for row in 0..screen.rows {
-        let start = usize::from(row) * usize::from(screen.cols);
-        let end = start + usize::from(screen.cols);
-        lines.push(cells_to_display_line(&screen.cells[start..end]));
-    }
-    while lines.last().is_some_and(String::is_empty) {
-        let row = lines.len() - 1;
-        let start = row * usize::from(screen.cols);
-        let end = start + usize::from(screen.cols);
-        if !row_is_display_blank(&screen.cells[start..end]) {
-            break;
-        }
-        lines.pop();
-    }
-    lines
+    let cols = usize::from(screen.cols);
+    screen
+        .cells
+        .chunks_exact(cols)
+        .take(screen.display_row_count())
+        .map(cells_to_display_line)
+        .collect()
 }
 
 /// Render a cell row to text preserving display columns: a continuation cell
@@ -1704,6 +1707,16 @@ fn row_is_display_blank(cells: &[Cell]) -> bool {
     cells.iter().all(|cell| {
         (cell.is_blank() || cell.is_continuation()) && cell.attributes().background().is_default()
     })
+}
+
+/// Shared row count behind every display-facing screen view.
+fn visible_display_row_count(screen: &ScreenBuffer) -> usize {
+    let cols = usize::from(screen.cols);
+    screen
+        .cells
+        .chunks_exact(cols)
+        .rposition(|row| !row_is_display_blank(row))
+        .map_or(0, |row| row + 1)
 }
 
 #[cfg(test)]
@@ -2002,6 +2015,8 @@ mod tests {
         state.feed_bytes(b"\x1b[48;2;73;18;146m ");
         let snapshot = state.snapshot();
 
+        assert_eq!(state.screen().display_row_count(), 1);
+        assert_eq!(snapshot.screen().display_row_count(), 1);
         assert_eq!(snapshot.display_lines(), [""]);
         assert_eq!(snapshot.display_cells().len(), 1);
         assert_eq!(snapshot.display_cells().next().unwrap()[0].text(), " ");

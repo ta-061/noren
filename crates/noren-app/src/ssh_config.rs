@@ -1,12 +1,13 @@
 //! Bounded, read-only parsing of the user's OpenSSH client configuration.
 //!
 //! This is an app-owned filesystem adapter rather than a session or transport
-//! implementation. It produces host facts for a later sidebar slice; it never
-//! opens an SSH connection and never opens a path named by `IdentityFile` (or
-//! any other non-`Include` directive).
+//! implementation. It produces bounded host facts consumed by the sidebar; it
+//! never opens an SSH connection and never opens a path named by `IdentityFile`
+//! (or any other non-`Include` directive).
 
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
@@ -52,6 +53,11 @@ const MAX_TOKEN_ITEMS: usize = 262_144;
 /// before any host, index, or output state is added for it.
 const MAX_HOSTS: usize = 65_536;
 
+/// Maximum retained bytes in a user-facing SSH source label, including its
+/// stable ordinal tag. Canonical paths are used only transiently for parser
+/// identity; the retained label is root-relative and bounded by this value.
+pub const MAX_SSH_SOURCE_LABEL_BYTES: usize = 64;
+
 /// Maximum conservative work estimate for discovering and resolving aliases.
 ///
 /// Before either cross-product runs, every alias/pattern pair is charged
@@ -84,6 +90,121 @@ const DEFAULT_LIMITS: ParserLimits = ParserLimits {
     hosts: MAX_HOSTS,
 };
 
+/// Scope of host discovery performed by this parser.
+///
+/// Noren does not ask OpenSSH to evaluate destinations here. Wildcard hosts,
+/// `Match` conditions, token expansion, system configuration, and other
+/// dynamic behavior therefore cannot produce a complete destination list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HostDiscoveryKind {
+    /// Only positive literal aliases written in `Host` directives are listed.
+    #[default]
+    PartialLiteralPatterns,
+}
+
+/// Stable, parse-local identity of an SSH configuration source.
+///
+/// Zero is the top-level source (or the synthetic inline source used by
+/// [`SshConfig::parse`]); successfully read included files receive increasing
+/// ordinals on first encounter. Repeated includes reuse the same identity.
+/// IDs are ordinal tokens, not globally unique: an ID must only be resolved
+/// through the [`SshConfig`] that produced it. The same ordinal from a different
+/// parse may identify a different source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SshSourceId(usize);
+
+impl SshSourceId {
+    /// Encounter-order ordinal within this [`SshConfig`].
+    #[must_use]
+    pub const fn ordinal(self) -> usize {
+        self.0
+    }
+}
+
+/// Bounded, user-facing provenance for one parsed configuration source.
+///
+/// The label base is either `inline` or an ASCII-escaped/lossy path relative to
+/// the top-level configuration directory. It never contains the canonical root
+/// or home-directory prefix. The ordinal tag is appended to the label so two
+/// paths with the same bounded prefix remain distinguishable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshSource {
+    id: SshSourceId,
+    tag: String,
+    label: String,
+}
+
+impl SshSource {
+    /// Parse-local source identity.
+    #[must_use]
+    pub const fn id(&self) -> SshSourceId {
+        self.id
+    }
+
+    /// Compact stable tag, such as `#0` or `#12`.
+    #[must_use]
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    /// Bounded root-relative display label with the stable tag appended.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+}
+
+fn inline_source(id: SshSourceId) -> SshSource {
+    let tag = format!("#{}", id.ordinal());
+    let label = bounded_source_label("inline", &tag);
+    SshSource { id, tag, label }
+}
+
+fn file_source(id: SshSourceId, source: &Path, root: &Path) -> SshSource {
+    let tag = format!("#{}", id.ordinal());
+    let relative = source
+        .strip_prefix(root)
+        .ok()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config".to_owned());
+    let label = bounded_source_label(&relative, &tag);
+    SshSource { id, tag, label }
+}
+
+fn bounded_source_label(raw: &str, tag: &str) -> String {
+    const TRUNCATION_MARKER: &str = "...";
+
+    let suffix = format!(" {tag}");
+    let content_limit = MAX_SSH_SOURCE_LABEL_BYTES.saturating_sub(suffix.len());
+    let mut escaped = String::new();
+    let mut fragment_ends = Vec::new();
+    for character in raw.chars() {
+        if (character.is_ascii_graphic() && character != '\\') || character == ' ' {
+            escaped.push(character);
+        } else {
+            escaped.extend(character.escape_default());
+        }
+        fragment_ends.push(escaped.len());
+    }
+
+    let content = if escaped.len() <= content_limit {
+        escaped
+    } else {
+        let truncated_limit = content_limit.saturating_sub(TRUNCATION_MARKER.len());
+        let boundary = fragment_ends
+            .into_iter()
+            .take_while(|end| *end <= truncated_limit)
+            .last()
+            .unwrap_or(0);
+        escaped.truncate(boundary);
+        escaped.push_str(TRUNCATION_MARKER);
+        escaped
+    };
+
+    format!("{content}{suffix}")
+}
+
 /// Parsed SSH host facts. Values are the first values obtained for the alias,
 /// following OpenSSH's per-keyword precedence rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +213,7 @@ pub struct SshHost {
     host_name: Option<String>,
     user: Option<String>,
     port: Option<u16>,
+    declared_source: SshSourceId,
 }
 
 impl SshHost {
@@ -118,12 +240,23 @@ impl SshHost {
     pub const fn port(&self) -> Option<u16> {
         self.port
     }
+
+    /// Source of the first qualifying positive literal `Host` declaration.
+    ///
+    /// Later blocks may supply effective values under OpenSSH's first-value
+    /// rules, but they do not replace this declaration provenance.
+    #[must_use]
+    pub const fn declared_source(&self) -> SshSourceId {
+        self.declared_source
+    }
 }
 
 /// Parsed SSH configuration.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SshConfig {
     hosts: Vec<SshHost>,
+    sources: Vec<SshSource>,
+    discovery_kind: HostDiscoveryKind,
 }
 
 impl SshConfig {
@@ -134,7 +267,9 @@ impl SshConfig {
     /// bounded-input failures; no error includes source text. Each source is
     /// capped at one MiB, aggregate source text at eight MiB, include matches
     /// at 256, include expansion at 65,536 charged units, emitted tokens at
-    /// 262,144, and distinct discovered hosts at 65,536.
+    /// 262,144, and distinct discovered hosts at 65,536. Relative `Include`
+    /// paths are resolved from the top-level path's parent, including in files
+    /// reached through nested includes.
     pub fn read(path: &Path) -> Result<Self, SshConfigError> {
         Self::read_with_limits(path, DEFAULT_LIMITS)
     }
@@ -164,10 +299,10 @@ impl SshConfig {
     /// If `HOME` is not available, or the file cannot be read, the result is
     /// an empty host list.
     pub fn read_default() -> Result<Self, SshConfigError> {
-        let Some(home) = env::var_os("HOME") else {
+        let Some(home) = home_directory(env::var_os("HOME")) else {
             return Ok(Self::default());
         };
-        Self::read(&PathBuf::from(home).join(".ssh/config"))
+        Self::read(&home.join(".ssh/config"))
     }
 
     /// Parse configuration text without resolving `Include` directives.
@@ -184,15 +319,43 @@ impl SshConfig {
         if text.len() > limits.file_bytes {
             return Err(error(0, SshConfigErrorKind::FileTooLarge));
         }
+        let inline_id = SshSourceId(0);
+        let sources = vec![inline_source(inline_id)];
         let mut token_items = 0usize;
-        let blocks = parse_text(text, 0, &mut token_items, limits.token_items)?;
-        Self::from_blocks_with_limit(&blocks, limits)
+        let blocks = parse_text(text, 0, inline_id, &mut token_items, limits.token_items)?;
+        Self::from_blocks_with_limit(&blocks, sources, limits)
     }
 
     /// The concrete hosts discovered from literal `Host` patterns.
     #[must_use]
     pub fn hosts(&self) -> &[SshHost] {
         &self.hosts
+    }
+
+    /// Explicitly partial scope used to discover [`Self::hosts`].
+    #[must_use]
+    pub const fn discovery_kind(&self) -> HostDiscoveryKind {
+        self.discovery_kind
+    }
+
+    /// Bounded provenance for a parse-local `id` produced by this config.
+    ///
+    /// IDs are ordinal tokens, so an ID from another parse with the same
+    /// ordinal may resolve to an unrelated source here. Callers must pair IDs
+    /// with the [`SshConfig`] that produced them. Returns `None` only when this
+    /// config has no source at the ID's ordinal.
+    #[must_use]
+    pub fn source(&self, id: SshSourceId) -> Option<&SshSource> {
+        self.sources
+            .get(id.ordinal())
+            .filter(|source| source.id == id)
+    }
+
+    /// Bounded sources that contributed to this parse, in first-encounter
+    /// order. A missing or unreadable top-level file has no sources.
+    #[must_use]
+    pub fn sources(&self) -> &[SshSource] {
+        &self.sources
     }
 
     fn from_text_with_includes(
@@ -202,12 +365,17 @@ impl SshConfig {
         limits: ParserLimits,
     ) -> Result<Self, SshConfigError> {
         let mut state = ParseState::new(text.len(), limits);
-        parse_file(text, source, root, 0, &mut state)?;
-        Self::from_blocks_with_limit(&state.blocks, limits)
+        let source_id = state.intern_source(source, root);
+        parse_file(text, source, source_id, root, 0, &mut state)?;
+        let ParseState {
+            blocks, sources, ..
+        } = state;
+        Self::from_blocks_with_limit(&blocks, sources, limits)
     }
 
     fn from_blocks_with_limit(
         blocks: &[Block],
+        sources: Vec<SshSource>,
         limits: ParserLimits,
     ) -> Result<Self, SshConfigError> {
         let discovery_match_work = blocks.iter().fold(0_u128, |total, block| {
@@ -273,7 +441,7 @@ impl SshConfig {
                             return Err(error(0, SshConfigErrorKind::HostCountExceeded));
                         }
                         seen_aliases.insert(key);
-                        aliases.push(pattern.clone());
+                        aliases.push((pattern.clone(), block.source));
                     }
                 }
             }
@@ -312,7 +480,7 @@ impl SshConfig {
         }
 
         let alias_count = aliases.len() as u128;
-        let alias_work = aliases.iter().fold(0_u128, |work, alias| {
+        let alias_work = aliases.iter().fold(0_u128, |work, (alias, _)| {
             work.saturating_add(alias.len() as u128 + 1)
         });
         resolution_work.alias_index_work = alias_work;
@@ -324,12 +492,13 @@ impl SshConfig {
 
         let hosts = aliases
             .into_iter()
-            .map(|alias| {
+            .map(|(alias, declared_source)| {
                 let mut host = SshHost {
                     alias: alias.clone(),
                     host_name: None,
                     user: None,
                     port: None,
+                    declared_source,
                 };
 
                 let indexed = literal_blocks
@@ -373,7 +542,11 @@ impl SshConfig {
                 host
             })
             .collect();
-        Ok(Self { hosts })
+        Ok(Self {
+            hosts,
+            sources,
+            discovery_kind: HostDiscoveryKind::PartialLiteralPatterns,
+        })
     }
 }
 
@@ -506,6 +679,7 @@ struct Block {
     /// `Match` section, which this configuration-only slice does not resolve.
     patterns: Option<Vec<String>>,
     settings: Vec<Setting>,
+    source: SshSourceId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -527,6 +701,8 @@ struct ParseState {
     include_expansion: IncludeExpansionBudget,
     blocks: Vec<Block>,
     current: Option<usize>,
+    source_ids: HashMap<PathBuf, SshSourceId>,
+    sources: Vec<SshSource>,
     limits: ParserLimits,
 }
 
@@ -540,8 +716,21 @@ impl ParseState {
             include_expansion: IncludeExpansionBudget::new(limits.include_expansion_work),
             blocks: Vec::new(),
             current: None,
+            source_ids: HashMap::new(),
+            sources: Vec::new(),
             limits,
         }
+    }
+
+    fn intern_source(&mut self, source: &Path, root: &Path) -> SshSourceId {
+        if let Some(id) = self.source_ids.get(source) {
+            return *id;
+        }
+
+        let id = SshSourceId(self.sources.len());
+        self.source_ids.insert(source.to_path_buf(), id);
+        self.sources.push(file_source(id, source, root));
+        id
     }
 
     fn charge_source_bytes(&mut self, bytes: usize, line: usize) -> Result<(), SshConfigError> {
@@ -649,6 +838,7 @@ impl Setting {
 fn parse_file(
     text: &str,
     source: &Path,
+    source_id: SshSourceId,
     root: &Path,
     depth: usize,
     state: &mut ParseState,
@@ -661,14 +851,14 @@ fn parse_file(
     if depth > MAX_INCLUDE_DEPTH || !state.active.insert(source.to_path_buf()) {
         return Ok(());
     }
-    let result = parse_file_body(text, source, root, depth, state);
+    let result = parse_file_body(text, source_id, root, depth, state);
     state.active.remove(source);
     result
 }
 
 fn parse_file_body(
     text: &str,
-    source: &Path,
+    source_id: SshSourceId,
     root: &Path,
     depth: usize,
     state: &mut ParseState,
@@ -693,6 +883,7 @@ fn parse_file_body(
                 state.blocks.push(Block {
                     patterns: Some(tokens[1..].to_vec()),
                     settings: Vec::new(),
+                    source: source_id,
                 });
                 state.current = Some(state.blocks.len() - 1);
             }
@@ -700,6 +891,7 @@ fn parse_file_body(
                 state.blocks.push(Block {
                     patterns: Some(Vec::new()),
                     settings: Vec::new(),
+                    source: source_id,
                 });
                 state.current = Some(state.blocks.len() - 1);
             }
@@ -707,6 +899,8 @@ fn parse_file_body(
                 if tokens.len() < 2 {
                     return Err(error(line_number, SshConfigErrorKind::MissingArgument));
                 }
+                // OpenSSH roots every relative Include in a user config at the
+                // user configuration directory, represented here by `root`.
                 for pattern in &tokens[1..] {
                     let remaining = state
                         .limits
@@ -714,7 +908,6 @@ fn parse_file_body(
                         .saturating_sub(state.included_files);
                     let included_paths = expand_include(
                         pattern,
-                        source.parent().unwrap_or(root),
                         root,
                         remaining,
                         &mut state.include_expansion,
@@ -740,14 +933,21 @@ fn parse_file_body(
                             continue;
                         };
                         state.charge_source_bytes(included_text.len(), line_number)?;
+                        let included_source_id = state.intern_source(&included_source, root);
                         // OpenSSH restores the caller's current Host context
                         // after an included file returns, and settings at the
                         // start of an included file attach to that caller
                         // context. Save and restore `current` around the
                         // recursive parse, including on the error path.
                         let saved_current = state.current;
-                        let result =
-                            parse_file(&included_text, &included_source, root, depth + 1, state);
+                        let result = parse_file(
+                            &included_text,
+                            &included_source,
+                            included_source_id,
+                            root,
+                            depth + 1,
+                            state,
+                        );
                         state.current = saved_current;
                         result?;
                     }
@@ -769,6 +969,7 @@ fn parse_file_body(
                     let mut block = Block {
                         patterns: None,
                         settings: Vec::new(),
+                        source: source_id,
                     };
                     block.push_setting(setting);
                     state.blocks.push(block);
@@ -787,6 +988,7 @@ fn parse_file_body(
 fn parse_text(
     text: &str,
     line_offset: usize,
+    source_id: SshSourceId,
     token_items: &mut usize,
     token_limit: usize,
 ) -> Result<Vec<Block>, SshConfigError> {
@@ -807,6 +1009,7 @@ fn parse_text(
                 blocks.push(Block {
                     patterns: Some(tokens[1..].to_vec()),
                     settings: Vec::new(),
+                    source: source_id,
                 });
                 current = Some(blocks.len() - 1);
             }
@@ -814,6 +1017,7 @@ fn parse_text(
                 blocks.push(Block {
                     patterns: Some(Vec::new()),
                     settings: Vec::new(),
+                    source: source_id,
                 });
                 current = Some(blocks.len() - 1);
             }
@@ -833,6 +1037,7 @@ fn parse_text(
                     let mut block = Block {
                         patterns: None,
                         settings: Vec::new(),
+                        source: source_id,
                     };
                     block.push_setting(setting);
                     blocks.push(block);
@@ -1103,14 +1308,13 @@ fn canonicalize_within(path: &Path, root: &Path) -> Option<PathBuf> {
 
 fn expand_include(
     pattern: &str,
-    including_dir: &Path,
     root: &Path,
     max_matches: usize,
     budget: &mut IncludeExpansionBudget,
     line: usize,
 ) -> Result<Vec<PathBuf>, SshConfigError> {
     // Charge the attacker-controlled raw pattern bytes before expand_home,
-    // PathBuf construction, the relative join, or component scanning can run,
+    // PathBuf construction, the root-relative join, or component scanning can run,
     // so a nearly one-MiB literal Include path cannot be built and scanned for a
     // handful of units. Overflow rejects content-free with
     // IncludeExpansionWorkExceeded.
@@ -1119,7 +1323,7 @@ fn expand_include(
     let path = if pattern.is_absolute() {
         pattern
     } else {
-        including_dir.join(pattern)
+        root.join(pattern)
     };
     let mut wildcard_index = None;
     for (index, component) in path.components().enumerate() {
@@ -1304,9 +1508,13 @@ fn expand_include(
         .collect())
 }
 
+fn home_directory(home: Option<OsString>) -> Option<PathBuf> {
+    home.filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
 fn expand_home(pattern: &str) -> Option<PathBuf> {
     let suffix = pattern.strip_prefix("~/")?;
-    Some(PathBuf::from(env::var_os("HOME")?).join(suffix))
+    Some(home_directory(env::var_os("HOME"))?.join(suffix))
 }
 
 #[cfg(test)]
@@ -1574,6 +1782,26 @@ mod tests {
     }
 
     #[test]
+    fn missing_home_has_no_home_directory() {
+        assert_eq!(home_directory(None), None);
+    }
+
+    #[test]
+    fn empty_home_has_no_home_directory() {
+        assert_eq!(home_directory(Some(OsString::new())), None);
+    }
+
+    #[test]
+    fn nonempty_home_resolves_to_its_path() {
+        let home = OsString::from("/deterministic/home");
+
+        assert_eq!(
+            home_directory(Some(home)),
+            Some(PathBuf::from("/deterministic/home"))
+        );
+    }
+
+    #[test]
     fn realistic_multi_host_config_produces_concrete_hosts() {
         let config = SshConfig::parse(
             r#"
@@ -1602,21 +1830,71 @@ mod tests {
                     host_name: Some("web.internal.example".to_owned()),
                     user: Some("deploy".to_owned()),
                     port: Some(2222),
+                    declared_source: SshSourceId(0),
                 },
                 SshHost {
                     alias: "staging".to_owned(),
                     host_name: Some("web.internal.example".to_owned()),
                     user: Some("deploy".to_owned()),
                     port: Some(2222),
+                    declared_source: SshSourceId(0),
                 },
                 SshHost {
                     alias: "database".to_owned(),
                     host_name: Some("db.internal.example".to_owned()),
                     user: Some("postgres".to_owned()),
                     port: Some(5432),
+                    declared_source: SshSourceId(0),
                 },
             ]
         );
+    }
+
+    #[test]
+    fn inline_parse_declares_partial_discovery_and_inline_provenance() {
+        let config = SshConfig::parse("Host workstation\n  User deploy\n")
+            .expect("inline provenance fixture parses");
+        let host = &config.hosts()[0];
+        let source = config
+            .source(host.declared_source())
+            .expect("host source belongs to config");
+
+        assert_eq!(
+            config.discovery_kind(),
+            HostDiscoveryKind::PartialLiteralPatterns
+        );
+        assert_eq!(host.declared_source().ordinal(), 0);
+        assert_eq!(source.id(), host.declared_source());
+        assert_eq!(source.tag(), "#0");
+        assert_eq!(source.label(), "inline #0");
+    }
+
+    #[test]
+    fn source_labels_are_root_relative_escaped_utf8_and_bounded() {
+        let root = Path::new("/private/user-home/.ssh");
+        let relative = format!("parts/line\n{}-host.conf", "界".repeat(40));
+        let source_path = root.join(relative);
+        let source = file_source(SshSourceId(7), &source_path, root);
+
+        assert_eq!(source.tag(), "#7");
+        assert!(source.label().contains("line\\n"));
+        assert!(source.label().contains("\\u{754c}"));
+        assert!(source.label().is_ascii());
+        assert!(source.label().ends_with(" #7"));
+        assert!(source.label().len() <= MAX_SSH_SOURCE_LABEL_BYTES);
+        assert!(!source.label().contains("/private/user-home"));
+    }
+
+    #[test]
+    fn a_source_outside_the_root_never_leaks_its_absolute_path() {
+        let source = file_source(
+            SshSourceId(3),
+            Path::new("/private/secret/config"),
+            Path::new("/safe/root"),
+        );
+
+        assert_eq!(source.label(), "config #3");
+        assert!(!source.label().contains("private"));
     }
 
     #[test]
@@ -1719,18 +1997,21 @@ mod tests {
                     host_name: Some("exact.example".to_owned()),
                     user: Some("exact".to_owned()),
                     port: None,
+                    declared_source: SshSourceId(0),
                 },
                 SshHost {
                     alias: "api.example".to_owned(),
                     host_name: Some("wildcard.example".to_owned()),
                     user: Some("wildcard".to_owned()),
                     port: None,
+                    declared_source: SshSourceId(0),
                 },
                 SshHost {
                     alias: "db.example".to_owned(),
                     host_name: Some("wildcard.example".to_owned()),
                     user: Some("wildcard".to_owned()),
                     port: Some(2200),
+                    declared_source: SshSourceId(0),
                 },
             ]
         );
@@ -1771,24 +2052,28 @@ mod tests {
                     host_name: Some("alpha-first.example".to_owned()),
                     user: Some("alpha-user".to_owned()),
                     port: Some(2022),
+                    declared_source: SshSourceId(0),
                 },
                 SshHost {
                     alias: "prod-Web".to_owned(),
                     host_name: Some("wildcard.example".to_owned()),
                     user: Some("wildcard-user".to_owned()),
                     port: Some(2022),
+                    declared_source: SshSourceId(0),
                 },
                 SshHost {
                     alias: "PROD-ADMIN".to_owned(),
                     host_name: Some("admin.example".to_owned()),
                     user: Some("default-user".to_owned()),
                     port: Some(2022),
+                    declared_source: SshSourceId(0),
                 },
                 SshHost {
                     alias: "skip".to_owned(),
                     host_name: Some("skip.example".to_owned()),
                     user: Some("skip-user".to_owned()),
                     port: Some(2022),
+                    declared_source: SshSourceId(0),
                 },
             ]
         );
@@ -1807,7 +2092,7 @@ mod tests {
         assert_eq!(text.len(), 1_048_567);
 
         let mut token_items = 0usize;
-        let blocks = parse_text(&text, 0, &mut token_items, MAX_TOKEN_ITEMS)
+        let blocks = parse_text(&text, 0, SshSourceId(0), &mut token_items, MAX_TOKEN_ITEMS)
             .expect("reviewer shape tokenizes");
         assert_eq!(blocks.len(), 1);
         assert_eq!(
@@ -1831,11 +2116,18 @@ mod tests {
     #[test]
     fn indexed_resolution_work_bites_at_boundary_and_saturates_on_overflow() {
         let mut token_items = 0usize;
-        let blocks = parse_text("Host a\nHostName x\n", 0, &mut token_items, MAX_TOKEN_ITEMS)
-            .expect("indexed fixture parses");
+        let blocks = parse_text(
+            "Host a\nHostName x\n",
+            0,
+            SshSourceId(0),
+            &mut token_items,
+            MAX_TOKEN_ITEMS,
+        )
+        .expect("indexed fixture parses");
 
         SshConfig::from_blocks_with_limit(
             &blocks,
+            vec![inline_source(SshSourceId(0))],
             ParserLimits {
                 resolution_work: 5,
                 ..DEFAULT_LIMITS
@@ -1844,6 +2136,7 @@ mod tests {
         .expect("alias lookup plus indexed block, setting visit, and clone byte cost five");
         let error = SshConfig::from_blocks_with_limit(
             &blocks,
+            vec![inline_source(SshSourceId(0))],
             ParserLimits {
                 resolution_work: 4,
                 ..DEFAULT_LIMITS
@@ -1913,11 +2206,18 @@ mod tests {
     #[test]
     fn self_negation_discovery_work_is_preflight_bounded() {
         let mut token_items = 0usize;
-        let blocks = parse_text("Host abcdef !*\n", 0, &mut token_items, MAX_TOKEN_ITEMS)
-            .expect("discovery fixture parses");
+        let blocks = parse_text(
+            "Host abcdef !*\n",
+            0,
+            SshSourceId(0),
+            &mut token_items,
+            MAX_TOKEN_ITEMS,
+        )
+        .expect("discovery fixture parses");
 
         SshConfig::from_blocks_with_limit(
             &blocks,
+            vec![inline_source(SshSourceId(0))],
             ParserLimits {
                 resolution_work: 14,
                 ..DEFAULT_LIMITS
@@ -1926,6 +2226,7 @@ mod tests {
         .expect("seven alias units times two negative-pattern units fits");
         let error = SshConfig::from_blocks_with_limit(
             &blocks,
+            vec![inline_source(SshSourceId(0))],
             ParserLimits {
                 resolution_work: 13,
                 ..DEFAULT_LIMITS
@@ -2089,22 +2390,84 @@ mod tests {
     }
 
     #[test]
-    fn relative_include_is_resolved_from_the_including_file_and_cycles_stop() {
+    fn relative_includes_are_resolved_from_root_and_cycles_stop() {
         let fixture = Fixture::new("include-cycle");
         let config_path = fixture.write("config", "Include parts/one.conf\n");
+        // The nested bare path must select root-level two.conf; parts/two.conf
+        // is a same-name decoy that exposes including-file-relative behavior.
         fixture.write(
             "parts/one.conf",
             "Host included\n  HostName included.example\nInclude two.conf\n",
         );
         fixture.write(
+            "two.conf",
+            "Host second\n  User included-user\nInclude parts/one.conf\n",
+        );
+        fixture.write(
             "parts/two.conf",
-            "Host second\n  User included-user\nInclude one.conf\n",
+            "Host decoy\n  HostName must-not-load.example\n",
         );
 
-        let config = SshConfig::read(&config_path).expect("include fixture parses");
+        // The cap admits the two real files and the cycle back-edge only. If
+        // active-stack cycle detection misses the back-edge, parsing fails.
+        let limits = ParserLimits {
+            included_files: 3,
+            ..DEFAULT_LIMITS
+        };
+        let config = SshConfig::read_with_limits(&config_path, limits)
+            .expect("root-relative include fixture parses and stops its cycle");
         assert_eq!(config.hosts().len(), 2);
+        assert_eq!(config.hosts()[0].alias(), "included");
         assert_eq!(config.hosts()[0].host_name(), Some("included.example"));
+        assert_eq!(config.hosts()[1].alias(), "second");
         assert_eq!(config.hosts()[1].user(), Some("included-user"));
+    }
+
+    #[test]
+    fn repeated_include_reuses_source_id_and_first_declaration_provenance() {
+        let fixture = Fixture::new("include-provenance");
+        let config_path = fixture.write(
+            "config",
+            "Include parts/hosts.conf\n\
+             Host inherited\n\
+               User parent-value\n\
+             Include parts/hosts.conf\n\
+             Host root-only\n",
+        );
+        fixture.write("parts/hosts.conf", "Host Inherited\n");
+
+        let config = SshConfig::read(&config_path).expect("provenance fixture parses");
+        assert_eq!(
+            config.sources.len(),
+            2,
+            "the repeated file is interned once"
+        );
+
+        let inherited = &config.hosts()[0];
+        assert_eq!(inherited.alias(), "Inherited");
+        assert_eq!(inherited.user(), Some("parent-value"));
+        assert_eq!(inherited.declared_source().ordinal(), 1);
+        assert_eq!(
+            config
+                .source(inherited.declared_source())
+                .expect("included source is retained")
+                .label(),
+            "parts/hosts.conf #1"
+        );
+
+        let root = config
+            .hosts()
+            .iter()
+            .find(|host| host.alias() == "root-only")
+            .expect("root host is discovered");
+        assert_eq!(root.declared_source().ordinal(), 0);
+        assert_eq!(
+            config
+                .source(root.declared_source())
+                .expect("top-level source is retained")
+                .label(),
+            "config #0"
+        );
     }
 
     #[test]
@@ -2781,7 +3144,8 @@ mod tests {
         let config_path = fixture.write("config", "Include levels/0.conf\n");
         for index in 0..=MAX_INCLUDE_DEPTH {
             let include = if index < MAX_INCLUDE_DEPTH {
-                format!("Include {}.conf\n", index + 1)
+                let next = index + 1;
+                format!("Include levels/{next}.conf\n")
             } else {
                 String::new()
             };
