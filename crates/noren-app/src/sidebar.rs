@@ -111,6 +111,11 @@ pub enum SidebarEntry {
         label: String,
         /// Secondary display text, such as a host or connection status.
         host: String,
+        /// Whether this disconnected target is the pending UI choice.
+        ///
+        /// This is display state only. It never denotes a live session,
+        /// connection, process, or viewport.
+        selected: bool,
     },
     /// A reserved agent entry.
     Agent {
@@ -187,10 +192,12 @@ impl SessionViewport {
 /// Invariants enforced by [`SidebarView::build`]:
 ///
 /// 1. `empty_state` is `Some` exactly when there are no rows.
-/// 2. At most one row has [`SidebarRow::is_selected`] set.
-/// 3. `viewport` is `Some` exactly when one non-restored session row is
-///    selected, and it names that same session. A restored entry has no live
-///    process to attach to, so selecting it does not create a viewport.
+/// 2. At most one row has [`SidebarRow::is_selected`] set. A pending SSH row
+///    suppresses the live-session row's visual marker.
+/// 3. `viewport` is `Some` exactly when one non-restored session is active,
+///    and it names that same session. A pending SSH marker does not replace
+///    this actual viewport. A restored entry has no live process to attach to,
+///    so selecting it does not create a viewport.
 /// 4. A selection that matches no entry is dropped, never rendered dangling.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidebarView {
@@ -202,13 +209,17 @@ pub struct SidebarView {
 impl SidebarView {
     /// Project `entries` into an immutable view with `selected` applied.
     ///
-    /// Entries render in order. The selection applies to session entries
-    /// only; the first session entry matching `selected` becomes the single
-    /// selected row and the single [`SessionViewport`]. Duplicate
-    /// descriptions of the same session render without selection, so the
-    /// one-selection invariant holds for every input.
+    /// Entries render in order. `selected` resolves the actual session
+    /// viewport. If an SSH entry carries pending display selection, its first
+    /// occurrence gets the sole visible marker and the actual session marker
+    /// is suppressed without changing that viewport. Duplicate descriptions
+    /// render without a second marker, so the one-selection invariant holds
+    /// for every input.
     #[must_use]
     pub fn build(entries: &[SidebarEntry], selected: Option<SessionId>) -> Self {
+        let pending_ssh = entries
+            .iter()
+            .any(|entry| matches!(entry, SidebarEntry::SshConnection { selected: true, .. }));
         let mut viewport: Option<SessionViewport> = None;
         let mut selected_row = false;
         let mut rows: Vec<SidebarRow> = Vec::with_capacity(entries.len());
@@ -226,12 +237,22 @@ impl SidebarView {
                     detail: Some(branch.clone()),
                     selected: false,
                 },
-                SidebarEntry::SshConnection { label, host } => SidebarRow {
-                    kind: EntryKind::SshConnection,
-                    label: label.clone(),
-                    detail: Some(host.clone()),
-                    selected: false,
-                },
+                SidebarEntry::SshConnection {
+                    label,
+                    host,
+                    selected,
+                } => {
+                    let is_selected = *selected && !selected_row;
+                    if is_selected {
+                        selected_row = true;
+                    }
+                    SidebarRow {
+                        kind: EntryKind::SshConnection,
+                        label: label.clone(),
+                        detail: Some(host.clone()),
+                        selected: is_selected,
+                    }
+                }
                 SidebarEntry::Agent { label } => SidebarRow {
                     kind: EntryKind::Agent,
                     label: label.clone(),
@@ -239,14 +260,15 @@ impl SidebarView {
                     selected: false,
                 },
                 SidebarEntry::Session(descriptor) => {
-                    let is_selected = !selected_row && selected == Some(descriptor.id());
-                    if is_selected {
-                        selected_row = true;
-                    }
-                    if is_selected && !matches!(descriptor.status(), SessionStatus::Restored) {
+                    let is_active = selected == Some(descriptor.id());
+                    if is_active && !matches!(descriptor.status(), SessionStatus::Restored) {
                         viewport = Some(SessionViewport {
                             session: descriptor.clone(),
                         });
+                    }
+                    let is_selected = is_active && !pending_ssh && !selected_row;
+                    if is_selected {
+                        selected_row = true;
                     }
                     SidebarRow {
                         kind: EntryKind::Session,
@@ -383,6 +405,7 @@ pub mod fixtures {
             SidebarEntry::SshConnection {
                 label: "web-1".to_string(),
                 host: "web1.internal:22".to_string(),
+                selected: false,
             },
             SidebarEntry::Agent {
                 label: "claude-code".to_string(),

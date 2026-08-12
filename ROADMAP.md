@@ -64,21 +64,27 @@ direct `zsh` child, and that child's tty reported `30 90` — the 900x600 window
 by the 10x20 cell, so the window to grid to PTY chain agrees. On termination the app
 exited, the child was reaped, and the pty device was gone.
 
-**What this does not establish.** A rendered-frame oracle now exists
-(`crates/noren-app/tests/frame_oracle.rs`, `crates/noren-app/src/renderer_capture.rs`,
-PR #89): it drives the real `wgpu` pipeline offscreen and checks *structural*
-properties — blank cells are dark, distinct glyphs have distinct lit patterns,
-glyphs do not bleed into neighbouring cells, and the drawn grid agrees with the
-terminal-state snapshot. It does **not** verify that an `A` is shaped like an A,
-and two of its tests are `#[ignore]`d because they document real font defects
-(case-folding in the bitmap font, and every non-ASCII code point falling through
-to the `?` glyph). Key injection into the real window still does not exist, so
-live keyboard input remains unverified by automation; the byte-level input
-contract is covered by tests instead. Mouse reporting is no longer encoder-only:
+**What the Milestone 2 close did not itself establish.** A rendered-frame oracle
+was added later (`crates/noren-app/tests/frame_oracle.rs`,
+`crates/noren-app/src/renderer_capture.rs`, PR #89). The current oracle drives
+the real `wgpu` pipeline offscreen and checks *structural* properties — blank
+cells are dark, distinct glyphs have distinct lit patterns, glyphs do not bleed
+into neighbouring cells, and the drawn grid agrees with the terminal-state
+snapshot — plus colour behaviour: distinct SGR foregrounds, fixed-palette ANSI
+and 256-colour values, direct RGB truecolor, explicit backgrounds, and unchanged
+defaults. It does **not** verify that an `A` is shaped like an A, and two of its
+tests are `#[ignore]`d because they document real font defects (case-folding in
+the bitmap font, and every non-ASCII code point falling through to the `?`
+glyph). Key injection into the real window still does not exist, so live
+keyboard input remains unverified by automation; the byte-level input contract
+is covered by tests instead. Mouse reporting is no longer encoder-only:
 `MouseEncoder::encode` (`crates/noren-app/src/mouse.rs`) is now reached from the
 pointer and wheel handlers in `main.rs` through their shared
 `encode_and_send_mouse` helper, which writes the report bytes to the PTY.
-Truecolor is modelled in terminal state but not yet wired to drawing. IME
+Colour drawing also landed after the close: `renderer.rs` resolves each cell's
+SGR foreground and any explicit background through the fixed ANSI/256-colour
+palette or as direct RGB, then carries that result to the shader as per-vertex
+colour. The default palette and theme are fixed and not user-configurable. IME
 and accessibility remain deferred.
 
 No milestone date is promised. Implementation advances through scoped Issues,
@@ -139,16 +145,21 @@ the Noren terminal." The reasoning and the decision are recorded in
   target and opens no connection or PTY. Only `SessionKind::Local` reaches a
   launch path; git worktrees remain unreachable, agents remain fixture-only,
   and keybindings are not configurable. See [Milestone 3 status](#milestone-3-status).
-- **The renderer is monochrome.** The fragment shader `fs_main` in
-  `renderer.rs` returns a constant colour and the vertex layout carries no
-  colour channel, so `ls --color`, `vim`, and Zellij's status bar all draw in
-  one shade. Truecolor is modelled in terminal state and never reaches drawing.
+- **Colour rendering exists, but themes are fixed.** `renderer.rs` resolves
+  each cell's SGR foreground and any explicit background through its compiled-in
+  ANSI/256-colour palette or as direct RGB truecolor. The vertex layout carries
+  the resolved colour alongside position and `fs_main` returns that per-vertex
+  input. There is no configuration surface for the default palette or theme,
+  so light, dark, high-contrast, and colour-vision-friendly themes remain
+  Milestone 6 work.
 - **The font is ASCII-only and case-blind.** Non-ASCII renders as `?`, and the
   `renderer.rs` test `ascii_glyphs_are_distinct_and_unknown_is_question_mark`
   asserts `glyph_rows('a') == glyph_rows('A')`.
 - **The FR-005 rendered-frame oracle now exists** (PR #89). It drives the real
-  pipeline offscreen, and its `#[ignore]`d defect tests record the font's
-  case-fold and non-ASCII-`?` failures — the same defects above.
+  pipeline offscreen; active colour-aware assertions cover SGR foregrounds,
+  ANSI/256-colour and direct RGB resolution, defaults, and explicit backgrounds.
+  Its `#[ignore]`d defect tests still record the font's case-fold and
+  non-ASCII-`?` failures — the same defects above.
 - **NFR-009 requires release-integrity gates** — signing, notarization,
   packaging — to pass before any Preview claim.
 

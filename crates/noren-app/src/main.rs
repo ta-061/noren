@@ -45,13 +45,14 @@ use winit::window::{Window, WindowId};
 const WINDOW_WIDTH: u32 = 900;
 const WINDOW_HEIGHT: u32 = 600;
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
-/// The renderer has no sidebar scrolling surface yet. Keep enough configured
-/// hosts for a normal window while leaving the local session visible.
+/// Keep configured-host memory and identity work bounded independently of the
+/// frame height. The sidebar exposes a scroll window over this bounded list.
 const MAX_SSH_SIDEBAR_HOSTS: usize = 24;
 /// Sidebar rows begin with a selection marker and one separating space.
 const SIDEBAR_ROW_PREFIX_CHARS: usize = 2;
-const SSH_SIDEBAR_LABEL_PREFIX: &str = "SSH ";
-const SSH_SIDEBAR_LABEL_PREFIX_CHARS: usize = 4;
+/// ASCII-only connection state that is always inside the first 16 columns.
+const SSH_SIDEBAR_LABEL_PREFIX: &str = "SSH-OFF ";
+const SSH_SIDEBAR_LABEL_PREFIX_CHARS: usize = 8;
 const SSH_SIDEBAR_TRUNCATION_MARKER: &str = "...";
 const SSH_SIDEBAR_TRUNCATION_MARKER_CHARS: usize = 3;
 const SSH_SIDEBAR_LABEL_CHARS: usize = renderer::SIDEBAR_COLS - SIDEBAR_ROW_PREFIX_CHARS;
@@ -278,6 +279,7 @@ impl WorkspaceState {
     /// view — the registry did not change, so the sidebar is still correct.
     fn select_session(&mut self, id: SessionId) -> Result<(), SessionError> {
         self.registry.apply(SessionAction::Select { id })?;
+        self.selected_ssh_target = None;
         self.rebuild_sidebar();
         self.persist();
         Ok(())
@@ -313,7 +315,7 @@ impl WorkspaceState {
 
     /// Select an SSH row as a pending UI choice, never as a live session.
     fn select_ssh_sidebar_row(&mut self, row_index: usize) -> bool {
-        let session_rows = self.registry.sessions().len();
+        let session_rows = self.registry.len();
         let host_index = row_index.checked_sub(session_rows);
         let Some(Some(SessionKind::Ssh { target })) =
             host_index.map(|index| self.ssh_hosts.get(index))
@@ -321,7 +323,28 @@ impl WorkspaceState {
             return false;
         };
         self.selected_ssh_target = Some(target.clone());
+        self.rebuild_sidebar();
         true
+    }
+
+    /// Select a local session row by its stable sidebar position.
+    ///
+    /// Session rows precede SSH facts and are generated from the registry's
+    /// deterministic id ordering. A successful local selection clears any
+    /// pending SSH choice through [`Self::select_session`].
+    fn select_local_sidebar_row(&mut self, row_index: usize) -> bool {
+        if row_index >= self.registry.len() {
+            return false;
+        }
+        let Some(id) = self
+            .registry
+            .sessions()
+            .get(row_index)
+            .map(|descriptor| descriptor.id())
+        else {
+            return false;
+        };
+        self.select_session(id).is_ok()
     }
 
     /// Observe a status transition for a session and rebuild the sidebar.
@@ -351,13 +374,18 @@ impl WorkspaceState {
             .map(SidebarEntry::Session)
             .collect();
         let mut entries = entries;
+        let mut pending_marked = false;
         entries.extend(self.ssh_hosts.iter().filter_map(|kind| {
             let SessionKind::Ssh { target } = kind else {
                 return None;
             };
+            let selected =
+                !pending_marked && self.selected_ssh_target.as_deref() == Some(target.as_str());
+            pending_marked |= selected;
             Some(SidebarEntry::SshConnection {
                 label: ssh_sidebar_label(target),
                 host: SSH_SIDEBAR_DETAIL.to_string(),
+                selected,
             })
         }));
         self.sidebar = SidebarView::build(&entries, self.registry.selected());
@@ -531,6 +559,8 @@ struct NorenApp {
     /// Drives the `button` field of motion (drag/hover) reports.
     held_mouse_button: Option<MouseButton>,
     workspace: WorkspaceState,
+    /// First workspace row currently visible in the bounded sidebar window.
+    sidebar_scroll_offset: usize,
     active_session: Option<SessionId>,
     palette_open: bool,
     palette_selection: usize,
@@ -597,6 +627,7 @@ impl NorenApp {
             mouse_mode_scanner: MouseModeScanner::default(),
             held_mouse_button: None,
             workspace: WorkspaceState::new(),
+            sidebar_scroll_offset: 0,
             active_session: None,
             palette_open: false,
             palette_selection: 0,
@@ -1155,13 +1186,17 @@ impl NorenApp {
         let Some(row_index) = self.sidebar_row_index(position, frame_size) else {
             return false;
         };
-        let selected = self.workspace.select_ssh_sidebar_row(row_index);
-        if selected {
+        if self.workspace.select_local_sidebar_row(row_index) {
+            self.redraw_needed = true;
+            return true;
+        }
+        if self.workspace.select_ssh_sidebar_row(row_index) {
             self.status = "Noren SSH host selected; connection not started";
             self.show_status = true;
             self.redraw_needed = true;
+            return true;
         }
-        selected
+        false
     }
 
     fn sidebar_row_index(
@@ -1182,7 +1217,85 @@ impl NorenApp {
         let row = pixel_row_index(position.y, self.geometry.cell_height())?;
         let fully_drawable_rows =
             renderer::fully_drawable_rows(frame_size.height, self.geometry.cell_metrics());
-        (row < fully_drawable_rows && row < self.workspace.sidebar().rows().len()).then_some(row)
+        let offset = self.clamped_sidebar_scroll_offset(fully_drawable_rows);
+        let row_index = offset.checked_add(row)?;
+        (row < fully_drawable_rows && row_index < self.workspace.sidebar().rows().len())
+            .then_some(row_index)
+    }
+
+    /// Consume a wheel event in the sidebar and move its bounded row window.
+    ///
+    /// This local-chrome route runs before terminal mouse tracking, so even an
+    /// application using DEC mouse modes receives no PTY bytes for sidebar
+    /// scrolling.
+    fn handle_sidebar_wheel_in_frame(
+        &mut self,
+        delta: MouseScrollDelta,
+        frame_size: PhysicalSize<u32>,
+    ) -> bool {
+        let Some(position) = self.cursor_position else {
+            return false;
+        };
+        if !position.x.is_finite()
+            || !position.y.is_finite()
+            || position.x < 0.0
+            || position.y < 0.0
+            || position.x >= sidebar_pixel_width(self.geometry.cell_width())
+            || position.x >= f64::from(frame_size.width)
+            || position.y >= f64::from(frame_size.height)
+        {
+            return false;
+        }
+
+        let visible_rows =
+            renderer::fully_drawable_rows(frame_size.height, self.geometry.cell_metrics());
+        self.clamp_sidebar_scroll(visible_rows);
+        let max_offset = self
+            .workspace
+            .sidebar()
+            .rows()
+            .len()
+            .saturating_sub(visible_rows);
+        let lines = match delta {
+            MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+            MouseScrollDelta::PixelDelta(position) => {
+                position.y / f64::from(self.geometry.cell_height())
+            }
+        };
+        let raw_steps = lines.abs().floor() as usize;
+        let steps = if raw_steps == 0 && lines != 0.0 {
+            1
+        } else {
+            raw_steps
+        }
+        .min(max_offset);
+        let previous = self.sidebar_scroll_offset;
+        if lines < 0.0 {
+            self.sidebar_scroll_offset = self
+                .sidebar_scroll_offset
+                .saturating_add(steps)
+                .min(max_offset);
+        } else if lines > 0.0 {
+            self.sidebar_scroll_offset = self.sidebar_scroll_offset.saturating_sub(steps);
+        }
+        if self.sidebar_scroll_offset != previous {
+            self.redraw_needed = true;
+        }
+        true
+    }
+
+    fn clamped_sidebar_scroll_offset(&self, visible_rows: usize) -> usize {
+        self.sidebar_scroll_offset.min(
+            self.workspace
+                .sidebar()
+                .rows()
+                .len()
+                .saturating_sub(visible_rows),
+        )
+    }
+
+    fn clamp_sidebar_scroll(&mut self, visible_rows: usize) {
+        self.sidebar_scroll_offset = self.clamped_sidebar_scroll_offset(visible_rows);
     }
 
     /// Handle a mouse button event while tracking is active (no Shift bypass).
@@ -1226,6 +1339,11 @@ impl NorenApp {
     /// (matching the pre-tracking behaviour where `MouseWheel` fell into the
     /// `_ => {}` catch-all).
     fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
+        if let Some(frame_size) = self.window.as_ref().map(|window| window.inner_size())
+            && self.handle_sidebar_wheel_in_frame(delta, frame_size)
+        {
+            return;
+        }
         if !self.mouse_reportable() {
             return;
         }
@@ -1427,6 +1545,9 @@ impl NorenApp {
         {
             self.pending_grid = Some(grid);
         }
+        let visible_rows =
+            renderer::fully_drawable_rows(physical.height, self.geometry.cell_metrics());
+        self.clamp_sidebar_scroll(visible_rows);
         self.redraw_needed = true;
     }
 
@@ -1542,7 +1663,22 @@ impl NorenApp {
         let status_row = self.status_row();
         let status =
             status_row.map(|source| source.text(self.status, self.ssh_diagnostic.as_deref()));
-        let sidebar_lines = sidebar_text_lines(self.workspace.sidebar());
+        let visible_rows = self
+            .window
+            .as_ref()
+            .map(|window| {
+                renderer::fully_drawable_rows(
+                    window.inner_size().height,
+                    self.geometry.cell_metrics(),
+                )
+            })
+            .unwrap_or_default();
+        self.clamp_sidebar_scroll(visible_rows);
+        let sidebar_lines = visible_sidebar_text_lines(
+            self.workspace.sidebar(),
+            self.sidebar_scroll_offset,
+            visible_rows,
+        );
         let lines = if self.palette_open {
             let mut lines = palette_text_lines(self.workspace.palette(), self.palette_selection);
             lines.extend(sidebar_lines);
@@ -1700,15 +1836,30 @@ fn terminal_cols(window_cols: u16) -> u16 {
 /// [`SidebarRow::detail`] verbatim. When the sidebar is empty the
 /// empty-state message is returned as the sole line.
 fn sidebar_text_lines(sidebar: &SidebarView) -> Vec<String> {
+    visible_sidebar_text_lines(sidebar, 0, usize::MAX)
+}
+
+/// Format only the visible slice of the sidebar. The scroll offset is clamped
+/// to the last full page so redraw work stays proportional to frame rows, not
+/// to hidden entries.
+fn visible_sidebar_text_lines(
+    sidebar: &SidebarView,
+    offset: usize,
+    max_rows: usize,
+) -> Vec<String> {
+    if max_rows == 0 {
+        return Vec::new();
+    }
     if sidebar.is_empty() {
         return sidebar
             .empty_state()
             .map(|state| vec![state.message().to_string()])
             .unwrap_or_default();
     }
-    sidebar
-        .rows()
+    let offset = offset.min(sidebar.rows().len().saturating_sub(max_rows));
+    sidebar.rows()[offset..]
         .iter()
+        .take(max_rows)
         .map(|row| {
             let marker = if row.is_selected() { '>' } else { ' ' };
             match row.detail() {
@@ -3930,39 +4081,101 @@ mod tests {
 
     static SSH_CASE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    fn temp_ssh_config_path() -> PathBuf {
-        let unique = SSH_CASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut path = std::env::temp_dir();
-        path.push(format!(
-            "noren-ssh-config-test-{}-{unique}",
-            std::process::id()
-        ));
-        path
+    /// Panic-safe SSH-config fixture rooted in a freshly-created private
+    /// directory. Atomic directory creation defeats predictable-name symlink
+    /// pre-placement, and config creation itself is exclusive and no-follow.
+    struct SshConfigFixture {
+        root: PathBuf,
+        path: PathBuf,
     }
 
-    fn cleanup_ssh_config(path: &std::path::Path) {
-        let _ = std::fs::remove_file(path);
+    impl SshConfigFixture {
+        fn new() -> Self {
+            use std::os::unix::fs::DirBuilderExt;
+
+            for _ in 0..128 {
+                let unique = SSH_CASE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let root = std::env::temp_dir().join(format!(
+                    "noren-ssh-config-fixture-{}-{unique}",
+                    std::process::id()
+                ));
+                let mut builder = std::fs::DirBuilder::new();
+                builder.mode(0o700);
+                match builder.create(&root) {
+                    Ok(()) => {
+                        let path = root.join("config");
+                        return Self { root, path };
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("create private SSH fixture directory: {error}"),
+                }
+            }
+            panic!("could not allocate a private SSH fixture directory")
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+
+        fn try_write_new(&self, bytes: impl AsRef<[u8]>) -> std::io::Result<()> {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&self.path)?;
+            file.write_all(bytes.as_ref())
+        }
+
+        fn write_new(&self, bytes: impl AsRef<[u8]>) {
+            self.try_write_new(bytes)
+                .expect("create exclusive SSH config fixture");
+        }
+
+        fn replace(&self, bytes: impl AsRef<[u8]>) {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&self.path)
+                .expect("open private SSH config fixture without following links");
+            file.write_all(bytes.as_ref())
+                .expect("replace private SSH config fixture");
+        }
+    }
+
+    impl Drop for SshConfigFixture {
+        fn drop(&mut self) {
+            // There is only one fixture file. Avoid recursive deletion so a
+            // surprising replacement can never make cleanup follow a tree.
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_dir(&self.root);
+        }
     }
 
     #[test]
     fn configured_ssh_hosts_appear_as_distinct_sidebar_rows() {
-        let path = temp_ssh_config_path();
-        std::fs::write(
-            &path,
+        let fixture = SshConfigFixture::new();
+        fixture.write_new(
             b"Host build\n  HostName build.example\n  User alice\n  Port 2222\nHost db\n  HostName db.example\n",
-        )
-        .expect("write SSH fixture");
+        );
 
         let mut app = NorenApp::default();
-        app.load_ssh_hosts_from(&path);
+        app.load_ssh_hosts_from(fixture.path());
 
         let rows = app.workspace.sidebar().rows();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].kind(), EntryKind::SshConnection);
-        assert_eq!(rows[0].label(), "SSH build");
+        assert_eq!(rows[0].label(), "SSH-OFF build");
         assert_eq!(rows[0].detail(), Some("not connected"));
         assert_eq!(rows[1].kind(), EntryKind::SshConnection);
-        assert_eq!(rows[1].label(), "SSH db");
+        assert_eq!(rows[1].label(), "SSH-OFF db");
         assert_eq!(
             app.workspace.ssh_hosts,
             vec![
@@ -3974,37 +4187,113 @@ mod tests {
                 },
             ]
         );
-        cleanup_ssh_config(&path);
     }
 
     #[test]
     fn ssh_sidebar_label_preserves_short_targets() {
-        assert_eq!(ssh_sidebar_label("staging"), "SSH staging");
-        assert_eq!(ssh_sidebar_label("abcdefghij"), "SSH abcdefghij");
-        assert_eq!(ssh_sidebar_label("abcdefghijk"), "SSH abcdefg...");
+        assert_eq!(ssh_sidebar_label("stage"), "SSH-OFF stage");
+        assert_eq!(ssh_sidebar_label("abcdef"), "SSH-OFF abcdef");
+        assert_eq!(ssh_sidebar_label("abcdefg"), "SSH-OFF abc...");
     }
 
     #[test]
     fn ssh_sidebar_label_truncates_multibyte_targets_on_a_scalar_boundary() {
         let label = ssh_sidebar_label("東京大阪京都札幌仙台横浜");
 
-        assert_eq!(label, "SSH 東京大阪京都札...");
+        assert_eq!(label, "SSH-OFF 東京大...");
         assert_eq!(label.chars().count(), SSH_SIDEBAR_LABEL_CHARS);
     }
 
     #[test]
+    fn every_rendered_ssh_prefix_encodes_disconnected_state_within_sixteen_columns() {
+        let fixture = SshConfigFixture::new();
+        fixture.write_new("Host db\nHost configured-host-with-long-alias\nHost 東京大阪京都札幌\n");
+        let mut workspace = WorkspaceState::new();
+        let config = SshConfig::read(fixture.path()).expect("bounded SSH fixture parses");
+        workspace.load_ssh_config(&config);
+
+        let lines = sidebar_text_lines(workspace.sidebar());
+        assert_eq!(lines.len(), 3);
+        for line in lines {
+            let rendered_prefix: String = line.chars().take(renderer::SIDEBAR_COLS).collect();
+            assert!(
+                rendered_prefix.contains(SSH_SIDEBAR_LABEL_PREFIX),
+                "the rendered prefix must identify SSH as offline"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_marker_identifies_exact_target_despite_colliding_truncated_labels() {
+        let fixture = SshConfigFixture::new();
+        fixture.write_new(b"Host abcdef-first\nHost abcdef-second\n");
+        let mut workspace = WorkspaceState::new();
+        let local = workspace.create_session(SessionKind::Local);
+        workspace
+            .select_session(local)
+            .expect("created local session is selectable");
+        workspace.observe_session(local, SessionStatus::Running);
+        let config = SshConfig::read(fixture.path()).expect("bounded SSH fixture parses");
+        workspace.load_ssh_config(&config);
+
+        assert_eq!(workspace.sidebar().rows()[1].label(), "SSH-OFF abc...");
+        assert_eq!(workspace.sidebar().rows()[2].label(), "SSH-OFF abc...");
+        assert!(workspace.select_ssh_sidebar_row(2));
+        assert_eq!(workspace.selected_ssh_target(), Some("abcdef-second"));
+
+        let rows = workspace.sidebar().rows();
+        assert!(!rows[0].is_selected(), "pending SSH supersedes live marker");
+        assert!(
+            !rows[1].is_selected(),
+            "colliding first label stays unmarked"
+        );
+        assert!(rows[2].is_selected(), "the exact pending target is marked");
+        assert_eq!(workspace.sidebar().selected_row_count(), 1);
+        assert_eq!(
+            workspace.sidebar().viewport().map(|view| view.session_id()),
+            Some(local),
+            "pending display state must not change the actual local viewport"
+        );
+
+        let lines = sidebar_text_lines(workspace.sidebar());
+        assert!(lines[1].starts_with(' '));
+        assert!(lines[2].starts_with('>'));
+    }
+
+    #[test]
+    fn exclusive_ssh_fixture_creation_rejects_a_preexisting_symlink() {
+        let fixture = SshConfigFixture::new();
+        std::os::unix::fs::symlink(&fixture.root, fixture.path())
+            .expect("place synthetic fixture symlink");
+
+        let result = fixture.try_write_new(b"Host must-not-be-written\n");
+
+        assert!(
+            result.is_err(),
+            "create_new/no-follow must reject the symlink"
+        );
+        assert!(fixture.root.is_dir(), "symlink target remains a directory");
+        assert!(
+            std::fs::symlink_metadata(fixture.path())
+                .expect("fixture link still exists")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
     fn near_one_mib_ssh_alias_keeps_full_identity_and_bounded_display_text() {
-        let path = temp_ssh_config_path();
+        let ssh_fixture = SshConfigFixture::new();
         let target = "a".repeat(1024 * 1024 - "Host \n".len());
-        let mut fixture = String::with_capacity(1024 * 1024);
-        fixture.push_str("Host ");
-        fixture.push_str(&target);
-        fixture.push('\n');
-        assert_eq!(fixture.len(), 1024 * 1024);
-        std::fs::write(&path, fixture).expect("write near-one-MiB SSH fixture");
+        let mut config_text = String::with_capacity(1024 * 1024);
+        config_text.push_str("Host ");
+        config_text.push_str(&target);
+        config_text.push('\n');
+        assert_eq!(config_text.len(), 1024 * 1024);
+        ssh_fixture.write_new(config_text.as_bytes());
 
         let mut workspace = WorkspaceState::new();
-        let config = SshConfig::read(&path).expect("near-one-MiB SSH fixture parses");
+        let config = SshConfig::read(ssh_fixture.path()).expect("near-one-MiB SSH fixture parses");
         assert_eq!(workspace.load_ssh_config(&config), 0);
 
         let SessionKind::Ssh { target: cached } = &workspace.ssh_hosts[0] else {
@@ -4016,7 +4305,7 @@ mod tests {
         );
 
         let row = &workspace.sidebar().rows()[0];
-        assert_eq!(row.label(), "SSH aaaaaaa...");
+        assert_eq!(row.label(), "SSH-OFF aaa...");
         assert_eq!(row.label().chars().count(), SSH_SIDEBAR_LABEL_CHARS);
 
         let redraw_lines = sidebar_text_lines(workspace.sidebar());
@@ -4035,14 +4324,13 @@ mod tests {
             workspace.selected_ssh_target() == Some(target.as_str()),
             "pending selection retains the full connection target"
         );
-        cleanup_ssh_config(&path);
     }
 
     #[test]
     fn missing_ssh_config_is_silent_and_adds_no_rows() {
-        let path = temp_ssh_config_path();
+        let fixture = SshConfigFixture::new();
         let mut app = NorenApp::default();
-        app.load_ssh_hosts_from(&path);
+        app.load_ssh_hosts_from(fixture.path());
 
         assert!(app.workspace.sidebar().rows().is_empty());
         assert!(app.ssh_diagnostic.is_none());
@@ -4050,14 +4338,13 @@ mod tests {
 
     #[test]
     fn malformed_ssh_config_starts_with_content_free_diagnostic() {
-        let path = temp_ssh_config_path();
+        let fixture = SshConfigFixture::new();
         let secret = "DO_NOT_LEAK_ssh_config_fixture";
-        std::fs::write(&path, format!("Host broken\nPort nope # {secret}\n"))
-            .expect("write malformed SSH fixture");
+        fixture.write_new(format!("Host broken\nPort nope # {secret}\n"));
 
         let mut app = NorenApp::default();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            app.load_ssh_hosts_from(&path);
+            app.load_ssh_hosts_from(fixture.path());
         }));
         assert!(result.is_ok(), "malformed config must not panic");
         assert!(app.workspace.sidebar().rows().is_empty());
@@ -4065,18 +4352,16 @@ mod tests {
         assert!(diagnostic.contains("SSH configuration error"));
         assert!(!diagnostic.contains(secret));
         assert!(!diagnostic.contains("nope"));
-        cleanup_ssh_config(&path);
     }
 
     #[test]
     fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_runtime() {
-        let path = temp_ssh_config_path();
+        let fixture = SshConfigFixture::new();
         let secret = "DO_NOT_LEAK_post_startup_ssh_fixture";
-        std::fs::write(&path, format!("Host broken\nPort nope # {secret}\n"))
-            .expect("write malformed SSH fixture");
+        fixture.write_new(format!("Host broken\nPort nope # {secret}\n"));
 
         let mut app = NorenApp::default();
-        app.load_ssh_hosts_from(&path);
+        app.load_ssh_hosts_from(fixture.path());
         let diagnostic = app
             .ssh_diagnostic
             .as_deref()
@@ -4219,41 +4504,38 @@ mod tests {
         );
         assert_eq!(app.ssh_diagnostic.as_deref(), Some(diagnostic.as_str()));
 
-        std::fs::write(&path, b"Host recovered\n").expect("replace with valid SSH fixture");
-        app.load_ssh_hosts_from(&path);
+        fixture.replace(b"Host recovered\n");
+        app.load_ssh_hosts_from(fixture.path());
         assert!(
             app.ssh_diagnostic.is_none(),
             "a clean configuration application ends the diagnostic lifetime"
         );
-
-        cleanup_ssh_config(&path);
     }
 
     #[test]
     fn ssh_rows_stay_distinguishable_from_local_rows() {
-        let path = temp_ssh_config_path();
-        std::fs::write(&path, b"Host staging\n").expect("write SSH fixture");
+        let fixture = SshConfigFixture::new();
+        fixture.write_new(b"Host staging\n");
 
         let mut app = NorenApp::default();
-        app.load_ssh_hosts_from(&path);
+        app.load_ssh_hosts_from(fixture.path());
         app.workspace.create_session(SessionKind::Local);
 
         let rows = app.workspace.sidebar().rows();
         assert_eq!(rows[0].kind(), EntryKind::Session);
         assert_eq!(rows[0].detail(), Some("local · starting"));
         assert_eq!(rows[1].kind(), EntryKind::SshConnection);
-        assert_eq!(rows[1].label(), "SSH staging");
+        assert_eq!(rows[1].label(), "SSH-OFF sta...");
         assert_eq!(rows[1].detail(), Some("not connected"));
-        cleanup_ssh_config(&path);
     }
 
     #[test]
     fn selecting_an_ssh_row_only_records_a_pending_non_connection_choice() {
-        let path = temp_ssh_config_path();
-        std::fs::write(&path, b"Host staging\n").expect("write SSH fixture");
+        let fixture = SshConfigFixture::new();
+        fixture.write_new(b"Host staging\n");
 
         let mut app = NorenApp::default();
-        app.load_ssh_hosts_from(&path);
+        app.load_ssh_hosts_from(fixture.path());
         app.workspace.create_session(SessionKind::Local);
         app.cursor_position = Some(PhysicalPosition::new(5.0, 25.0));
 
@@ -4274,16 +4556,15 @@ mod tests {
             app.workspace.sidebar().viewport().is_none(),
             "SSH selection must not claim a connected viewport"
         );
-        cleanup_ssh_config(&path);
     }
 
     #[test]
     fn partial_undrawn_sidebar_row_cannot_select_a_hidden_ssh_entry() {
-        let path = temp_ssh_config_path();
-        std::fs::write(&path, b"Host visible\nHost hidden\n").expect("write SSH fixture");
+        let fixture = SshConfigFixture::new();
+        fixture.write_new(b"Host visible\nHost hidden\n");
 
         let mut app = NorenApp::default();
-        app.load_ssh_hosts_from(&path);
+        app.load_ssh_hosts_from(fixture.path());
         assert_eq!(app.workspace.sidebar().rows().len(), 2);
 
         let cell_height = app.geometry.cell_height();
@@ -4329,28 +4610,106 @@ mod tests {
             app.pty.is_none(),
             "SSH selection must remain non-connecting"
         );
-
-        cleanup_ssh_config(&path);
     }
 
     #[test]
-    fn local_sidebar_press_falls_through_instead_of_being_swallowed() {
+    fn sidebar_scroll_reveals_and_selects_ssh_without_terminal_mouse_output() {
+        let fixture = SshConfigFixture::new();
+        fixture.write_new(b"Host alpha\nHost beta\nHost gamma\n");
         let mut app = NorenApp::default();
+        for _ in 0..3 {
+            app.workspace.registry.restore(SessionKind::Local);
+        }
         app.workspace.create_session(SessionKind::Local);
+        app.workspace.rebuild_sidebar();
+        app.load_ssh_hosts_from(fixture.path());
+        app.terminal = Some(TerminalState::new(2, 8).expect("valid terminal"));
+        app.mouse_modes = MouseModes::disabled().with_normal(true).with_sgr(true);
+
+        let metrics = app.geometry.cell_metrics();
+        let frame_size = PhysicalSize::new(
+            renderer::SIDEBAR_COLS as u32 * metrics.width(),
+            2 * metrics.height(),
+        );
+        let initial = visible_sidebar_text_lines(app.workspace.sidebar(), 0, 2);
+        assert!(
+            initial
+                .iter()
+                .all(|line| !line.contains(SSH_SIDEBAR_LABEL_PREFIX)),
+            "restored/local rows initially hide SSH rows"
+        );
+
+        app.cursor_position = Some(PhysicalPosition::new(1.0, 1.0));
+        app.redraw_needed = false;
+        assert!(
+            app.handle_sidebar_wheel_in_frame(MouseScrollDelta::LineDelta(0.0, -4.0), frame_size,),
+            "sidebar wheel is consumed before tracked-terminal reporting"
+        );
+        assert_eq!(app.sidebar_scroll_offset, 4);
+        assert!(app.redraw_needed);
+        assert_eq!(
+            app.mouse_cell_in_frame(PhysicalPosition::new(1.0, 1.0), frame_size),
+            None,
+            "sidebar coordinates cannot become PTY mouse coordinates"
+        );
+        assert!(app.pty.is_none(), "the local scroll route opens no PTY");
+
+        let visible =
+            visible_sidebar_text_lines(app.workspace.sidebar(), app.sidebar_scroll_offset, 2);
+        assert!(visible[0].contains("SSH-OFF alpha"));
+        assert!(app.handle_sidebar_click_in_frame(
+            ElementState::Pressed,
+            MouseButton::Left,
+            frame_size,
+        ));
+        assert_eq!(app.workspace.selected_ssh_target(), Some("alpha"));
+        assert!(
+            visible_sidebar_text_lines(app.workspace.sidebar(), app.sidebar_scroll_offset, 2,)[0]
+                .starts_with('>')
+        );
+
+        let tall_frame = PhysicalSize::new(frame_size.width, 7 * metrics.height());
+        app.handle_resize(tall_frame);
+        assert_eq!(
+            app.sidebar_scroll_offset, 0,
+            "a taller frame clamps the obsolete scroll offset"
+        );
+    }
+
+    #[test]
+    fn local_sidebar_press_selects_it_and_clears_pending_ssh() {
+        let mut app = NorenApp::default();
+        let local = app.workspace.create_session(SessionKind::Local);
+        app.workspace
+            .select_session(local)
+            .expect("created local session is selectable");
+        app.workspace.ssh_hosts.push(SessionKind::Ssh {
+            target: "staging".to_owned(),
+        });
+        app.workspace.rebuild_sidebar();
+        assert!(app.workspace.select_ssh_sidebar_row(1));
+        assert_eq!(app.workspace.selected_ssh_target(), Some("staging"));
         app.cursor_position = Some(PhysicalPosition::new(5.0, 1.0));
-        let initial_status = app.status;
 
         assert!(
-            !app.handle_sidebar_click_in_frame(
+            app.handle_sidebar_click_in_frame(
                 ElementState::Pressed,
                 MouseButton::Left,
                 PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
             ),
-            "a local session row is not handled by the SSH sidebar path"
+            "a visible local row is consumed by the sidebar"
         );
         assert_eq!(app.workspace.selected_ssh_target(), None);
-        assert_eq!(app.workspace.registry().selected(), None);
-        assert_eq!(app.status, initial_status);
+        assert_eq!(app.workspace.registry().selected(), Some(local));
+        assert!(app.workspace.sidebar().rows()[0].is_selected());
+        assert_eq!(app.workspace.sidebar().selected_row_count(), 1);
+        assert_eq!(
+            app.workspace
+                .sidebar()
+                .viewport()
+                .map(|view| view.session_id()),
+            Some(local)
+        );
     }
 
     #[test]
@@ -4365,14 +4724,14 @@ mod tests {
 
     #[test]
     fn many_ssh_hosts_are_bounded_and_report_the_omitted_count() {
-        let path = temp_ssh_config_path();
+        let fixture = SshConfigFixture::new();
         let config: String = (0..30)
             .map(|index| format!("Host configured-host-{index:02}-with-long-alias\n"))
             .collect();
-        std::fs::write(&path, config).expect("write many-host SSH fixture");
+        fixture.write_new(config);
 
         let mut app = NorenApp::default();
-        app.load_ssh_hosts_from(&path);
+        app.load_ssh_hosts_from(fixture.path());
 
         let rows = app.workspace.sidebar().rows();
         assert_eq!(rows.len(), MAX_SSH_SIDEBAR_HOSTS);
@@ -4395,7 +4754,6 @@ mod tests {
                 .as_deref()
                 .is_some_and(|line| line.contains("showing first 24; 6 omitted"))
         );
-        cleanup_ssh_config(&path);
     }
 
     // ── Sidebar state persistence (Milestone 3 final piece) ────────────

@@ -53,6 +53,11 @@ const MAX_TOKEN_ITEMS: usize = 262_144;
 /// before any host, index, or output state is added for it.
 const MAX_HOSTS: usize = 65_536;
 
+/// Maximum retained bytes in a user-facing SSH source label, including its
+/// stable ordinal tag. Canonical paths are used only transiently for parser
+/// identity; the retained label is root-relative and bounded by this value.
+pub const MAX_SSH_SOURCE_LABEL_BYTES: usize = 64;
+
 /// Maximum conservative work estimate for discovering and resolving aliases.
 ///
 /// Before either cross-product runs, every alias/pattern pair is charged
@@ -85,6 +90,67 @@ const DEFAULT_LIMITS: ParserLimits = ParserLimits {
     hosts: MAX_HOSTS,
 };
 
+/// Scope of host discovery performed by this parser.
+///
+/// Noren does not ask OpenSSH to evaluate destinations here. Wildcard hosts,
+/// `Match` conditions, token expansion, system configuration, and other
+/// dynamic behavior therefore cannot produce a complete destination list.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HostDiscoveryKind {
+    /// Only positive literal aliases written in `Host` directives are listed.
+    #[default]
+    PartialLiteralPatterns,
+}
+
+/// Stable, parse-local identity of an SSH configuration source.
+///
+/// Zero is the top-level source (or the synthetic inline source used by
+/// [`SshConfig::parse`]); successfully read included files receive increasing
+/// ordinals on first encounter. Repeated includes reuse the same identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SshSourceId(usize);
+
+impl SshSourceId {
+    /// Encounter-order ordinal within this [`SshConfig`].
+    #[must_use]
+    pub const fn ordinal(self) -> usize {
+        self.0
+    }
+}
+
+/// Bounded, user-facing provenance for one parsed configuration source.
+///
+/// `label` is either `inline` or an escaped/lossy path relative to the
+/// top-level configuration directory. It never contains the canonical root or
+/// home-directory prefix. The ordinal tag is appended to the label so two
+/// paths with the same bounded prefix remain distinguishable.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshSource {
+    id: SshSourceId,
+    tag: String,
+    label: String,
+}
+
+impl SshSource {
+    /// Parse-local source identity.
+    #[must_use]
+    pub const fn id(&self) -> SshSourceId {
+        self.id
+    }
+
+    /// Compact stable tag, such as `#0` or `#12`.
+    #[must_use]
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    /// Bounded root-relative display label with the stable tag appended.
+    #[must_use]
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+}
+
 /// Parsed SSH host facts. Values are the first values obtained for the alias,
 /// following OpenSSH's per-keyword precedence rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +159,7 @@ pub struct SshHost {
     host_name: Option<String>,
     user: Option<String>,
     port: Option<u16>,
+    declared_source: SshSourceId,
 }
 
 impl SshHost {
@@ -119,12 +186,23 @@ impl SshHost {
     pub const fn port(&self) -> Option<u16> {
         self.port
     }
+
+    /// Source of the first qualifying positive literal `Host` declaration.
+    ///
+    /// Later blocks may supply effective values under OpenSSH's first-value
+    /// rules, but they do not replace this declaration provenance.
+    #[must_use]
+    pub const fn declared_source(&self) -> SshSourceId {
+        self.declared_source
+    }
 }
 
 /// Parsed SSH configuration.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SshConfig {
     hosts: Vec<SshHost>,
+    sources: Vec<SshSource>,
+    discovery_kind: HostDiscoveryKind,
 }
 
 impl SshConfig {
@@ -187,15 +265,36 @@ impl SshConfig {
         if text.len() > limits.file_bytes {
             return Err(error(0, SshConfigErrorKind::FileTooLarge));
         }
+        let inline_id = SshSourceId(0);
+        let sources = vec![inline_source(inline_id)];
         let mut token_items = 0usize;
-        let blocks = parse_text(text, 0, &mut token_items, limits.token_items)?;
-        Self::from_blocks_with_limit(&blocks, limits)
+        let blocks = parse_text(
+            text,
+            0,
+            inline_id,
+            &mut token_items,
+            limits.token_items,
+        )?;
+        Self::from_blocks_with_limit(&blocks, sources, limits)
     }
 
     /// The concrete hosts discovered from literal `Host` patterns.
     #[must_use]
     pub fn hosts(&self) -> &[SshHost] {
         &self.hosts
+    }
+
+    /// Explicitly partial scope used to discover [`Self::hosts`].
+    #[must_use]
+    pub const fn discovery_kind(&self) -> HostDiscoveryKind {
+        self.discovery_kind
+    }
+
+    /// Bounded provenance for `id`, or `None` when the ID belongs to another
+    /// parse result.
+    #[must_use]
+    pub fn source(&self, id: SshSourceId) -> Option<&SshSource> {
+        self.sources.get(id.ordinal()).filter(|source| source.id == id)
     }
 
     fn from_text_with_includes(
@@ -205,12 +304,17 @@ impl SshConfig {
         limits: ParserLimits,
     ) -> Result<Self, SshConfigError> {
         let mut state = ParseState::new(text.len(), limits);
-        parse_file(text, source, root, 0, &mut state)?;
-        Self::from_blocks_with_limit(&state.blocks, limits)
+        let source_id = state.intern_source(source, root);
+        parse_file(text, source, source_id, root, 0, &mut state)?;
+        let ParseState {
+            blocks, sources, ..
+        } = state;
+        Self::from_blocks_with_limit(&blocks, sources, limits)
     }
 
     fn from_blocks_with_limit(
         blocks: &[Block],
+        sources: Vec<SshSource>,
         limits: ParserLimits,
     ) -> Result<Self, SshConfigError> {
         let discovery_match_work = blocks.iter().fold(0_u128, |total, block| {
@@ -276,7 +380,7 @@ impl SshConfig {
                             return Err(error(0, SshConfigErrorKind::HostCountExceeded));
                         }
                         seen_aliases.insert(key);
-                        aliases.push(pattern.clone());
+                        aliases.push((pattern.clone(), block.source));
                     }
                 }
             }
@@ -315,7 +419,7 @@ impl SshConfig {
         }
 
         let alias_count = aliases.len() as u128;
-        let alias_work = aliases.iter().fold(0_u128, |work, alias| {
+        let alias_work = aliases.iter().fold(0_u128, |work, (alias, _)| {
             work.saturating_add(alias.len() as u128 + 1)
         });
         resolution_work.alias_index_work = alias_work;
@@ -327,12 +431,13 @@ impl SshConfig {
 
         let hosts = aliases
             .into_iter()
-            .map(|alias| {
+            .map(|(alias, declared_source)| {
                 let mut host = SshHost {
                     alias: alias.clone(),
                     host_name: None,
                     user: None,
                     port: None,
+                    declared_source,
                 };
 
                 let indexed = literal_blocks
@@ -376,7 +481,11 @@ impl SshConfig {
                 host
             })
             .collect();
-        Ok(Self { hosts })
+        Ok(Self {
+            hosts,
+            sources,
+            discovery_kind: HostDiscoveryKind::PartialLiteralPatterns,
+        })
     }
 }
 

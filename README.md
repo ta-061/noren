@@ -8,13 +8,16 @@
 > palette that creates/selects/closes local sessions, mouse reporting that
 > reaches the program inside, and sidebar state that survives a restart.
 >
-> It still renders in a single colour, in a case-insensitive 5x7 ASCII bitmap
-> font, with all non-ASCII shown as `?`, no visible cursor, no IME, and no
-> accessibility surface. Only local sessions can be launched. Configured SSH
-> hosts are discovered, displayed in the sidebar, and selectable as pending
-> targets without opening an SSH connection or PTY; git worktrees and agents
-> remain modelled but unreachable. Keybindings are not configurable. There are
-> no published binaries. Read
+> Per-cell SGR foreground and explicit background colours now reach drawing:
+> ANSI and 256-colour values resolve through a fixed palette, while RGB passes
+> through as direct truecolor, with the resolved colour carried per vertex. The
+> default palette and theme are not user-configurable. The renderer still uses
+> a case-insensitive 5x7 ASCII bitmap font, with all non-ASCII shown as `?`, no
+> visible cursor, no IME, and no accessibility surface. Only local sessions can
+> be launched. Configured SSH hosts are discovered, displayed in the sidebar,
+> and selectable as pending targets without opening an SSH connection or PTY;
+> git worktrees and agents remain modelled but unreachable. Keybindings are not
+> configurable. There are no published binaries. Read
 > **[docs/known-limitations.md](docs/known-limitations.md)** first — it is the
 > accurate predictor of what happens when you run the build. Everything below
 > the status block describes **intent**, not current capability.

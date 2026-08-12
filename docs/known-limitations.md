@@ -73,16 +73,17 @@ Each item states what you would actually see if you ran the build.
   word "cursor" does not appear anywhere in `renderer.rs`. In practice: you type, characters appear,
   and nothing shows you where the insertion point is. This is the first thing
   most people notice.
-- **Everything renders in one colour.** The fragment shader returns a constant
-  pale green — the `fs_main` entry point returns a constant
-  `vec4<f32>(0.80, 0.92, 0.82, 1.0)` (`crates/noren-app/src/renderer.rs`) — and
-  the pipeline's vertex `buffers` slice carries a single `Float32x2` position
-  attribute on an 8-byte stride, no colour channel. SGR
-  colours — including 256-colour and truecolor — are parsed and modelled in
-  terminal state but never reach drawing ([ROADMAP, "What blocks a public
-  preview"](../ROADMAP.md#what-blocks-a-public-preview)). In practice:
-  `ls --color`, `vim` syntax highlighting, and Zellij's status bar all appear
-  in one shade of green.
+- **Colours render, but the palette and theme are fixed.** `glyph_vertices`
+  reads each terminal cell's attributes: `resolve_foreground` and
+  `resolve_background` route ANSI and 256-colour values through
+  `DEFAULT_PALETTE`, while direct RGB truecolor passes through unchanged
+  (`crates/noren-app/src/renderer.rs`). Explicit backgrounds emit a full-cell
+  rectangle before the glyph. Each vertex now carries a `Float32x2` position
+  and `Float32x3` resolved colour on a 20-byte stride, and `fs_main` returns
+  that per-vertex colour. The defaults and xterm-style palette are compiled in;
+  `config.rs` exposes no palette or theme setting. In practice, SGR foreground
+  and explicit background colours appear, but users cannot select or customise
+  a light, dark, high-contrast, or colour-vision-friendly theme.
 - **The font cannot distinguish case.** Glyphs are a hand-built 5x7 ASCII
   bitmap indexed through `character.to_ascii_uppercase()` inside the
   `glyph_rows` function (`crates/noren-app/src/renderer.rs`); the test
@@ -180,13 +181,16 @@ What this evidence now covers that the M2 snapshot did not: PR #89 added the
 **FR-005 rendered-frame oracle** (`crates/noren-app/tests/frame_oracle.rs`,
 drawing through the shipped pipeline via
 `crates/noren-app/src/renderer_capture.rs`). It re-compiles the real `wgpu`
-glyph pipeline and drives it offscreen to assert **structural** properties,
-never a golden image: a cell the state says is blank contains no lit pixels;
-distinct glyphs produce distinct lit patterns; a glyph lights its own cell and
-not its neighbours; the drawn grid matches the state grid; and per-cell
-lit/blank agrees with `TerminalSnapshot` across the FR-005 fixture classes. It
-does **not** assert an `A` looks like an A — only that the structure is right.
-Its two `#[ignore]`d tests (`lowercase_distinct_from_uppercase`,
+glyph pipeline and drives it offscreen with structural assertions, never a
+golden image: a cell the state says is blank contains no lit pixels; distinct
+glyphs produce distinct lit patterns; a glyph lights its own cell and not its
+neighbours; the drawn grid matches the state grid; and per-cell lit/blank agrees
+with `TerminalSnapshot` across the FR-005 fixture classes. Its active
+colour-aware assertions also cover distinct SGR foregrounds, unchanged defaults,
+ANSI/256-colour and direct RGB resolution, explicit truecolor backgrounds,
+background-only spaces, and indexed/background equivalence. It does **not**
+assert an `A` looks like an A — only that the structure and resolved pixel
+colours are right. Its two `#[ignore]`d tests (`lowercase_distinct_from_uppercase`,
 `non_ascii_glyph_is_not_the_question_mark`) are the executable specifications of
 the two font defects listed above — case-blindness and non-ASCII falling
 through to `?` — left failing rather than weakened, and their `#[ignore]`
@@ -197,11 +201,12 @@ has none.
 What this evidence does **not** cover: there is still **no key injection into
 the real window**, so live input is unverified end-to-end — the byte-level
 input contract is tested at the `KeyEncoder`, but no test synthesizes a real
-key event into a live window and observes the result. The oracle guards shape
-and grid mapping, not glyph identity or colour, so the manual check above
-remains a smoke test of the window→grid→PTY chain rather than a perceptual
-proof of what appears on screen. Colour, IME, and accessibility are absent
-from testing because they are absent from the build.
+key event into a live window and observes the result. The oracle guards
+structural shape, grid mapping, and resolved pixel colour, but not glyph
+identity or overall perceptual correctness, so the manual check above remains a
+smoke test of the window→grid→PTY chain rather than a perceptual proof of what
+appears on screen. The palette/theme has no user-configurable surface to test;
+IME and accessibility remain absent from both testing and the build.
 
 ## What is deliberately delegated
 
@@ -226,5 +231,5 @@ publishing any artifact is a reserved owner decision. Nothing here should be
 read as "nearly done": the honest summary is that the foundation is tested, a
 first workspace slice is now real and visible, and what stands between this and
 a usable daily terminal is not workspace plumbing but the display itself —
-colour, a real font, a cursor. Those are the things a user sees first, and they
-are the things still missing.
+a user-configurable theme, a real font, and a cursor. SGR colour is now drawn,
+but its fixed defaults are not yet a usable theming system.
