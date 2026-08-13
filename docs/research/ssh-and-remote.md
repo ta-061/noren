@@ -100,10 +100,15 @@ that partial-browser boundary. It lists at most 24 positive literal aliases,
 labels the result as partial literal discovery, and attributes each retained
 alias to the first declaring source with a bounded root-relative label and
 stable parse-local tag. Successfully read duplicate or cyclic includes reuse
-their canonical source identity. No DNS lookup, `ssh -G`, system-configuration
-evaluation, connection, or remote PTY occurs. This is honest discovery metadata,
-not an OpenSSH-equivalent effective configuration; the SSH-01–SSH-05 gates below
-still apply before any connection path.
+their canonical source identity. Includes are followed only when the canonical
+target remains under the top-level config directory, an intentional confinement
+stricter than OpenSSH. Parsed `HostName` and `User` values are retained literally,
+so `%h`, `%p`, `%r`, and other tokens remain unresolved and must be resolved with
+OpenSSH-equivalent semantics or rejected before future connection use. No DNS
+lookup, `ssh -G`, system-configuration evaluation, connection, or remote PTY
+occurs. This is honest discovery metadata, not an OpenSSH-equivalent effective
+configuration; the SSH-01–SSH-05 gates below still apply before any connection
+path.
 
 ## Process and command boundaries
 
