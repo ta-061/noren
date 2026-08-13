@@ -1,9 +1,7 @@
 //! macOS entry point for the bounded local-zsh PTY PoC.
 
-mod mouse_mode_scanner;
 mod renderer;
 
-use mouse_mode_scanner::MouseModeScanner;
 use noren_app::{
     Arrow, CellMetrics, CursorKeyMode, FunctionKey, GridGeometry, GridSize, InputMode, Key,
     KeyDropReason, KeyEncoder, KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode,
@@ -504,12 +502,6 @@ struct NorenApp {
     drag_origin: Option<GridPoint>,
     drag_mode: SelectionMode,
     cursor_position: Option<PhysicalPosition<f64>>,
-    /// Mouse tracking/encoding modes observed from PTY output (DECSET/DECRST).
-    /// TerminalState does not track mouse modes, so the app maintains this as
-    /// the single source of truth for whether pointer events are reported.
-    mouse_modes: MouseModes,
-    /// DFA retaining partial DECSET/DECRST sequences across PTY chunks.
-    mouse_mode_scanner: MouseModeScanner,
     /// The currently-held mouse button when tracking is active, or `None`.
     /// Drives the `button` field of motion (drag/hover) reports.
     held_mouse_button: Option<MouseButton>,
@@ -590,8 +582,6 @@ impl NorenApp {
             drag_origin: None,
             drag_mode: SelectionMode::Char,
             cursor_position: None,
-            mouse_modes: MouseModes::disabled(),
-            mouse_mode_scanner: MouseModeScanner::default(),
             held_mouse_button: None,
             workspace: WorkspaceState::new(),
             sidebar_scroll_offset: 0,
@@ -1437,7 +1427,7 @@ impl NorenApp {
     /// and Shift is not held — Shift bypasses reporting so the user can still
     /// select text while a program tracks the mouse, matching xterm/iTerm.
     fn mouse_reportable(&self) -> bool {
-        self.mouse_modes.is_tracked() && !self.modifiers.is_shift()
+        self.current_mouse_modes().is_tracked() && !self.modifiers.is_shift()
     }
 
     /// Map a pixel position to 0-based `(col, row)` cell indices suitable for
@@ -1471,6 +1461,22 @@ impl NorenApp {
         MouseGrid::new(cols, rows)
     }
 
+    /// Project the terminal's authoritative mode state into the mouse
+    /// encoder's existing input type. The projection is deliberately computed
+    /// for each event so there is no second mode cache to synchronize.
+    fn current_mouse_modes(&self) -> MouseModes {
+        let Some(modes) = self.terminal.as_ref().map(TerminalState::modes) else {
+            return MouseModes::disabled();
+        };
+        MouseModes::disabled()
+            .with_normal(modes.is_mouse_normal_tracking_enabled())
+            .with_button_event(modes.is_mouse_button_event_tracking_enabled())
+            .with_any_event(modes.is_mouse_any_event_tracking_enabled())
+            .with_utf8(modes.is_mouse_utf8_encoding_enabled())
+            .with_sgr(modes.is_mouse_sgr_encoding_enabled())
+            .with_urxvt(modes.is_mouse_urxvt_encoding_enabled())
+    }
+
     /// Convert the app's current modifier state to mouse pointer modifiers.
     /// Super/Command is excluded (the window layer drops it), matching the key
     /// encoder's policy.
@@ -1488,15 +1494,15 @@ impl NorenApp {
         mods
     }
 
-    /// Encode one pointer event and write the report bytes to the PTY. When
-    /// the encoder returns `None` (event not reportable under the active
-    /// tracking mode, or coordinate out of range), no bytes are sent.
+    /// Encode one pointer event from the live terminal authority without PTY
+    /// side effects. A return of `None` means the event is not reportable.
+    fn encode_mouse(&self, event: PointerEvent) -> Option<Vec<u8>> {
+        MouseEncoder::encode(event, self.current_mouse_modes(), self.mouse_grid()?)
+    }
+
+    /// Encode one pointer event and write the report bytes to the PTY.
     fn encode_and_send_mouse(&mut self, event: PointerEvent) {
-        let Some(grid) = self.mouse_grid() else {
-            return;
-        };
-        let modes = self.mouse_modes;
-        if let Some(bytes) = MouseEncoder::encode(event, modes, grid) {
+        if let Some(bytes) = self.encode_mouse(event) {
             self.send_input(&bytes);
         }
     }
@@ -1594,6 +1600,15 @@ impl NorenApp {
         self.redraw_needed = true;
     }
 
+    /// Apply one PTY output chunk, in order, to the authoritative terminal
+    /// parser. Production and application tests share this exact byte path.
+    fn apply_pty_output(&mut self, bytes: &[u8]) {
+        if let Some(terminal) = &mut self.terminal {
+            terminal.feed_bytes(bytes);
+        }
+        self.redraw_needed = true;
+    }
+
     fn drain_pty(&mut self) {
         let mut remaining = PARSE_BUDGET_BYTES_PER_TURN;
         let mut terminal_status = None;
@@ -1616,14 +1631,8 @@ impl NorenApp {
                         break;
                     }
                     remaining -= bytes.len();
-                    // Passively observe DECSET/DECRST for mouse modes before
-                    // feeding the terminal. The scanner consumes no bytes.
-                    self.mouse_mode_scanner.scan(&bytes, &mut self.mouse_modes);
-                    if let Some(terminal) = &mut self.terminal {
-                        terminal.feed_bytes(&bytes);
-                    }
+                    self.apply_pty_output(&bytes);
                     output_consumed = true;
-                    self.redraw_needed = true;
                 }
                 PtyEvent::Eof => {
                     self.pty_child = PtyChildStatus::Exited { code: None };

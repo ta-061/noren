@@ -1408,82 +1408,129 @@ fn palette_text_lines_show_selection_marker() {
     );
 }
 
-// ── Mouse mode scanner ───────────────────────────────────────────────
+// ── Authoritative application mouse modes ───────────────────────────
 
-/// DECSET 1000 is detected and enables tracking. This is the most basic
-/// mode-detection test: without it, no mouse event ever reaches the PTY.
 #[test]
-fn scanner_detects_decset_1000_and_enables_tracking() {
-    let mut scanner = MouseModeScanner::default();
-    let mut modes = MouseModes::disabled();
-    scanner.scan(b"\x1b[?1000h", &mut modes);
-    assert!(modes.is_tracked(), "mode 1000 must enable tracking");
-}
+fn app_multi_param_1002_1006_output_drives_sgr_encoding() {
+    let mut app = NorenApp {
+        terminal: Some(TerminalState::new(4, 8).expect("valid terminal")),
+        ..Default::default()
+    };
+    app.apply_pty_output(b"\x1b[?1002;1006h");
 
-/// DECRST clears a previously-set mode. If reset is broken, a program
-/// that disables tracking would still receive reports.
-#[test]
-fn scanner_detects_decrst_and_clears_mode() {
-    let mut scanner = MouseModeScanner::default();
-    let mut modes = MouseModes::disabled();
-    scanner.scan(b"\x1b[?1000h\x1b[?1000l", &mut modes);
-    assert!(!modes.is_tracked(), "DECRST must clear the mode");
-}
-
-/// Multiple mouse modes in one DECSET (`CSI ? 1002 ; 1006 h`) are all
-/// applied. Zellij enables tracking and encoding in a single sequence on
-/// attach, so this is the realistic path.
-#[test]
-fn scanner_handles_multi_param_decset() {
-    let mut scanner = MouseModeScanner::default();
-    let mut modes = MouseModes::disabled();
-    scanner.scan(b"\x1b[?1002;1006h", &mut modes);
-    assert!(modes.is_tracked(), "1002 must be set");
-    // Encoding must also be set; verify via the SGR output form.
-    let grid = MouseGrid::new(10, 40).expect("grid");
-    let event = PointerEvent::press(EncoderButton::Left, 0, 0, PointerModifiers::empty());
-    let bytes = MouseEncoder::encode(event, modes, grid).expect("must encode");
-    assert!(
-        bytes.starts_with(b"\x1b[<"),
-        "1006 SGR must be active after multi-param DECSET, got {:?}",
-        String::from_utf8_lossy(&bytes)
+    assert!(app.mouse_reportable(), "1002 must enable reporting");
+    let drag = PointerEvent::move_to(Some(EncoderButton::Left), 2, 1, PointerModifiers::empty());
+    assert_eq!(
+        app.encode_mouse(drag).as_deref(),
+        Some(b"\x1b[<32;3;2M".as_slice()),
+        "1006 must select SGR for the application encoding path"
     );
 }
 
-/// A sequence split across two scan() calls is still detected. PTY output
-/// arrives in arbitrary chunks; the DFA must retain state.
 #[test]
-fn scanner_retains_state_across_chunks() {
-    let mut scanner = MouseModeScanner::default();
-    let mut modes = MouseModes::disabled();
-    scanner.scan(b"\x1b[?10", &mut modes);
-    assert!(!modes.is_tracked(), "partial sequence must not set mode");
-    scanner.scan(b"00h", &mut modes);
-    assert!(modes.is_tracked(), "completed sequence must set mode");
-}
+fn app_split_mouse_mode_output_uses_incremental_terminal_authority() {
+    let mut app = NorenApp {
+        terminal: Some(TerminalState::new(4, 8).expect("valid terminal")),
+        ..Default::default()
+    };
+    let press = PointerEvent::press(EncoderButton::Left, 0, 0, PointerModifiers::empty());
 
-/// Unrelated private modes (1049, 2004) do not alter mouse tracking.
-#[test]
-fn scanner_ignores_non_mouse_private_modes() {
-    let mut scanner = MouseModeScanner::default();
-    let mut modes = MouseModes::disabled().with_normal(true);
-    scanner.scan(b"\x1b[?1049h\x1b[?2004h\x1b[?1h", &mut modes);
+    app.apply_pty_output(b"\x1b[?1002;");
     assert!(
-        modes.is_tracked(),
-        "non-mouse modes must not change tracking"
+        !app.mouse_reportable(),
+        "an incomplete DECSET has no effect"
+    );
+    assert_eq!(app.encode_mouse(press), None);
+
+    app.apply_pty_output(b"1006h");
+    assert!(app.mouse_reportable());
+    assert_eq!(
+        app.encode_mouse(press).as_deref(),
+        Some(b"\x1b[<0;1;1M".as_slice())
     );
 }
 
-/// Random garbage between valid sequences does not confuse the DFA.
 #[test]
-fn scanner_recovers_from_garbage_between_sequences() {
-    let mut scanner = MouseModeScanner::default();
-    let mut modes = MouseModes::disabled();
-    scanner.scan(b"garbage\x1b[?1000h more text", &mut modes);
-    assert!(
-        modes.is_tracked(),
-        "DECSET after garbage must still be detected"
+fn app_decrst_mouse_output_disables_encoding() {
+    let mut app = NorenApp {
+        terminal: Some(TerminalState::new(4, 8).expect("valid terminal")),
+        ..Default::default()
+    };
+    let press = PointerEvent::press(EncoderButton::Left, 0, 0, PointerModifiers::empty());
+
+    app.apply_pty_output(b"\x1b[?1000;1006h");
+    assert_eq!(
+        app.encode_mouse(press).as_deref(),
+        Some(b"\x1b[<0;1;1M".as_slice())
     );
+
+    app.apply_pty_output(b"\x1b[?1000l");
+    assert!(!app.mouse_reportable());
+    assert_eq!(app.encode_mouse(press), None);
+    assert_eq!(
+        app.current_mouse_modes(),
+        MouseModes::disabled().with_sgr(true),
+        "DECRST 1000 must not reset the independent 1006 flag"
+    );
+}
+
+#[test]
+fn app_current_mouse_modes_projects_all_six_terminal_flags() {
+    let cases: &[(&[u8], MouseModes)] = &[
+        (b"\x1b[?1000h", MouseModes::disabled().with_normal(true)),
+        (
+            b"\x1b[?1002h",
+            MouseModes::disabled().with_button_event(true),
+        ),
+        (b"\x1b[?1003h", MouseModes::disabled().with_any_event(true)),
+        (b"\x1b[?1005h", MouseModes::disabled().with_utf8(true)),
+        (b"\x1b[?1006h", MouseModes::disabled().with_sgr(true)),
+        (b"\x1b[?1015h", MouseModes::disabled().with_urxvt(true)),
+    ];
+
+    for &(output, expected) in cases {
+        let mut app = NorenApp {
+            terminal: Some(TerminalState::new(2, 4).expect("valid terminal")),
+            ..Default::default()
+        };
+        app.apply_pty_output(output);
+        assert_eq!(app.current_mouse_modes(), expected, "output {output:?}");
+    }
+}
+
+#[test]
+fn app_mouse_authority_defaults_disabled_and_live_mutation_enables_encoding() {
+    let mut app = NorenApp {
+        terminal: Some(TerminalState::new(4, 8).expect("valid terminal")),
+        ..Default::default()
+    };
+    let press = PointerEvent::press(EncoderButton::Left, 0, 0, PointerModifiers::empty());
+
+    assert_eq!(app.current_mouse_modes(), MouseModes::disabled());
+    assert_eq!(app.encode_mouse(press), None);
+
+    app.apply_pty_output(b"\x1b[?1000h");
+    assert_eq!(
+        app.encode_mouse(press).as_deref(),
+        Some(b"\x1b[M\x20\x21\x21".as_slice()),
+        "encoding must observe the mutated terminal rather than a separate disabled default"
+    );
+}
+
+#[test]
+fn apply_pty_output_preserves_terminal_bytes_and_order() {
+    let mut app = NorenApp {
+        terminal: Some(TerminalState::new(2, 8).expect("valid terminal")),
+        ..Default::default()
+    };
+    app.redraw_needed = false;
+
+    app.apply_pty_output(b"ab\x1b[?1000hcd");
+
+    let snapshot = app.terminal.as_ref().expect("terminal present").snapshot();
+    assert_eq!(snapshot.lines()[0], "abcd");
+    assert!(app.current_mouse_modes().is_tracked());
+    assert!(app.redraw_needed);
 }
 
 // ── Tracking / selection-bypass policy ──────────────────────────────
@@ -1499,10 +1546,11 @@ fn no_tracking_mode_means_not_reportable() {
 /// Mode 1000 without Shift: tracking active, events go to the PTY.
 #[test]
 fn mode_1000_without_shift_is_reportable() {
-    let app = NorenApp {
-        mouse_modes: MouseModes::disabled().with_normal(true),
+    let mut app = NorenApp {
+        terminal: Some(TerminalState::new(2, 4).expect("valid terminal")),
         ..Default::default()
     };
+    app.apply_pty_output(b"\x1b[?1000h");
     assert!(app.mouse_reportable());
 }
 
@@ -1511,11 +1559,18 @@ fn mode_1000_without_shift_is_reportable() {
 #[test]
 fn shift_bypasses_tracking_for_local_selection() {
     let mut app = NorenApp {
-        mouse_modes: MouseModes::disabled().with_normal(true),
+        terminal: Some(TerminalState::new(2, 4).expect("valid terminal")),
         ..Default::default()
     };
+    app.apply_pty_output(b"\x1b[?1000h");
 
     assert!(app.mouse_reportable(), "active without Shift");
+    let press = PointerEvent::press(EncoderButton::Left, 0, 0, app.pointer_modifiers());
+    assert_eq!(
+        app.encode_mouse(press).as_deref(),
+        Some(b"\x1b[M\x20\x21\x21".as_slice()),
+        "the non-Shift encoding remains byte-compatible"
+    );
 
     app.modifiers = Modifiers::empty().shift();
     assert!(!app.mouse_reportable(), "Shift bypasses tracking");
@@ -1827,10 +1882,9 @@ fn disabled_tracking_routes_to_selection_not_pty() {
 #[test]
 fn shift_bypass_with_tracking_routes_to_selection() {
     let mut terminal = TerminalState::new(4, 8).expect("valid terminal");
-    terminal.feed_bytes(b"hello");
+    terminal.feed_bytes(b"hello\x1b[?1000h");
     let mut app = NorenApp {
         terminal: Some(terminal),
-        mouse_modes: MouseModes::disabled().with_normal(true),
         modifiers: Modifiers::empty().shift(),
         ..Default::default()
     };
@@ -1854,10 +1908,10 @@ fn shift_bypass_with_tracking_routes_to_selection() {
 /// branch was not entered.
 #[test]
 fn tracking_enabled_press_enters_tracking_branch() {
-    let terminal = TerminalState::new(4, 8).expect("valid terminal");
+    let mut terminal = TerminalState::new(4, 8).expect("valid terminal");
+    terminal.feed_bytes(b"\x1b[?1000h");
     let mut app = NorenApp {
         terminal: Some(terminal),
-        mouse_modes: MouseModes::disabled().with_normal(true),
         ..Default::default()
     };
 
@@ -1889,12 +1943,10 @@ fn tracking_enabled_press_enters_tracking_branch() {
 /// handler has no button to carry.
 #[test]
 fn sidebar_press_does_not_produce_orphan_motion_report() {
-    let terminal = TerminalState::new(4, 8).expect("valid terminal");
+    let mut terminal = TerminalState::new(4, 8).expect("valid terminal");
+    terminal.feed_bytes(b"\x1b[?1000;1002h");
     let mut app = NorenApp {
         terminal: Some(terminal),
-        mouse_modes: MouseModes::disabled()
-            .with_normal(true)
-            .with_button_event(true),
         ..Default::default()
     };
 
@@ -1957,17 +2009,16 @@ fn mouse_grid_dimensions_match_terminal_in_order() {
 /// rather than constructing `MouseGrid` directly.
 #[test]
 fn mouse_grid_right_edge_click_reports_true_column() {
-    let terminal = TerminalState::new(4, 8).expect("valid terminal");
+    let mut terminal = TerminalState::new(4, 8).expect("valid terminal");
+    terminal.feed_bytes(b"\x1b[?1000;1006h");
     let app = NorenApp {
         terminal: Some(terminal),
-        mouse_modes: MouseModes::disabled().with_normal(true).with_sgr(true),
         ..Default::default()
     };
 
-    let grid = app.mouse_grid().expect("terminal present");
     // Press the rightmost cell of row 0 (0-based col 7 of 8).
     let event = PointerEvent::press(EncoderButton::Left, 7, 0, PointerModifiers::empty());
-    let bytes = MouseEncoder::encode(event, app.mouse_modes, grid).expect("tracked: must encode");
+    let bytes = app.encode_mouse(event).expect("tracked: must encode");
     let report = String::from_utf8(bytes).expect("SGR is ASCII");
 
     // 1-based column must be 8, not the clamped 4 a transposed grid yields.
@@ -2661,7 +2712,7 @@ fn sidebar_scroll_reveals_and_selects_ssh_without_terminal_mouse_output() {
     app.workspace.rebuild_sidebar();
     app.load_ssh_hosts_from(fixture.path());
     app.terminal = Some(TerminalState::new(2, 8).expect("valid terminal"));
-    app.mouse_modes = MouseModes::disabled().with_normal(true).with_sgr(true);
+    app.apply_pty_output(b"\x1b[?1000;1006h");
 
     let metrics = app.geometry.cell_metrics();
     let frame_size = PhysicalSize::new(
