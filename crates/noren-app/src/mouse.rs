@@ -79,11 +79,13 @@ const CB_SHIFT: u32 = 4;
 const CB_ALT: u32 = 8;
 const CB_CTRL: u32 = 16;
 
-/// Active mouse modes set by the application through DECSET/DECRST.
+/// Encoder-facing projection of the terminal's active mouse modes.
 ///
 /// Tracking flags (1000/1002/1003) gate *whether* a report is produced;
 /// encoding flags (1005/1006/1015) gate *how* it is formatted. The two
-/// groups are independent.
+/// groups are independent. The application derives this value from the active
+/// `TerminalState::modes()` for each pointer event; it is not a second source
+/// of DECSET/DECRST state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MouseModes {
     normal: bool,
@@ -154,9 +156,10 @@ impl MouseModes {
     /// Apply a DECSET/DECRST transition by mode number. Unrecognized mode
     /// numbers are left for their own handlers and return `self` unchanged.
     ///
-    /// This is the entry point the future terminal-mode wiring will call when
-    /// it observes `CSI ? <mode> h/l`; the named builders exist for tests and
-    /// for code that already knows which flag it is setting.
+    /// This remains available for standalone encoder users and tests. Noren's
+    /// runtime parser owns DECSET/DECRST state in `TerminalState`; the
+    /// application projects that state through the named builders instead of
+    /// maintaining a separate `MouseModes` cache.
     #[must_use]
     pub fn set(self, mode: u16, on: bool) -> Self {
         match mode {
@@ -385,9 +388,9 @@ impl PointerEvent {
 
 /// Pure encoder from pointer events to xterm mouse report bytes.
 ///
-/// The encoder is stateless: callers track [`MouseModes`] (observing the
-/// application's DECSET/DECRST transitions) and [`MouseGrid`] (from resize)
-/// and pass them with each event. A return of `None` means "emit nothing" —
+/// The encoder is stateless: callers pass a [`MouseModes`] snapshot (projected
+/// from the authoritative terminal modes in Noren) and a [`MouseGrid`] (from
+/// resize) with each event. A return of `None` means "emit nothing" —
 /// either no tracking mode is on, the event kind is not reported under the
 /// active tracking mode, or the active byte form cannot represent the
 /// coordinate (see the X10 223 rule in the module docs).

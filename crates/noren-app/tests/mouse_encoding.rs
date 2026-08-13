@@ -2,7 +2,8 @@
 //!
 //! The mouse module is wired into `lib.rs` as `pub mod mouse`. It is
 //! self-contained — no `crate::` items — and these tests exercise the public
-//! API the way the future terminal-mode wiring will.
+//! API with mode snapshots like those Noren now projects from the
+//! authoritative `TerminalState::modes()` value.
 //!
 //! Coordinate convention used throughout: `col`/`row` are 0-based cell indices;
 //! the encoder clamps to the grid and emits 1-based `Cx`/`Cy`. A click at
