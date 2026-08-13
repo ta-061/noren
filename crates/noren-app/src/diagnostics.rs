@@ -58,6 +58,7 @@ pub struct DiagnosticsInput {
     scrollback_cap: usize,
     pty: PtyChildStatus,
     persistence_conflict: bool,
+    persistence_unverified: bool,
 }
 
 /// Build diagnostics input from the live terminal snapshot.
@@ -77,6 +78,7 @@ pub fn from_snapshot(snapshot: Option<&TerminalSnapshot>, pty: PtyChildStatus) -
             scrollback_cap: MAX_SCROLLBACK_LINES,
             pty,
             persistence_conflict: false,
+            persistence_unverified: false,
         },
         None => DiagnosticsInput {
             grid_rows: None,
@@ -86,6 +88,7 @@ pub fn from_snapshot(snapshot: Option<&TerminalSnapshot>, pty: PtyChildStatus) -
             scrollback_cap: MAX_SCROLLBACK_LINES,
             pty,
             persistence_conflict: false,
+            persistence_unverified: false,
         },
     }
 }
@@ -95,6 +98,14 @@ impl DiagnosticsInput {
     #[must_use]
     pub const fn with_persistence_conflict(mut self, conflict: bool) -> Self {
         self.persistence_conflict = conflict;
+        self
+    }
+
+    /// Record that the last persistence attempt could not be fully inspected,
+    /// saved, or verified.
+    #[must_use]
+    pub const fn with_persistence_unverified(mut self, unverified: bool) -> Self {
+        self.persistence_unverified = unverified;
         self
     }
 }
@@ -132,7 +143,9 @@ pub fn report(input: &DiagnosticsInput) -> String {
         input.scrollback_len,
         input.scrollback_cap,
         input.pty,
-        if input.persistence_conflict {
+        if input.persistence_unverified {
+            "unverified"
+        } else if input.persistence_conflict {
             "changed-underneath"
         } else {
             "ok"
@@ -258,10 +271,24 @@ mod tests {
         let mut terminal = TerminalState::new(1024, 1024).expect("within MAX_SCREEN_CELLS");
         terminal.feed_bytes(b"\x1b[?1h\x1b=\x1b[?1049h");
         let state = terminal.snapshot();
-        let input = from_snapshot(Some(&state), PtyChildStatus::Exited { code: None });
+        let input = from_snapshot(Some(&state), PtyChildStatus::Exited { code: None })
+            .with_persistence_unverified(true);
         let line = report(&input);
         assert!(line.len() < 200, "report must stay bounded: {line}");
         assert!(line.is_ascii(), "no free text can reach the report");
+        assert!(line.ends_with("state=unverified"), "{line}");
+    }
+
+    /// A sticky historical conflict remains recorded, but it must never hide
+    /// the current attempt's unsafe outcome in the single diagnostics field.
+    #[test]
+    fn current_unverified_state_has_priority_over_sticky_conflict() {
+        let input = from_snapshot(None, PtyChildStatus::NotLaunched)
+            .with_persistence_conflict(true)
+            .with_persistence_unverified(true);
+        let line = report(&input);
+        assert!(line.ends_with("state=unverified"), "{line}");
+        assert!(!line.contains("state=changed-underneath"), "{line}");
     }
 
     /// The scrollback ceiling diagnostics reports is the terminal

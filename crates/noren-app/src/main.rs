@@ -1,6 +1,9 @@
 //! macOS entry point for the bounded local-zsh PTY PoC.
 
+mod persistence_state;
 mod renderer;
+
+use persistence_state::{AttemptOutcome, Observation, PersistenceState, SaveOutcome};
 
 use noren_app::{
     Arrow, CellMetrics, CursorKeyMode, FunctionKey, GridGeometry, GridSize, InputMode, Key,
@@ -24,7 +27,7 @@ use noren_app::{
         SessionStatus,
     },
     session_persistence::{
-        SESSION_STATE_FILE_NAME, SessionPersistenceError, load_snapshot, save, snapshot,
+        SESSION_STATE_FILE_NAME, SessionPersistenceError, load_snapshot, save_snapshot, snapshot,
     },
     sidebar::{SidebarEntry, SidebarView},
     ssh_config::{HostDiscoveryKind, SshConfig},
@@ -199,15 +202,12 @@ struct WorkspaceState {
     /// Owned by the workspace; dispatched when the palette opens.
     palette: Palette<WorkspaceAction>,
     /// Where sidebar state is persisted. `None` in tests and when `HOME` is
-    /// unset; in both cases the workspace is in-memory only and [`persist`]
-    /// is a no-op.
+    /// unset; in both cases the workspace is in-memory only and
+    /// [`Self::persist`] is a no-op.
     state_path: Option<PathBuf>,
-    /// Exact state-file bytes observed at restore or after the last save.
-    /// `None` also represents a normally absent first-run file.
-    loaded_snapshot: Option<Vec<u8>>,
-    /// Sticky warning for the diagnostics overlay when another instance has
-    /// replaced the file since this workspace loaded it.
-    persistence_conflict: bool,
+    /// Exact comparison baseline plus persistence diagnostics. Baseline
+    /// validity is explicit so failures cannot reuse stale or assumed bytes.
+    persistence: PersistenceState,
 }
 
 impl Default for WorkspaceState {
@@ -241,8 +241,7 @@ impl WorkspaceState {
                 WorkspaceAction::FocusSidebar,
             ),
             state_path,
-            loaded_snapshot: None,
-            persistence_conflict: false,
+            persistence: PersistenceState::default(),
         }
     }
 
@@ -259,7 +258,13 @@ impl WorkspaceState {
         let Some(path) = &self.state_path else {
             return Ok(());
         };
-        self.loaded_snapshot = load_snapshot(path, &mut self.registry)?;
+        match load_snapshot(path, &mut self.registry) {
+            Ok(snapshot) => self.persistence.restore_succeeded(snapshot),
+            Err(error) => {
+                self.persistence.restore_failed();
+                return Err(error);
+            }
+        }
         self.rebuild_sidebar();
         Ok(())
     }
@@ -267,34 +272,51 @@ impl WorkspaceState {
     /// Persist the current sidebar state to
     /// [`state_path`](Self::state_path), if one is set.
     ///
-    /// The write is atomic (temp-file rename) inside [`save`]; this method
-    /// never bypasses it. A failure is surfaced through stderr and swallowed
-    /// so the app keeps running — losing a save is preferable to crashing the
-    /// terminal.
+    /// The write is atomic (temp-file rename) inside [`save_snapshot`]; this
+    /// method never bypasses it. A failure is surfaced through stderr and
+    /// swallowed so the app keeps running — losing a save is preferable to
+    /// crashing the terminal.
     fn persist(&mut self) {
         let Some(path) = &self.state_path else {
             return;
         };
-        match snapshot(path) {
-            Ok(current) if current != self.loaded_snapshot => {
-                self.persistence_conflict = true;
-            }
+        let before = match snapshot(path) {
+            Ok(current) => Observation::Observed(current),
             Err(error) => {
                 eprintln!("Noren could not inspect sidebar state before saving: {error}");
+                Observation::Unavailable
             }
-            _ => {}
-        }
-        if let Err(error) = save(path, &self.registry) {
-            eprintln!("Noren could not save sidebar state: {error}");
-        } else if let Ok(current) = snapshot(path) {
-            self.loaded_snapshot = current;
-        }
+        };
+        let save = match save_snapshot(path, &self.registry) {
+            Ok(intended) => {
+                let observed = match snapshot(path) {
+                    Ok(current) => Observation::Observed(current),
+                    Err(error) => {
+                        eprintln!("Noren could not verify saved sidebar state: {error}");
+                        Observation::Unavailable
+                    }
+                };
+                SaveOutcome::Written { intended, observed }
+            }
+            Err(error) => {
+                eprintln!("Noren could not save sidebar state: {error}");
+                SaveOutcome::Failed
+            }
+        };
+        self.persistence
+            .apply_attempt(AttemptOutcome::new(before, save));
     }
 
     /// Whether a save observed state written by another instance since the
-    /// last restore or successful save.
+    /// last verified restore or save.
     fn persistence_conflict(&self) -> bool {
-        self.persistence_conflict
+        self.persistence.conflict()
+    }
+
+    /// Whether the latest persistence attempt completed without enough
+    /// evidence to call the on-disk state safe.
+    fn persistence_unverified(&self) -> bool {
+        self.persistence.unverified()
     }
 
     /// Create a new session and rebuild the sidebar.
@@ -1533,7 +1555,8 @@ impl NorenApp {
         }
         let snapshot = self.terminal.as_ref().map(TerminalEngine::snapshot);
         let input = diagnostics::from_snapshot(snapshot.as_ref(), self.pty_child)
-            .with_persistence_conflict(self.workspace.persistence_conflict());
+            .with_persistence_conflict(self.workspace.persistence_conflict())
+            .with_persistence_unverified(self.workspace.persistence_unverified());
         let line = diagnostics::report(&input);
         eprintln!("{line}");
         if let Some(window) = &self.window {
