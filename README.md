@@ -19,7 +19,11 @@
 > from the user's OpenSSH config is displayed in the sidebar (at most 24 rows),
 > and selecting one shows its root-relative config source without opening an
 > SSH connection or PTY. Wildcard-only and dynamic OpenSSH destinations are not
-> a complete browseable list;
+> a complete browseable list. Parsed `HostName` and `User` values retain
+> unresolved tokens such as `%h`, `%p`, and `%r` and are discovery metadata
+> only; a future connection path must resolve or reject them first. `Include`
+> handling is intentionally stricter than OpenSSH: Noren follows only files
+> whose canonical targets remain under the top-level config directory;
 > git worktrees and agents remain modelled but unreachable. Keybindings are not
 > configurable. There are no published binaries. Read
 > **[docs/known-limitations.md](docs/known-limitations.md)** first — it is the

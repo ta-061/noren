@@ -4,6 +4,16 @@
 //! implementation. It produces bounded host facts consumed by the sidebar; it
 //! never opens an SSH connection and never opens a path named by `IdentityFile`
 //! (or any other non-`Include` directive).
+//!
+//! `HostName` and `User` values are retained as discovery metadata, not as
+//! connection-ready values. In particular, percent tokens such as `%h`, `%p`,
+//! and `%r` remain unexpanded. A future connection path must resolve them with
+//! OpenSSH-equivalent semantics or reject them before use.
+//!
+//! File-backed parsing intentionally confines every `Include` target to the
+//! canonical parent directory of the top-level config. This is stricter than
+//! OpenSSH: absolute, `~`, `..`, and symlinked targets are ignored when their
+//! canonical destination escapes that root.
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -205,8 +215,12 @@ fn bounded_source_label(raw: &str, tag: &str) -> String {
     format!("{content}{suffix}")
 }
 
-/// Parsed SSH host facts. Values are the first values obtained for the alias,
-/// following OpenSSH's per-keyword precedence rule.
+/// Parsed SSH host-discovery facts.
+///
+/// Values are the first values obtained for the alias, following OpenSSH's
+/// per-keyword precedence rule, but they are not an effective connection
+/// configuration. Percent tokens such as `%h`, `%p`, and `%r` remain literal;
+/// callers must not pass unresolved values to a future connection path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SshHost {
     alias: String,
@@ -224,12 +238,18 @@ impl SshHost {
     }
 
     /// The configured `HostName`, if one was provided.
+    ///
+    /// This is the literal, unexpanded value and may still contain percent
+    /// tokens. It is discovery metadata, not a connection-ready hostname.
     #[must_use]
     pub fn host_name(&self) -> Option<&str> {
         self.host_name.as_deref()
     }
 
     /// The configured `User`, if one was provided.
+    ///
+    /// This is the literal, unexpanded value and may still contain percent
+    /// tokens. It is discovery metadata, not a connection-ready login name.
     #[must_use]
     pub fn user(&self) -> Option<&str> {
         self.user.as_deref()
@@ -269,7 +289,10 @@ impl SshConfig {
     /// at 256, include expansion at 65,536 charged units, emitted tokens at
     /// 262,144, and distinct discovered hosts at 65,536. Relative `Include`
     /// paths are resolved from the top-level path's parent, including in files
-    /// reached through nested includes.
+    /// reached through nested includes. Every candidate must canonicalize
+    /// beneath that canonical parent. This confinement is intentionally
+    /// stricter than OpenSSH: an absolute, `~`, `..`, or symlinked target whose
+    /// canonical destination escapes the root is ignored.
     pub fn read(path: &Path) -> Result<Self, SshConfigError> {
         Self::read_with_limits(path, DEFAULT_LIMITS)
     }
@@ -310,7 +333,8 @@ impl SshConfig {
     /// This is useful for deterministic callers that already expanded their
     /// source, and keeps the parser independently testable. Use [`Self::read`]
     /// for normal file loading. Inputs larger than one MiB are rejected before
-    /// tokenization.
+    /// tokenization. `HostName` and `User` percent tokens remain literal; the
+    /// returned facts must not be treated as connection-ready values.
     pub fn parse(text: &str) -> Result<Self, SshConfigError> {
         Self::parse_with_limits(text, DEFAULT_LIMITS)
     }
@@ -320,9 +344,12 @@ impl SshConfig {
             return Err(error(0, SshConfigErrorKind::FileTooLarge));
         }
         let inline_id = SshSourceId(0);
-        let sources = vec![inline_source(inline_id)];
-        let mut token_items = 0usize;
-        let blocks = parse_text(text, 0, inline_id, &mut token_items, limits.token_items)?;
+        let mut state = ParseState::new(text.len(), limits);
+        state.sources.push(inline_source(inline_id));
+        parse_source(text, 0, inline_id, IncludeHandling::Ignore, &mut state)?;
+        let ParseState {
+            blocks, sources, ..
+        } = state;
         Self::from_blocks_with_limit(&blocks, sources, limits)
     }
 
@@ -628,6 +655,8 @@ impl SshConfigError {
 pub enum SshConfigErrorKind {
     /// A directive needs an argument that was not present.
     MissingArgument,
+    /// A supported single-argument directive has extra arguments.
+    SurplusArgument,
     /// A `Host` directive has no patterns.
     MissingHostPattern,
     /// A `Port` argument is not a valid TCP port.
@@ -835,6 +864,16 @@ impl Setting {
     }
 }
 
+/// `Include` is the only directive whose behavior differs between the two
+/// public parsing paths. Inline parsing keeps it opaque and performs no
+/// filesystem access. File parsing follows it through the dedicated confined
+/// handler below. All other directive semantics live in [`parse_source`].
+#[derive(Clone, Copy, Debug)]
+enum IncludeHandling<'a> {
+    Ignore,
+    FollowConfined { root: &'a Path, depth: usize },
+}
+
 fn parse_file(
     text: &str,
     source: &Path,
@@ -851,20 +890,31 @@ fn parse_file(
     if depth > MAX_INCLUDE_DEPTH || !state.active.insert(source.to_path_buf()) {
         return Ok(());
     }
-    let result = parse_file_body(text, source_id, root, depth, state);
+    let result = parse_source(
+        text,
+        0,
+        source_id,
+        IncludeHandling::FollowConfined { root, depth },
+        state,
+    );
     state.active.remove(source);
     result
 }
 
-fn parse_file_body(
+/// Behavior-preserving parsing core shared by inline text and every file,
+/// including recursively followed sources. Keeping the line/token loop here
+/// makes directive validation, block construction, source provenance, and
+/// token charging identical on both paths; only `Include` delegates to the
+/// explicitly selected policy.
+fn parse_source(
     text: &str,
+    line_offset: usize,
     source_id: SshSourceId,
-    root: &Path,
-    depth: usize,
+    include_handling: IncludeHandling<'_>,
     state: &mut ParseState,
 ) -> Result<(), SshConfigError> {
     for (line_index, line) in text.lines().enumerate() {
-        let line_number = line_index + 1;
+        let line_number = line_index + 1 + line_offset;
         let tokens = tokenize(
             line,
             line_number,
@@ -896,61 +946,11 @@ fn parse_file_body(
                 state.current = Some(state.blocks.len() - 1);
             }
             "include" => {
-                if tokens.len() < 2 {
-                    return Err(error(line_number, SshConfigErrorKind::MissingArgument));
-                }
-                // OpenSSH roots every relative Include in a user config at the
-                // user configuration directory, represented here by `root`.
-                for pattern in &tokens[1..] {
-                    let remaining = state
-                        .limits
-                        .included_files
-                        .saturating_sub(state.included_files);
-                    let included_paths = expand_include(
-                        pattern,
-                        root,
-                        remaining,
-                        &mut state.include_expansion,
-                        line_number,
-                    )?;
-                    for included in included_paths {
-                        if state.included_files >= state.limits.included_files {
-                            return Err(error(
-                                line_number,
-                                SshConfigErrorKind::IncludedFilesExceeded,
-                            ));
-                        }
-                        state.included_files += 1;
-                        let Some(included_source) = canonicalize_within(&included, root) else {
-                            continue;
-                        };
-                        if depth >= MAX_INCLUDE_DEPTH || state.active.contains(&included_source) {
-                            continue;
-                        }
-                        let Some(included_text) =
-                            read_text_file(&included_source, line_number, state.limits.file_bytes)?
-                        else {
-                            continue;
-                        };
-                        state.charge_source_bytes(included_text.len(), line_number)?;
-                        let included_source_id = state.intern_source(&included_source, root);
-                        // OpenSSH restores the caller's current Host context
-                        // after an included file returns, and settings at the
-                        // start of an included file attach to that caller
-                        // context. Save and restore `current` around the
-                        // recursive parse, including on the error path.
-                        let saved_current = state.current;
-                        let result = parse_file(
-                            &included_text,
-                            &included_source,
-                            included_source_id,
-                            root,
-                            depth + 1,
-                            state,
-                        );
-                        state.current = saved_current;
-                        result?;
+                if let IncludeHandling::FollowConfined { root, depth } = include_handling {
+                    if tokens.len() < 2 {
+                        return Err(error(line_number, SshConfigErrorKind::MissingArgument));
                     }
+                    follow_confined_includes(&tokens[1..], root, depth, line_number, state)?;
                 }
             }
             "hostname" | "user" | "port" => {
@@ -963,6 +963,13 @@ fn parse_file_body(
                     "port" => Setting::Port(parse_port(value, line_number)?),
                     _ => unreachable!("keyword was matched above"),
                 };
+                // OpenSSH validates the first argument before reporting trailing
+                // garbage (for example, `Port invalid extra` is InvalidPort).
+                // Preserve that diagnostic ordering while rejecting every
+                // extra argument for the supported single-value directives.
+                if tokens.len() > 2 {
+                    return Err(error(line_number, SshConfigErrorKind::SurplusArgument));
+                }
                 if let Some(index) = state.current {
                     state.blocks[index].push_setting(setting);
                 } else {
@@ -985,70 +992,73 @@ fn parse_file_body(
     Ok(())
 }
 
-fn parse_text(
-    text: &str,
-    line_offset: usize,
-    source_id: SshSourceId,
-    token_items: &mut usize,
-    token_limit: usize,
-) -> Result<Vec<Block>, SshConfigError> {
-    let mut blocks = Vec::new();
-    let mut current = None;
-    for (line_index, line) in text.lines().enumerate() {
-        let line_number = line_index + 1 + line_offset;
-        let tokens = tokenize(line, line_number, token_items, token_limit)?;
-        if tokens.is_empty() {
-            continue;
-        }
-        let keyword = tokens[0].to_ascii_lowercase();
-        match keyword.as_str() {
-            "host" => {
-                if tokens.len() < 2 {
-                    return Err(error(line_number, SshConfigErrorKind::MissingHostPattern));
-                }
-                blocks.push(Block {
-                    patterns: Some(tokens[1..].to_vec()),
-                    settings: Vec::new(),
-                    source: source_id,
-                });
-                current = Some(blocks.len() - 1);
+/// Follow already-tokenized Include patterns without weakening any of the
+/// filesystem boundary. The order below is security-significant: expansion is
+/// globally budgeted before filesystem work, the include count is charged
+/// before canonicalization/read, regular files are opened through the no-follow
+/// seam, bytes are charged before parsing, and caller context is restored on
+/// both success and error.
+fn follow_confined_includes(
+    patterns: &[String],
+    root: &Path,
+    depth: usize,
+    line_number: usize,
+    state: &mut ParseState,
+) -> Result<(), SshConfigError> {
+    // OpenSSH roots every relative Include in a user config at the user
+    // configuration directory, represented here by `root`. Noren additionally
+    // requires every canonical target to remain under that root.
+    for pattern in patterns {
+        let remaining = state
+            .limits
+            .included_files
+            .saturating_sub(state.included_files);
+        let included_paths = expand_include(
+            pattern,
+            root,
+            remaining,
+            &mut state.include_expansion,
+            line_number,
+        )?;
+        for included in included_paths {
+            if state.included_files >= state.limits.included_files {
+                return Err(error(
+                    line_number,
+                    SshConfigErrorKind::IncludedFilesExceeded,
+                ));
             }
-            "match" => {
-                blocks.push(Block {
-                    patterns: Some(Vec::new()),
-                    settings: Vec::new(),
-                    source: source_id,
-                });
-                current = Some(blocks.len() - 1);
+            state.included_files += 1;
+            let Some(included_source) = canonicalize_within(&included, root) else {
+                continue;
+            };
+            if depth >= MAX_INCLUDE_DEPTH || state.active.contains(&included_source) {
+                continue;
             }
-            "hostname" | "user" | "port" => {
-                let value = tokens
-                    .get(1)
-                    .ok_or_else(|| error(line_number, SshConfigErrorKind::MissingArgument))?;
-                let setting = match keyword.as_str() {
-                    "hostname" => Setting::HostName(value.clone()),
-                    "user" => Setting::User(value.clone()),
-                    "port" => Setting::Port(parse_port(value, line_number)?),
-                    _ => unreachable!("keyword was matched above"),
-                };
-                if let Some(index) = current {
-                    blocks[index].push_setting(setting);
-                } else {
-                    let mut block = Block {
-                        patterns: None,
-                        settings: Vec::new(),
-                        source: source_id,
-                    };
-                    block.push_setting(setting);
-                    blocks.push(block);
-                    current = Some(blocks.len() - 1);
-                }
-            }
-            "include" => {}
-            _ => {}
+            let Some(included_text) =
+                read_text_file(&included_source, line_number, state.limits.file_bytes)?
+            else {
+                continue;
+            };
+            state.charge_source_bytes(included_text.len(), line_number)?;
+            let included_source_id = state.intern_source(&included_source, root);
+            // OpenSSH restores the caller's current Host context after an
+            // included file returns, and settings at the start of an included
+            // file attach to that caller context. Save and restore `current`
+            // around the recursive parse, including on the error path.
+            let saved_current = state.current;
+            let result = parse_file(
+                &included_text,
+                &included_source,
+                included_source_id,
+                root,
+                depth + 1,
+                state,
+            );
+            state.current = saved_current;
+            result?;
         }
     }
-    Ok(blocks)
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1781,6 +1791,33 @@ mod tests {
             .len()
     }
 
+    fn parse_blocks_for_test(
+        text: &str,
+        line_offset: usize,
+        source_id: SshSourceId,
+        token_items: &mut usize,
+        token_limit: usize,
+    ) -> Result<Vec<Block>, SshConfigError> {
+        let mut state = ParseState::new(
+            text.len(),
+            ParserLimits {
+                token_items: token_limit,
+                ..DEFAULT_LIMITS
+            },
+        );
+        state.token_items = *token_items;
+        let result = parse_source(
+            text,
+            line_offset,
+            source_id,
+            IncludeHandling::Ignore,
+            &mut state,
+        );
+        *token_items = state.token_items;
+        result?;
+        Ok(state.blocks)
+    }
+
     #[test]
     fn missing_home_has_no_home_directory() {
         assert_eq!(home_directory(None), None);
@@ -2092,8 +2129,9 @@ mod tests {
         assert_eq!(text.len(), 1_048_567);
 
         let mut token_items = 0usize;
-        let blocks = parse_text(&text, 0, SshSourceId(0), &mut token_items, MAX_TOKEN_ITEMS)
-            .expect("reviewer shape tokenizes");
+        let blocks =
+            parse_blocks_for_test(&text, 0, SshSourceId(0), &mut token_items, MAX_TOKEN_ITEMS)
+                .expect("reviewer shape tokenizes");
         assert_eq!(blocks.len(), 1);
         assert_eq!(
             blocks[0].settings.len(),
@@ -2116,7 +2154,7 @@ mod tests {
     #[test]
     fn indexed_resolution_work_bites_at_boundary_and_saturates_on_overflow() {
         let mut token_items = 0usize;
-        let blocks = parse_text(
+        let blocks = parse_blocks_for_test(
             "Host a\nHostName x\n",
             0,
             SshSourceId(0),
@@ -2206,7 +2244,7 @@ mod tests {
     #[test]
     fn self_negation_discovery_work_is_preflight_bounded() {
         let mut token_items = 0usize;
-        let blocks = parse_text(
+        let blocks = parse_blocks_for_test(
             "Host abcdef !*\n",
             0,
             SshSourceId(0),
@@ -2382,11 +2420,110 @@ mod tests {
 
     #[test]
     fn empty_quoted_values_are_preserved() {
-        let config = SshConfig::parse("Host empty\nHostName \"\"\nUser \"\" realuser\n")
+        let config = SshConfig::parse("Host empty\nHostName \"\"\nUser \"\"\n")
             .expect("empty quoted values parse");
 
         assert_eq!(config.hosts()[0].host_name(), Some(""));
         assert_eq!(config.hosts()[0].user(), Some(""));
+    }
+
+    #[test]
+    fn percent_tokens_remain_literal_discovery_metadata() {
+        let config = SshConfig::parse("Host tokenized\n  HostName %h-via-%p.example\n  User %r\n")
+            .expect("token-bearing discovery facts parse");
+
+        assert_eq!(config.hosts().len(), 1);
+        assert_eq!(config.hosts()[0].host_name(), Some("%h-via-%p.example"));
+        assert_eq!(config.hosts()[0].user(), Some("%r"));
+    }
+
+    #[test]
+    fn direct_single_value_directives_reject_surplus_arguments() {
+        let secret = "surplus-secret-value";
+        for directive in [
+            format!("HostName target.example {secret}-hostname"),
+            format!("User deploy {secret}-user"),
+            format!("Port 2200 {secret}-port"),
+        ] {
+            let text = format!("# direct source\nHost direct\n{directive}\nHost after\n");
+            let error = SshConfig::parse(&text)
+                .expect_err("every supported single-value directive rejects a surplus token");
+
+            assert_eq!(error.line(), 3);
+            assert_eq!(error.kind(), &SshConfigErrorKind::SurplusArgument);
+            assert!(!error.to_string().contains(secret));
+            assert!(!format!("{error:?}").contains(secret));
+        }
+    }
+
+    #[test]
+    fn invalid_port_precedes_surplus_argument_like_openssh() {
+        let error = SshConfig::parse("Host direct\nPort invalid extra\n")
+            .expect_err("the invalid first Port argument is diagnosed first");
+
+        assert_eq!(error.line(), 2);
+        assert_eq!(error.kind(), &SshConfigErrorKind::InvalidPort);
+    }
+
+    #[test]
+    fn direct_and_included_sources_share_supported_directive_semantics() {
+        let body = "Host parity\n  HostName %h-via-%p.example\n  User %r\n  Port 2200\n";
+        let direct = SshConfig::parse(body).expect("direct source parses");
+
+        let fixture = Fixture::new("shared-directive-core");
+        let config_path = fixture.write("config", "Include parts/body.conf\n");
+        fixture.write("parts/body.conf", body);
+        let included = SshConfig::read(&config_path).expect("included source parses");
+
+        assert_eq!(direct.hosts().len(), 1);
+        assert_eq!(included.hosts().len(), 1);
+        let direct = &direct.hosts()[0];
+        let included = &included.hosts()[0];
+        assert_eq!(direct.alias(), included.alias());
+        assert_eq!(direct.host_name(), included.host_name());
+        assert_eq!(direct.user(), included.user());
+        assert_eq!(direct.port(), included.port());
+        assert_eq!(included.declared_source().ordinal(), 1);
+    }
+
+    #[test]
+    fn included_single_value_directives_reject_surplus_arguments() {
+        let fixture = Fixture::new("included-surplus-argument");
+        let config_path = fixture.write("config", "Include parts/body.conf\n");
+        let secret = "included-surplus-secret";
+
+        for directive in [
+            format!("HostName target.example {secret}-hostname"),
+            format!("User deploy {secret}-user"),
+            format!("Port 2200 {secret}-port"),
+        ] {
+            fixture.write(
+                "parts/body.conf",
+                &format!("Host included\n{directive}\nHost after\n"),
+            );
+            let error = SshConfig::read(&config_path)
+                .expect_err("included directives use the same strict single-value parsing core");
+
+            assert_eq!(error.line(), 2);
+            assert_eq!(error.kind(), &SshConfigErrorKind::SurplusArgument);
+            assert!(!error.to_string().contains(secret));
+            assert!(!format!("{error:?}").contains(secret));
+        }
+    }
+
+    #[test]
+    fn inline_include_stays_opaque_while_file_include_is_validated() {
+        let inline = SshConfig::parse("Include\nHost inline\n  User direct\n")
+            .expect("inline parsing keeps Include opaque");
+        assert_eq!(inline.hosts().len(), 1);
+        assert_eq!(inline.hosts()[0].alias(), "inline");
+
+        let fixture = Fixture::new("explicit-include-policy");
+        let config_path = fixture.write("config", "Include\nHost file-backed\n");
+        let error = SshConfig::read(&config_path)
+            .expect_err("file parsing explicitly validates Include arguments");
+        assert_eq!(error.line(), 1);
+        assert_eq!(error.kind(), &SshConfigErrorKind::MissingArgument);
     }
 
     #[test]

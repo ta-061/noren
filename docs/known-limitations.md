@@ -5,11 +5,12 @@ This document exists so that the first thing a reader meets is what Noren
 first artifact is an explicitly dated developer preview, not a
 `0.1.0-preview` of the product; this page is the substance behind that framing.
 This page retains a 2026-08-08 verification baseline. The SSH/sidebar and
-renderer claims changed for PR 120 were verified against the candidate tree on
-2026-08-13. Citations point at the file, function, type, constant, or test that
-establishes them. Names are used rather than line numbers, which rot; where a
-count is genuinely needed the command that reproduces it is given instead. If
-anything here has drifted, treat the code as correct and this page as a bug.
+renderer claims changed for PR 120, plus the SSH parser follow-ups for Issue
+#117, were verified against their candidate trees on 2026-08-13. Citations
+point at the file, function, type, constant, or test that establishes them.
+Names are used rather than line numbers, which rot; where a count is genuinely
+needed the command that reproduces it is given instead. If anything here has
+drifted, treat the code as correct and this page as a bug.
 
 ## What Noren is today
 
@@ -57,14 +58,20 @@ binary. What now actually happens on screen:
 - **The SSH sidebar is bounded and explicitly partial.** `SshConfig` labels its
   scope as `HostDiscoveryKind::PartialLiteralPatterns`: only positive literal
   aliases written in `Host` directives become browseable targets. `HostName`,
-  `User`, and `Port` participate in bounded first-value resolution, and
-  root-relative `Include` files are followed in lexical order only when their
-  canonical targets remain below the top-level config directory. `Match`,
-  wildcard-only destinations, system configuration, token expansion, and other
-  dynamic OpenSSH behaviour cannot make this a complete host inventory. The UI
-  says `partial literal aliases`, retains at most `MAX_SSH_SIDEBAR_HOSTS` (24),
-  and shows the selected alias's stable source tag plus a bounded root-relative
-  label; it never retains or displays the canonical HOME prefix.
+  `User`, and `Port` participate in bounded first-value resolution, but
+  `HostName` and `User` remain literal: `%h`, `%p`, `%r`, and other percent
+  tokens are not expanded. Those values are discovery metadata and must be
+  resolved with OpenSSH-equivalent semantics or rejected before any future
+  connection use. Root-relative `Include` files are followed in lexical order
+  only when their canonical targets remain below the top-level config
+  directory. That canonical-root confinement is intentionally stricter than
+  OpenSSH: absolute, `~`, `..`, and symlinked targets outside the root are
+  ignored. `Match`, wildcard-only destinations, system configuration, token
+  expansion, and other dynamic OpenSSH behaviour cannot make this a complete
+  host inventory. The UI says `partial literal aliases`, retains at most
+  `MAX_SSH_SIDEBAR_HOSTS` (24), and shows the selected alias's stable source tag
+  plus a bounded root-relative label; it never retains or displays the
+  canonical HOME prefix.
 
 It is still **not** the full workspace product that [ADR
 0003](adr/0003-noren-zellij-responsibility-boundary.md) describes — one local
@@ -156,11 +163,13 @@ Each item states what you would actually see if you ran the build.
   patterns are matching policy rather than concrete aliases, `Match` and token
   expansion are not evaluated into destinations, and includes outside the
   top-level configuration directory are deliberately ignored even though
-  OpenSSH may accept them. The status row therefore never calls the rows a
-  complete host list. It shows only the first 24 literal aliases and reports an
-  omitted count; selecting a row shows where its first literal declaration came
-  from, but does not prove the effective configuration that a future connection
-  will use.
+  OpenSSH may accept them. A retained `HostName` or `User` can therefore still
+  contain literal `%h`, `%p`, or `%r`; it is not safe connection input until a
+  future resolver expands it with OpenSSH-equivalent semantics or rejects it.
+  The status row therefore never calls the rows a complete host list. It shows
+  only the first 24 literal aliases and reports an omitted count; selecting a
+  row shows where its first literal declaration came from, but does not prove
+  the effective configuration that a future connection will use.
 - **There is one live session, not session switching.** The sidebar may list
   restored or palette-created model entries, but only the startup session owns
   the terminal viewport and input. Clicking an inactive row cannot move that
