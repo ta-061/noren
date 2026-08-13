@@ -1,7 +1,7 @@
 use super::*;
 use noren_app::palette::CommandId;
 use noren_app::passthrough::{self, collisions};
-use noren_app::session_persistence::load;
+use noren_app::session_persistence::{MAX_SESSION_STATE_BYTES, load};
 use noren_app::sidebar::EntryKind;
 
 #[test]
@@ -3056,6 +3056,10 @@ fn corrupt_state_file_surfaces_error_without_panicking() {
         state.sidebar().is_empty(),
         "corrupt file leaves empty sidebar"
     );
+    assert!(
+        state.persistence_unverified(),
+        "the restore error is the current unsafe persistence outcome"
+    );
     cleanup_state_file(&path);
 }
 
@@ -3472,6 +3476,180 @@ fn second_instance_overwrite_is_detected_and_reported_by_diagnostics() {
     cleanup_state_file(&path);
 }
 
+// Pure persistence-transition tests moved beside the binary-private state
+// machine in `persistence_state.rs`. Filesystem and diagnostics integration
+// coverage remains here.
+
+/// The diagnostic integration follows the state machine's two-stage outcome:
+/// a definitive post-save replacement is currently unverified, while a later
+/// exact retry clears that current flag and reveals the sticky conflict.
+#[test]
+fn post_save_absence_or_mismatch_then_exact_retry_moves_diagnostics_to_changed_underneath() {
+    for (case, replacement) in [
+        ("absence", Observation::Observed(None)),
+        (
+            "mismatch",
+            Observation::Observed(Some(b"peer replacement".to_vec())),
+        ),
+    ] {
+        let baseline = b"verified baseline".to_vec();
+        let first_write = b"first intended bytes".to_vec();
+        let retry_write = b"retry intended bytes".to_vec();
+        let mut app = NorenApp::new(AppConfig::default());
+        app.workspace
+            .persistence
+            .restore_succeeded(Some(baseline.clone()));
+        app.workspace.persistence.apply_attempt(AttemptOutcome::new(
+            Observation::Observed(Some(baseline)),
+            SaveOutcome::Written {
+                intended: first_write,
+                observed: replacement.clone(),
+            },
+        ));
+
+        assert!(app.workspace.persistence_conflict(), "case={case}");
+        assert!(app.workspace.persistence_unverified(), "case={case}");
+        app.toggle_diagnostics();
+        assert!(
+            app.diagnostics_line.ends_with("state=unverified"),
+            "case={case}: {}",
+            app.diagnostics_line
+        );
+        app.toggle_diagnostics();
+
+        app.workspace.persistence.apply_attempt(AttemptOutcome::new(
+            replacement,
+            SaveOutcome::Written {
+                intended: retry_write.clone(),
+                observed: Observation::Observed(Some(retry_write)),
+            },
+        ));
+
+        assert!(app.workspace.persistence_conflict(), "case={case}");
+        assert!(!app.workspace.persistence_unverified(), "case={case}");
+        app.toggle_diagnostics();
+        assert!(
+            app.diagnostics_line.ends_with("state=changed-underneath"),
+            "case={case}: {}",
+            app.diagnostics_line
+        );
+    }
+}
+
+/// Mutation check for Issue #122: if the `snapshot` error arm stops marking
+/// persistence unverified, an oversized external replacement falsely reports
+/// `state=ok` even though the conflict check could not inspect it.
+#[test]
+fn oversized_external_snapshot_never_reports_persistence_ok() {
+    let path = temp_state_path();
+    let mut app = app_with_state_path(&path);
+    std::fs::write(&path, vec![b'#'; MAX_SESSION_STATE_BYTES as usize + 1])
+        .expect("write oversized external replacement");
+
+    app.workspace.create_session(SessionKind::Local);
+
+    assert!(
+        app.workspace.persistence_unverified(),
+        "the failed external-change check must remain visible"
+    );
+    app.toggle_diagnostics();
+    assert!(
+        app.diagnostics_line.contains("state=unverified"),
+        "diagnostics: {}",
+        app.diagnostics_line
+    );
+    assert!(
+        !app.diagnostics_line.contains("state=ok"),
+        "diagnostics must not certify an uninspected save: {}",
+        app.diagnostics_line
+    );
+
+    let mut saved = SessionRegistry::new();
+    load(&path, &mut saved).expect("the atomic save itself still succeeds");
+    assert_eq!(
+        saved.len(),
+        1,
+        "the warning is about verification, not loss"
+    );
+    cleanup_state_file(&path);
+}
+
+/// Mutation check for Issue #122: replacing the state file with a directory
+/// makes both inspection and atomic rename fail. Dropping failure propagation
+/// would leave two in-memory sessions behind a false `state=ok` diagnostic.
+#[test]
+fn directory_replacement_save_failure_never_reports_persistence_ok() {
+    let path = temp_state_path();
+    let mut app = app_with_state_path(&path);
+    app.workspace.create_session(SessionKind::Local);
+    std::fs::remove_file(&path).expect("remove saved state fixture");
+    std::fs::create_dir(&path).expect("replace the state path with a directory");
+
+    app.workspace.create_session(SessionKind::Local);
+
+    assert_eq!(app.workspace.registry().len(), 2, "memory did mutate");
+    assert!(
+        path.is_dir(),
+        "the failed save did not replace the directory"
+    );
+    assert!(
+        app.workspace.persistence_unverified(),
+        "the failed save must remain visible"
+    );
+    app.toggle_diagnostics();
+    assert!(
+        app.diagnostics_line.contains("state=unverified"),
+        "diagnostics: {}",
+        app.diagnostics_line
+    );
+    assert!(
+        !app.diagnostics_line.contains("state=ok"),
+        "diagnostics must not certify unsaved state: {}",
+        app.diagnostics_line
+    );
+
+    std::fs::remove_dir(&path).expect("remove directory replacement fixture");
+}
+
+/// Isolate the save-error arm from the pre-save inspection arm. The existing
+/// file is readable and unchanged, but the new in-memory document is too large
+/// to encode; removing save-error propagation therefore makes this test fail.
+#[test]
+fn save_failure_after_clean_inspection_never_reports_persistence_ok() {
+    let path = temp_state_path();
+    let mut app = app_with_state_path(&path);
+    app.workspace.create_session(SessionKind::Local);
+    let before = std::fs::read(&path).expect("read the clean baseline");
+
+    app.workspace.create_session(SessionKind::Ssh {
+        target: "x".repeat(MAX_SESSION_STATE_BYTES as usize + 1),
+    });
+
+    assert_eq!(
+        std::fs::read(&path).expect("the baseline remains readable"),
+        before,
+        "a refused save must leave the prior safe state intact"
+    );
+    assert!(
+        app.workspace.persistence_unverified(),
+        "a save error after clean inspection must remain visible"
+    );
+    app.toggle_diagnostics();
+    assert!(
+        app.diagnostics_line.contains("state=unverified"),
+        "diagnostics: {}",
+        app.diagnostics_line
+    );
+    assert!(
+        !app.diagnostics_line.contains("state=ok"),
+        "diagnostics must not certify unsaved state: {}",
+        app.diagnostics_line
+    );
+    cleanup_state_file(&path);
+}
+
+/// Clean persistence must remain distinguishable from both Issue #122 error
+/// paths; making either the default or successful path unverified breaks this.
 #[test]
 fn single_instance_save_has_no_persistence_false_alarm() {
     let path = temp_state_path();
@@ -3489,5 +3667,12 @@ fn single_instance_save_has_no_persistence_false_alarm() {
         "diagnostics: {}",
         app.diagnostics_line
     );
+    assert!(
+        !app.diagnostics_line.contains("unverified"),
+        "diagnostics: {}",
+        app.diagnostics_line
+    );
+    let saved = std::fs::read(&path).expect("read exact verified save");
+    assert!(!saved.is_empty(), "the real save path wrote a document");
     cleanup_state_file(&path);
 }

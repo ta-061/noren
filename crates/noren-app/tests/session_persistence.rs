@@ -18,7 +18,7 @@
 use noren_app::session::{SessionDescriptor, SessionKind, SessionRegistry, SessionStatus};
 use noren_app::session_persistence::{
     MAX_SESSION_STATE_BYTES, MAX_SESSIONS, SESSION_STATE_VERSION, SessionPersistenceError, encode,
-    load, load_bytes, save,
+    load, load_bytes, save, save_snapshot,
 };
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -227,6 +227,24 @@ fn encoding_is_deterministic_across_saves() {
     );
     cleanup(&first);
     cleanup(&second);
+}
+
+#[test]
+fn save_snapshot_returns_the_exact_bounded_bytes_written() {
+    let source = sidebar_registry();
+    let path = temp_path("returned-save-snapshot.toml");
+
+    let intended = save_snapshot(&path, &source).expect("state saves with exact bytes");
+
+    assert_eq!(
+        intended,
+        std::fs::read(&path).expect("saved state remains readable")
+    );
+    assert!(
+        intended.len() <= MAX_SESSION_STATE_BYTES as usize,
+        "the returned verification buffer shares the serialization bound"
+    );
+    cleanup(&path);
 }
 
 #[test]

@@ -195,8 +195,30 @@ impl std::error::Error for SessionPersistenceError {}
 /// more than [`MAX_SESSIONS`] entries or a document larger than
 /// [`MAX_SESSION_STATE_BYTES`]. Parent directories are created when absent.
 pub fn save(path: &Path, registry: &SessionRegistry) -> Result<(), SessionPersistenceError> {
-    let text = encode(registry)?;
-    write_atomic(path, text.as_bytes())
+    save_snapshot(path, registry).map(drop)
+}
+
+/// Save the sidebar state and return the exact bounded bytes handed to the
+/// atomic writer.
+///
+/// This function is public only because this package's library and binary are
+/// separate crates: the binary needs the exact write bytes for post-save
+/// verification and cannot call a library-private item. The returned buffer
+/// is no larger than [`MAX_SESSION_STATE_BYTES`], enforced by [`encode`].
+///
+/// Callers that verify a save must compare their post-save observation with
+/// this value. Merely observing that some file exists after the rename is not
+/// evidence that it contains this process's document: another process may
+/// have replaced it between the write and the observation. The returned
+/// buffer is therefore the intended document, not a claim about later disk
+/// contents.
+pub fn save_snapshot(
+    path: &Path,
+    registry: &SessionRegistry,
+) -> Result<Vec<u8>, SessionPersistenceError> {
+    let bytes = encode(registry)?.into_bytes();
+    write_atomic(path, &bytes)?;
+    Ok(bytes)
 }
 
 /// Load the sidebar state from `path` into `registry`, creating one entry
