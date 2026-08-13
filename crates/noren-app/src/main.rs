@@ -1839,7 +1839,12 @@ impl ApplicationHandler for NorenApp {
             WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(&event),
             WindowEvent::Ime(_) => {
-                let _ = KeyDropReason::ImeOrDeadKey;
+                // An Ime event means composition replaced the keyboard path:
+                // the typed content is dropped unread because IME support
+                // itself is deferred. The record is argument-free, so the
+                // drop surfaces in diagnostics as a count that can never
+                // carry the composed text.
+                diagnostics::record_ime_drop();
             }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             _ => {}

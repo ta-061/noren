@@ -2,23 +2,49 @@
 //!
 //! One key chord (Super+D, see `main.rs`) asks this module for a single-line
 //! report of the live state: grid geometry, active modes, scrollback length,
-//! and PTY child status. Each trigger emits exactly one bounded line — to the
-//! window title and standard error — so the feature is opt-in and cannot grow
-//! into an unbounded log.
+//! PTY child status, and the IME/dead-key input drop count. Each trigger
+//! emits exactly one bounded line — to the window title and standard error —
+//! so the feature is opt-in and cannot grow into an unbounded log.
 //!
 //! # Privacy rule
 //!
 //! Diagnostics report counters and flags only: grid dimensions, mode bits,
-//! scrollback length against its hard cap, and the child exit code. They
-//! never include PTY output bytes, screen cell text, scrollback contents,
-//! terminal replies, or input, because that content is user data and may
-//! contain secrets. There is deliberately no opt-in for content: no API in
-//! this module accepts or returns screen text, and [`report`] cannot name it.
-//! Any future feature that would emit content requires a threat-model change
-//! (TM-08) before it is designed.
+//! scrollback length against its hard cap, the child exit code, and the
+//! IME/dead-key drop counter. They never include PTY output bytes, screen
+//! cell text, scrollback contents, terminal replies, or input, because that
+//! content is user data and may contain secrets. There is deliberately no
+//! opt-in for content: no API in this module accepts or returns screen text,
+//! and [`report`] cannot name it. Drop counting is a number, not content:
+//! [`record_ime_drop`] takes no arguments at all, so there is no path by
+//! which a dropped payload could reach the counter or the report. Any future
+//! feature that would emit content requires a threat-model change (TM-08)
+//! before it is designed.
 
 use noren_terminal::{MAX_SCROLLBACK_LINES, TerminalModes, TerminalSnapshot};
 use std::fmt::{self, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// IME and dead-key drops recorded by [`record_ime_drop`].
+///
+/// The counter is process-wide because drops are observed on the event loop
+/// while reports are assembled from terminal snapshots. It can only ever be
+/// a number: the recording API accepts no payload, so the count can never
+/// carry the dropped character.
+static IME_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Record that one IME composition or dead-key event was dropped.
+///
+/// Deliberately argument-free: only the fact of the drop crosses into
+/// diagnostics, never the composed or dead-key text.
+pub fn record_ime_drop() {
+    IME_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Number of IME/dead-key drops recorded in this process so far.
+#[must_use]
+pub fn ime_drop_count() -> u64 {
+    IME_DROP_COUNT.load(Ordering::Relaxed)
+}
 
 /// PTY child status as observed by the application.
 ///
@@ -114,7 +140,9 @@ impl DiagnosticsInput {
 ///
 /// The output is a fixed field sequence with no free text, so its length is
 /// bounded by its numeric fields; hostile terminal state cannot inject
-/// content into the overlay or log.
+/// content into the overlay or log. The `ime_drops` field reads the
+/// process-wide drop counter recorded on the event loop (see
+/// [`record_ime_drop`]).
 #[must_use]
 pub fn report(input: &DiagnosticsInput) -> String {
     let mut out = String::with_capacity(128);
@@ -139,10 +167,11 @@ pub fn report(input: &DiagnosticsInput) -> String {
     }
     let _ = write!(
         out,
-        " scrollback={}/{} child={} state={}",
+        " scrollback={}/{} child={} ime_drops={} state={}",
         input.scrollback_len,
         input.scrollback_cap,
         input.pty,
+        ime_drop_count(),
         if input.persistence_unverified {
             "unverified"
         } else if input.persistence_conflict {
@@ -307,5 +336,27 @@ mod tests {
             from_snapshot(Some(&state), PtyChildStatus::Running).scrollback_cap,
             MAX_SCROLLBACK_LINES
         );
+    }
+
+    /// IME/dead-key drops surface in the report as a pure number. The
+    /// recording API is argument-free, so the count cannot carry dropped
+    /// content by construction; the report must stay bounded ASCII with the
+    /// persistence state last.
+    #[test]
+    fn ime_drops_are_counted_in_the_report_as_payload_free_numbers() {
+        let before = ime_drop_count();
+        record_ime_drop();
+        record_ime_drop();
+        record_ime_drop();
+        assert_eq!(ime_drop_count(), before + 3);
+
+        let line = report(&from_snapshot(None, PtyChildStatus::NotLaunched));
+        assert!(
+            line.contains(&format!("ime_drops={}", before + 3)),
+            "{line}"
+        );
+        assert!(line.ends_with("state=ok"), "{line}");
+        assert!(line.is_ascii(), "no free text can reach the report");
+        assert!(line.len() < 200, "report must stay bounded: {line}");
     }
 }
