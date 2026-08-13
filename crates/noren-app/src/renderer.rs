@@ -569,6 +569,30 @@ pub(crate) fn glyph_vertices(
     height: u32,
     metrics: CellMetrics,
 ) -> Vec<Vertex> {
+    glyph_vertices_with_budget(
+        terminal,
+        sidebar,
+        status,
+        width,
+        height,
+        metrics,
+        MAX_VERTICES,
+    )
+}
+
+/// Internal seam for exercising the production vertex-budget backstop without
+/// allocating a clamp-sized frame. The shipped path above always supplies
+/// [`MAX_VERTICES`]; tests use a smaller budget but traverse this same emission
+/// code and the same post-primitive guards.
+fn glyph_vertices_with_budget(
+    terminal: Option<&TerminalSnapshot>,
+    sidebar: Option<&[String]>,
+    status: Option<&str>,
+    width: u32,
+    height: u32,
+    metrics: CellMetrics,
+    vertex_budget: usize,
+) -> Vec<Vertex> {
     if width == 0 || height == 0 {
         return Vec::new();
     }
@@ -632,7 +656,7 @@ pub(crate) fn glyph_vertices(
                     row,
                     target,
                 );
-                if vertices.len() >= MAX_VERTICES {
+                if vertices.len() >= vertex_budget {
                     return vertices;
                 }
             }
@@ -660,7 +684,7 @@ pub(crate) fn glyph_vertices(
                             target,
                         );
                     }
-                    if vertices.len() >= MAX_VERTICES {
+                    if vertices.len() >= vertex_budget {
                         return vertices;
                     }
                     // A continuation cell draws no glyph but still owns its
@@ -679,7 +703,7 @@ pub(crate) fn glyph_vertices(
                             row,
                             target,
                         );
-                        if vertices.len() >= MAX_VERTICES {
+                        if vertices.len() >= vertex_budget {
                             return vertices;
                         }
                     }
@@ -701,7 +725,7 @@ pub(crate) fn glyph_vertices(
                         row,
                         target,
                     );
-                    if vertices.len() >= MAX_VERTICES {
+                    if vertices.len() >= vertex_budget {
                         return vertices;
                     }
                 }
@@ -908,7 +932,139 @@ mod tests {
     // #109). It is replaced by `frame_oracle::glyphs_stay_inside_the_render_clamp_grid`,
     // which reads pixels back from the real pipeline and asserts on *where*
     // glyphs land — the property a vertex-count assertion is structurally
-    // unable to pin.
+    // unable to pin. The separate test below exercises the vertex-budget
+    // backstop itself through a deliberately smaller budget (issue #118).
+
+    #[test]
+    fn vertex_budget_backstop_truncates_every_emission_path() {
+        let metrics = poc_metrics();
+        let height = metrics.height();
+        let glyph_budget = glyph_rows('A')
+            .iter()
+            .map(|row| row.count_ones() as usize)
+            .sum::<usize>()
+            * VERTICES_PER_RECT;
+        assert!(glyph_budget > 0, "the detector glyph must emit vertices");
+
+        // Each fixture has a known first primitive or glyph and additional
+        // drawable input after it. At a budget equal to that first emission,
+        // the limited result must be its exact prefix. A `<=` ceiling assertion
+        // would not prove which guard stopped emission; these exact prefix and
+        // positive-control checks fail if the relevant early return is removed.
+        let assert_truncated =
+            |path: &str, full: Vec<Vertex>, limited: Vec<Vertex>, expected_len: usize| {
+                assert!(
+                    full.len() > expected_len,
+                    "{path} fixture has no post-budget emission to detect a missing guard"
+                );
+                assert_eq!(
+                    limited.len(),
+                    expected_len,
+                    "{path} did not stop at the first budget-reaching emission"
+                );
+                assert_eq!(
+                    limited.as_slice(),
+                    &full[..expected_len],
+                    "{path} did not return the exact pre-backstop prefix"
+                );
+            };
+
+        let sidebar = vec!["AA".to_owned()];
+        let sidebar_width = u32::try_from(SIDEBAR_COLS).unwrap_or(u32::MAX) * metrics.width();
+        assert_truncated(
+            "sidebar glyph",
+            glyph_vertices(
+                None,
+                Some(sidebar.as_slice()),
+                None,
+                sidebar_width,
+                height,
+                metrics,
+            ),
+            glyph_vertices_with_budget(
+                None,
+                Some(sidebar.as_slice()),
+                None,
+                sidebar_width,
+                height,
+                metrics,
+                glyph_budget,
+            ),
+            glyph_budget,
+        );
+
+        let background_terminal = snapshot(1, 1, b"\x1b[48;2;12;98;201mA");
+        assert_truncated(
+            "terminal background rectangle",
+            glyph_vertices(
+                Some(&background_terminal),
+                None,
+                None,
+                metrics.width(),
+                height,
+                metrics,
+            ),
+            glyph_vertices_with_budget(
+                Some(&background_terminal),
+                None,
+                None,
+                metrics.width(),
+                height,
+                metrics,
+                VERTICES_PER_RECT,
+            ),
+            VERTICES_PER_RECT,
+        );
+
+        // Two ordinary cells would be a weak detector for the terminal-glyph
+        // guard: the background-path check runs before the second cell and
+        // could stop it instead. A combining mark shares the first cell, so
+        // only the guard inside this cell's character loop can suppress it.
+        let terminal_glyphs = snapshot(1, 1, "A\u{0301}".as_bytes());
+        let rows: Vec<_> = terminal_glyphs.display_cells().collect();
+        assert_eq!(
+            rows[0][0].text(),
+            "A\u{0301}",
+            "terminal-glyph fixture must keep both code points in one cell"
+        );
+        assert_truncated(
+            "terminal cell glyph",
+            glyph_vertices(
+                Some(&terminal_glyphs),
+                None,
+                None,
+                metrics.width(),
+                height,
+                metrics,
+            ),
+            glyph_vertices_with_budget(
+                Some(&terminal_glyphs),
+                None,
+                None,
+                metrics.width(),
+                height,
+                metrics,
+                glyph_budget,
+            ),
+            glyph_budget,
+        );
+
+        let status_width = 2 * metrics.width();
+        assert_truncated(
+            "status glyph",
+            glyph_vertices(None, None, Some("AA"), status_width, height, metrics),
+            glyph_vertices_with_budget(
+                None,
+                None,
+                Some("AA"),
+                status_width,
+                height,
+                metrics,
+                glyph_budget,
+            ),
+            glyph_budget,
+        );
+    }
 
     #[test]
     fn shared_frame_row_layout_pins_all_alignment_regimes() {
