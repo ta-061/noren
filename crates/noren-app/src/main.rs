@@ -1,7 +1,9 @@
 //! macOS entry point for the bounded local-zsh PTY PoC.
 
+mod mouse_mode_scanner;
 mod renderer;
 
+use mouse_mode_scanner::MouseModeScanner;
 use noren_app::{
     Arrow, CellMetrics, CursorKeyMode, FunctionKey, GridGeometry, GridSize, InputMode, Key,
     KeyDropReason, KeyEncoder, KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode,
@@ -477,103 +479,6 @@ fn created_session_id(events: Vec<SessionEvent>) -> SessionId {
             _ => None,
         })
         .expect("SessionAction::Create yields exactly one Created event")
-}
-
-/// Passive scanner that observes DECSET (`CSI ? Pn h`) and DECRST
-/// (`CSI ? Pn l`) sequences in PTY *output* and updates the app's
-/// [`MouseModes`].
-///
-/// TerminalState's parser recognises only modes 1, 1049, and 2004; mouse
-/// tracking and encoding modes (1000/1002/1003/1005/1006/1015) are dropped at
-/// `private_action` and never reach `TerminalModes`. This scanner sits on the
-/// output side as a read-only observer — it consumes no bytes and alters no
-/// parsing — so the terminal's own state machine is undisturbed. It exists
-/// because the alternative (a second parser) is what the project keeps filing
-/// as a bug; this is the narrowest possible seam.
-///
-/// Cross-chunk boundaries: the DFA retains its state across calls, so a
-/// `CSI ? 1000 h` split across two `PtyEvent::Output` chunks is still detected.
-#[derive(Default)]
-struct MouseModeScanner {
-    state: ScanState,
-    /// Parsed parameter values; supports multi-param sequences
-    /// (`CSI ? 1000 ; 1006 h`).
-    params: Vec<u16>,
-}
-
-#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
-enum ScanState {
-    #[default]
-    Ground,
-    Esc,
-    Csi,
-    /// After `ESC [ ?` or after a `;` separator — expecting the first digit
-    /// of the next parameter.
-    CsiQuestion,
-    /// Accumulating digits of the current parameter.
-    Param,
-}
-
-impl MouseModeScanner {
-    /// Feed one PTY output byte. Updates `modes` when a complete DECSET/DECRST
-    /// for a recognized mouse mode is observed.
-    fn feed(&mut self, byte: u8, modes: &mut MouseModes) {
-        // ESC always starts a fresh sequence regardless of current state.
-        if byte == 0x1b {
-            self.params.clear();
-            self.state = ScanState::Esc;
-            return;
-        }
-        match (self.state, byte) {
-            (ScanState::Esc, b'[') => {
-                self.state = ScanState::Csi;
-            }
-            (ScanState::Csi, b'?') => {
-                self.params.clear();
-                self.state = ScanState::CsiQuestion;
-            }
-            (ScanState::CsiQuestion, digit @ b'0'..=b'9') => {
-                self.params.push(u16::from(digit - b'0'));
-                self.state = ScanState::Param;
-            }
-            (ScanState::Param, digit @ b'0'..=b'9') => {
-                if let Some(last) = self.params.last_mut() {
-                    *last = last
-                        .saturating_mul(10)
-                        .saturating_add(u16::from(digit - b'0'));
-                }
-            }
-            (ScanState::Param, b';') => {
-                // Multi-parameter: wait for the next digit.
-                self.state = ScanState::CsiQuestion;
-            }
-            (ScanState::Param, b'h') => {
-                for &mode in &self.params {
-                    *modes = modes.set(mode, true);
-                }
-                self.params.clear();
-                self.state = ScanState::Ground;
-            }
-            (ScanState::Param, b'l') => {
-                for &mode in &self.params {
-                    *modes = modes.set(mode, false);
-                }
-                self.params.clear();
-                self.state = ScanState::Ground;
-            }
-            _ => {
-                self.params.clear();
-                self.state = ScanState::Ground;
-            }
-        }
-    }
-
-    /// Convenience: feed an entire byte slice.
-    fn scan(&mut self, bytes: &[u8], modes: &mut MouseModes) {
-        for &byte in bytes {
-            self.feed(byte, modes);
-        }
-    }
 }
 
 struct NorenApp {
