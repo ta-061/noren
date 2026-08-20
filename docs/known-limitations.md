@@ -4,10 +4,10 @@ This document exists so that the first thing a reader meets is what Noren
 **cannot** do today, not what it hopes to do. Decision D-M8-001 settled that the
 first artifact is an explicitly dated developer preview, not a
 `0.1.0-preview` of the product; this page is the substance behind that framing.
-This page retains a 2026-08-08 verification baseline. The SSH/sidebar and
-renderer claims changed for PR 120, plus the SSH parser follow-ups for Issue
-#117, were verified against their candidate trees on 2026-08-13. Citations
-point at the file, function, type, constant, or test that establishes them.
+This page retains a 2026-08-08 verification baseline and was re-verified clause
+by clause against the working tree at the 2026-08-20 milestone-gate sync.
+Citations point at the file, function, type, constant, or test that establishes
+them.
 Names are used rather than line numbers, which rot; where a count is genuinely
 needed the command that reproduces it is given instead. If anything here has
 drifted, treat the code as correct and this page as a bug.
@@ -34,23 +34,35 @@ binary. What now actually happens on screen:
   the command palette (claimed by `palette_policy` in `main.rs` as
   `PassthroughAction::OpenCommandPalette`). Its `c` command adds a model row;
   it does not start another shell. The `s` and `x` commands cannot move or
-  remove the startup PTY's input owner, while `f` focuses the sidebar. Arrow
+  remove the startup PTY's input owner, while `f` dispatches sidebar focus —
+  currently a no-op, since the sidebar is always visible. Arrow
   keys and Enter navigate the same command list; Escape dismisses it.
 - **Mouse reporting reaches the program.** `handle_mouse_button`,
   `handle_mouse_move`, and `handle_mouse_wheel` in `main.rs` each call
   `encode_and_send_mouse`, the helper that invokes `MouseEncoder::encode` and
-  writes the resulting report bytes to the PTY, so clicks, drags, and the wheel
-  now work in Zellij, `vim` with `set mouse=a`, and `tmux`.
+  writes the resulting report bytes to the PTY. Encoding follows the terminal
+  state's authoritative mode tracking (`current_mouse_modes` in `main.rs`): a
+  program that never enables a tracking mode receives no reports, and holding
+  Shift bypasses reporting so local text selection still works
+  (`mouse_reportable`). Clicks, drags, and the wheel therefore reach programs
+  that ask for them — Zellij, `vim` with `set mouse=a`, and `tmux` among them.
 - **Configured cell size reaches the renderer.** `[font] cell_width` /
   `cell_height` flow through `GridGeometry::with_cells` to the drawing path;
-  the regression test `configured_cell_sizes_drive_the_app_geometry` in
-  `main.rs` pins it, and a mutation note in `renderer.rs`'s tests records that
+  the regression test `configured_cell_sizes_drive_the_app_geometry` in the
+  binary's extracted test module (`src/main/tests.rs`) pins it, and a mutation
+  note in `renderer.rs`'s tests records that
   reverting `push_glyph` to the fixed `POC_CELL_WIDTH` constants must fail.
 - **Sidebar state survives a restart.** State is written to `sessions.toml`
   (`SESSION_STATE_FILE_NAME`) in the directory `config::default_path` resolves —
   `~/Library/Application Support/Noren/` on macOS — resolved by
   `session_state_path` in `main.rs`. With `HOME` unset the app runs in-memory
-  only, by design.
+  only, by design. Saves are evidence-based rather than fire-and-forget:
+  `persist` in `main.rs` snapshots the file before and after each write
+  (`PersistenceState`), an external replacement becomes a sticky conflict
+  surfaced through the diagnostics line (`with_persistence_conflict`), and a
+  save that cannot be inspected or verified says so
+  (`with_persistence_unverified`) — failures print to stderr and never crash
+  the app.
 - **Session status reflects the real lifecycle.** `SessionStatus` advances
   `Starting -> Running -> Exited/Failed` through `SessionRegistry::observe`
   rather than sitting at a permanent "starting"; `main.rs` observes `Running` on
@@ -71,7 +83,18 @@ binary. What now actually happens on screen:
   host inventory. The UI says `partial literal aliases`, retains at most
   `MAX_SSH_SIDEBAR_HOSTS` (24), and shows the selected alias's stable source tag
   plus a bounded root-relative label; it never retains or displays the
-  canonical HOME prefix.
+  canonical HOME prefix. Hostile configuration fails closed rather than
+  hanging: every budget in `ssh_config.rs` (`MAX_FILE_BYTES`,
+  `MAX_TOTAL_BYTES`, `MAX_TOKEN_ITEMS`, `MAX_HOSTS`, `MAX_RESOLUTION_WORK`,
+  and the include-expansion budget) rejects its input before the work runs, so
+  a hostile file becomes a content-free diagnostic line through
+  `report_ssh_diagnostic` in `main.rs`, not a stall. That closure is history,
+  not luck: the parser's first glob matcher was exponential (`87a67b3` replaced
+  it with an iterative one) and its first alias scans were quadratic
+  (`4f698af` made parsing linear in the number of hosts); FIFOs and symlink
+  races are handled at open time (`open_regular_file`) and pinned by bounded
+  subprocess regression tests (`top_level_fifo_returns_promptly`,
+  `included_fifo_sources_return_promptly`).
 
 It is still **not** the full workspace product that [ADR
 0003](adr/0003-noren-zellij-responsibility-boundary.md) describes — one local
@@ -86,8 +109,9 @@ Each item states what you would actually see if you ran the build.
 
 - **There is no visible cursor.** The terminal state tracks a cursor position
   and moves it correctly, but the render path never draws it: the
-  `glyph_vertices` function (`crates/noren-app/src/renderer.rs`) emits only
-  character bitmaps from `display_lines` plus an optional status line, and the
+  `glyph_vertices` function (`crates/noren-app/src/renderer.rs`) emits sidebar
+  rows, optional per-cell background rectangles, character bitmaps from
+  `display_cells`, and an optional status line — never a cursor — and the
   word "cursor" does not appear anywhere in `renderer.rs`. In practice: you type, characters appear,
   and nothing shows you where the insertion point is. This is the first thing
   most people notice.
@@ -133,6 +157,15 @@ Each item states what you would actually see if you ran the build.
   `first_terminal_line` as `content_rows - terminal_row_count`. There is no
   scroll-offset input, so rendering stays on the newest suffix and you cannot
   scroll back through it. The data is there; the view onto it is not.
+- **Paste is bracketed-paste-only.** `Cmd+V` never sends raw clipboard bytes:
+  `paste_bytes` in `main.rs` wraps the text in bracketed-paste markers only
+  when the program enabled DEC private mode 2004, and every other case is
+  gated with a visible status line (`show_paste_gate`) instead of sending
+  something unbracketed — `paste_is_gated_when_mode_2004_is_off_or_terminal_unavailable`
+  and `paste_is_bracketed_when_mode_2004_is_enabled` pin it. In practice: you
+  cannot paste into a program that has not asked for bracketed paste, and
+  oversized or empty clipboard text is gated (`PasteReject::Oversized`,
+  `PasteReject::Empty`) rather than truncated or sent.
 - **macOS only, one fixed shell.**   `Renderer::new` requests Metal exclusively
   (`instance_descriptor.backends = wgpu::Backends::METAL` in
   `crates/noren-app/src/renderer.rs`), so it does not *run* on other platforms —
@@ -198,9 +231,12 @@ Each item states what you would actually see if you ran the build.
   which is where the later growth is witnessed. The suites include a bounded VT
   compatibility harness, two independent adversarial hostile-input suites, and
   the FR-005 rendered-frame oracle. Workspace behaviour has its own integration
-  suites under `crates/noren-app/tests/` — `sidebar_view.rs`, `palette.rs`,
-  `session_domain.rs`, `session_supervisor.rs`, `session_persistence.rs`,
-  `session_adversarial.rs`, `mouse_encoding.rs`, and `passthrough.rs`.
+  suites under `crates/noren-app/tests/` — `frame_oracle.rs`,
+  `mouse_encoding.rs`, `palette.rs`, `passthrough.rs`,
+  `session_adversarial.rs`, `session_domain.rs`, `session_persistence.rs`,
+  `session_supervisor.rs`, `sidebar_view.rs`, and `verify59_independent.rs`
+  (an independently authored verification pass over configuration,
+  diagnostics, and scrollback bounds).
 - **Four CI gates** required by branch protection (see the
   [roadmap](../ROADMAP.md) and `.github/workflows/`): the Rust workflow
   (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
@@ -261,7 +297,13 @@ kinds, configurable keybindings) are legitimate things to report.
 
 No binary, installer, checksum, or release tag is published with this document;
 building and running from source is the only way to see the current state, and
-publishing any artifact is a reserved owner decision. Nothing here should be
+publishing any artifact is a reserved owner decision. A local `cargo build`
+produces an arm64 binary carrying only macOS's automatic ad-hoc signature — no
+signing identity and no notarization (`codesign -dvvv <binary>` reports
+`Signature=adhoc` and `TeamIdentifier=not set`). NFR-009's signing,
+notarization, and packaging gates are therefore unmet, and the application
+shows no first-launch warning about any of this; verify any build yourself
+rather than trusting a copy from elsewhere. Nothing here should be
 read as "nearly done": the honest summary is that the foundation is tested, a
 first workspace slice is now real and visible, and what stands between this and
 a usable daily terminal is not workspace plumbing but the display itself —
