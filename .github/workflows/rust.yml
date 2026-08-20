@@ -48,3 +48,5 @@ jobs:
         run: python3 scripts/check_docs.py
       - name: Documentation checker regression tests
         run: python3 -m unittest scripts/test_check_docs.py
+      - name: Release tooling regression tests
+        run: python3 -m unittest scripts/test_release_tools.py

@@ -256,14 +256,15 @@ terminal. That side now has a first vertical slice — a drawn sidebar, a comman
 palette over model rows, one live local PTY, and state that survives a restart
 — and the gaps that remain there (real session switching, non-local session
 kinds, configurable keybindings) are legitimate things to report.
-
 ## What this preview is not
 
-No binary, installer, checksum, or release tag is published with this document;
-building and running from source is the only way to see the current state, and
+No binary, installer, checksum, or release tag is published with this
+document; the [release-candidate machinery](release/README.md) can build and
+checksum an unsigned macOS binary locally, but building and running from
+source remains the only supported way to see the current state, and
 publishing any artifact is a reserved owner decision. Nothing here should be
-read as "nearly done": the honest summary is that the foundation is tested, a
-first workspace slice is now real and visible, and what stands between this and
-a usable daily terminal is not workspace plumbing but the display itself —
-a user-configurable theme, a real font, and a cursor. SGR colour is now drawn,
-but its fixed defaults are not yet a usable theming system.
+read as "nearly done": the honest summary is that the foundation is tested,
+a first workspace slice is now real and visible, and what stands between
+this and a usable daily terminal is not workspace plumbing but the display
+itself — a user-configurable theme, a real font, and a cursor. SGR colour is
+now drawn, but its fixed defaults are not yet a usable theming system.

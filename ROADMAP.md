@@ -13,7 +13,7 @@ Only evidence-backed work is marked complete.
 | 5 — Agent experience | Launchers, verified adapters, trustworthy state, notifications and jump-to-source | Not started |
 | 6 — Themes and accessibility | Light/dark/high-contrast palettes, contrast checks, IME/CJK/HiDPI and keyboard/accessibility work | Not started |
 | 7 — Quality | Unit/integration/compatibility/fault/security/visual tests, fuzzing, soak tests and benchmarks | Not started |
-| 8 — Public Preview | Honest docs/site, binaries, checksums, release review, known limitations and `0.1.0-preview` | Not started; scope decided by [D-M8-001](docs/coordination/decisions/D-M8-001-preview-scope.md) |
+| 8 — Public Preview | Honest docs/site, binaries, checksums, release review, known limitations and `0.1.0-preview` | In progress — release-candidate machinery landed ([release process](docs/release/README.md): reproducible build script, SHA-256 manifest, git-history release notes, [install verification](docs/release/install-verification.md)); signing, notarization, tagging, and publication remain owner decisions per [D-M8-001](docs/coordination/decisions/D-M8-001-preview-scope.md); nothing is published |
 
 A renderer-independent terminal state core is merged as PR
 [#19](https://github.com/ta-061/noren/pull/19) (`c695920`), described in
