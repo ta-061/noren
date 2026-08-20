@@ -28,6 +28,13 @@ test-support = []
 # `test-support`-gated `sidebar::fixtures` module without shipping it in
 # release builds.
 noren-app = { path = ".", features = ["test-support"] }
+# Test-only exception to "no PTY backend types at the app layer": the live
+# Zellij harness (`tests/zellij_live.rs`) spawns an installed Zellij in the
+# same PTY backend `noren-pty` uses, because the product crate's launch
+# policy is deliberately fixed to `/bin/zsh`. The harness takes TERM and
+# TERM_PROGRAM from `noren_pty`'s real `LaunchMetadata` so it cannot drift
+# from the production environment policy.
+portable-pty.workspace = true
 
 [lints]
 workspace = true
