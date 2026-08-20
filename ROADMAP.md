@@ -117,20 +117,19 @@ Measured against it, item by item:
 | Session lifecycle | Done | `SessionStatus` advances `Starting -> Running -> Exited/Failed` via `SessionRegistry::observe`, wired in `main.rs` |
 | Sidebar-state persistence | Done | `sessions.toml` (`SESSION_STATE_FILE_NAME`) under the `config::default_path` directory, resolved by `session_state_path` |
 | Palette | Done | `Super+p` via `palette_policy`; `Palette::noren`'s four commands dispatched by `handle_palette_key` |
-| Configurable keybindings | **Not started** | `palette_policy` and `handle_palette_key` hard-code the chords; `config.rs` exposes no keymap surface |
+| Configurable keybindings | Done for the palette surface | `[keys]` in `config.toml` (`KeymapConfig` in `config.rs`) rebinds the palette opener and the four palette command chords with the previous values as defaults; `palette_policy`/`handle_palette_key` in `main.rs` honor them, unparseable chords and unknown actions are typed errors, and the opener is validated against the pinned Zellij corpus and the exit leader. The exit leader, palette navigation keys, diagnostics chord, and clipboard shortcuts remain fixed |
 | Zellij pass-through | Done against a pinned corpus | `passthrough.rs` policy claims only Super-space chords that the pinned Zellij `v0.44.3` default corpus (`ZELLIJ_FIXTURE_TAG`) never binds; no test drives a live Zellij |
 
-Two named scope items remain unsatisfied: **configurable keybindings do not
-exist at all**, and **SSH connections and agents do not run**. Positive literal
-aliases now appear in a bounded sidebar list and a click records a
-source-attributed pending target, but opens no SSH connection or PTY; wildcard
-or dynamic destinations are not presented as a complete host inventory, and
-agent entries remain fixtures and launch no agent. Since "Only evidence-backed
-work is marked complete" and the scope line
-names both, Milestone 3 stays **In progress**. The SSH and agent session kinds
-also depend on Milestones 4 and 5; whether they are retired from Milestone 3's
-scope or carried is an open scoping decision, not something to settle by
-relabelling the status.
+One named scope item remains unsatisfied: **SSH connections and agents do
+not run**. Positive literal aliases now appear in a bounded sidebar list and
+a click records a source-attributed pending target, but opens no SSH
+connection or PTY; wildcard or dynamic destinations are not presented as a
+complete host inventory, and agent entries remain fixtures and launch no
+agent. Since "Only evidence-backed work is marked complete" and the scope
+line names it, Milestone 3 stays **In progress**. The SSH and agent session
+kinds also depend on Milestones 4 and 5; whether they are retired from
+Milestone 3's scope or carried is an open scoping decision, not something to
+settle by relabelling the status.
 
 ## What blocks a public preview
 

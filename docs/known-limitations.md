@@ -30,9 +30,11 @@ binary. What now actually happens on screen:
   `glyph_vertices` in `renderer.rs`, which takes a `sidebar` argument and
   applies `col_offset`, and `sidebar_text_lines` in `main.rs`, which formats the
   rows.
-- **The session palette is present, but only one PTY is live.** `Super+p` opens
-  the command palette (claimed by `palette_policy` in `main.rs` as
-  `PassthroughAction::OpenCommandPalette`). Its `c` command adds a model row;
+- **The session palette is present, but only one PTY is live.** `super+p`
+  opens the command palette (claimed by `palette_policy` in `main.rs` as
+  `PassthroughAction::OpenCommandPalette`); the opener and the four command
+  chords are configurable through `[keys]` in `config.toml` with
+  `super+p`/`c`/`s`/`x`/`f` as the defaults. The `c` command adds a model row;
   it does not start another shell. The `s` and `x` commands cannot move or
   remove the startup PTY's input owner, while `f` focuses the sidebar. Arrow
   keys and Enter navigate the same command list; Escape dismisses it.
@@ -176,11 +178,16 @@ Each item states what you would actually see if you ran the build.
   ownership. There is no split, tiled, or multi-session view. Panes and layout
   *inside* the live session are delegated to Zellij by design — see "What is
   deliberately delegated".
-- **Keybindings are not configurable.** The palette opener (`Super+p`), the exit
-  leader (`Super+Escape`), and the `c`/`s`/`x`/`f` command keys are compiled in:
-  `palette_policy` and `handle_palette_key` in `main.rs` hard-code them, and the
-  config parser (`config.rs`) exposes no keybinding or keymap surface. Rebinding
-  requires editing source.
+- **Keybindings are configurable for the palette only, within bounds.** The
+  `[keys]` table in `config.toml` rebinds the palette opener and the four
+  palette command chords (`palette_policy` and `handle_palette_key` in
+  `main.rs` read them from `KeymapConfig`), with the pre-configuration
+  chords as defaults. The exit leader (`super+escape`), the palette's
+  structural keys (Escape, Enter, the vertical arrows), the diagnostics
+  chord (Super+D), and the clipboard shortcuts (Super+A/C/V) remain
+  compiled in; see [configuration](configuration.md) for the grammar and the
+  rejection rules, including the pinned-Zellij-corpus constraint on the
+  opener.
 - **A restored session's shell is not running.** Sidebar state persists across a
   restart, but a restored entry comes back as `SessionStatus::Restored` — a
   visible row whose PTY does not exist yet. The comment on `teardown` in
