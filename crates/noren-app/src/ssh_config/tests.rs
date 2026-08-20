@@ -2347,3 +2347,79 @@ fn keywords_are_case_insensitive_and_values_are_preserved() {
     assert_eq!(host.user(), Some("DeployUser"));
     assert_eq!(host.port(), Some(2201));
 }
+
+fn baseline_mixed_text(pairs: usize) -> String {
+    let mut text = String::new();
+    for index in 0..pairs {
+        writeln!(text, "Host literal-alias-{index:05}").expect("write to string");
+        text.push_str("HostName x\n");
+        writeln!(text, "Host impossible-{index:05}*").expect("write to string");
+        text.push_str("HostName y\n");
+    }
+    text
+}
+
+#[test]
+#[ignore = "temporary baseline measurement for the mixed DoS remediation"]
+fn baseline_mixed_quadratic_measurement() {
+    let text = baseline_mixed_text(14_189);
+    assert!((900 * 1024..=1024 * 1024).contains(&text.len()));
+
+    let started = std::time::Instant::now();
+    let default_result = SshConfig::parse(&text);
+    let default_elapsed = started.elapsed();
+    eprintln!(
+        "BASELINE default limits: {:?} ({})",
+        default_elapsed,
+        match &default_result {
+            Ok(config) => format!("Ok({} hosts)", config.hosts().len()),
+            Err(error) => format!("{error:?}"),
+        }
+    );
+
+    let mut token_items = 0usize;
+    let blocks = parse_blocks_for_test(&text, 0, SshSourceId(0), &mut token_items, MAX_TOKEN_ITEMS)
+        .expect("baseline blocks parse");
+    let lifted = ParserLimits {
+        resolution_work: u128::MAX,
+        ..DEFAULT_LIMITS
+    };
+    let started = std::time::Instant::now();
+    let lifted_result = SshConfig::from_blocks_with_limit(
+        &blocks,
+        vec![inline_source(SshSourceId(0))],
+        lifted,
+    );
+    let lifted_elapsed = started.elapsed();
+    eprintln!(
+        "BASELINE lifted budget (true resolution): {:?} ({})",
+        lifted_elapsed,
+        match &lifted_result {
+            Ok(config) => format!("Ok({} hosts)", config.hosts().len()),
+            Err(error) => format!("{error:?}"),
+        }
+    );
+    drop(lifted_result);
+
+    for pairs in [1_000usize, 4_000, 8_000] {
+        let text = baseline_mixed_text(pairs);
+        let mut token_items = 0usize;
+        let blocks =
+            parse_blocks_for_test(&text, 0, SshSourceId(0), &mut token_items, MAX_TOKEN_ITEMS)
+                .expect("baseline blocks parse");
+        let started = std::time::Instant::now();
+        let result = SshConfig::from_blocks_with_limit(
+            &blocks,
+            vec![inline_source(SshSourceId(0))],
+            lifted,
+        );
+        let elapsed = started.elapsed();
+        eprintln!(
+            "BASELINE lifted budget {pairs} pairs: {elapsed:?} ({})",
+            match &result {
+                Ok(config) => format!("Ok({} hosts)", config.hosts().len()),
+                Err(error) => format!("{error:?}"),
+            }
+        );
+    }
+}
