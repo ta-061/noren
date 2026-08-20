@@ -687,6 +687,7 @@ dependencies = [
  "noren-app",
  "noren-pty",
  "noren-terminal",
+ "portable-pty",
  "toml_edit",
  "wgpu",
  "winit",
