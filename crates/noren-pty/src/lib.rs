@@ -1,9 +1,15 @@
 //! Noren-owned process and PTY boundary for the macOS local-shell PoC.
 //!
 //! The public API deliberately exposes no `portable-pty` types. A session
-//! always launches `/bin/zsh` without caller-controlled arguments or `-c`,
-//! moves blocking I/O off the UI thread, bounds every queue and payload, and
-//! owns child termination and reaping in one supervisor thread.
+//! launches either the fixed `/bin/zsh` shell or the fixed system SSH client
+//! (`/usr/bin/ssh`) — in both cases without caller-controlled arguments or
+//! `-c`, moves blocking I/O off the UI thread, bounds every queue and payload,
+//! and owns child termination and reaping in one supervisor thread.
+//!
+//! The SSH launch path drives the system `ssh` binary only. Noren never
+//! reimplements the SSH protocol and never passes a credential, key, or
+//! password on the command line: argv is exactly `ssh -- <destination>`, and
+//! authentication relies on ssh's own agent and configuration resolution.
 
 use portable_pty::{CommandBuilder, PtySize as PortablePtySize, native_pty_system};
 use std::ffi::OsString;
@@ -31,6 +37,14 @@ pub const REPLY_BYTES_PER_SECOND: usize = 64 * 1024;
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
 
 const ZSH_PROGRAM: &str = "/bin/zsh";
+/// Fixed system SSH client. An absolute path deliberately bypasses `PATH`
+/// so a writable `PATH` entry cannot substitute a different binary.
+const SSH_PROGRAM: &str = "/usr/bin/ssh";
+/// End-of-options marker. Combined with the destination validation this makes
+/// option injection through a hostile alias impossible, not just unlikely.
+const SSH_END_OF_OPTIONS: &str = "--";
+/// Maximum accepted SSH destination bytes before the launch is refused.
+const MAX_SSH_DESTINATION_BYTES: usize = 1024;
 const TERM_VALUE: &str = "xterm-256color";
 const TERM_PROGRAM_VALUE: &str = "Noren-PoC";
 const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
@@ -166,6 +180,117 @@ fn build_zsh_command(policy: &ZshLaunchPolicy) -> CommandBuilder {
     command
 }
 
+/// A validated SSH destination (`ssh -- <destination>` final argument).
+///
+/// Validation is the argv-injection boundary, so it is deliberately stricter
+/// than what OpenSSH would accept: the destination must be non-empty, at most
+/// [`MAX_SSH_DESTINATION_BYTES`] bytes, free of ASCII control characters and
+/// whitespace, and must not begin with `-` (an alias like `-oProxyCommand=…`
+/// parsed out of a hostile `Host` directive must never reach argv as an
+/// option). Combined with the fixed `--` end-of-options marker, no accepted
+/// destination can be interpreted as an ssh option.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SshDestination {
+    destination: String,
+}
+
+impl SshDestination {
+    /// Validate `destination` for the fixed ssh argv, or reject it.
+    #[must_use]
+    pub fn new(destination: &str) -> Option<Self> {
+        if destination.is_empty()
+            || destination.len() > MAX_SSH_DESTINATION_BYTES
+            || destination.starts_with('-')
+            || destination
+                .chars()
+                .any(|c| c.is_ascii_control() || c.is_whitespace())
+        {
+            return None;
+        }
+        Some(Self {
+            destination: destination.to_owned(),
+        })
+    }
+
+    /// The validated destination string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.destination
+    }
+}
+
+impl fmt::Debug for SshDestination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The destination is the public connection target shown in the UI;
+        // it is not a credential. Bound the Debug form so an oversized value
+        // can never flood a log line even if the length cap changes.
+        let inspected: Vec<char> = self.destination.chars().take(80).collect();
+        f.debug_struct("SshDestination")
+            .field("destination", &inspected.into_iter().collect::<String>())
+            .finish()
+    }
+}
+
+/// Fixed system-ssh launch policy.
+///
+/// Production inherits the caller's environment unchanged (except the fixed
+/// `TERM`/`TERM_PROGRAM` overrides below) so ssh performs its own agent,
+/// key, and config resolution. The optional home override exists only for the
+/// crate-local test harness, mirroring [`ZshLaunchPolicy`]'s isolated-home
+/// seam; it never mutates process-global environment.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SshLaunchPolicy {
+    destination: SshDestination,
+    home: Option<PathBuf>,
+}
+
+impl SshLaunchPolicy {
+    /// Launch the system ssh client to `destination`, inheriting HOME and the
+    /// agent environment from this process.
+    #[must_use]
+    pub fn inherit(destination: SshDestination) -> Self {
+        Self {
+            destination,
+            home: None,
+        }
+    }
+
+    /// The validated destination this policy connects to.
+    #[must_use]
+    pub fn destination(&self) -> &SshDestination {
+        &self.destination
+    }
+}
+
+impl fmt::Debug for SshLaunchPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SshLaunchPolicy")
+            .field("destination", &self.destination)
+            .field("home", &"<inherited>")
+            .finish()
+    }
+}
+
+/// Build the fixed ssh command. Security invariants, pinned by tests:
+///
+/// - argv is exactly `[SSH_PROGRAM, "--", destination]` — no options, so no
+///   credential, identity, or command can ever appear in argv (`ps`-visible).
+/// - `HOME` is not overridden (ssh needs the real agent/config resolution);
+///   `COLUMNS`/`LINES` are dropped exactly like the zsh policy.
+fn build_ssh_command(policy: &SshLaunchPolicy) -> CommandBuilder {
+    let mut command = CommandBuilder::new(SSH_PROGRAM);
+    command.arg(SSH_END_OF_OPTIONS);
+    command.arg(policy.destination.as_str());
+    if let Some(home) = &policy.home {
+        command.env("HOME", home);
+    }
+    command.env("TERM", TERM_VALUE);
+    command.env("TERM_PROGRAM", TERM_PROGRAM_VALUE);
+    command.env_remove("COLUMNS");
+    command.env_remove("LINES");
+    command
+}
+
 /// PTY operations named by payload-free errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PtyOperation {
@@ -294,8 +419,23 @@ impl PtySession {
         Self::spawn_with_policy(ZshLaunchPolicy::from_environment()?, size)
     }
 
+    /// Spawn the fixed system ssh client for `destination` at the supplied
+    /// initial non-zero size, so the remote shell is interactive.
+    ///
+    /// argv is exactly `ssh -- <destination>` (see [`build_ssh_command`]);
+    /// no credential is ever passed on the command line and authentication is
+    /// left to ssh's own agent and configuration resolution.
+    pub fn spawn_ssh(policy: SshLaunchPolicy, size: PtySize) -> Result<Self, PtyError> {
+        Self::spawn_session(build_ssh_command(&policy), size)
+    }
+
     /// Spawn using an already validated fixed-zsh policy.
     fn spawn_with_policy(policy: ZshLaunchPolicy, size: PtySize) -> Result<Self, PtyError> {
+        Self::spawn_session(build_zsh_command(&policy), size)
+    }
+
+    /// Common bounded supervisor wiring for every fixed launch policy.
+    fn spawn_session(command: CommandBuilder, size: PtySize) -> Result<Self, PtyError> {
         let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::sync_channel(OUTPUT_CHANNEL_CAPACITY);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -307,7 +447,7 @@ impl PtySession {
             .name("noren-pty-supervisor".to_owned())
             .spawn(move || {
                 supervisor_main(
-                    policy,
+                    command,
                     size,
                     command_rx,
                     event_tx,
