@@ -127,6 +127,8 @@ pub enum SessionStatus {
     /// The entry exists but no runtime observation has been reported.
     #[default]
     Starting,
+    /// A sidebar entry restored from disk with no live process attached.
+    Restored,
     /// Observed running.
     Running,
     /// Observed to have exited, carrying the exit code when known.
@@ -144,13 +146,14 @@ pub enum SessionStatus {
 impl SessionStatus {
     /// Lifecycle rank used to reject backwards observations.
     ///
-    /// `Starting` (0) < `Running` (1) < terminal `Exited`/`Failed` (2).
+    /// `Starting`/`Restored` (0) < `Running` (1) < terminal
+    /// `Exited`/`Failed` (2).
     /// Equal-rank terminal observations may refine their payload or variant,
     /// but a terminal session can never return to a live status.
     #[must_use]
     pub const fn rank(&self) -> u8 {
         match self {
-            Self::Starting => 0,
+            Self::Starting | Self::Restored => 0,
             Self::Running => 1,
             Self::Exited { .. } | Self::Failed { .. } => 2,
         }
@@ -357,6 +360,18 @@ impl SessionRegistry {
         id
     }
 
+    /// Restore a persisted session entry without claiming that its process
+    /// still exists.
+    #[must_use]
+    pub fn restore(&mut self, kind: SessionKind) -> SessionId {
+        let id = self.create(kind);
+        self.sessions
+            .get_mut(&id)
+            .expect("restored session was just created")
+            .status = SessionStatus::Restored;
+        id
+    }
+
     /// Remove a session, clearing the selection if it was selected.
     ///
     /// Returns [`SessionError::UnknownSession`] when `id` is not live.
@@ -512,6 +527,21 @@ mod tests {
     fn kinds_and_statuses_have_natural_defaults() {
         assert_eq!(SessionKind::default(), SessionKind::Local);
         assert_eq!(SessionStatus::default(), SessionStatus::Starting);
+    }
+
+    #[test]
+    fn status_ranks_pin_all_lifecycle_variants() {
+        assert_eq!(SessionStatus::Starting.rank(), 0);
+        assert_eq!(SessionStatus::Restored.rank(), 0);
+        assert_eq!(SessionStatus::Running.rank(), 1);
+        assert_eq!(SessionStatus::Exited { code: None }.rank(), 2);
+        assert_eq!(
+            SessionStatus::Failed {
+                reason: String::new()
+            }
+            .rank(),
+            2
+        );
     }
 
     #[test]

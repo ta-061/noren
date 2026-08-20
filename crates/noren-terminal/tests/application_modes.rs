@@ -80,13 +80,18 @@ fn application_modes_survive_resize_and_alternate_screen_switching() {
 }
 
 #[test]
-fn unsupported_private_mode_lists_do_not_mutate_or_poison_modes() {
+fn unsupported_private_modes_do_not_mutate_but_known_lists_still_apply() {
     let mut state = TerminalState::new(2, 4).expect("valid terminal");
 
-    state.feed_bytes(b"\x1b[?999h\x1b[?1;1049h");
+    state.feed_bytes(b"\x1b[?999h");
     assert_modes(&state, false, false);
     assert!(!state.modes().is_alternate_screen_active());
 
-    state.feed_bytes(b"\x1b[?1h\x1b=");
-    assert_modes(&state, true, true);
+    state.feed_bytes(b"\x1b[?1;1049h");
+    assert_modes(&state, true, false);
+    assert!(state.modes().is_alternate_screen_active());
+
+    state.feed_bytes(b"\x1b[?1;1049l");
+    assert_modes(&state, false, false);
+    assert!(!state.modes().is_alternate_screen_active());
 }

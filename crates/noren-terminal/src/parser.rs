@@ -100,6 +100,11 @@ pub(crate) enum Action {
         mode: PrivateMode,
         enabled: bool,
     },
+    SetPrivateModes {
+        modes: [Option<PrivateMode>; MAX_CSI_PARAMS],
+        enabled: bool,
+        len: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +119,12 @@ pub(crate) enum PrivateMode {
     AlternateScreen,
     ApplicationCursorKey,
     BracketedPaste,
+    MouseTrackingNormal,
+    MouseTrackingButtonEvent,
+    MouseTrackingAnyEvent,
+    MouseEncodingUtf8,
+    MouseEncodingSgr,
+    MouseEncodingUrxvt,
 }
 
 /// Incremental UTF-8 decoder for printable text in the Ground state.
@@ -490,24 +501,41 @@ impl Csi {
     }
 
     fn private_action(&self, final_byte: u8) -> Option<Action> {
-        if self.len != 1 {
-            return None;
-        }
-        let mode = match self.params[0] {
-            1 => PrivateMode::ApplicationCursorKey,
-            1049 => PrivateMode::AlternateScreen,
-            2004 => PrivateMode::BracketedPaste,
+        let enabled = match final_byte {
+            b'h' => true,
+            b'l' => false,
             _ => return None,
         };
-        match final_byte {
-            b'h' => Some(Action::SetPrivateMode {
-                mode,
-                enabled: true,
-            }),
-            b'l' => Some(Action::SetPrivateMode {
-                mode,
-                enabled: false,
-            }),
+        if self.len == 1 {
+            return self
+                .private_mode(self.params[0])
+                .map(|mode| Action::SetPrivateMode { mode, enabled });
+        }
+
+        let mut modes = [None; MAX_CSI_PARAMS];
+        let mut known = false;
+        for (index, mode) in modes.iter_mut().enumerate().take(self.len) {
+            *mode = self.private_mode(self.params[index]);
+            known |= mode.is_some();
+        }
+        known.then_some(Action::SetPrivateModes {
+            modes,
+            enabled,
+            len: self.len,
+        })
+    }
+
+    fn private_mode(&self, param: u16) -> Option<PrivateMode> {
+        match param {
+            1 => Some(PrivateMode::ApplicationCursorKey),
+            1049 => Some(PrivateMode::AlternateScreen),
+            2004 => Some(PrivateMode::BracketedPaste),
+            1000 => Some(PrivateMode::MouseTrackingNormal),
+            1002 => Some(PrivateMode::MouseTrackingButtonEvent),
+            1003 => Some(PrivateMode::MouseTrackingAnyEvent),
+            1005 => Some(PrivateMode::MouseEncodingUtf8),
+            1006 => Some(PrivateMode::MouseEncodingSgr),
+            1015 => Some(PrivateMode::MouseEncodingUrxvt),
             _ => None,
         }
     }
@@ -707,6 +735,52 @@ mod tests {
     }
 
     #[test]
+    fn mouse_tracking_and_encoding_modes_are_tracked_as_private_modes() {
+        assert_eq!(
+            actions(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1005h\x1b[?1006h\x1b[?1015h"),
+            [
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseTrackingNormal,
+                    enabled: true,
+                },
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseTrackingButtonEvent,
+                    enabled: true,
+                },
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseTrackingAnyEvent,
+                    enabled: true,
+                },
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseEncodingUtf8,
+                    enabled: true,
+                },
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseEncodingSgr,
+                    enabled: true,
+                },
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseEncodingUrxvt,
+                    enabled: true,
+                },
+            ]
+        );
+        assert_eq!(
+            actions(b"\x1b[?1000l\x1b[?1006l"),
+            [
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseTrackingNormal,
+                    enabled: false,
+                },
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseEncodingSgr,
+                    enabled: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn escape_restarts_an_incomplete_csi_sequence() {
         assert_eq!(actions(b"\x1b[9\x1b[2A"), [Action::MoveUp(2)]);
     }
@@ -799,6 +873,15 @@ mod tests {
                 },
             ]
         );
-        assert!(actions(b"\x1b[?9999h\x1b[?1049;1h\x1b[>1049h").is_empty());
+        assert!(actions(b"\x1b[?9999h").is_empty());
+        assert!(actions(b"\x1b[>1049h").is_empty());
+        assert!(matches!(
+            actions(b"\x1b[?1049;1h").as_slice(),
+            [Action::SetPrivateModes {
+                enabled: true,
+                len: 2,
+                ..
+            }]
+        ));
     }
 }

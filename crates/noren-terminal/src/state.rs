@@ -261,6 +261,12 @@ pub struct TerminalModes {
     application_cursor_key: bool,
     application_keypad: bool,
     bracketed_paste: bool,
+    mouse_normal_tracking: bool,
+    mouse_button_event_tracking: bool,
+    mouse_any_event_tracking: bool,
+    mouse_utf8_encoding: bool,
+    mouse_sgr_encoding: bool,
+    mouse_urxvt_encoding: bool,
 }
 
 impl TerminalModes {
@@ -290,6 +296,42 @@ impl TerminalModes {
     #[must_use]
     pub const fn is_bracketed_paste_enabled(self) -> bool {
         self.bracketed_paste
+    }
+
+    /// Whether DEC private mode 1000 (normal mouse tracking) is enabled.
+    #[must_use]
+    pub const fn is_mouse_normal_tracking_enabled(self) -> bool {
+        self.mouse_normal_tracking
+    }
+
+    /// Whether DEC private mode 1002 (button-event mouse tracking) is enabled.
+    #[must_use]
+    pub const fn is_mouse_button_event_tracking_enabled(self) -> bool {
+        self.mouse_button_event_tracking
+    }
+
+    /// Whether DEC private mode 1003 (any-event mouse tracking) is enabled.
+    #[must_use]
+    pub const fn is_mouse_any_event_tracking_enabled(self) -> bool {
+        self.mouse_any_event_tracking
+    }
+
+    /// Whether DEC private mode 1006 (SGR mouse encoding) is enabled.
+    #[must_use]
+    pub const fn is_mouse_sgr_encoding_enabled(self) -> bool {
+        self.mouse_sgr_encoding
+    }
+
+    /// Whether DEC private mode 1005 (UTF-8 mouse encoding) is enabled.
+    #[must_use]
+    pub const fn is_mouse_utf8_encoding_enabled(self) -> bool {
+        self.mouse_utf8_encoding
+    }
+
+    /// Whether DEC private mode 1015 (urxvt mouse encoding) is enabled.
+    #[must_use]
+    pub const fn is_mouse_urxvt_encoding_enabled(self) -> bool {
+        self.mouse_urxvt_encoding
     }
 }
 
@@ -327,6 +369,19 @@ impl ScreenBuffer {
     #[must_use]
     pub fn cells(&self) -> &[Cell] {
         &self.cells
+    }
+
+    /// Number of leading screen rows retained by the display model.
+    ///
+    /// Trailing rows made only of baseline blanks and wide-character
+    /// continuations are omitted. A row containing an explicit background is
+    /// retained even when every cell contains only a space, because renderers
+    /// still draw that background. This is the row-selection rule used by
+    /// [`TerminalSnapshot::display_lines`] and
+    /// [`TerminalSnapshot::display_cells`].
+    #[must_use]
+    pub fn display_row_count(&self) -> usize {
+        visible_display_row_count(self)
     }
 
     /// The cells of one zero-based row, as a contiguous slice.
@@ -902,6 +957,15 @@ impl TerminalState {
                 self.modes.application_keypad = enabled;
             }
             Action::SetPrivateMode { mode, enabled } => self.set_private_mode(mode, enabled),
+            Action::SetPrivateModes {
+                modes,
+                enabled,
+                len,
+            } => {
+                for mode in modes[..len].iter().flatten() {
+                    self.set_private_mode(*mode, enabled);
+                }
+            }
         }
         debug_assert!(self.active.screen.wide_cells_intact());
         if let Some(primary) = &self.primary_screen {
@@ -1219,6 +1283,24 @@ impl TerminalState {
             (PrivateMode::BracketedPaste, enabled) => {
                 self.modes.bracketed_paste = enabled;
             }
+            (PrivateMode::MouseTrackingNormal, enabled) => {
+                self.modes.mouse_normal_tracking = enabled;
+            }
+            (PrivateMode::MouseTrackingButtonEvent, enabled) => {
+                self.modes.mouse_button_event_tracking = enabled;
+            }
+            (PrivateMode::MouseTrackingAnyEvent, enabled) => {
+                self.modes.mouse_any_event_tracking = enabled;
+            }
+            (PrivateMode::MouseEncodingUtf8, enabled) => {
+                self.modes.mouse_utf8_encoding = enabled;
+            }
+            (PrivateMode::MouseEncodingSgr, enabled) => {
+                self.modes.mouse_sgr_encoding = enabled;
+            }
+            (PrivateMode::MouseEncodingUrxvt, enabled) => {
+                self.modes.mouse_urxvt_encoding = enabled;
+            }
         }
     }
 
@@ -1458,6 +1540,29 @@ impl TerminalSnapshot {
         &self.display_lines
     }
 
+    /// Display-positioned cell rows of the visible screen, parallel to
+    /// [`display_lines`](Self::display_lines).
+    ///
+    /// Rows are contiguous slices of exactly [`cols`](Self::cols) cells,
+    /// selected exactly like `display_lines` (trailing all-blank rows are
+    /// dropped, so both accessors always agree on the row count and on which
+    /// screen row each entry represents). Enumerating a row yields one cell
+    /// per display column: a width-two character's continuation cell keeps
+    /// its own column with empty text ([`Cell::is_continuation`]), encoding
+    /// the same column rule that `display_lines` encodes with one placeholder
+    /// character — so both accessors agree where every following glyph lands.
+    /// Within a row, trailing blank cells are retained (only whole rows are
+    /// dropped) so per-cell attributes stay addressable to the end of the
+    /// row.
+    #[must_use]
+    pub fn display_cells(&self) -> impl ExactSizeIterator<Item = &[Cell]> {
+        let cols = usize::from(self.screen.cols);
+        self.screen
+            .cells
+            .chunks_exact(cols)
+            .take(self.screen.display_row_count())
+    }
+
     /// Retained scrollback rows in eviction order (oldest first, newest last).
     ///
     /// Each row is the full cell content of a primary-screen line that scrolled
@@ -1562,16 +1667,13 @@ fn cells_to_line(cells: &[Cell]) -> String {
 }
 
 fn visible_display_lines(screen: &ScreenBuffer) -> Vec<String> {
-    let mut lines = Vec::with_capacity(usize::from(screen.rows));
-    for row in 0..screen.rows {
-        let start = usize::from(row) * usize::from(screen.cols);
-        let end = start + usize::from(screen.cols);
-        lines.push(cells_to_display_line(&screen.cells[start..end]));
-    }
-    while lines.last().is_some_and(String::is_empty) {
-        lines.pop();
-    }
-    lines
+    let cols = usize::from(screen.cols);
+    screen
+        .cells
+        .chunks_exact(cols)
+        .take(screen.display_row_count())
+        .map(cells_to_display_line)
+        .collect()
 }
 
 /// Render a cell row to text preserving display columns: a continuation cell
@@ -1590,6 +1692,31 @@ fn cells_to_display_line(cells: &[Cell]) -> String {
         line.pop();
     }
     line
+}
+
+/// Whether a cell row renders as a blank display line.
+///
+/// This is exactly the condition under which
+/// [`visible_display_lines`] drops a trailing row: every cell contributes
+/// only spaces (blank cells) or placeholders (continuation cells), and no cell
+/// carries an explicit background. Keeping the predicate here — next to the
+/// line builder it mirrors — is what lets [`TerminalSnapshot::display_cells`]
+/// select the same rows as [`TerminalSnapshot::display_lines`] while retaining
+/// background-only rows for rendering.
+fn row_is_display_blank(cells: &[Cell]) -> bool {
+    cells.iter().all(|cell| {
+        (cell.is_blank() || cell.is_continuation()) && cell.attributes().background().is_default()
+    })
+}
+
+/// Shared row count behind every display-facing screen view.
+fn visible_display_row_count(screen: &ScreenBuffer) -> usize {
+    let cols = usize::from(screen.cols);
+    screen
+        .cells
+        .chunks_exact(cols)
+        .rposition(|row| !row_is_display_blank(row))
+        .map_or(0, |row| row + 1)
 }
 
 #[cfg(test)]
@@ -1809,6 +1936,96 @@ mod tests {
         assert_eq!(row_widths(&state, 0), vec![1, 2, 0, 2, 0, 1, 1, 1, 1, 1]);
         assert_eq!(state.snapshot().lines(), ["a日😀b"]);
         assert_eq!(state.cursor(), Cursor { row: 0, column: 6 });
+    }
+
+    #[test]
+    fn display_cells_match_display_lines_column_positions() {
+        let mut state = TerminalState::new(2, 6).expect("valid terminal");
+        state.feed_bytes("a日b".as_bytes());
+        let snapshot = state.snapshot();
+
+        // One cell per display column: the continuation keeps column 2, so
+        // the cell index equals the placeholder character index of
+        // display_lines and `b` sits at display column 3 in both.
+        let cells: &[Cell] = snapshot.display_cells().next().expect("row");
+        assert_eq!(
+            cells.iter().map(|cell| cell.text()).collect::<Vec<_>>(),
+            ["a", "日", "", "b", " ", " "]
+        );
+        assert!(!cells[0].is_continuation());
+        assert!(!cells[1].is_continuation());
+        assert!(cells[2].is_continuation());
+        assert_eq!(snapshot.display_lines()[0].chars().count(), 4);
+        assert_eq!(
+            snapshot.display_lines()[0].chars().nth(3),
+            Some('b'),
+            "the cell index and the display-line character index agree"
+        );
+        // Row selection matches display_lines: identical counts at every
+        // trailing-blank height.
+        assert_eq!(
+            snapshot.display_cells().len(),
+            snapshot.display_lines().len()
+        );
+        let mut more = TerminalState::new(3, 6).expect("valid terminal");
+        more.feed_bytes("x\r\n\r\n".as_bytes());
+        assert_eq!(
+            more.snapshot().display_cells().len(),
+            more.snapshot().display_lines().len()
+        );
+    }
+
+    #[test]
+    fn display_cells_keep_attributes_through_continuations_and_trailing_blanks() {
+        let mut state = TerminalState::new(3, 6).expect("valid terminal");
+        // A printed blank keeps the pen's background; display_lines would
+        // trim it, so cell access is the only way to see it.
+        state.feed_bytes("\x1b[42ma日 \r\nX".as_bytes());
+        let snapshot = state.snapshot();
+
+        let row: Vec<CellAttributes> = snapshot
+            .display_cells()
+            .next()
+            .expect("row")
+            .iter()
+            .map(|cell| *cell.attributes())
+            .collect();
+        // The green background covers the lead, its continuation, and the
+        // printed blank, but not the untouched blanks ahead of the cursor.
+        let green_background =
+            CellAttributes::default().with_background(Color::Ansi(AnsiColor::Green));
+        assert_eq!(row[0], green_background);
+        assert_eq!(row[1], green_background);
+        assert_eq!(row[2], green_background);
+        assert_eq!(row[3], green_background);
+        assert_eq!(row[4], CellAttributes::default());
+        assert_eq!(row[5], CellAttributes::default());
+        assert_eq!(snapshot.display_lines(), ["a日", "X"]);
+        // Trailing blank cells within a row stay addressable, and row
+        // selection still matches display_lines.
+        assert_eq!(
+            snapshot.display_cells().len(),
+            snapshot.display_lines().len()
+        );
+    }
+
+    #[test]
+    fn display_rows_retain_a_background_only_space() {
+        let mut state = TerminalState::new(1, 1).expect("valid terminal");
+        state.feed_bytes(b"\x1b[48;2;73;18;146m ");
+        let snapshot = state.snapshot();
+
+        assert_eq!(state.screen().display_row_count(), 1);
+        assert_eq!(snapshot.screen().display_row_count(), 1);
+        assert_eq!(snapshot.display_lines(), [""]);
+        assert_eq!(snapshot.display_cells().len(), 1);
+        assert_eq!(snapshot.display_cells().next().unwrap()[0].text(), " ");
+        assert!(
+            !snapshot.display_cells().next().unwrap()[0]
+                .attributes()
+                .background()
+                .is_default()
+        );
     }
 
     #[test]

@@ -2,10 +2,33 @@
 
 > A Zellij-friendly terminal for local, remote, and agent workflows.
 
-> **Project status: Discovery.** Noren does not yet contain a terminal
-> application, installable binaries, or a Preview release. Everything described
-> below is a product goal until the implementation and release evidence says
-> otherwise.
+> **Current state: a first workspace slice on a terminal foundation.** What
+> exists on `main` is a macOS window over a local `zsh` PTY with a tested
+> terminal state core, plus a drawn workspace sidebar, a `Super+p` command
+> palette over the session registry, mouse reporting that
+> reaches the program inside, and sidebar state that survives a restart.
+>
+> Per-cell SGR foreground and explicit background colours now reach drawing:
+> ANSI and 256-colour values resolve through a fixed palette, while RGB passes
+> through as direct truecolor, with the resolved colour carried per vertex. The
+> default palette and theme are not user-configurable. The renderer still uses
+> a case-insensitive 5x7 ASCII bitmap font, with all non-ASCII shown as `?`, no
+> visible cursor, no IME, and no accessibility surface. Startup launches
+> exactly one local session; additional palette rows do not launch or switch
+> PTYs yet. A bounded, explicitly partial list of positive literal aliases
+> from the user's OpenSSH config is displayed in the sidebar (at most 24 rows),
+> and selecting one shows its root-relative config source without opening an
+> SSH connection or PTY. Wildcard-only and dynamic OpenSSH destinations are not
+> a complete browseable list. Parsed `HostName` and `User` values retain
+> unresolved tokens such as `%h`, `%p`, and `%r` and are discovery metadata
+> only; a future connection path must resolve or reject them first. `Include`
+> handling is intentionally stricter than OpenSSH: Noren follows only files
+> whose canonical targets remain under the top-level config directory;
+> git worktrees and agents remain modelled but unreachable. Keybindings are not
+> configurable. There are no published binaries. Read
+> **[docs/known-limitations.md](docs/known-limitations.md)** first — it is the
+> accurate predictor of what happens when you run the build. Everything below
+> the status block describes **intent**, not current capability.
 
 Noren (ノレン) is being designed as a Rust workspace terminal for macOS and
 Linux. Its name comes from the Japanese *noren*: a curtain that divides a space
@@ -33,8 +56,15 @@ pass-through takes priority over Noren shortcuts.
 
 ## Current phase
 
-The project is completing Discovery and requirements work before production
-implementation. The required sequence is:
+Milestones 0–2 (discovery, requirements/design, terminal foundation) are
+complete on the evidence recorded in [ROADMAP.md](ROADMAP.md). Milestone 3
+(workspace) is **in progress**: the vertical slice — sidebar, palette, session
+lifecycle, persistence, Zellij pass-through — has landed, while configurable
+keybindings, SSH connection launching, and agent launching have not; the
+reasoning is in
+[Milestone 3 status](ROADMAP.md#milestone-3-status). The SSH,
+agent-experience, theming/accessibility, quality, and preview milestones are
+open. The required sequence remains:
 
 1. verify tools, upstream behavior, licenses, and project constraints;
 2. calibrate the available AI contributors on the same bounded task;
