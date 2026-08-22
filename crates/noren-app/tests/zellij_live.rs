@@ -17,18 +17,31 @@
 //!   ordering: encode first, gate-decide, forward on `GateKind::Forwarded`.
 //!
 //! Skip policy: when `zellij` is not on `PATH`, each live test returns early
-//! and prints `SKIP:` on stderr — CI without Zellij stays green while the
-//! output states explicitly that live evidence was NOT gathered. A skip is
-//! never reported as a pass.
+//! after printing `SKIP: [...]` to the REAL stderr (bypassing the harness's
+//! output capture) — CI without Zellij stays green while the output states
+//! explicitly that live evidence was NOT gathered. A skip is never reported
+//! as gathered evidence.
 //!
-//! Empirical record (printed by the mouse-mode test against the installed
-//! version): Zellij 0.44.3 enables mouse tracking with single-parameter
-//! DECSETs (`CSI ? 1002 h`, `CSI ? 1006 h`, ...); the multi-parameter form
-//! `CSI ? 1002;1006 h` does not appear in its attach stream. The parser's
-//! multi-parameter DECSET handling (fixed in PR #113) therefore stays
-//! covered by the `noren-terminal` unit suites; this harness additionally
-//! prints the live multi-parameter count so a future Zellij that changes
-//! shape surfaces as visible drift.
+//! Empirical record against the INSTALLED Zellij (drift-printed by the
+//! mouse-mode test): Zellij 0.44.3 requests mouse tracking with
+//! single-parameter DECSETs (`CSI ? 1002 h`, `CSI ? 1006 h`, ...). Across the
+//! FULL lifecycle probed while building this harness — attach, tab/pane
+//! interaction, typed input, and quit/restore — zero multi-parameter private
+//! CSI sequences appeared, and Zellij does not forward a pane program's
+//! multi-parameter DECSET to the host terminal (it re-renders panes itself
+//! and owns the host mode set). The multi-parameter form
+//! `CSI ? 1002;1006 h` is therefore NOT live-Zellij wire shape for this
+//! version.
+//!
+//! The multi-parameter DECSET path is a proven regression site (fixed in
+//! PR #113), so the mouse-mode test pins it EXPLICITLY beside the live
+//! evidence: after asserting on the real attach stream, it drives
+//! `CSI ? 1002;1006 h` through the SAME `TerminalState` instance that just
+//! parsed that stream. That pin is a regression guard co-located with the
+//! live evidence, not a claim about what Zellij sent; a parser that bails on
+//! multi-parameter DECSETs fails this test file. The harness also prints the
+//! live multi-parameter count, so a future Zellij that changes wire shape
+//! surfaces as visible drift.
 
 use std::ffi::OsString;
 use std::fs;
@@ -36,10 +49,11 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use noren_app::config::KeymapConfig;
 use noren_app::passthrough::{
     CLAIM_ID_PALETTE, Chord, ChordSeq, GateKind, KeyCode as GateKeyCode,
     Modifiers as GateModifiers, PassthroughAction, PassthroughClaim, PassthroughGate,
@@ -80,11 +94,23 @@ fn parse_version_line(line: &str) -> Option<&str> {
 }
 
 /// Print the skip notice shared by every live test when Zellij is absent.
+///
+/// The notice is written straight to the process's stderr file descriptor so
+/// it survives the test harness's output capture: an early-returning test
+/// otherwise reads as a silent pass under default `cargo test` output, and a
+/// skip must never be mistaken for gathered evidence.
 fn report_skip(test: &str) {
-    eprintln!(
+    let notice = format!(
         "SKIP [{test}]: zellij is not installed (or `zellij --version` failed); \
          live pass-through evidence was NOT gathered. This is a skip, not a pass."
     );
+    match fs::OpenOptions::new().write(true).open("/dev/stderr") {
+        Ok(mut file) => {
+            let _ = file.write_all(notice.as_bytes());
+            let _ = file.write_all(b"\n");
+        }
+        Err(_) => eprintln!("{notice}"),
+    }
 }
 
 /// Isolated config/data/socket/home directories for one live Zellij run.
@@ -237,14 +263,9 @@ impl LiveZellij {
     ) -> bool {
         let deadline = Instant::now() + budget;
         loop {
-            loop {
-                match self.events.try_recv() {
-                    Ok(chunk) => {
-                        self.terminal.feed_bytes(&chunk);
-                        self.raw.extend_from_slice(&chunk);
-                    }
-                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-                }
+            while let Ok(chunk) = self.events.try_recv() {
+                self.terminal.feed_bytes(&chunk);
+                self.raw.extend_from_slice(&chunk);
             }
             if ready(&self.terminal, &self.raw) {
                 return true;
@@ -393,17 +414,14 @@ fn plain_stroke(character: char) -> Stroke {
 }
 
 /// Mirror of `main.rs`'s `palette_policy`: the exit leader `Super+Escape`
-/// plus the palette chord `Super+p`.
+/// plus the configured palette chord (`KeymapConfig::default()` is Super+p).
 fn palette_policy() -> PassthroughPolicy {
     let palette_claim = PassthroughClaim {
         id: CLAIM_ID_PALETTE,
         action: PassthroughAction::OpenCommandPalette,
-        seq: ChordSeq::single(
-            Chord::new(GateKeyCode::Char('p'), GateModifiers::empty().super_key())
-                .expect("normalized Super+p"),
-        ),
-        justification: "live harness mirrors main.rs: Super+p lives in the Super/Cmd \
-                        modifier space the Zellij defaults never bind",
+        seq: ChordSeq::single(KeymapConfig::default().palette_open()),
+        justification: "live harness mirrors main.rs: the default palette chord (super+p) \
+                        lives in the Super/Cmd modifier space the Zellij defaults never bind",
     };
     PassthroughPolicy::try_new(vec![default_exit_claim(), palette_claim])
         .expect("live harness policy is valid and collision-free")
@@ -421,16 +439,16 @@ fn bind_chords(config: &str) -> Vec<String> {
             continue;
         };
         let bound_part = rest.split('{').next().unwrap_or(rest);
-        let mut quoted = None;
+        let mut current: Option<String> = None;
         for character in bound_part.chars() {
-            match quoted {
-                None if character == '"' => quoted = Some(String::new()),
-                Some(current) if character == '"' => {
-                    chords.push(current.clone());
-                    quoted = None;
+            if character == '"' {
+                if let Some(chord) = current.take() {
+                    chords.push(chord);
+                } else {
+                    current = Some(String::new());
                 }
-                Some(current) => current.push(character),
-                None => {}
+            } else if let Some(buffer) = current.as_mut() {
+                buffer.push(character);
             }
         }
     }
@@ -485,6 +503,30 @@ fn live_zellij_attach_enables_mouse_modes_in_noren_terminal_state() {
         "live zellij {version}: DECSET 1002/1006 mouse modes did not reach Noren's \
          terminal state; seen sequences: {decsets:?}; modes: {:?}",
         session.terminal.modes()
+    );
+
+    // Co-located regression pin for the multi-parameter DECSET path (PR #113).
+    // See the module docs: the installed Zellij 0.44.3 sends 1002 and 1006 as
+    // SEPARATE single-parameter DECSETs (the inventory printed above is the
+    // live evidence), so the combined form — a proven regression site that
+    // other terminal multiplexers do send — is pinned here by driving it
+    // through the SAME TerminalState instance that just parsed the live
+    // attach stream. A parser that bails on multi-parameter DECSETs fails
+    // this test.
+    let state = &mut session.terminal;
+    state.feed_bytes(b"\x1b[?1002l\x1b[?1006l");
+    assert!(
+        !state.modes().is_mouse_button_event_tracking_enabled()
+            && !state.modes().is_mouse_sgr_encoding_enabled(),
+        "zellij {version}: DECRST through the live parser must disable both mouse modes \
+         before the multi-parameter pin runs"
+    );
+    state.feed_bytes(b"\x1b[?1002;1006h");
+    assert!(
+        state.modes().is_mouse_button_event_tracking_enabled()
+            && state.modes().is_mouse_sgr_encoding_enabled(),
+        "zellij {version}: the multi-parameter DECSET `CSI ? 1002;1006 h` (the PR #113 \
+         regression site) no longer enables both mouse modes in Noren's terminal state"
     );
 }
 
@@ -594,16 +636,23 @@ fn live_zellij_default_keybinds_bind_no_super_chord() {
     );
     let super_chords: Vec<&String> = chords
         .iter()
-        .filter(|chord| chord.to_ascii_lowercase().contains("super"))
+        .filter(|chord| {
+            let lowered = chord.to_ascii_lowercase();
+            // Zellij spells the Super modifier "Super" (and on some builds
+            // "Cmd"/"Meta"); any bound chord using that modifier space would
+            // collide with Noren's claims.
+            lowered.contains("super") || lowered.contains("cmd") || lowered.contains("meta")
+        })
         .collect();
     assert!(
         super_chords.is_empty(),
-        "zellij {version}: its default keybinds bind Super chords {super_chords:?}, so \
-         Noren's Super+Escape and Super+p claims would collide with the installed version"
+        "zellij {version}: its default keybinds bind Super/Cmd/Meta chords {super_chords:?}, so \
+         Noren's Super+Escape exit leader and Super+p palette chords would collide with the \
+         installed version"
     );
     println!(
-        "live zellij {version}: {} default bind chords verified, none binds the Super \
-         modifier (Noren claims Super+Escape and Super+p)",
+        "live zellij {version}: {} default bind chords verified, none binds the \
+         Super/Cmd/Meta modifier space (Noren claims Super+Escape and Super+p)",
         chords.len()
     );
 }
