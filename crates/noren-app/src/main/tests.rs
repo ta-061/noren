@@ -3684,6 +3684,46 @@ fn single_instance_save_has_no_persistence_false_alarm() {
 // children are reaped through `PtySession`'s bounded shutdown when the app (or
 // its parked map) drops.
 
+/// An isolated home directory for PTY children, following the `noren-pty`
+/// suite's `TestHome` convention.
+///
+/// Tests that drive a shell by typing must not run it in the developer's real
+/// `$HOME`: personal startup files can take arbitrarily long (over a minute on
+/// some machines) or read the terminal, which would make the test's prompt
+/// wait depend on personal configuration. An empty home gives the same fixed
+/// `/bin/zsh` policy with a deterministic, immediate prompt.
+struct AppTestHome(PathBuf);
+
+impl AppTestHome {
+    fn new() -> Self {
+        static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "noren-app-test-home-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).expect("create isolated test home");
+        Self(path)
+    }
+
+    /// A default app whose spawned sessions run in this isolated home.
+    ///
+    /// Borrows the guard so it stays alive (and the directory stays present)
+    /// for the whole test: the child validates the directory at spawn time.
+    fn app(&self) -> NorenApp {
+        NorenApp {
+            test_pty_home: Some(self.0.clone()),
+            ..NorenApp::default()
+        }
+    }
+}
+
+impl Drop for AppTestHome {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).expect("remove isolated test home");
+    }
+}
+
 /// Registry ids in sidebar order.
 fn registry_ids(app: &NorenApp) -> Vec<SessionId> {
     app.workspace
@@ -3785,13 +3825,13 @@ fn palette_create_spawns_a_real_local_pty_session() {
 /// a live-surface entry behind.
 #[test]
 fn a_parked_session_that_exits_is_observed_and_detached() {
-    let mut app = NorenApp::default();
+    let home = AppTestHome::new();
+    let mut app = home.app();
     app.run_workspace_action(WorkspaceAction::CreateSession);
     let first = registry_ids(&app)[0];
     // Wait for the shell to finish starting up before typing into it: input
-    // queued while zsh is still reading its startup files races them, and the
-    // real $HOME (unlike the noren-pty suite's isolated TestHome) carries a
-    // full user configuration.
+    // queued while zsh is still reading its startup files races them. The
+    // isolated home makes that startup immediate and deterministic.
     wait_for_shell_output(&mut app);
     // Tell the first shell to exit while it still owns the live view; the
     // exit is only observed after the session has been parked, because

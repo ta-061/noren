@@ -549,6 +549,13 @@ struct NorenApp {
     active_session: Option<SessionId>,
     /// Live sessions that are not the active one, keyed by session id.
     parked_sessions: HashMap<SessionId, ParkedSession>,
+    /// Test-only override for the PTY child's home directory. Production
+    /// always spawns in the inherited `$HOME`; tests that drive a shell by
+    /// typing set an isolated empty directory so the shell's startup cannot
+    /// depend on the developer's personal configuration (which may take
+    /// arbitrarily long or read the terminal).
+    #[cfg(test)]
+    test_pty_home: Option<PathBuf>,
     palette_open: bool,
     palette_selection: usize,
     passthrough_gate: PassthroughGate,
@@ -627,6 +634,8 @@ impl NorenApp {
             sidebar_scroll_offset: 0,
             active_session: None,
             parked_sessions: HashMap::new(),
+            #[cfg(test)]
+            test_pty_home: None,
             palette_open: false,
             palette_selection: 0,
             passthrough_gate: PassthroughGate::new(),
@@ -797,6 +806,21 @@ impl NorenApp {
         }
     }
 
+    /// Spawn the PTY for a new session.
+    ///
+    /// Production always runs the fixed `/bin/zsh` policy in the inherited
+    /// `$HOME`. Tests that drive a shell by typing redirect the child into an
+    /// isolated empty home (see [`NorenApp::test_pty_home`]) so a developer's
+    /// startup files cannot make the test wait minutes for a prompt — the
+    /// spawn itself, the policy, and the reaping contract are identical.
+    fn spawn_pty_session(&self, size: PtySize) -> Result<PtySession, noren_pty::PtyError> {
+        #[cfg(test)]
+        if let Some(home) = &self.test_pty_home {
+            return PtySession::spawn_in_home(home, size);
+        }
+        PtySession::spawn(size)
+    }
+
     /// Spawn a real local PTY session and give it the live view.
     ///
     /// This is the palette `session_create` runtime: the new sidebar row is
@@ -817,7 +841,7 @@ impl NorenApp {
             );
             return None;
         };
-        match PtySession::spawn(pty_size) {
+        match self.spawn_pty_session(pty_size) {
             Ok(pty) => {
                 self.workspace.observe_session(id, SessionStatus::Running);
                 self.park_active_session();
