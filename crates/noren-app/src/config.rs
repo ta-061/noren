@@ -17,6 +17,17 @@
 //! `docs/configuration.md` for the reserved settings and the lane work each
 //! one is waiting on.
 //!
+//! The `[keys]` table configures the workspace key chords (the palette
+//! opener and the four palette command shortcuts). It follows the same
+//! discipline: an absent table keeps the compiled-in defaults, an
+//! unparseable chord is a typed [`ConfigError::InvalidChord`] naming the
+//! offending key and value, an unknown action name is
+//! [`ConfigError::UnknownKey`], two actions on one chord is
+//! [`ConfigError::DuplicateChord`], and a palette chord the pass-through
+//! policy could never claim (a pinned Zellij default or the frozen
+//! `Super+Escape` exit leader) is [`ConfigError::UnclaimableChord`] rather
+//! than a silently dead binding.
+//!
 //! # Privacy
 //!
 //! Configuration carries no secrets: no supported key names a credential,
@@ -24,6 +35,10 @@
 //! keys at all. The shell program is **not** configurable: the threat model
 //! (TM-01) fixes the spawn at `/bin/zsh` with no configured additions.
 
+use crate::passthrough::{
+    CLAIM_ID_PALETTE, Chord, ChordError, ChordSeq, KeyCode, Modifiers, PassthroughAction,
+    PassthroughClaim, PassthroughPolicy, default_exit_claim,
+};
 use crate::{POC_CELL_HEIGHT, POC_CELL_WIDTH};
 use std::env;
 use std::fmt;
@@ -97,6 +112,72 @@ impl FontConfig {
     }
 }
 
+/// Configurable workspace key chords.
+///
+/// [`KeymapConfig::default`] is exactly the chord set the app shipped with
+/// before configuration existed: `super+p` opens the palette, and the bare
+/// characters `c`/`s`/`x`/`f` dispatch the four palette commands. Every
+/// chord is a normalized pass-through [`Chord`], so the binary compares
+/// configured bindings against live key events without re-parsing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeymapConfig {
+    palette_open: Chord,
+    session_create: Chord,
+    session_select: Chord,
+    session_close: Chord,
+    sidebar_focus: Chord,
+}
+
+impl Default for KeymapConfig {
+    fn default() -> Self {
+        Self {
+            palette_open: default_chord(KeyCode::Char('p'), Modifiers::empty().super_key()),
+            session_create: default_chord(KeyCode::Char('c'), Modifiers::empty()),
+            session_select: default_chord(KeyCode::Char('s'), Modifiers::empty()),
+            session_close: default_chord(KeyCode::Char('x'), Modifiers::empty()),
+            sidebar_focus: default_chord(KeyCode::Char('f'), Modifiers::empty()),
+        }
+    }
+}
+
+impl KeymapConfig {
+    /// The chord opening the command palette; defaults to `super+p`.
+    #[must_use]
+    pub const fn palette_open(self) -> Chord {
+        self.palette_open
+    }
+
+    /// The palette command chord dispatching `session.create`; defaults to `c`.
+    #[must_use]
+    pub const fn session_create(self) -> Chord {
+        self.session_create
+    }
+
+    /// The palette command chord dispatching `session.select`; defaults to `s`.
+    #[must_use]
+    pub const fn session_select(self) -> Chord {
+        self.session_select
+    }
+
+    /// The palette command chord dispatching `session.close`; defaults to `x`.
+    #[must_use]
+    pub const fn session_close(self) -> Chord {
+        self.session_close
+    }
+
+    /// The palette command chord dispatching `sidebar.focus`; defaults to `f`.
+    #[must_use]
+    pub const fn sidebar_focus(self) -> Chord {
+        self.sidebar_focus
+    }
+}
+
+/// A default keymap chord constant; the values are printable characters and
+/// the Super modifier, which always normalize.
+fn default_chord(code: KeyCode, modifiers: Modifiers) -> Chord {
+    Chord::new(code, modifiers).expect("default keymap chords are normalized constants")
+}
+
 /// Validated application configuration.
 ///
 /// [`AppConfig::default`] is byte-for-byte the behavior the app had before
@@ -104,6 +185,7 @@ impl FontConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct AppConfig {
     font: FontConfig,
+    keys: KeymapConfig,
 }
 
 impl AppConfig {
@@ -111,6 +193,12 @@ impl AppConfig {
     #[must_use]
     pub const fn font(self) -> FontConfig {
         self.font
+    }
+
+    /// Workspace key chord settings.
+    #[must_use]
+    pub const fn keys(self) -> KeymapConfig {
+        self.keys
     }
 
     /// Load configuration from the standard path or the [`CONFIG_ENV_VAR`]
@@ -161,6 +249,7 @@ impl AppConfig {
                 .ok_or_else(|| ConfigError::WrongType { key: clip(key) })?;
             match key {
                 "font" => parse_font(table, &mut config.font)?,
+                "keys" => parse_keys(table, &mut config.keys)?,
                 // `[terminal]` historically attracted a `scrollback_lines` key.
                 // The terminal foundation has no configurable retention cap yet,
                 // so the table is rejected instead of parsed-and-ignored.
@@ -207,6 +296,345 @@ fn integer_in_range(key: &str, item: &Item, min: usize, max: usize) -> Result<us
         .ok_or_else(|| ConfigError::OutOfRange { key: clip(key) })?;
     Ok(value)
 }
+
+/// Apply the `[keys]` table to the keymap.
+/// Every TOML key must name a known action and every value must be a string
+/// holding one parseable chord. Palette-command chords must avoid the keys
+/// the open palette always interprets structurally (Escape, Enter, and the
+/// vertical arrows), the palette opener must stay claimable by the
+/// pass-through policy, and after applying the table all five chords must
+/// stay pairwise distinct — including the chords of actions the table left
+/// at their defaults.
+fn parse_keys(table: &dyn TableLike, keys: &mut KeymapConfig) -> Result<(), ConfigError> {
+    for (key, item) in table.iter() {
+        // Unknown action names are rejected before the value is examined,
+        // so a sub-table named by a typo reports the unknown action, not a
+        // value-type complaint.
+        let value = match key {
+            "palette_open" | "session_create" | "session_select" | "session_close"
+            | "sidebar_focus" => item
+                .as_str()
+                .ok_or_else(|| ConfigError::ChordNotAString { key: clip(key) })?,
+            _ => return Err(ConfigError::UnknownKey(clip(key))),
+        };
+        match key {
+            "palette_open" => {
+                let chord = parse_configured_chord(key, value)?;
+                keys.palette_open = validate_palette_claim(chord, key, value)?;
+            }
+            "session_create" => keys.session_create = parse_command_chord(key, value)?,
+            "session_select" => keys.session_select = parse_command_chord(key, value)?,
+            "session_close" => keys.session_close = parse_command_chord(key, value)?,
+            "sidebar_focus" => keys.sidebar_focus = parse_command_chord(key, value)?,
+            // Unreachable in practice: the value match above rejected every
+            // other name as unknown.
+            _ => return Err(ConfigError::UnknownKey(clip(key))),
+        }
+    }
+    ensure_distinct_chords(keys)
+}
+
+/// Parse one `[keys]` value into a chord, blaming the key and value on
+/// failure.
+///
+/// The binary claims Super+A/C/V (clipboard) and Super+D (diagnostics)
+/// ahead of every configured path — palette commands included, because
+/// `handle_key` consults them first even while the palette is open — and
+/// matches them with any combination of further modifiers held. A chord
+/// there would be dead configuration, so it is rejected here like every
+/// other unclaimable binding.
+fn parse_configured_chord(key: &str, value: &str) -> Result<Chord, ConfigError> {
+    let chord = parse_chord(value).map_err(|error| ConfigError::InvalidChord {
+        key: clip(key),
+        value: clip(value),
+        reason: clip(error.to_string()),
+    })?;
+    if chord.modifiers().is_super()
+        && matches!(
+            chord.code(),
+            KeyCode::Char('a') | KeyCode::Char('c') | KeyCode::Char('v') | KeyCode::Char('d')
+        )
+    {
+        return Err(ConfigError::ReservedChord {
+            key: clip(key),
+            value: clip(value),
+        });
+    }
+    Ok(chord)
+}
+
+/// Parse and validate one palette-command chord. The four command chords are
+/// matched only while the palette is open, so they cannot steal a chord from
+/// Zellij or the child, but the open palette interprets Escape, Enter, and
+/// the vertical arrows structurally before chord dispatch — a command bound
+/// there would be dead configuration, so it is rejected.
+fn parse_command_chord(key: &str, value: &str) -> Result<Chord, ConfigError> {
+    let chord = parse_configured_chord(key, value)?;
+    if matches!(
+        chord.code(),
+        KeyCode::Escape | KeyCode::Enter | KeyCode::Up | KeyCode::Down
+    ) {
+        return Err(ConfigError::ReservedChord {
+            key: clip(key),
+            value: clip(value),
+        });
+    }
+    Ok(chord)
+}
+
+/// Validate that the pass-through policy could actually claim the configured
+/// palette chord, using the same enforcement point the live policy uses.
+///
+/// A chord colliding with a pinned Zellij default, or shadowed by / shadowing
+/// the frozen `Super+Escape` exit leader, could never open the palette;
+/// accepting it would be a silently dead binding.
+fn validate_palette_claim(chord: Chord, key: &str, value: &str) -> Result<Chord, ConfigError> {
+    let probe = PassthroughClaim {
+        id: CLAIM_ID_PALETTE,
+        action: PassthroughAction::OpenCommandPalette,
+        seq: ChordSeq::single(chord),
+        justification: "configuration validation probe",
+    };
+    match PassthroughPolicy::try_new(vec![default_exit_claim(), probe]) {
+        Ok(_) => Ok(chord),
+        Err(_) => Err(ConfigError::UnclaimableChord {
+            key: clip(key),
+            value: clip(value),
+        }),
+    }
+}
+
+/// Reject any chord bound to two of the five actions.
+///
+/// The check runs on the final keymap, so it also catches a configured value
+/// that silently collides with an action the table left at its default.
+fn ensure_distinct_chords(keys: &KeymapConfig) -> Result<(), ConfigError> {
+    let bindings = [
+        ("palette_open", keys.palette_open),
+        ("session_create", keys.session_create),
+        ("session_select", keys.session_select),
+        ("session_close", keys.session_close),
+        ("sidebar_focus", keys.sidebar_focus),
+    ];
+    for (index, (first_name, first)) in bindings.iter().enumerate() {
+        for (second_name, second) in bindings.iter().skip(index + 1) {
+            if first == second {
+                return Err(ConfigError::DuplicateChord {
+                    first: (*first_name).to_owned(),
+                    second: (*second_name).to_owned(),
+                    chord: chord_text(*first),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One chord modifier recognized by the [`parse_chord`] grammar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Modifier {
+    Ctrl,
+    Alt,
+    Shift,
+    Super,
+}
+
+/// Parse a modifier token, case-insensitively.
+fn parse_modifier(token: &str) -> Option<Modifier> {
+    match token.to_ascii_lowercase().as_str() {
+        "ctrl" => Some(Modifier::Ctrl),
+        "alt" => Some(Modifier::Alt),
+        "shift" => Some(Modifier::Shift),
+        "super" => Some(Modifier::Super),
+        _ => None,
+    }
+}
+
+/// Parse a final key token: one character (case-folded by [`Chord::new`]) or
+/// a named key, case-insensitively.
+fn parse_key_code(token: &str) -> Result<KeyCode, ChordParseError> {
+    let mut characters = token.chars();
+    let Some(first) = characters.next() else {
+        return Err(ChordParseError::EmptyToken);
+    };
+    if characters.next().is_none() {
+        return Ok(KeyCode::Char(first));
+    }
+    let lowered = token.to_ascii_lowercase();
+    let code = match lowered.as_str() {
+        "enter" => KeyCode::Enter,
+        "tab" => KeyCode::Tab,
+        "backspace" => KeyCode::Backspace,
+        "escape" => KeyCode::Escape,
+        "space" => KeyCode::Space,
+        "up" => KeyCode::Up,
+        "down" => KeyCode::Down,
+        "left" => KeyCode::Left,
+        "right" => KeyCode::Right,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "pageup" => KeyCode::PageUp,
+        "pagedown" => KeyCode::PageDown,
+        "insert" => KeyCode::Insert,
+        "delete" => KeyCode::Delete,
+        other => {
+            let Some(number) = other.strip_prefix('f') else {
+                return Err(ChordParseError::UnknownKey(token.to_owned()));
+            };
+            let Ok(number) = number.parse::<u8>() else {
+                return Err(ChordParseError::UnknownKey(token.to_owned()));
+            };
+            KeyCode::Function(number)
+        }
+    };
+    Ok(code)
+}
+
+/// Parse chord text such as `"super+p"` or `"ctrl+shift+t"` into a normalized
+/// [`Chord`].
+///
+/// The grammar is zero or more of the modifiers `super`, `ctrl`, `alt`, and
+/// `shift` (each at most once, case-insensitive) followed by exactly one key,
+/// all joined with `+`. The key is a single character or a named key
+/// (`enter`, `tab`, `backspace`, `escape`, `space`, arrows, `home`, `end`,
+/// `pageup`, `pagedown`, `insert`, `delete`, `f1`–`f24`). Characters fold to
+/// lowercase and whitespace or control characters are rejected, exactly as
+/// [`Chord::new`] normalizes. Every failure is a typed
+/// [`ChordParseError`]; there is no forgiving or default chord.
+///
+/// # Errors
+///
+/// Returns the first violation in left-to-right token order: an empty text,
+/// an empty `+`-separated token, a missing final key, a non-modifier token
+/// before the key, an unknown key name, a repeated modifier, or a key that
+/// [`Chord::new`] cannot normalize.
+pub fn parse_chord(text: &str) -> Result<Chord, ChordParseError> {
+    if text.is_empty() {
+        return Err(ChordParseError::Empty);
+    }
+    let tokens: Vec<&str> = text.split('+').collect();
+    if tokens.iter().any(|token| token.is_empty()) {
+        return Err(ChordParseError::EmptyToken);
+    }
+    let Some((key_token, modifier_tokens)) = tokens.split_last() else {
+        return Err(ChordParseError::Empty);
+    };
+    if parse_modifier(key_token).is_some() {
+        return Err(ChordParseError::MissingKey);
+    }
+    let mut modifiers = Modifiers::empty();
+    for token in modifier_tokens {
+        let token = *token;
+        let Some(modifier) = parse_modifier(token) else {
+            return Err(ChordParseError::NotAModifier(token.to_owned()));
+        };
+        let already = match modifier {
+            Modifier::Ctrl => modifiers.is_ctrl(),
+            Modifier::Alt => modifiers.is_alt(),
+            Modifier::Shift => modifiers.is_shift(),
+            Modifier::Super => modifiers.is_super(),
+        };
+        if already {
+            return Err(ChordParseError::RepeatedModifier(token.to_owned()));
+        }
+        modifiers = match modifier {
+            Modifier::Ctrl => modifiers.ctrl(),
+            Modifier::Alt => modifiers.alt(),
+            Modifier::Shift => modifiers.shift(),
+            Modifier::Super => modifiers.super_key(),
+        };
+    }
+    let code = parse_key_code(key_token)?;
+    Chord::new(code, modifiers).map_err(ChordParseError::InvalidKey)
+}
+
+/// Render a chord back to its canonical `parse_chord` text.
+///
+/// Used for error messages, so the text names exactly what two actions share.
+fn chord_text(chord: Chord) -> String {
+    let modifiers = chord.modifiers();
+    let mut parts: Vec<String> = Vec::new();
+    if modifiers.is_ctrl() {
+        parts.push("ctrl".to_owned());
+    }
+    if modifiers.is_alt() {
+        parts.push("alt".to_owned());
+    }
+    if modifiers.is_shift() {
+        parts.push("shift".to_owned());
+    }
+    if modifiers.is_super() {
+        parts.push("super".to_owned());
+    }
+    parts.push(key_code_text(chord.code()));
+    parts.join("+")
+}
+
+/// Canonical text of one key identity.
+fn key_code_text(code: KeyCode) -> String {
+    match code {
+        KeyCode::Char(character) => character.to_string(),
+        KeyCode::Function(number) => format!("f{number}"),
+        KeyCode::Enter => "enter".to_owned(),
+        KeyCode::Tab => "tab".to_owned(),
+        KeyCode::Backspace => "backspace".to_owned(),
+        KeyCode::Escape => "escape".to_owned(),
+        KeyCode::Space => "space".to_owned(),
+        KeyCode::Up => "up".to_owned(),
+        KeyCode::Down => "down".to_owned(),
+        KeyCode::Left => "left".to_owned(),
+        KeyCode::Right => "right".to_owned(),
+        KeyCode::Home => "home".to_owned(),
+        KeyCode::End => "end".to_owned(),
+        KeyCode::PageUp => "pageup".to_owned(),
+        KeyCode::PageDown => "pagedown".to_owned(),
+        KeyCode::Insert => "insert".to_owned(),
+        KeyCode::Delete => "delete".to_owned(),
+    }
+}
+
+/// Why chord text could not be parsed.
+///
+/// Every failure is typed; none falls back to a default chord.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChordParseError {
+    /// The chord text is empty.
+    Empty,
+    /// A `+`-separated token is empty (leading, trailing, or doubled `+`).
+    EmptyToken,
+    /// The text ends in a modifier, leaving no final key.
+    MissingKey,
+    /// A token before the final key is not one of the four modifiers.
+    NotAModifier(String),
+    /// The final token is not a character or known key name.
+    UnknownKey(String),
+    /// The same modifier appears more than once.
+    RepeatedModifier(String),
+    /// The key is valid grammar but not a normalizable [`Chord`] (a control
+    /// or whitespace character, or a function key outside F1–F24).
+    InvalidKey(ChordError),
+}
+
+impl fmt::Display for ChordParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("the chord is empty"),
+            Self::EmptyToken => f.write_str("a '+'-separated part of the chord is empty"),
+            Self::MissingKey => f.write_str("the chord has modifiers but no final key"),
+            Self::NotAModifier(token) => write!(
+                f,
+                "chord part {token} precedes the key but is not one of super, ctrl, alt, shift"
+            ),
+            Self::UnknownKey(token) => {
+                write!(f, "chord key {token} is not a recognized single key")
+            }
+            Self::RepeatedModifier(token) => write!(f, "modifier {token} appears more than once"),
+            Self::InvalidKey(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ChordParseError {}
 
 /// Standard per-user configuration path:
 /// `~/Library/Application Support/Noren/config.toml`.
@@ -299,6 +727,27 @@ pub enum ConfigError {
     WrongType { key: String },
     /// A value is outside its accepted range.
     OutOfRange { key: String },
+    /// A `[keys]` action is bound to a value that is not a TOML string.
+    ChordNotAString { key: String },
+    /// A `[keys]` value does not parse as a chord.
+    InvalidChord {
+        key: String,
+        value: String,
+        reason: String,
+    },
+    /// A `[keys]` palette chord parses but could never be claimed: it
+    /// collides with a pinned Zellij default or the frozen `Super+Escape`
+    /// exit leader.
+    UnclaimableChord { key: String, value: String },
+    /// A `[keys]` palette command chord uses a key the open palette always
+    /// interprets structurally, so the binding could never fire.
+    ReservedChord { key: String, value: String },
+    /// Two `[keys]` actions are bound to the same chord.
+    DuplicateChord {
+        first: String,
+        second: String,
+        chord: String,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -317,6 +766,33 @@ impl fmt::Display for ConfigError {
             Self::OutOfRange { key } => {
                 write!(f, "configuration key {key} is outside its accepted range")
             }
+            Self::ChordNotAString { key } => write!(
+                f,
+                "configuration key {key} must be a chord string like \"super+p\""
+            ),
+            Self::InvalidChord { key, value, reason } => write!(
+                f,
+                "configuration key {key} has an unparseable chord {value}: {reason}"
+            ),
+            Self::UnclaimableChord { key, value } => write!(
+                f,
+                "configuration key {key} binds chord {value}, which collides with a pinned \
+                 Zellij default or the frozen Super+Escape exit leader"
+            ),
+            Self::ReservedChord { key, value } => write!(
+                f,
+                "configuration key {key} binds chord {value} on a key the application \
+                 always claims first: the open palette reads it as navigation or dismissal, \
+                 and Super+A/C/V/D are fixed clipboard and diagnostics shortcuts"
+            ),
+            Self::DuplicateChord {
+                first,
+                second,
+                chord,
+            } => write!(
+                f,
+                "configuration keys {first} and {second} are both bound to the chord {chord}"
+            ),
         }
     }
 }
@@ -662,5 +1138,416 @@ mod tests {
         let error = AppConfig::parse(&hostile).expect_err("malformed input fails");
         let message = error.to_string();
         assert!(message.len() < 1024, "message must stay bounded: {message}");
+    }
+
+    // ── [keys] keymap tests ────────────────────────────────────────────
+
+    fn chord(code: KeyCode, modifiers: Modifiers) -> Chord {
+        Chord::new(code, modifiers).expect("test chords are normalized constants")
+    }
+
+    /// With no `[keys]` surface at all, the keymap is exactly the chord set
+    /// the app shipped with before configuration existed.
+    #[test]
+    fn default_keymap_matches_the_pre_configuration_chords() {
+        let keys = KeymapConfig::default();
+        assert_eq!(
+            keys.palette_open(),
+            chord(KeyCode::Char('p'), Modifiers::empty().super_key()),
+            "palette opener defaults to super+p"
+        );
+        assert_eq!(
+            keys.session_create(),
+            chord(KeyCode::Char('c'), Modifiers::empty())
+        );
+        assert_eq!(
+            keys.session_select(),
+            chord(KeyCode::Char('s'), Modifiers::empty())
+        );
+        assert_eq!(
+            keys.session_close(),
+            chord(KeyCode::Char('x'), Modifiers::empty())
+        );
+        assert_eq!(
+            keys.sidebar_focus(),
+            chord(KeyCode::Char('f'), Modifiers::empty())
+        );
+        assert_eq!(AppConfig::default().keys(), keys);
+        assert_eq!(AppConfig::parse("# nothing\n").expect("valid").keys(), keys);
+    }
+
+    /// An empty `[keys]` table is presence without content: all defaults.
+    #[test]
+    fn empty_keys_table_keeps_every_default_chord() {
+        let config = AppConfig::parse("[keys]\n").expect("an empty table is valid");
+        assert_eq!(config.keys(), KeymapConfig::default());
+    }
+
+    #[test]
+    fn custom_palette_chord_overrides_only_the_opener() {
+        let config = AppConfig::parse("[keys]\npalette_open = \"super+k\"\n")
+            .expect("super+k is claimable and distinct");
+        assert_eq!(
+            config.keys().palette_open(),
+            chord(KeyCode::Char('k'), Modifiers::empty().super_key())
+        );
+        assert_eq!(
+            config.keys(),
+            KeymapConfig {
+                palette_open: config.keys().palette_open(),
+                ..KeymapConfig::default()
+            }
+        );
+    }
+
+    #[test]
+    fn custom_command_chords_apply_to_their_own_actions() {
+        let config = AppConfig::parse(
+            "[keys]\nsession_create = \"ctrl+shift+t\"\nsession_select = \"n\"\n\
+             session_close = \"f2\"\nsidebar_focus = \"tab\"\n",
+        )
+        .expect("all four command chords are valid and distinct");
+        assert_eq!(
+            config.keys().session_create(),
+            chord(KeyCode::Char('t'), Modifiers::empty().ctrl().shift())
+        );
+        assert_eq!(
+            config.keys().session_select(),
+            chord(KeyCode::Char('n'), Modifiers::empty())
+        );
+        assert_eq!(
+            config.keys().session_close(),
+            chord(KeyCode::Function(2), Modifiers::empty())
+        );
+        assert_eq!(
+            config.keys().sidebar_focus(),
+            chord(KeyCode::Tab, Modifiers::empty())
+        );
+        assert_eq!(
+            config.keys().palette_open(),
+            KeymapConfig::default().palette_open()
+        );
+    }
+
+    #[test]
+    fn keys_apply_alongside_font_in_one_file() {
+        let config =
+            AppConfig::parse("[font]\ncell_width = 12\n[keys]\npalette_open = \"super+b\"\n")
+                .expect("both tables are valid");
+        assert_eq!(config.font().cell_width(), 12);
+        assert_eq!(
+            config.keys().palette_open(),
+            chord(KeyCode::Char('b'), Modifiers::empty().super_key())
+        );
+    }
+
+    /// Mutation proof (a): an action name the schema does not define must be
+    /// an error, never a silently ignored key. If unknown actions were
+    /// ignored, these files would parse as defaults and this test would fail.
+    #[test]
+    fn unknown_keys_actions_are_rejected_not_ignored() {
+        let cases = [
+            ("[keys]\npalette = \"super+p\"\n", "palette"),
+            ("[keys]\nsession_creat = \"c\"\n", "session_creat"),
+            ("[keys]\nzoom = \"super+z\"\n", "zoom"),
+            // A dotted action name becomes a sub-table, still unknown.
+            ("[keys.session]\ncreate = \"c\"\n", "session"),
+        ];
+        for (text, name) in cases {
+            assert_eq!(
+                AppConfig::parse(text),
+                Err(ConfigError::UnknownKey(name.to_owned())),
+                "{text:?} must not parse as a working setting"
+            );
+        }
+    }
+
+    /// Super+A/C/V (clipboard) and Super+D (diagnostics) are handled ahead of
+    /// every configured path, for every action, with further modifiers still
+    /// matching — a configured binding there would be dead, so it is a typed
+    /// `ReservedChord` error naming the key, never a silently shadowed accept.
+    #[test]
+    fn fixed_global_shortcuts_are_rejected_for_every_action() {
+        let actions = [
+            "palette_open",
+            "session_create",
+            "session_select",
+            "session_close",
+            "sidebar_focus",
+        ];
+        let reserved = [
+            ("super+a", 'a'),
+            ("super+c", 'c'),
+            ("super+v", 'v'),
+            ("super+d", 'd'),
+            // Shift (and any further modifier) still routes into the fixed
+            // handlers, so these are dead too.
+            ("super+shift+a", 'a'),
+            ("super+ctrl+d", 'd'),
+        ];
+        for action in actions {
+            for (chord, character) in reserved {
+                let text = format!("[keys]\n{action} = \"{chord}\"\n");
+                assert_eq!(
+                    AppConfig::parse(&text),
+                    Err(ConfigError::ReservedChord {
+                        key: action.to_owned(),
+                        value: chord.to_owned(),
+                    }),
+                    "{chord} must not be accepted for {action}"
+                );
+                let _ = character;
+            }
+        }
+        // The unmodified command keys and the default palette chord stay
+        // acceptable; only the fixed globals are refused.
+        for (action, chord) in [
+            ("session_create", "c"),
+            ("palette_open", "super+p"),
+            ("sidebar_focus", "f"),
+        ] {
+            let text = format!("[keys]\n{action} = \"{chord}\"\n");
+            assert!(
+                AppConfig::parse(&text).is_ok(),
+                "{chord} for {action} must stay accepted"
+            );
+        }
+    }
+
+    /// Every unparseable chord is a typed error naming the offending key and
+    /// its value; none falls back to a default chord.
+    #[test]
+    fn unparseable_chords_are_typed_errors_naming_key_and_value() {
+        let cases = [
+            ("", ChordParseError::Empty),
+            ("+p", ChordParseError::EmptyToken),
+            ("super+", ChordParseError::EmptyToken),
+            ("super++p", ChordParseError::EmptyToken),
+            ("super", ChordParseError::MissingKey),
+            ("ctrl+shift", ChordParseError::MissingKey),
+            ("hyper+p", ChordParseError::NotAModifier("hyper".to_owned())),
+            ("p+q", ChordParseError::NotAModifier("p".to_owned())),
+            (
+                "ctrl+ctrl+t",
+                ChordParseError::RepeatedModifier("ctrl".to_owned()),
+            ),
+            ("foo", ChordParseError::UnknownKey("foo".to_owned())),
+            ("super+foo", ChordParseError::UnknownKey("foo".to_owned())),
+            ("fxy", ChordParseError::UnknownKey("fxy".to_owned())),
+            (
+                " ",
+                ChordParseError::InvalidKey(ChordError::ControlOrWhitespaceChar),
+            ),
+            (
+                "f25",
+                ChordParseError::InvalidKey(ChordError::FunctionKeyOutOfRange),
+            ),
+        ];
+        for (value, reason) in cases {
+            assert_eq!(
+                AppConfig::parse(&format!("[keys]\nsession_create = \"{value}\"\n")),
+                Err(ConfigError::InvalidChord {
+                    key: "session_create".to_owned(),
+                    value: value.to_owned(),
+                    reason: reason.to_string(),
+                }),
+                "chord {value:?} must be rejected with its key and value"
+            );
+        }
+    }
+
+    /// Hostile chord values are clipped in the error, like hostile keys.
+    #[test]
+    fn unparseable_chord_values_are_clipped_in_errors() {
+        let mut value = String::new();
+        value.extend(std::iter::repeat_n('a', 10_000));
+        let error = AppConfig::parse(&format!("[keys]\npalette_open = \"{value}\"\n"))
+            .expect_err("hostile chord value fails");
+        match error {
+            ConfigError::InvalidChord { value, .. } => {
+                assert!(
+                    value.chars().count() <= MAX_ERROR_DETAIL_CHARS + 1,
+                    "chord value must be clipped: {value}"
+                );
+            }
+            other => panic!("expected InvalidChord, got {other:?}"),
+        }
+    }
+
+    /// Two actions on one chord are rejected — including a configured value
+    /// that collides with an action the table left at its default.
+    #[test]
+    fn duplicate_chords_are_rejected_including_against_defaults() {
+        let explicit = AppConfig::parse("[keys]\nsession_create = \"n\"\nsession_select = \"n\"\n")
+            .expect_err("two actions on one chord");
+        assert_eq!(
+            explicit,
+            ConfigError::DuplicateChord {
+                first: "session_create".to_owned(),
+                second: "session_select".to_owned(),
+                chord: "n".to_owned(),
+            }
+        );
+
+        let against_default = AppConfig::parse("[keys]\nsession_create = \"f\"\n")
+            .expect_err("f is the sidebar_focus default");
+        assert_eq!(
+            against_default,
+            ConfigError::DuplicateChord {
+                first: "session_create".to_owned(),
+                second: "sidebar_focus".to_owned(),
+                chord: "f".to_owned(),
+            }
+        );
+
+        // Distinct-modifier chords on the same character are fine.
+        assert!(AppConfig::parse("[keys]\nsession_create = \"ctrl+c\"\n").is_ok());
+    }
+
+    /// A palette chord the pass-through policy could never claim is an
+    /// error, because the app could never honor it.
+    #[test]
+    fn unclaimable_palette_chords_are_rejected() {
+        for value in [
+            "p",            // bare p: Zellij pane mode binds it
+            "ctrl+t",       // Zellij shared_except_locked binds Ctrl t
+            "super+escape", // the frozen exit leader
+        ] {
+            assert_eq!(
+                AppConfig::parse(&format!("[keys]\npalette_open = \"{value}\"\n")),
+                Err(ConfigError::UnclaimableChord {
+                    key: "palette_open".to_owned(),
+                    value: value.to_owned(),
+                }),
+                "chord {value:?} must not parse as a claimable opener"
+            );
+        }
+        // Super-space chords stay outside the corpus and are accepted.
+        assert!(AppConfig::parse("[keys]\npalette_open = \"super+shift+p\"\n").is_ok());
+    }
+
+    /// Command chords on keys the open palette always interprets structurally
+    /// would be dead bindings, so they are rejected; the opener may use them.
+    #[test]
+    fn command_chords_on_palette_ui_keys_are_rejected() {
+        for value in ["escape", "enter", "up", "down"] {
+            assert_eq!(
+                AppConfig::parse(&format!("[keys]\nsession_create = \"{value}\"\n")),
+                Err(ConfigError::ReservedChord {
+                    key: "session_create".to_owned(),
+                    value: value.to_owned(),
+                }),
+                "command chord {value:?} could never fire"
+            );
+        }
+        assert!(AppConfig::parse("[keys]\nsession_create = \"left\"\n").is_ok());
+        assert!(AppConfig::parse("[keys]\npalette_open = \"super+enter\"\n").is_ok());
+    }
+
+    /// `[keys]` values must be TOML strings.
+    #[test]
+    fn keys_values_must_be_chord_strings() {
+        for text in [
+            "[keys]\nsession_create = 3\n",
+            "[keys]\npalette_open = true\n",
+            "[keys]\nsession_select = ['c']\n",
+        ] {
+            let error = AppConfig::parse(text).expect_err("non-string chord fails");
+            assert!(
+                matches!(error, ConfigError::ChordNotAString { .. }),
+                "{text:?} must be ChordNotAString, got {error:?}"
+            );
+        }
+    }
+
+    // ── chord parser unit tests ────────────────────────────────────────
+
+    #[test]
+    fn parse_chord_builds_modifiers_named_keys_and_folds_case() {
+        let cases = [
+            (
+                "super+p",
+                chord(KeyCode::Char('p'), Modifiers::empty().super_key()),
+            ),
+            (
+                "SUPER+P",
+                chord(KeyCode::Char('p'), Modifiers::empty().super_key()),
+            ),
+            (
+                "ctrl+shift+t",
+                chord(KeyCode::Char('t'), Modifiers::empty().ctrl().shift()),
+            ),
+            (
+                "alt+ctrl+shift+super+x",
+                chord(
+                    KeyCode::Char('x'),
+                    Modifiers::empty().alt().ctrl().shift().super_key(),
+                ),
+            ),
+            ("c", chord(KeyCode::Char('c'), Modifiers::empty())),
+            ("P", chord(KeyCode::Char('p'), Modifiers::empty())),
+            (
+                "super+f5",
+                chord(KeyCode::Function(5), Modifiers::empty().super_key()),
+            ),
+            ("enter", chord(KeyCode::Enter, Modifiers::empty())),
+            (
+                "alt+pageup",
+                chord(KeyCode::PageUp, Modifiers::empty().alt()),
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(parse_chord(text), Ok(expected), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn parse_chord_rejects_each_grammar_violation_directly() {
+        let cases = [
+            ("", ChordParseError::Empty),
+            ("+", ChordParseError::EmptyToken),
+            ("p+", ChordParseError::EmptyToken),
+            ("shift", ChordParseError::MissingKey),
+            (
+                "alt+hyper+p",
+                ChordParseError::NotAModifier("hyper".to_owned()),
+            ),
+            (
+                "super+super+p",
+                ChordParseError::RepeatedModifier("super".to_owned()),
+            ),
+            (
+                "f0",
+                ChordParseError::InvalidKey(ChordError::FunctionKeyOutOfRange),
+            ),
+            (
+                "\t",
+                ChordParseError::InvalidKey(ChordError::ControlOrWhitespaceChar),
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(parse_chord(text), Err(expected), "{text:?}");
+        }
+    }
+
+    /// Canonical text renders every chord back to its own parse input.
+    #[test]
+    fn chord_text_round_trips_through_parse_chord() {
+        let chords = [
+            chord(KeyCode::Char('p'), Modifiers::empty().super_key()),
+            chord(KeyCode::Char('t'), Modifiers::empty().ctrl().shift()),
+            chord(KeyCode::Char('c'), Modifiers::empty()),
+            chord(KeyCode::Function(12), Modifiers::empty().super_key()),
+            chord(KeyCode::Enter, Modifiers::empty()),
+            chord(KeyCode::PageUp, Modifiers::empty().alt()),
+        ];
+        for parsed in chords {
+            let text = chord_text(parsed);
+            assert_eq!(parse_chord(&text), Ok(parsed), "{text:?} must round-trip");
+        }
+        assert_eq!(
+            chord_text(KeymapConfig::default().palette_open()),
+            "super+p"
+        );
     }
 }

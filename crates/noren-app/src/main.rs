@@ -9,7 +9,7 @@ use noren_app::{
     Arrow, CellMetrics, CursorKeyMode, FunctionKey, GridGeometry, GridSize, InputMode, Key,
     KeyDropReason, KeyEncoder, KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode,
     MAX_RENDER_COLS, Modifiers, PARSE_BUDGET_BYTES_PER_TURN, PasteReject, Resize, SystemClipboard,
-    config::AppConfig,
+    config::{AppConfig, KeymapConfig},
     diagnostics::{self, PtyChildStatus},
     encode_paste,
     mouse::{
@@ -152,28 +152,26 @@ enum WorkspaceAction {
 /// registry's current sessions and selection, so the view and the model can
 /// never disagree.
 /// Build the pass-through policy claiming the exit leader (Super+Escape) and
-/// the palette opener (Super+p).
+/// the palette opener from the configured keymap.
 ///
-/// Both claimed chords live in the Super/Command modifier space, which the
-/// pinned Zellij v0.44.3 default corpus never binds. Super+Escape is the
-/// frozen exit leader from [`default_exit_claim`]; Super+p opens the command
-/// palette. This is the smallest set that works: one chord to open the
+/// The exit leader stays the frozen [`default_exit_claim`]. The palette claim
+/// is the configured [`KeymapConfig::palette_open`] chord, which
+/// configuration has already validated against the pinned Zellij v0.44.3
+/// corpus and the exit leader, so this claim steals no chord from Zellij or
+/// its panes. This is the smallest set that works: one chord to open the
 /// palette, one to exit to the workspace. No bare modifier chords, no
-/// Ctrl/Alt chords, nothing Zellij could ever use.
-fn palette_policy() -> PassthroughPolicy {
+/// chords the corpus binds.
+fn palette_policy(keys: KeymapConfig) -> PassthroughPolicy {
     let palette_claim = PassthroughClaim {
         id: CLAIM_ID_PALETTE,
         action: PassthroughAction::OpenCommandPalette,
-        seq: ChordSeq::single(
-            Chord::new(GateKeyCode::Char('p'), GateModifiers::empty().super_key())
-                .expect("normalized Super+p"),
-        ),
-        justification: "Super+p lives in the Super/Cmd modifier space which the \
-                        pinned Zellij v0.44.3 default corpus never binds, so claiming it \
-                        steals no chord from Zellij or its panes",
+        seq: ChordSeq::single(keys.palette_open()),
+        justification: "the configured palette chord is validated at load time against the \
+                        pinned Zellij v0.44.3 default corpus and the exit leader, so claiming \
+                        it steals no chord from Zellij or its panes",
     };
     PassthroughPolicy::try_new(vec![default_exit_claim(), palette_claim])
-        .expect("palette policy is valid and collision-free")
+        .expect("configuration validates the palette chord; the claim set is collision-free")
 }
 
 /// Resolve the sidebar state file path alongside the configuration file.
@@ -535,6 +533,10 @@ struct NorenApp {
     palette_selection: usize,
     passthrough_gate: PassthroughGate,
     passthrough_policy: PassthroughPolicy,
+    /// Configured key chords for the palette opener and the four palette
+    /// commands. The single source of truth for every workspace chord the
+    /// binary honors; no hard-coded chord remains on the key paths.
+    keys: KeymapConfig,
 }
 
 /// Which application-owned line, if any, occupies the renderer's status row.
@@ -611,7 +613,8 @@ impl NorenApp {
             palette_open: false,
             palette_selection: 0,
             passthrough_gate: PassthroughGate::new(),
-            passthrough_policy: palette_policy(),
+            passthrough_policy: palette_policy(config.keys()),
+            keys: config.keys(),
         }
     }
 
@@ -833,10 +836,10 @@ impl NorenApp {
 
     /// Route one key event through the pass-through gate.
     ///
-    /// The gate claims Super+Escape (exit) and Super+p (palette). Everything
-    /// else is forwarded byte-for-byte through the same encoder path as
-    /// before the gate existed, so a closed-palette key press is
-    /// byte-identical to the pre-gate behaviour.
+    /// The gate claims the exit leader (Super+Escape) and the configured
+    /// palette chord. Everything else is forwarded byte-for-byte through the
+    /// same encoder path as before the gate existed, so a closed-palette key
+    /// press is byte-identical to the pre-gate behaviour.
     fn handle_passthrough_key(&mut self, event: &KeyEvent) {
         let input_mode = self.current_input_mode();
         let encoded = if let Some(input) = translate_keypad_key(event) {
@@ -845,29 +848,11 @@ impl NorenApp {
             translate_key(event, self.modifiers)
                 .and_then(|input| KeyEncoder::encode_with(input, input_mode))
         };
-        if event.state == ElementState::Pressed {
-            if let Some(chord) = chord_from_event(event, self.modifiers) {
-                let decision = self.passthrough_gate.press(&self.passthrough_policy, chord);
-                match decision.kind {
-                    GateKind::Intercepted(PassthroughAction::OpenCommandPalette) => {
-                        self.open_palette();
-                        return;
-                    }
-                    GateKind::Intercepted(PassthroughAction::ExitToWorkspace) => {
-                        return;
-                    }
-                    GateKind::Pending => {
-                        return;
-                    }
-                    GateKind::Forwarded => {
-                        for replayed in &decision.replayed {
-                            if let Some(bytes) = encode_chord(replayed, input_mode) {
-                                self.send_input(&bytes);
-                            }
-                        }
-                    }
-                }
-            }
+        if event.state == ElementState::Pressed
+            && let Some(chord) = chord_from_event(event, self.modifiers)
+            && self.gate_pressed_chord(chord, input_mode)
+        {
+            return;
         }
         let Ok(bytes) = encoded else {
             return;
@@ -875,16 +860,55 @@ impl NorenApp {
         self.send_input(&bytes);
     }
 
+    /// Route one pressed chord through the gate.
+    ///
+    /// This is the seam the key-event path delegates to; it owns the palette
+    /// claim, so the configured opener chord — and nothing else — opens the
+    /// palette. Returns whether the chord was consumed (intercepted or held
+    /// pending); a forwarded chord replays any held leader bytes and falls
+    /// through to normal encoding.
+    fn gate_pressed_chord(&mut self, chord: Chord, input_mode: InputMode) -> bool {
+        let decision = self.passthrough_gate.press(&self.passthrough_policy, chord);
+        match decision.kind {
+            GateKind::Intercepted(PassthroughAction::OpenCommandPalette) => {
+                self.open_palette();
+                true
+            }
+            GateKind::Intercepted(PassthroughAction::ExitToWorkspace) => true,
+            GateKind::Pending => true,
+            GateKind::Forwarded => {
+                for replayed in &decision.replayed {
+                    if let Some(bytes) = encode_chord(replayed, input_mode) {
+                        self.send_input(&bytes);
+                    }
+                }
+                false
+            }
+        }
+    }
+
     /// Handle a key event while the palette is open.
     ///
-    /// Single-key shortcuts dispatch the four canonical commands; Escape
+    /// The four configured command chords dispatch their commands; Escape
     /// dismisses without running; Arrow Up/Down and Enter navigate and
-    /// confirm the selection.
+    /// confirm the selection. A single character that matches no command
+    /// chord dismisses the palette, as before configuration existed.
     fn handle_palette_key(&mut self, event: &KeyEvent) {
-        if event.state != ElementState::Pressed || event.repeat {
+        self.handle_palette_key_impl(&event.logical_key, event.state, event.repeat);
+    }
+
+    /// Window-independent seam for the palette key path: the real handler
+    /// with the winit event reduced to the parts it reads.
+    fn handle_palette_key_impl(
+        &mut self,
+        logical_key: &WinitKey,
+        state: ElementState,
+        repeat: bool,
+    ) {
+        if state != ElementState::Pressed || repeat {
             return;
         }
-        match &event.logical_key {
+        match logical_key {
             WinitKey::Named(NamedKey::Escape) => {
                 self.close_palette();
             }
@@ -908,19 +932,19 @@ impl NorenApp {
                 if text.chars().count() > 1 {
                     return;
                 }
-                let id = match ch.to_ascii_lowercase() {
-                    'c' => CommandId::SESSION_CREATE,
-                    's' => CommandId::SESSION_SELECT,
-                    'x' => CommandId::SESSION_CLOSE,
-                    'f' => CommandId::SIDEBAR_FOCUS,
-                    _ => {
-                        self.close_palette();
-                        return;
-                    }
-                };
-                self.dispatch_palette_command(id);
+                let pressed = chord_from_logical(logical_key, self.modifiers);
+                let bare = GateKeyCode::Char(ch.to_ascii_lowercase());
+                match palette_command_for(&self.keys, pressed, Some(bare)) {
+                    Some(id) => self.dispatch_palette_command(id),
+                    None => self.close_palette(),
+                }
             }
-            _ => {}
+            _ => {
+                let pressed = chord_from_logical(logical_key, self.modifiers);
+                if let Some(id) = palette_command_for(&self.keys, pressed, None) {
+                    self.dispatch_palette_command(id);
+                }
+            }
         }
     }
 
@@ -1732,7 +1756,8 @@ impl NorenApp {
             visible_rows,
         );
         let lines = if self.palette_open {
-            let mut lines = palette_text_lines(self.workspace.palette(), self.palette_selection);
+            let mut lines =
+                palette_text_lines(self.workspace.palette(), self.palette_selection, &self.keys);
             lines.extend(sidebar_lines);
             lines
         } else {
@@ -1969,17 +1994,41 @@ fn visible_sidebar_text_lines(
 /// Each command is one line: `]` marks the selected command, space otherwise,
 /// followed by a single-key shortcut and the label. The lines are uppercase
 /// to match the bitmap font's case-folding.
-fn palette_text_lines(palette: &Palette<WorkspaceAction>, selection: usize) -> Vec<String> {
-    let shortcuts = ['C', 'S', 'X', 'F'];
+fn palette_text_lines(
+    palette: &Palette<WorkspaceAction>,
+    selection: usize,
+    keys: &KeymapConfig,
+) -> Vec<String> {
     palette
         .iter()
         .enumerate()
         .map(|(idx, cmd)| {
             let marker = if idx == selection { ']' } else { ' ' };
-            let key = shortcuts.get(idx).copied().unwrap_or('?');
+            let key = command_shortcut(cmd.id(), keys);
             format!("{marker}{key} {label}", label = cmd.label())
         })
         .collect()
+}
+
+/// The one-character palette display shortcut for a command's configured
+/// chord.
+///
+/// A character binding shows its (upper-cased) character; any other chord —
+/// modifiers or a named key — has no single-glyph representation in the
+/// bitmap font and shows `?`. The label therefore never claims a shortcut
+/// the chord does not carry.
+fn command_shortcut(id: CommandId, keys: &KeymapConfig) -> char {
+    let binding = match id {
+        CommandId::SESSION_CREATE => keys.session_create(),
+        CommandId::SESSION_SELECT => keys.session_select(),
+        CommandId::SESSION_CLOSE => keys.session_close(),
+        CommandId::SIDEBAR_FOCUS => keys.sidebar_focus(),
+        _ => return '?',
+    };
+    match binding.code() {
+        GateKeyCode::Char(character) => character.to_ascii_uppercase(),
+        _ => '?',
+    }
 }
 
 /// Map a winit key event and app modifiers to a pass-through chord.
@@ -1988,9 +2037,48 @@ fn palette_text_lines(palette: &Palette<WorkspaceAction>, selection: usize) -> V
 /// (whitespace characters, dead keys, multi-codepoint IME sequences). Such
 /// keys bypass the gate and follow the normal encode-and-send path.
 fn chord_from_event(event: &KeyEvent, modifiers: Modifiers) -> Option<Chord> {
-    let code = winit_to_gate_key(&event.logical_key)?;
+    chord_from_logical(&event.logical_key, modifiers)
+}
+
+/// Map a logical key and app modifiers to a pass-through chord.
+///
+/// The window-free core of [`chord_from_event`], shared by the pass-through
+/// gate and the open palette's command-chord matching.
+fn chord_from_logical(key: &WinitKey, modifiers: Modifiers) -> Option<Chord> {
+    let code = winit_to_gate_key(key)?;
     let gate_mods = gate_modifiers(modifiers);
     Chord::new(code, gate_mods).ok()
+}
+
+/// Resolve a pressed key inside the open palette to its command.
+///
+/// An exact chord match honors configured modifiers. A modifier-free
+/// character binding additionally matches by logical character regardless of
+/// held modifiers, preserving the palette's pre-configuration behavior for
+/// the default `c`/`s`/`x`/`f` bindings; `bare` is `None` for non-character
+/// keys, which only ever match exactly.
+fn palette_command_for(
+    keys: &KeymapConfig,
+    pressed: Option<Chord>,
+    bare: Option<GateKeyCode>,
+) -> Option<CommandId> {
+    let bindings = [
+        (keys.session_create(), CommandId::SESSION_CREATE),
+        (keys.session_select(), CommandId::SESSION_SELECT),
+        (keys.session_close(), CommandId::SESSION_CLOSE),
+        (keys.sidebar_focus(), CommandId::SIDEBAR_FOCUS),
+    ];
+    for (binding, id) in bindings {
+        if pressed == Some(binding) {
+            return Some(id);
+        }
+        if binding.modifiers() == GateModifiers::empty()
+            && bare.is_some_and(|bare| binding.code() == bare)
+        {
+            return Some(id);
+        }
+    }
+    None
 }
 
 /// Encode a pass-through chord into PTY bytes for replay.
@@ -2030,6 +2118,32 @@ fn winit_to_gate_key(key: &WinitKey) -> Option<GateKeyCode> {
         WinitKey::Named(NamedKey::PageDown) => Some(GateKeyCode::PageDown),
         WinitKey::Named(NamedKey::Delete) => Some(GateKeyCode::Delete),
         WinitKey::Named(NamedKey::Insert) => Some(GateKeyCode::Insert),
+        // Function keys F1–F24 round out the chord vocabulary the keymap
+        // parser accepts (`f1`–`f24`); higher F-keys stay unmapped.
+        WinitKey::Named(NamedKey::F1) => Some(GateKeyCode::Function(1)),
+        WinitKey::Named(NamedKey::F2) => Some(GateKeyCode::Function(2)),
+        WinitKey::Named(NamedKey::F3) => Some(GateKeyCode::Function(3)),
+        WinitKey::Named(NamedKey::F4) => Some(GateKeyCode::Function(4)),
+        WinitKey::Named(NamedKey::F5) => Some(GateKeyCode::Function(5)),
+        WinitKey::Named(NamedKey::F6) => Some(GateKeyCode::Function(6)),
+        WinitKey::Named(NamedKey::F7) => Some(GateKeyCode::Function(7)),
+        WinitKey::Named(NamedKey::F8) => Some(GateKeyCode::Function(8)),
+        WinitKey::Named(NamedKey::F9) => Some(GateKeyCode::Function(9)),
+        WinitKey::Named(NamedKey::F10) => Some(GateKeyCode::Function(10)),
+        WinitKey::Named(NamedKey::F11) => Some(GateKeyCode::Function(11)),
+        WinitKey::Named(NamedKey::F12) => Some(GateKeyCode::Function(12)),
+        WinitKey::Named(NamedKey::F13) => Some(GateKeyCode::Function(13)),
+        WinitKey::Named(NamedKey::F14) => Some(GateKeyCode::Function(14)),
+        WinitKey::Named(NamedKey::F15) => Some(GateKeyCode::Function(15)),
+        WinitKey::Named(NamedKey::F16) => Some(GateKeyCode::Function(16)),
+        WinitKey::Named(NamedKey::F17) => Some(GateKeyCode::Function(17)),
+        WinitKey::Named(NamedKey::F18) => Some(GateKeyCode::Function(18)),
+        WinitKey::Named(NamedKey::F19) => Some(GateKeyCode::Function(19)),
+        WinitKey::Named(NamedKey::F20) => Some(GateKeyCode::Function(20)),
+        WinitKey::Named(NamedKey::F21) => Some(GateKeyCode::Function(21)),
+        WinitKey::Named(NamedKey::F22) => Some(GateKeyCode::Function(22)),
+        WinitKey::Named(NamedKey::F23) => Some(GateKeyCode::Function(23)),
+        WinitKey::Named(NamedKey::F24) => Some(GateKeyCode::Function(24)),
         _ => None,
     }
 }
