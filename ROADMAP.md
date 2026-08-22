@@ -93,9 +93,10 @@ Draft PRs, and current-head CI evidence.
 ## Milestone 3 status
 
 **In progress, not Complete.** The vertical slice reached the binary: launching
-the build now draws a workspace sidebar and starts one local PTY. The command
-palette operates on the session registry, but its additional rows are
-model-only and cannot take the live PTY's input ownership.
+the build now draws a workspace sidebar and starts one local PTY. Session
+switching is real for local sessions: palette-created rows spawn their own
+PTY, sidebar clicks and `session_select` move the live view between them, and
+`session_close` reaps the closed child.
 
 The milestone's own scope line is the test, so it is quoted here in full:
 
@@ -112,9 +113,9 @@ Measured against it, item by item:
 | Sidebar drawn | Done | `SIDEBAR_COLS` reserved in `renderer.rs`; `glyph_vertices` applies the column offset; `sidebar_text_lines` formats rows |
 | — projects, git worktrees | Modelled, not launchable | `EntryKind::Project`/`Worktree`, `SessionKind::Project`/`Worktree` exist; no runtime path creates them, though `parse_session` will reconstruct one from a hand-written `sessions.toml` `kind` field — nothing in the product writes such an entry |
 | — SSH connections, agents | Partial configured-target list, not connected; agents fixture only | At most 24 positive literal OpenSSH aliases become `SessionKind::Ssh` and `SidebarEntry::SshConnection` rows; the status identifies partial discovery, and clicking shows bounded root-relative source provenance while opening no SSH connection or PTY; agent entries remain reserved |
-| — terminal sessions | Partial runtime | The running binary starts one `SessionKind::Local` PTY; palette-created rows are model entries only until supervisor-backed switching lands |
-| Single-session view | Done | The one live terminal is drawn beside the sidebar, narrowed to the remaining columns; inactive rows cannot claim its selection or input owner |
-| Session lifecycle | Done | `SessionStatus` advances `Starting -> Running -> Exited/Failed` via `SessionRegistry::observe`, wired in `main.rs` |
+| — terminal sessions | Runtime for local sessions | Every palette `session_create` spawns a real `SessionKind::Local` PTY (`spawn_local_session`); sidebar clicks and the palette's `session_select` switch the live view between live sessions (`switch_live_session`, parked surfaces keep draining and resizing), and `session_close` reaps the closed child and repairs the view. Rows restored from disk come back `Restored` with no live surface and cannot take the live view |
+| Single-session view | Done | The active terminal is drawn beside the sidebar, narrowed to the remaining columns; switching swaps the active surface whole, and rows without a live surface cannot claim its selection or input owner |
+| Session lifecycle | Done | `SessionStatus` advances `Starting -> Running -> Exited/Failed` via `SessionRegistry::observe`, wired in `main.rs` for spawned, parked, closed, and restored sessions alike |
 | Sidebar-state persistence | Done | `sessions.toml` (`SESSION_STATE_FILE_NAME`) under the `config::default_path` directory, resolved by `session_state_path` |
 | Palette | Done | `Super+p` via `palette_policy`; `Palette::noren`'s four commands dispatched by `handle_palette_key` |
 | Configurable keybindings | Done for the palette surface | `[keys]` in `config.toml` (`KeymapConfig` in `config.rs`) rebinds the palette opener and the four palette command chords with the previous values as defaults; `palette_policy`/`handle_palette_key` in `main.rs` honor them, unparseable chords and unknown actions are typed errors, and the opener is validated against the pinned Zellij corpus and the exit leader. The exit leader, palette navigation keys, diagnostics chord, and clipboard shortcuts remain fixed |
@@ -140,9 +141,9 @@ the Noren terminal." The reasoning and the decision are recorded in
 
 - **The workspace is a slice, not a product.** The Milestone 3 modules now
   reach the binary: the sidebar is drawn, the palette opens on `Super+p`,
-  one startup session owns the live PTY while palette-created rows remain
-  model-only, mouse reports reach that PTY, and sidebar state persists across a
-  restart. What is still missing is breadth and real session switching —
+  local sessions spawn real PTYs that switch, park, and close through the
+  live view, mouse reports reach the active PTY, and sidebar state persists
+  across a restart. What is still missing is breadth —
   bounded OpenSSH configuration now produces an explicitly partial list of at
   most 24 positive literal aliases as `SessionKind::Ssh` values and
   `SidebarEntry::SshConnection` rows. The UI labels the discovery scope and

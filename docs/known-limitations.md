@@ -30,14 +30,17 @@ binary. What now actually happens on screen:
   `glyph_vertices` in `renderer.rs`, which takes a `sidebar` argument and
   applies `col_offset`, and `sidebar_text_lines` in `main.rs`, which formats the
   rows.
-- **The session palette is present, but only one PTY is live.** `super+p`
-  opens the command palette (claimed by `palette_policy` in `main.rs` as
+- **The session palette operates on real local sessions.** `Super+p` opens
+  the command palette (claimed by `palette_policy` in `main.rs` as
   `PassthroughAction::OpenCommandPalette`); the opener and the four command
   chords are configurable through `[keys]` in `config.toml` with
-  `super+p`/`c`/`s`/`x`/`f` as the defaults. The `c` command adds a model row;
-  it does not start another shell. The `s` and `x` commands cannot move or
-  remove the startup PTY's input owner, while `f` dispatches sidebar focus —
-  currently a no-op, since the sidebar is always visible. Arrow
+  `super+p`/`c`/`s`/`x`/`f` as the defaults. The `c` command spawns a real
+  `/bin/zsh` PTY and gives it the live view (parking the previous one, not
+  killing it); `s` cycles the live view to the next live session in sidebar
+  order; `x` closes the selected row, reaping its child and falling back to
+  the topmost remaining live session — or an honest empty view when it was the
+  last one. The `f` command dispatches sidebar focus — currently a no-op, since
+  the sidebar is always visible. Arrow
   keys and Enter navigate the same command list; Escape dismisses it.
 - **Mouse reporting reaches the program.** `handle_mouse_button`,
   `handle_mouse_move`, and `handle_mouse_wheel` in `main.rs` each call
@@ -99,9 +102,11 @@ binary. What now actually happens on screen:
   `included_fifo_sources_return_promptly`).
 
 It is still **not** the full workspace product that [ADR
-0003](adr/0003-noren-zellij-responsibility-boundary.md) describes — one local
-shell at a time; configured SSH targets are now discovered and selectable in
-the sidebar, but no non-local session can launch. See "What does not work"
+0003](adr/0003-noren-zellij-responsibility-boundary.md) describes — one live
+PTY at a time; configured SSH targets are now discoverable in the sidebar, and
+selecting one launches the system `ssh` client for that alias in the single
+terminal PTY (one non-local launch path exists; there is still no
+multi-session switching). See "What does not work"
 below, which remains the more useful list. Milestones 3–8 are open on the
 [roadmap](../ROADMAP.md).
 
@@ -179,20 +184,29 @@ Each item states what you would actually see if you ran the build.
   The PTY launches `/bin/zsh` with a fixed policy and no caller-controlled
   arguments (`ZSH_PROGRAM` in `crates/noren-pty/src/lib.rs`). Linux support and SSH/remote
   sessions are roadmap intent (Milestones 4 and 6), not current capability.
-- **Only the startup local session is actually launched.** `SessionKind` models
+- **Only local sessions are actually launched.** `SessionKind` models
   `Local`, `Project`, `Worktree`, `Ssh`, and `Agent`, and `EntryKind` in
   `sidebar.rs` can describe project, worktree, SSH-connection, and agent rows —
-  but only `Local` has a launch path. The running binary now reads bounded
-  OpenSSH configuration facts, constructs `SessionKind::Ssh`, and displays
-  configured targets as `SidebarEntry::SshConnection` rows. Clicking one only
-  records a pending target; it opens neither an SSH connection nor a PTY.
+  `Local` and `Ssh` have launch paths. The running binary reads bounded
+  OpenSSH configuration facts and displays configured targets as
+  `SidebarEntry::SshConnection` rows. Clicking one validates the alias as an
+  `SshDestination` (raw `%h`/`%p`/`%r` tokens are refused with a typed error
+  naming the keyword and token) and, if accepted, launches the fixed system
+  `/usr/bin/ssh` client in the single terminal PTY — argv is exactly
+  `ssh -- <alias>`, so no credential, identity, or option is ever
+  `ps`-visible — replacing the previous session. Launch, connect, and
+  disconnect failures surface as visible per-row and status-row states; the
+  alias never enters the persisted registry, so `sessions.toml` cannot carry
+  it. Authentication, agent, and config resolution (including the user's own
+  `ProxyCommand`) remain entirely ssh's own, executed by the system binary.
   Project and worktree kinds remain modelled, while agent entries remain
   reserved fixtures and no agent is launched. In practice: startup owns exactly
-  one local `zsh`. The palette's "New Session" currently records another local
-  model row but does not spawn a PTY, and an inactive or restored row cannot
-  take the live PTY's selection/input ownership. There is no way to open an SSH
-  host, a git worktree, or an agent from the workspace. Milestones 4 and 5 own
-  the remaining work.
+  one local `zsh`, the palette's "New Session" spawns another real local `zsh`,
+  and every local row can take the live view; a restored row cannot (its shell
+  died with the previous launch). Selecting an SSH host row now launches the
+  system `ssh` client in the terminal's PTY (see the SSH section); a git
+  worktree or an agent still cannot be opened from the workspace. Milestones 4
+  and 5 own the remaining work.
 - **The SSH list is not OpenSSH-equivalent discovery.** A readable config can
   legitimately name destinations that do not appear: wildcard or negated
   patterns are matching policy rather than concrete aliases, `Match` and token
@@ -205,11 +219,15 @@ Each item states what you would actually see if you ran the build.
   only the first 24 literal aliases and reports an omitted count; selecting a
   row shows where its first literal declaration came from, but does not prove
   the effective configuration that a future connection will use.
-- **There is one live session, not session switching.** The sidebar may list
-  restored or palette-created model entries, but only the startup session owns
-  the terminal viewport and input. Clicking an inactive row cannot move that
-  ownership. There is no split, tiled, or multi-session view. Panes and layout
-  *inside* the live session are delegated to Zellij by design — see "What is
+- **Session switching exists, within one viewport.** Clicking a live session
+  row in the sidebar (or the palette's `s` command) moves the whole live view
+  — terminal surface, input routing, renderer — to that session's own PTY and
+  screen; the previous session is parked with its child still running and its
+  output still drained and resized in the background, so switching back shows
+  current content. Restored or exited rows have no live surface and cannot
+  take the live view. There is still no split, tiled, or multi-session view:
+  exactly one session owns the viewport at a time. Panes and layout *inside*
+  the live session are delegated to Zellij by design — see "What is
   deliberately delegated".
 - **Keybindings are configurable for the palette only, within bounds.** The
   `[keys]` table in `config.toml` rebinds the palette opener and the four
@@ -300,9 +318,11 @@ When Zellij is running, correct input pass-through takes priority over Noren
 shortcuts. Please do not file the absence of native tabs or panes as a bug —
 but do hold Noren to its side of the boundary: a workspace *outside* the
 terminal. That side now has a first vertical slice — a drawn sidebar, a command
-palette over model rows, one live local PTY, and state that survives a restart
-— and the gaps that remain there (real session switching, non-local session
-kinds) are legitimate things to report; keybindings are configurable through
+palette over real local sessions (spawn, switch, close), live switching between
+them, and state that survives a restart
+— and the gaps that remain there (non-local session
+kinds, reattaching a restored session's shell) are
+legitimate things to report; keybindings are configurable through
 `[keys]` now, with the live winit dispatch gap noted above.
 
 ## What this preview is not

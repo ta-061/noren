@@ -1293,20 +1293,43 @@ fn palette_close_action_removes_the_selected_session() {
     );
 }
 
+/// Closing the row that owns the live PTY is a real close now: the child is
+/// reaped through the bounded shutdown *before* the row is removed, the live
+/// surface is detached, and — with no other live session left — the app falls
+/// back to an honest empty view (no terminal, truthful status) instead of a
+/// dead session's frozen frame.
+///
+/// This replaces `palette_close_cannot_remove_the_live_pty_owner`, which
+/// pinned the interim behaviour where close refused every live row because it
+/// could not reap a child; `close_session` can and does.
+///
+/// Mutation check: removing the reaping/detaching from `close_session`
+/// (leaving the child running behind a removed row, or leaving the closed
+/// session's surface attached) fails every assertion past the first.
 #[test]
-fn palette_close_cannot_remove_the_live_pty_owner() {
-    let mut app = NorenApp::default();
-    let active = app.workspace.create_session(SessionKind::Local);
-    app.workspace
-        .select_session(active)
-        .expect("active session is selectable");
-    app.active_session = Some(active);
+fn palette_close_reaps_the_live_owner_and_falls_back_to_an_empty_view() {
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let only = registry_ids(&app)[0];
 
     app.run_workspace_action(WorkspaceAction::CloseSession);
 
-    assert!(app.workspace.registry().get(active).is_some());
-    assert_eq!(app.workspace.registry().selected(), Some(active));
-    assert_eq!(app.active_session, Some(active));
+    assert!(
+        app.workspace.registry().get(only).is_none(),
+        "the closed row is gone from the registry"
+    );
+    assert!(
+        app.pty.is_none() && app.terminal.is_none(),
+        "no surface may outlive its session"
+    );
+    assert_eq!(app.active_session, None);
+    assert!(
+        app.parked_sessions.is_empty(),
+        "the child handle was reaped and dropped, not parked or leaked"
+    );
+    assert!(app.workspace.sidebar().is_empty());
+    assert!(app.show_status, "an empty workspace must say so honestly");
 }
 
 /// Escape dismisses the palette without running a command.
@@ -2445,7 +2468,10 @@ fn included_ssh_host_selection_shows_bounded_root_relative_provenance() {
     fixture.write_new(b"Include included.conf\nHost root-only\n");
     fixture.write_sibling_new("included.conf", b"Host remote\n");
 
-    let mut app = NorenApp::default();
+    // The click attempts a real launch; the deterministic seam disables the
+    // spawn so this test observes the provenance line plus the observed
+    // launch phase without starting any process.
+    let mut app = app_with_deterministic_ssh_seam();
     app.load_ssh_hosts_from(fixture.path());
     assert_eq!(app.workspace.ssh_hosts[0].source_label, "included.conf #1");
     app.cursor_position = Some(PhysicalPosition::new(5.0, 1.0));
@@ -2457,7 +2483,7 @@ fn included_ssh_host_selection_shows_bounded_root_relative_provenance() {
     ));
     assert_eq!(
         app.ssh_selection_status.as_deref(),
-        Some("SSH partial source #1 included.conf; offline")
+        Some("SSH partial source #1 included.conf; launch failed")
     );
     assert!(
         !app.ssh_selection_status
@@ -2828,11 +2854,13 @@ fn ssh_rows_stay_distinguishable_from_local_rows() {
 }
 
 #[test]
-fn selecting_an_ssh_row_only_records_a_pending_non_connection_choice() {
+fn selecting_an_ssh_row_keeps_a_pending_choice_and_never_a_registry_connection() {
     let fixture = SshConfigFixture::new();
     fixture.write_new(b"Host staging\n");
 
-    let mut app = NorenApp::default();
+    // Deterministic seam: the click path attempts the launch, and the
+    // disabled spawn reports the attempt's failure without any process.
+    let mut app = app_with_deterministic_ssh_seam();
     app.load_ssh_hosts_from(fixture.path());
     app.workspace.create_session(SessionKind::Local);
     app.cursor_position = Some(PhysicalPosition::new(5.0, 25.0));
@@ -2845,7 +2873,10 @@ fn selecting_an_ssh_row_only_records_a_pending_non_connection_choice() {
     assert_eq!(app.workspace.selected_ssh_target(), Some("staging"));
     assert_eq!(app.workspace.registry().selected(), None);
     assert_eq!(app.workspace.registry().len(), 1);
-    assert!(app.pty.is_none(), "SSH selection must not open a PTY");
+    assert!(
+        app.pty.is_none(),
+        "the deterministic seam must leave no PTY behind"
+    );
     app.show_status = false;
     let source = app.status_row();
     assert_eq!(source, StatusRowSource::SshSelection);
@@ -2855,7 +2886,7 @@ fn selecting_an_ssh_row_only_records_a_pending_non_connection_choice() {
             app.ssh_selection_status.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
-        "SSH partial source #0 config; offline"
+        "SSH partial source #0 config; launch failed"
     );
     assert!(
         app.workspace.sidebar().viewport().is_none(),
@@ -2867,7 +2898,7 @@ fn selecting_an_ssh_row_only_records_a_pending_non_connection_choice() {
 fn ssh_selection_does_not_hide_a_runtime_failure() {
     let fixture = SshConfigFixture::new();
     fixture.write_new(b"Host staging\n");
-    let mut app = NorenApp::default();
+    let mut app = app_with_deterministic_ssh_seam();
     app.load_ssh_hosts_from(fixture.path());
     app.finish_pty("Noren PTY operation failed");
     app.cursor_position = Some(PhysicalPosition::new(5.0, 1.0));
@@ -2889,7 +2920,7 @@ fn partial_undrawn_sidebar_row_cannot_select_a_hidden_ssh_entry() {
     let fixture = SshConfigFixture::new();
     fixture.write_new(b"Host visible\nHost hidden\n");
 
-    let mut app = NorenApp::default();
+    let mut app = app_with_deterministic_ssh_seam();
     app.load_ssh_hosts_from(fixture.path());
     assert_eq!(app.workspace.sidebar().rows().len(), 2);
 
@@ -2942,7 +2973,7 @@ fn partial_undrawn_sidebar_row_cannot_select_a_hidden_ssh_entry() {
 fn sidebar_scroll_reveals_and_selects_ssh_without_terminal_mouse_output() {
     let fixture = SshConfigFixture::new();
     fixture.write_new(b"Host alpha\nHost beta\nHost gamma\n");
-    let mut app = NorenApp::default();
+    let mut app = app_with_deterministic_ssh_seam();
     for _ in 0..3 {
         let _ = app.workspace.registry.restore(SessionKind::Local);
     }
@@ -3061,9 +3092,11 @@ fn inactive_local_sidebar_press_is_consumed_without_moving_the_pty_owner() {
     ));
 
     assert_eq!(app.workspace.local_sidebar_session(0), Some(inactive));
-    assert_eq!(app.workspace.registry().selected(), Some(active));
+    // Input ownership stays with the active session, but the click SELECTS
+    // the clicked row — the close command operates on the selection.
+    assert_eq!(app.workspace.registry().selected(), Some(inactive));
     assert_eq!(app.active_session, Some(active));
-    assert!(app.workspace.sidebar().rows()[1].is_selected());
+    assert!(app.workspace.sidebar().rows()[0].is_selected());
 }
 
 #[test]
@@ -3085,9 +3118,11 @@ fn restored_local_sidebar_press_cannot_claim_live_input_ownership() {
     ));
 
     assert_eq!(app.workspace.local_sidebar_session(0), Some(restored));
-    assert_eq!(app.workspace.registry().selected(), Some(active));
+    // Input ownership stays with the active session; the click selects the
+    // restored row so a close targets what the user pointed at.
+    assert_eq!(app.workspace.registry().selected(), Some(restored));
     assert_eq!(app.active_session, Some(active));
-    assert!(app.workspace.sidebar().rows()[1].is_selected());
+    assert!(app.workspace.sidebar().rows()[0].is_selected());
 }
 
 #[test]
@@ -3912,5 +3947,1030 @@ fn single_instance_save_has_no_persistence_false_alarm() {
     );
     let saved = std::fs::read(&path).expect("read exact verified save");
     assert!(!saved.is_empty(), "the real save path wrote a document");
+    cleanup_state_file(&path);
+}
+
+// ── SSH connect: real launches, refusals, and visible failure states ──
+
+/// Test constructor with the deterministic ssh spawn seam disabled: the
+/// click path runs its full validation and phase reporting without
+/// launching any process.
+fn app_with_deterministic_ssh_seam() -> NorenApp {
+    NorenApp {
+        ssh_spawn_enabled: false,
+        ..NorenApp::default()
+    }
+}
+
+/// Unique secret-shaped stand-in for a destination that could embed a
+/// credential. Any surface that prints it is a leak.
+fn ssh_secret_sentinel(tag: &str) -> String {
+    format!("NOREN-SSHCONN-{tag}-hunter2-{}", std::process::id())
+}
+
+#[test]
+fn ssh_click_surfaces_launch_failure_when_no_child_can_spawn() {
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(b"Host web\n");
+    let mut app = app_with_deterministic_ssh_seam();
+    app.load_ssh_hosts_from(fixture.path());
+    app.cursor_position = Some(PhysicalPosition::new(5.0, 1.0));
+
+    assert!(app.handle_sidebar_click_in_frame(
+        ElementState::Pressed,
+        MouseButton::Left,
+        PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+    ));
+
+    // The failure is first-class: runtime status row, provenance line, and
+    // the sidebar row all carry the launch failure.
+    assert_eq!(app.status, "Noren ssh launch failed");
+    assert!(app.show_status, "the launch failure must be visible");
+    assert_eq!(
+        app.ssh_selection_status.as_deref(),
+        Some("SSH partial source #0 config; launch failed")
+    );
+    let row = &app.workspace.sidebar().rows()[0];
+    assert_eq!(row.label(), "SSH-ERR web");
+    assert_eq!(row.detail(), Some("launch failed"));
+    assert!(
+        app.pty.is_none(),
+        "a failed launch must leave no PTY behind"
+    );
+    assert!(
+        app.workspace.registry().sessions().is_empty(),
+        "the refused registry must record no session"
+    );
+}
+
+#[test]
+fn ssh_spawn_failure_never_retires_the_running_local_session() {
+    // Found by independent review: connect_ssh_target orders
+    // retire_live_terminal() inside the Ok arm only, but no test pinned it —
+    // a mutation moving the retire BEFORE the spawn attempt passed the whole
+    // suite. This seeds a real live session and forces the spawn's Err arm,
+    // so a failed ssh launch must leave the running local shell untouched.
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let live = registry_ids(&app)[0];
+    assert!(app.pty.is_some(), "a live local session is running");
+
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(b"Host web\n");
+    app.ssh_spawn_force_failure = true;
+    app.load_ssh_hosts_from(fixture.path());
+    // Row 0 is the live local session; the SSH host sits at row 1.
+    app.cursor_position = Some(PhysicalPosition::new(5.0, 25.0));
+
+    assert!(app.handle_sidebar_click_in_frame(
+        ElementState::Pressed,
+        MouseButton::Left,
+        PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+    ));
+
+    assert_eq!(
+        app.status, "Noren ssh launch failed",
+        "the failure is surfaced first-class"
+    );
+    assert!(
+        app.pty.is_some(),
+        "a failed ssh spawn must not tear down the running local shell"
+    );
+    assert_eq!(
+        app.active_session,
+        Some(live),
+        "the local session keeps the live view"
+    );
+    assert_eq!(
+        session_status(&app, live),
+        SessionStatus::Running,
+        "the local session is not observed Exiting behind a failed launch"
+    );
+}
+
+#[test]
+fn ssh_click_refuses_a_raw_token_destination_without_spawning() {
+    let secret = ssh_secret_sentinel("TOKEN");
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(format!("Host %p-{secret}\n").as_bytes());
+    let mut app = app_with_deterministic_ssh_seam();
+    app.load_ssh_hosts_from(fixture.path());
+    app.cursor_position = Some(PhysicalPosition::new(5.0, 1.0));
+
+    assert!(app.handle_sidebar_click_in_frame(
+        ElementState::Pressed,
+        MouseButton::Left,
+        PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+    ));
+
+    let status = app
+        .ssh_selection_status
+        .as_deref()
+        .expect("the typed refusal is visible");
+    assert!(
+        status.contains("%p"),
+        "the refusal must name the token: {status}"
+    );
+    assert!(
+        status.contains("Port"),
+        "the refusal must name the keyword: {status}"
+    );
+    assert!(
+        !status.contains(&secret),
+        "the refusal must never carry destination content: {status}"
+    );
+    // The connect did not proceed.
+    assert!(app.pty.is_none(), "a refused destination must not spawn");
+    assert!(app.workspace.ssh_connection.is_none());
+    let row = &app.workspace.sidebar().rows()[0];
+    assert!(
+        row.label().starts_with("SSH-OFF "),
+        "the row must stay disconnected: {}",
+        row.label()
+    );
+    assert_eq!(row.detail(), Some("not connected"));
+    // No debug surface may print the destination either.
+    assert!(!format!("{:?}", app.workspace).contains(&secret));
+}
+
+#[test]
+fn ssh_exit_observation_maps_every_child_outcome_to_a_visible_phase() {
+    assert_eq!(
+        ssh_exit_observation(Some(0)),
+        SshConnectionPhase::Closed,
+        "a clean ssh exit is a close, not a failure"
+    );
+    for code in [1, 127, 255] {
+        assert_eq!(
+            ssh_exit_observation(Some(code)),
+            SshConnectionPhase::ConnectFailed,
+            "exit {code} is an unreachable-host/auth/disconnect failure"
+        );
+    }
+    assert_eq!(
+        ssh_exit_observation(None),
+        SshConnectionPhase::Disconnected,
+        "a code-less end is an immediate disconnect"
+    );
+    assert_eq!(ssh_launch_observation(true), SshConnectionPhase::Connecting);
+    assert_eq!(
+        ssh_launch_observation(false),
+        SshConnectionPhase::LaunchFailed,
+        "a failed spawn must never report success"
+    );
+
+    for phase in [
+        SshConnectionPhase::Connecting,
+        SshConnectionPhase::Connected,
+        SshConnectionPhase::Closed,
+        SshConnectionPhase::LaunchFailed,
+        SshConnectionPhase::ConnectFailed,
+        SshConnectionPhase::Disconnected,
+    ] {
+        assert!(!phase.status_text().is_empty());
+        assert!(!phase.sidebar_detail().is_empty());
+        assert_eq!(
+            phase.sidebar_prefix().chars().count(),
+            SSH_SIDEBAR_LABEL_PREFIX_CHARS,
+            "the prefix must keep the fixed label arithmetic"
+        );
+        assert!(phase.sidebar_prefix().starts_with("SSH-"));
+    }
+}
+
+#[test]
+fn ssh_sidebar_state_prefixes_encode_the_connection_phase() {
+    assert_eq!(
+        ssh_state_label(SshConnectionPhase::Connected, "abcdef"),
+        "SSH-ON  abcdef"
+    );
+    assert_eq!(
+        ssh_state_label(SshConnectionPhase::Connecting, "abcdefg"),
+        "SSH-ON  abc..."
+    );
+    assert_eq!(
+        ssh_state_label(SshConnectionPhase::ConnectFailed, "abcdefg"),
+        "SSH-ERR abc..."
+    );
+    assert_eq!(
+        ssh_state_label(SshConnectionPhase::Disconnected, "abcdef"),
+        "SSH-ERR abcdef"
+    );
+    assert_eq!(
+        ssh_state_label(SshConnectionPhase::Closed, "abcdefg"),
+        "SSH-OFF abc..."
+    );
+    // Long targets stay bounded in every phase.
+    for phase in [
+        SshConnectionPhase::Connecting,
+        SshConnectionPhase::Connected,
+        SshConnectionPhase::Closed,
+        SshConnectionPhase::LaunchFailed,
+        SshConnectionPhase::ConnectFailed,
+        SshConnectionPhase::Disconnected,
+    ] {
+        let label = ssh_state_label(phase, &"x".repeat(2048));
+        assert_eq!(label.chars().count(), SSH_SIDEBAR_LABEL_CHARS);
+    }
+}
+
+#[test]
+fn ssh_connection_marker_identifies_only_the_exact_connected_target() {
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(b"Host abcdef-first\nHost abcdef-second\n");
+    let mut workspace = WorkspaceState::new();
+    let config = SshConfig::read(fixture.path()).expect("bounded SSH fixture parses");
+    workspace.load_ssh_config(&config);
+
+    workspace.set_ssh_connection("abcdef-second", SshConnectionPhase::Connected);
+    let rows = workspace.sidebar().rows();
+    assert!(
+        rows[0].label().starts_with("SSH-OFF "),
+        "{}",
+        rows[0].label()
+    );
+    assert!(
+        rows[1].label().starts_with("SSH-ON  "),
+        "{}",
+        rows[1].label()
+    );
+    assert_eq!(rows[1].detail(), Some("connected"));
+
+    workspace.set_ssh_connection("abcdef-second", SshConnectionPhase::ConnectFailed);
+    let rows = workspace.sidebar().rows();
+    assert!(
+        rows[1].label().starts_with("SSH-ERR "),
+        "{}",
+        rows[1].label()
+    );
+    assert_eq!(rows[1].detail(), Some("connection failed"));
+}
+
+#[test]
+fn ssh_connect_flow_never_persists_or_debug_prints_the_destination() {
+    let secret = ssh_secret_sentinel("PERSIST");
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(format!("Host {secret}\n").as_bytes());
+    let path = temp_state_path();
+    let mut workspace = WorkspaceState::with_state_path(Some(path.clone()));
+    let local = workspace.create_session(SessionKind::Local);
+    workspace.observe_session(local, SessionStatus::Running);
+    let config = SshConfig::read(fixture.path()).expect("bounded SSH fixture parses");
+    workspace.load_ssh_config(&config);
+
+    // The full connect path's workspace writes: pending selection, live
+    // connection, observed failure. Row 1 is the host row: the local
+    // session occupies row 0.
+    assert!(workspace.select_ssh_sidebar_row(1));
+    workspace.set_ssh_connection(&secret, SshConnectionPhase::Connecting);
+    workspace.set_ssh_connection(&secret, SshConnectionPhase::ConnectFailed);
+    workspace.persist();
+
+    let written = std::fs::read_to_string(&path).expect("the real save path wrote a document");
+    assert!(
+        !written.contains(&secret),
+        "the persisted sessions.toml must never carry the destination: {written}"
+    );
+    assert!(
+        !written.contains("kind = \"ssh\""),
+        "an SSH launch must never enter the persisted registry: {written}"
+    );
+    assert!(
+        !format!("{workspace:?}").contains(&secret),
+        "no debug surface may carry the destination"
+    );
+    assert!(
+        workspace
+            .registry()
+            .sessions()
+            .iter()
+            .all(|descriptor| !matches!(descriptor.kind(), SessionKind::Ssh { .. })),
+        "the live registry records no SSH session for the launch"
+    );
+    cleanup_state_file(&path);
+}
+
+// ── Live multi-session bookkeeping (supervisor-backed switching, slice 1) ──
+//
+// The palette's `session_create` now spawns a real `/bin/zsh` PTY per row.
+// These tests spawn real PTYs, following the `noren-pty` test convention; the
+// children are reaped through `PtySession`'s bounded shutdown when the app (or
+// its parked map) drops.
+
+/// An isolated home directory for PTY children, following the `noren-pty`
+/// suite's `TestHome` convention.
+///
+/// Tests that drive a shell by typing must not run it in the developer's real
+/// `$HOME`: personal startup files can take arbitrarily long (over a minute on
+/// some machines) or read the terminal, which would make the test's prompt
+/// wait depend on personal configuration. An empty home gives the same fixed
+/// `/bin/zsh` policy with a deterministic, immediate prompt.
+struct AppTestHome(PathBuf);
+
+impl AppTestHome {
+    fn new() -> Self {
+        static SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "noren-app-test-home-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).expect("create isolated test home");
+        Self(path)
+    }
+
+    /// A default app whose spawned sessions run in this isolated home.
+    ///
+    /// Borrows the guard so it stays alive (and the directory stays present)
+    /// for the whole test: the child validates the directory at spawn time.
+    fn app(&self) -> NorenApp {
+        NorenApp {
+            test_pty_home: Some(self.0.clone()),
+            ..NorenApp::default()
+        }
+    }
+}
+
+impl Drop for AppTestHome {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(&self.0).expect("remove isolated test home");
+    }
+}
+
+/// Registry ids in sidebar order.
+fn registry_ids(app: &NorenApp) -> Vec<SessionId> {
+    app.workspace
+        .registry()
+        .sessions()
+        .into_iter()
+        .map(|descriptor| descriptor.id())
+        .collect()
+}
+
+/// Observed status of a live registry row.
+fn session_status(app: &NorenApp, id: SessionId) -> SessionStatus {
+    app.workspace
+        .registry()
+        .get(id)
+        .expect("session exists in the registry")
+        .status()
+        .clone()
+}
+
+/// Drain the live view until the shell has produced its first output.
+///
+/// Real zsh sessions run in the inherited `$HOME`, whose startup files a user
+/// may have customized: input typed before they finish races them, so every
+/// test that drives a shell by typing first waits for its prompt.
+fn wait_for_shell_output(app: &mut NorenApp) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.drain_pty();
+        let ready = app
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.screen().display_row_count() > 0);
+        assert!(
+            Instant::now() < deadline || ready,
+            "the spawned shell never produced its prompt"
+        );
+        if ready {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The palette's session_create must spawn a real local PTY: the row is
+/// observed `Running` (never left `Starting`), it owns the live surface, and a
+/// second create parks the first live session instead of killing it.
+///
+/// Mutation check: making `session_create` add a model row without spawning
+/// (no PTY, no `Running` observation) fails every assertion past the first.
+#[test]
+fn palette_create_spawns_a_real_local_pty_session() {
+    let home = AppTestHome::new();
+    let mut app = home.app();
+
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+
+    let ids = registry_ids(&app);
+    assert_eq!(ids.len(), 1);
+    let first = ids[0];
+    assert_eq!(
+        session_status(&app, first),
+        SessionStatus::Running,
+        "a spawned session must be observed Running, not left Starting"
+    );
+    assert!(
+        app.pty.is_some(),
+        "the new session must own a real live PTY surface"
+    );
+    assert_eq!(app.active_session, Some(first));
+    assert_eq!(app.workspace.registry().selected(), Some(first));
+
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let ids = registry_ids(&app);
+    assert_eq!(ids.len(), 2);
+    let second = ids[1];
+    assert_eq!(
+        session_status(&app, second),
+        SessionStatus::Running,
+        "the second spawn is also a real running session"
+    );
+    assert_eq!(
+        app.active_session,
+        Some(second),
+        "a new session takes the live view"
+    );
+    assert!(
+        app.parked_sessions.contains_key(&first),
+        "the previous live session must be parked, not dropped"
+    );
+    assert_eq!(
+        session_status(&app, first),
+        SessionStatus::Running,
+        "parking keeps the first session truthfully Running"
+    );
+}
+
+/// A parked session that exits in the background is observed through the
+/// registry, reaped, and detached — it never stays `Running` and never leaves
+/// a live-surface entry behind.
+#[test]
+fn a_parked_session_that_exits_is_observed_and_detached() {
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let first = registry_ids(&app)[0];
+    // Wait for the shell to finish starting up before typing into it: input
+    // queued while zsh is still reading its startup files races them. The
+    // isolated home makes that startup immediate and deterministic.
+    wait_for_shell_output(&mut app);
+    // Tell the first shell to exit while it still owns the live view; the
+    // exit is only observed after the session has been parked, because
+    // nothing drains between these calls.
+    app.send_input(b"exit\n");
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let second = registry_ids(&app)[1];
+    assert!(app.parked_sessions.contains_key(&first));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session_status(&app, first) == SessionStatus::Running {
+        app.drain_pty();
+        app.drain_parked_sessions();
+        assert!(
+            Instant::now() < deadline,
+            "the parked session's exit was never observed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        matches!(session_status(&app, first), SessionStatus::Exited { .. }),
+        "an exited parked session is observed as Exited (the code is None when \
+         the reader's EOF wins the race with the supervisor's exit poll)"
+    );
+    assert!(
+        !app.parked_sessions.contains_key(&first),
+        "a dead parked session must be detached from the live bookkeeping"
+    );
+    assert_eq!(
+        app.active_session,
+        Some(second),
+        "a parked exit must not disturb the live view"
+    );
+    assert_eq!(session_status(&app, second), SessionStatus::Running);
+}
+
+/// Quitting with several real live sessions persists them all for the next
+/// launch, where they come back as `Restored` rows — live PTYs never survive a
+/// restart, and the persisted model must say so.
+#[test]
+fn quitting_persists_spawned_sessions_for_the_next_launch() {
+    let path = temp_state_path();
+    let home = AppTestHome::new();
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..app_with_state_path(&path)
+    };
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+
+    app.teardown();
+
+    let text = std::fs::read_to_string(&path).expect("state saved on quit");
+    assert_eq!(
+        text.matches("kind = \"local\"").count(),
+        2,
+        "both spawned sessions persist: {text}"
+    );
+
+    let relaunched = sidebar_after_relaunch(&path);
+    assert_eq!(relaunched.registry().len(), 2);
+    for descriptor in relaunched.registry().sessions() {
+        let status = descriptor.status().clone();
+        assert_eq!(
+            status,
+            SessionStatus::Restored,
+            "a relaunched row must be Restored, not Running"
+        );
+    }
+    assert!(
+        relaunched.registry().selected().is_some(),
+        "the persisted selection survives the restart"
+    );
+    cleanup_state_file(&path);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn ssh_click_connects_the_system_client_end_to_end() {
+    // The alias begins with `@`, which the system ssh client rejects during
+    // its own argument parsing: the launch, the interactive I/O path, and
+    // the failure mapping are all observed with no network access and no
+    // credential.
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(b"Host @noren-refuse\n");
+    let mut app = NorenApp::default();
+    app.load_ssh_hosts_from(fixture.path());
+    app.terminal = Some(TerminalState::new(24, 80).expect("valid grid"));
+    app.cursor_position = Some(PhysicalPosition::new(5.0, 1.0));
+
+    assert!(app.handle_sidebar_click_in_frame(
+        ElementState::Pressed,
+        MouseButton::Left,
+        PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+    ));
+
+    // The click spawned the real system ssh client in the terminal's PTY.
+    assert!(
+        app.pty.is_some(),
+        "the click must launch the system ssh client"
+    );
+    assert_eq!(
+        app.workspace.ssh_connection.as_ref().map(|(_, p)| *p),
+        Some(SshConnectionPhase::Connecting)
+    );
+    assert_eq!(app.status, "Noren ssh connecting");
+
+    // Pump the production drain loop until the child's failure surfaces.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        app.drain_pty();
+        let phase = app.workspace.ssh_connection.as_ref().map(|(_, p)| *p);
+        if matches!(
+            phase,
+            Some(
+                SshConnectionPhase::ConnectFailed
+                    | SshConnectionPhase::Disconnected
+                    | SshConnectionPhase::Closed
+            )
+        ) || std::time::Instant::now() >= deadline
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    assert_eq!(
+        app.workspace
+            .ssh_connection
+            .as_ref()
+            .map(|(_, phase)| *phase),
+        Some(SshConnectionPhase::ConnectFailed),
+        "ssh's own error exit must surface as a connection failure"
+    );
+    assert_eq!(app.status, "Noren ssh connection failed");
+    assert!(app.show_status, "the failure must own the status row");
+    assert!(app.pty.is_none(), "the failed child's PTY is retired");
+
+    // ssh's own usage diagnostic flowed through the normal terminal path.
+    let snapshot = app.terminal.as_ref().expect("terminal present").snapshot();
+    let rendered: Vec<&str> = snapshot.lines().iter().map(String::as_str).collect();
+    assert!(
+        rendered.iter().any(|line| line.contains("usage:")),
+        "the ssh diagnostic must reach the terminal content"
+    );
+
+    // The sidebar row carries the failure state.
+    let row = &app.workspace.sidebar().rows()[0];
+    assert!(row.label().starts_with("SSH-ERR "), "{}", row.label());
+    assert_eq!(row.detail(), Some("connection failed"));
+}
+
+// ── Sidebar switching (supervisor-backed switching, slice 2) ────────────
+
+/// Whether the session owns a live surface: it is the active one or parked.
+fn has_live_surface(app: &NorenApp, id: SessionId) -> bool {
+    app.active_session == Some(id) || app.parked_sessions.contains_key(&id)
+}
+
+/// Visible text of a terminal state, extracted through the selection path.
+fn terminal_text(terminal: &TerminalState) -> String {
+    Selection::entire_grid(terminal).extract(terminal)
+}
+
+/// Click a sidebar row in a default-sized synthetic frame.
+fn click_sidebar_row(app: &mut NorenApp, row: usize) -> bool {
+    app.cursor_position = Some(PhysicalPosition::new(
+        5.0,
+        f64::from(app.geometry.cell_height()) * row as f64 + 1.0,
+    ));
+    app.handle_sidebar_click_in_frame(
+        ElementState::Pressed,
+        MouseButton::Left,
+        PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+    )
+}
+
+/// Clicking another session row must move the whole live view — the terminal
+/// surface the renderer draws and `send_input` feeds — to the clicked
+/// session, and switching back must show that session's own screen again.
+///
+/// Mutation check: making the switch a no-op that keeps rendering the old
+/// session fails the screen-content assertions after every click.
+#[test]
+fn sidebar_click_switches_the_live_surface_between_sessions() {
+    let mut app = NorenApp::default();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let ids = registry_ids(&app);
+    let (first, second) = (ids[0], ids[1]);
+    assert_eq!(app.active_session, Some(second));
+
+    // The second (live) session's screen gets a marker through the exact
+    // byte path production uses for PTY output.
+    app.apply_pty_output(b"SECOND-LIVE-7f31\r\n");
+
+    assert!(click_sidebar_row(&mut app, 0), "row 0 is consumed");
+    assert_eq!(app.active_session, Some(first), "the live view moved");
+    assert_eq!(app.workspace.registry().selected(), Some(first));
+    let text = terminal_text(app.terminal.as_ref().expect("first surface attached"));
+    assert!(
+        !text.contains("SECOND-LIVE-7f31"),
+        "the live view must show the first session's screen, not the previous one"
+    );
+    assert!(
+        has_live_surface(&app, second),
+        "the parked session stays live"
+    );
+
+    // Each session's screen keeps its own bytes after a switch.
+    app.apply_pty_output(b"FIRST-LIVE-7f31\r\n");
+    assert!(click_sidebar_row(&mut app, 1));
+    assert_eq!(app.active_session, Some(second));
+    let text = terminal_text(app.terminal.as_ref().expect("second surface attached"));
+    assert!(text.contains("SECOND-LIVE-7f31"));
+    assert!(!text.contains("FIRST-LIVE-7f31"));
+
+    assert!(click_sidebar_row(&mut app, 0));
+    assert_eq!(app.active_session, Some(first));
+    let text = terminal_text(app.terminal.as_ref().expect("first surface attached"));
+    assert!(
+        text.contains("FIRST-LIVE-7f31"),
+        "switching back re-attaches the first session's own screen"
+    );
+    assert!(!text.contains("SECOND-LIVE-7f31"));
+}
+
+/// A row without a live surface (model-only, restored, or exited) is consumed
+/// but cannot take input ownership: the current live session keeps it.
+#[test]
+fn switching_to_a_row_without_a_live_surface_keeps_the_current_owner() {
+    let mut app = NorenApp::default();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let live = registry_ids(&app)[0];
+    // A model-only row straight from the registry seam: no PTY behind it.
+    let _model = app.workspace.create_session(SessionKind::Local);
+    app.workspace.rebuild_sidebar();
+
+    assert!(click_sidebar_row(&mut app, 1), "the model row is consumed");
+
+    assert_eq!(
+        app.active_session,
+        Some(live),
+        "a row without a live surface must not take the live view"
+    );
+    // The click selects the model row (close targets what was clicked);
+    // input ownership stays with the live session.
+    assert_eq!(app.workspace.registry().selected(), Some(_model));
+    assert!(app.pty.is_some(), "the live surface is untouched");
+    assert!(!has_live_surface(&app, _model));
+}
+
+/// Switching expires selections captured on the previous session's screen:
+/// grid coordinates only address the content they were captured on.
+#[test]
+fn switching_expires_the_previous_sessions_selection() {
+    let mut app = NorenApp::default();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let ids = registry_ids(&app);
+    app.apply_pty_output(b"SELECT-7f31");
+    app.select_entire_grid();
+    assert!(app.selection.is_some());
+
+    assert!(click_sidebar_row(&mut app, 0));
+
+    assert_eq!(app.active_session, Some(ids[0]));
+    assert!(
+        app.selection.is_none(),
+        "a selection from the previous screen must not survive the switch"
+    );
+    assert!(app.drag_origin.is_none());
+}
+
+/// Creating a new session takes the live view through the same expiry a
+/// sidebar switch runs: a selection captured on the old screen must not
+/// survive into the new session's coordinates (found by independent review —
+/// `spawn_local_session` once switched surfaces without expiring).
+#[test]
+fn creating_a_session_expires_the_previous_sessions_selection() {
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.apply_pty_output(b"CREATE-9c2e");
+    app.select_entire_grid();
+    assert!(app.selection.is_some());
+
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+
+    assert!(
+        app.selection.is_none(),
+        "a selection from the previous screen must not survive creation"
+    );
+    assert!(app.drag_origin.is_none());
+}
+
+/// Closing the row whose EXITED final frame is still displayed must clear
+/// the surface and run the same fallback an active close does — not leave a
+/// frozen frame behind a vanished row in an empty workspace (found by
+/// independent review).
+#[test]
+fn closing_the_displayed_exited_frame_clears_the_surface_honestly() {
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let id = registry_ids(&app)[0];
+    assert_eq!(app.active_session, Some(id));
+
+    // The child exits: finish_pty keeps the final frame displayed with input
+    // ownership already gone.
+    app.finish_pty("Noren shell reached EOF");
+    assert_eq!(app.active_session, None);
+    assert!(app.terminal.is_some(), "the final frame stays displayed");
+
+    app.run_workspace_action(WorkspaceAction::CloseSession);
+
+    assert!(
+        app.workspace.registry().get(id).is_none(),
+        "the exited row is closed"
+    );
+    assert!(
+        app.terminal.is_none(),
+        "no closed session's frozen frame may stay on screen"
+    );
+    assert!(
+        app.parked_sessions.is_empty() && app.active_session.is_none(),
+        "an empty workspace is reported honestly"
+    );
+}
+
+// ── Closing live sessions (supervisor-backed switching, slice 3) ────────
+
+/// Closing the ACTIVE session while other live sessions exist falls back to
+/// the topmost remaining live row (the lowest id), and that row's own screen
+/// — not the closed session's — owns the live view afterwards.
+///
+/// Mutation check: skipping the reaping/detaching in `close_session` (or
+/// falling back to the closed session's own surface) fails the marker and
+/// ownership assertions.
+#[test]
+fn closing_the_active_session_falls_back_to_the_topmost_live_session() {
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let first = registry_ids(&app)[0];
+    // First session's screen gets a marker while it still owns the live view.
+    app.apply_pty_output(b"FIRST-SCREEN-9c2d\r\n");
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let second = registry_ids(&app)[1];
+    assert_eq!(app.active_session, Some(second));
+
+    // The palette closes the selected row; the newest session is both
+    // selected and active.
+    app.run_workspace_action(WorkspaceAction::CloseSession);
+
+    assert!(app.workspace.registry().get(second).is_none());
+    assert_eq!(
+        app.active_session,
+        Some(first),
+        "the live view falls back to the topmost remaining live session"
+    );
+    assert_eq!(app.workspace.registry().selected(), Some(first));
+    assert!(
+        app.pty.is_some(),
+        "the fallback session's real PTY owns the live view"
+    );
+    let text = terminal_text(app.terminal.as_ref().expect("fallback surface"));
+    assert!(
+        text.contains("FIRST-SCREEN-9c2d"),
+        "the fallback must show the first session's own screen"
+    );
+    assert_eq!(session_status(&app, first), SessionStatus::Running);
+    assert!(app.parked_sessions.is_empty());
+}
+
+/// Closing a PARKED session reaps its child and leaves the live view on the
+/// active session, untouched.
+#[test]
+fn closing_a_parked_session_reaps_it_and_keeps_the_live_view() {
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let ids = registry_ids(&app);
+    let (first, second) = (ids[0], ids[1]);
+    assert!(app.parked_sessions.contains_key(&first));
+
+    // Make the parked row the palette's target: registry selection is a
+    // model-level choice and does not move the live view.
+    app.workspace
+        .select_session(first)
+        .expect("parked row selectable");
+
+    app.run_workspace_action(WorkspaceAction::CloseSession);
+
+    assert!(app.workspace.registry().get(first).is_none());
+    assert!(
+        !app.parked_sessions.contains_key(&first),
+        "the parked child handle was reaped and removed, not left in the map"
+    );
+    assert_eq!(
+        app.active_session,
+        Some(second),
+        "the live view is untouched"
+    );
+    assert!(app.pty.is_some());
+    assert_eq!(session_status(&app, second), SessionStatus::Running);
+    assert_eq!(app.workspace.registry().selected(), None);
+}
+
+/// A structural close persists immediately: the next launch restores exactly
+/// the surviving rows as `Restored` entries, never the closed one, and never
+/// a live status for a shell that died with the previous launch.
+#[test]
+fn closing_a_session_persists_the_shrunk_sidebar_for_the_next_launch() {
+    let home = AppTestHome::new();
+    let path = temp_state_path();
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..app_with_state_path(&path)
+    };
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.run_workspace_action(WorkspaceAction::CloseSession);
+
+    let relaunched = sidebar_after_relaunch(&path);
+    assert_eq!(
+        relaunched.registry().len(),
+        1,
+        "the closed row is not saved"
+    );
+    for descriptor in relaunched.registry().sessions() {
+        assert_eq!(
+            descriptor.status().clone(),
+            SessionStatus::Restored,
+            "a relaunched row is Restored: its shell did not survive the launch"
+        );
+    }
+    cleanup_state_file(&path);
+}
+
+/// The palette's `session_select` cycles the live view through live sessions
+/// in sidebar order, wrapping around, and each switch shows the target
+/// session's own screen. With no other live session it re-affirms the current
+/// owner instead of moving input to a model-only row.
+///
+/// Mutation check: making the switch a no-op that keeps rendering the old
+/// session fails every screen-content assertion here.
+#[test]
+fn palette_select_cycles_the_live_view_between_live_sessions() {
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    // Three real sessions; each gets a marker on its own screen while it owns
+    // the live view.
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.apply_pty_output(b"MARK-A-51e0\r\n");
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.apply_pty_output(b"MARK-B-51e0\r\n");
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.apply_pty_output(b"MARK-C-51e0\r\n");
+    let ids = registry_ids(&app);
+    let (a, b, c) = (ids[0], ids[1], ids[2]);
+    assert_eq!(app.active_session, Some(c));
+
+    app.run_workspace_action(WorkspaceAction::SelectSession);
+    assert_eq!(app.active_session, Some(a), "cycles forward and wraps");
+    assert_eq!(app.workspace.registry().selected(), Some(a));
+    assert!(terminal_text(app.terminal.as_ref().expect("a attached")).contains("MARK-A-51e0"));
+
+    app.run_workspace_action(WorkspaceAction::SelectSession);
+    assert_eq!(app.active_session, Some(b));
+    assert!(terminal_text(app.terminal.as_ref().expect("b attached")).contains("MARK-B-51e0"));
+
+    app.run_workspace_action(WorkspaceAction::SelectSession);
+    assert_eq!(app.active_session, Some(c));
+    let text = terminal_text(app.terminal.as_ref().expect("c attached"));
+    assert!(text.contains("MARK-C-51e0"));
+    assert!(
+        !text.contains("MARK-A-51e0") && !text.contains("MARK-B-51e0"),
+        "the live view shows only the selected session's screen"
+    );
+}
+
+/// With a single live session, `session_select` keeps that session as the
+/// input owner; a model-only row never takes the live view through the
+/// palette either.
+#[test]
+fn palette_select_with_one_live_session_reaffirms_its_owner() {
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let live = registry_ids(&app)[0];
+    let _model = app.workspace.create_session(SessionKind::Local);
+    app.workspace.rebuild_sidebar();
+
+    app.run_workspace_action(WorkspaceAction::SelectSession);
+
+    assert_eq!(app.active_session, Some(live));
+    assert_eq!(app.workspace.registry().selected(), Some(live));
+    assert!(!has_live_surface(&app, _model));
+}
+
+/// Restart honesty: rows restored from disk have no live process behind them,
+/// so selecting one must not move the live view — while the persisted
+/// selection itself survives the restart untouched. Live PTYs never survive a
+/// restart and the model never pretends otherwise.
+#[test]
+fn a_restored_row_never_takes_the_live_view_from_the_running_session() {
+    let path = temp_state_path();
+    // Launch one: one real session, quit (which persists it), relaunch.
+    {
+        let home = AppTestHome::new();
+        let mut first_launch = NorenApp {
+            test_pty_home: Some(home.0.clone()),
+            ..app_with_state_path(&path)
+        };
+        first_launch.run_workspace_action(WorkspaceAction::CreateSession);
+        first_launch.teardown();
+    }
+    let home = AppTestHome::new();
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..app_with_state_path(&path)
+    };
+    // The relaunched app has one Restored row and no live surface yet.
+    let restored = registry_ids(&app)[0];
+    assert_eq!(session_status(&app, restored), SessionStatus::Restored);
+    assert_eq!(app.active_session, None);
+
+    // The user creates a new real session; it takes the live view.
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let live = registry_ids(&app)[1];
+    assert_eq!(app.active_session, Some(live));
+
+    // Clicking the Restored row is consumed but cannot take input ownership:
+    // its shell died with the previous launch. The click still SELECTS the
+    // clicked row — the palette's close command operates on the selected
+    // row, and re-selecting the live one would redirect a close onto a shell
+    // the user did not point at (found by independent review).
+    assert!(
+        click_sidebar_row(&mut app, 0),
+        "the restored row is consumed"
+    );
+    assert_eq!(
+        app.active_session,
+        Some(live),
+        "a restored row has no live surface to attach"
+    );
+    assert_eq!(
+        app.workspace.registry().selected(),
+        Some(restored),
+        "the click selects the clicked row, not the live one"
+    );
+    assert!(app.pty.is_some(), "the live surface is untouched");
+    // And closing now removes the clicked restored row, never the live shell.
+    app.run_workspace_action(WorkspaceAction::CloseSession);
+    assert!(
+        app.workspace.registry().get(restored).is_none(),
+        "close targets the row the user just clicked"
+    );
+    assert!(
+        app.workspace.registry().get(live).is_some(),
+        "the live shell survives closing the restored row"
+    );
     cleanup_state_file(&path);
 }
