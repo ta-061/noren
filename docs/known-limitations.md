@@ -234,9 +234,10 @@ Each item states what you would actually see if you ran the build.
   suites under `crates/noren-app/tests/` — `frame_oracle.rs`,
   `mouse_encoding.rs`, `palette.rs`, `passthrough.rs`,
   `session_adversarial.rs`, `session_domain.rs`, `session_persistence.rs`,
-  `session_supervisor.rs`, `sidebar_view.rs`, and `verify59_independent.rs`
+  `session_supervisor.rs`, `sidebar_view.rs`, `verify59_independent.rs`
   (an independently authored verification pass over configuration,
-  diagnostics, and scrollback bounds).
+  diagnostics, and scrollback bounds), and `security_no_leak.rs` (sentinel
+  tests that fail if secret material reaches a log, error, or Debug sink).
 - **Four CI gates** required by branch protection (see the
   [roadmap](../ROADMAP.md) and `.github/workflows/`): the Rust workflow
   (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,

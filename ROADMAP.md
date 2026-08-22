@@ -110,7 +110,7 @@ Measured against it, item by item:
 | Scope item | State | Evidence |
 | --- | --- | --- |
 | Sidebar drawn | Done | `SIDEBAR_COLS` reserved in `renderer.rs`; `glyph_vertices` applies the column offset; `sidebar_text_lines` formats rows |
-| — projects, git worktrees | Modelled, not launchable | `EntryKind::Project`/`Worktree`, `SessionKind::Project`/`Worktree` exist; no runtime path constructs them — only tests do |
+| — projects, git worktrees | Modelled, not launchable | `EntryKind::Project`/`Worktree`, `SessionKind::Project`/`Worktree` exist; no runtime path creates them, though `parse_session` will reconstruct one from a hand-written `sessions.toml` `kind` field — nothing in the product writes such an entry |
 | — SSH connections, agents | Partial configured-target list, not connected; agents fixture only | At most 24 positive literal OpenSSH aliases become `SessionKind::Ssh` and `SidebarEntry::SshConnection` rows; the status identifies partial discovery, and clicking shows bounded root-relative source provenance while opening no SSH connection or PTY; agent entries remain reserved |
 | — terminal sessions | Partial runtime | The running binary starts one `SessionKind::Local` PTY; palette-created rows are model entries only until supervisor-backed switching lands |
 | Single-session view | Done | The one live terminal is drawn beside the sidebar, narrowed to the remaining columns; inactive rows cannot claim its selection or input owner |
