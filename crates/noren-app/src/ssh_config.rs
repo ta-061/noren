@@ -627,6 +627,11 @@ impl HeadMask {
         };
         for pattern in patterns {
             let Some(head) = pattern.chars().next() else {
+                // An empty positive pattern matches only the empty alias
+                // (`wildcard_match("", "")`), and the empty alias has no head
+                // character to bucket by — admit the block everywhere rather
+                // than lose it for that one alias.
+                mask.any = true;
                 continue;
             };
             if head == '!' {

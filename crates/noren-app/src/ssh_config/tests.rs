@@ -2512,3 +2512,35 @@ fn first_character_filter_preserves_wildcard_semantics() {
     assert_eq!(unicode.user(), None);
     assert_eq!(unicode.port(), None);
 }
+
+#[test]
+fn empty_positive_pattern_still_reaches_the_empty_alias() {
+    // Found by independent review of the first-character filter: a mixed
+    // block whose positive pattern is the empty string matches the empty
+    // alias under wildcard_match("", ""), but the empty alias has no head
+    // character to bucket by — the block must still be walked, or the
+    // later wildcard block's value would win instead of the first block's.
+    let config = SshConfig::parse(
+        "Host \"\" !z*\nHostName first\nPort 29\n\
+         Host other\nHostName literal\n\
+         Host *\nHostName last\nPort 99\n",
+    )
+    .expect("empty-pattern config parses");
+    let empty = config
+        .hosts()
+        .iter()
+        .find(|host| host.alias().is_empty())
+        .expect("empty alias discovered");
+    assert_eq!(empty.host_name(), Some("first"));
+    assert_eq!(empty.port(), Some(29));
+    // A non-empty alias is never matched by the empty pattern; its own
+    // literal block precedes `*`, so first-value-wins keeps `literal` while
+    // `*` contributes the port the literal block left unset.
+    let other = config
+        .hosts()
+        .iter()
+        .find(|host| host.alias() == "other")
+        .expect("literal alias present");
+    assert_eq!(other.host_name(), Some("literal"));
+    assert_eq!(other.port(), Some(99));
+}
