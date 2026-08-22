@@ -32,7 +32,9 @@ binary. What now actually happens on screen:
   rows.
 - **The session palette operates on real local sessions.** `Super+p` opens
   the command palette (claimed by `palette_policy` in `main.rs` as
-  `PassthroughAction::OpenCommandPalette`). Its `c` command spawns a real
+  `PassthroughAction::OpenCommandPalette`); the opener and the four command
+  chords are configurable through `[keys]` in `config.toml` with
+  `super+p`/`c`/`s`/`x`/`f` as the defaults. The `c` command spawns a real
   `/bin/zsh` PTY and gives it the live view (parking the previous one, not
   killing it); `s` cycles the live view to the next live session in sidebar
   order; `x` closes the selected row, reaping its child and falling back to
@@ -216,11 +218,16 @@ Each item states what you would actually see if you ran the build.
   exactly one session owns the viewport at a time. Panes and layout *inside*
   the live session are delegated to Zellij by design — see "What is
   deliberately delegated".
-- **Keybindings are not configurable.** The palette opener (`Super+p`), the exit
-  leader (`Super+Escape`), and the `c`/`s`/`x`/`f` command keys are compiled in:
-  `palette_policy` and `handle_palette_key` in `main.rs` hard-code them, and the
-  config parser (`config.rs`) exposes no keybinding or keymap surface. Rebinding
-  requires editing source.
+- **Keybindings are configurable for the palette only, within bounds.** The
+  `[keys]` table in `config.toml` rebinds the palette opener and the four
+  palette command chords (`palette_policy` and `handle_palette_key` in
+  `main.rs` read them from `KeymapConfig`), with the pre-configuration
+  chords as defaults. The exit leader (`super+escape`), the palette's
+  structural keys (Escape, Enter, the vertical arrows), the diagnostics
+  chord (Super+D), and the clipboard shortcuts (Super+A/C/V) remain
+  compiled in; see [configuration](configuration.md) for the grammar and the
+  rejection rules, including the pinned-Zellij-corpus constraint on the
+  opener.
 - **A restored session's shell is not running.** Sidebar state persists across a
   restart, but a restored entry comes back as `SessionStatus::Restored` — a
   visible row whose PTY does not exist yet. The comment on `teardown` in
@@ -300,8 +307,9 @@ terminal. That side now has a first vertical slice — a drawn sidebar, a comman
 palette over real local sessions (spawn, switch, close), live switching between
 them, and state that survives a restart
 — and the gaps that remain there (non-local session
-kinds, configurable keybindings, reattaching a restored session's shell) are
-legitimate things to report.
+kinds, reattaching a restored session's shell) are
+legitimate things to report; keybindings are configurable through
+`[keys]` now, with the live winit dispatch gap noted above.
 
 ## What this preview is not
 
