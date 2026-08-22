@@ -4004,6 +4004,52 @@ fn ssh_click_surfaces_launch_failure_when_no_child_can_spawn() {
 }
 
 #[test]
+fn ssh_spawn_failure_never_retires_the_running_local_session() {
+    // Found by independent review: connect_ssh_target orders
+    // retire_live_terminal() inside the Ok arm only, but no test pinned it —
+    // a mutation moving the retire BEFORE the spawn attempt passed the whole
+    // suite. This seeds a real live session and forces the spawn's Err arm,
+    // so a failed ssh launch must leave the running local shell untouched.
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let live = registry_ids(&app)[0];
+    assert!(app.pty.is_some(), "a live local session is running");
+
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(b"Host web\n");
+    app.ssh_spawn_force_failure = true;
+    app.load_ssh_hosts_from(fixture.path());
+    // Row 0 is the live local session; the SSH host sits at row 1.
+    app.cursor_position = Some(PhysicalPosition::new(5.0, 25.0));
+
+    assert!(app.handle_sidebar_click_in_frame(
+        ElementState::Pressed,
+        MouseButton::Left,
+        PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+    ));
+
+    assert_eq!(
+        app.status, "Noren ssh launch failed",
+        "the failure is surfaced first-class"
+    );
+    assert!(
+        app.pty.is_some(),
+        "a failed ssh spawn must not tear down the running local shell"
+    );
+    assert_eq!(
+        app.active_session,
+        Some(live),
+        "the local session keeps the live view"
+    );
+    assert_eq!(
+        session_status(&app, live),
+        SessionStatus::Running,
+        "the local session is not observed Exiting behind a failed launch"
+    );
+}
+
+#[test]
 fn ssh_click_refuses_a_raw_token_destination_without_spawning() {
     let secret = ssh_secret_sentinel("TOKEN");
     let fixture = SshConfigFixture::new();
@@ -4201,6 +4247,10 @@ fn ssh_connect_flow_never_persists_or_debug_prints_the_destination() {
             .iter()
             .all(|descriptor| !matches!(descriptor.kind(), SessionKind::Ssh { .. })),
         "the live registry records no SSH session for the launch"
+    );
+    cleanup_state_file(&path);
+}
+
 // ── Live multi-session bookkeeping (supervisor-backed switching, slice 1) ──
 //
 // The palette's `session_create` now spawns a real `/bin/zsh` PTY per row.
@@ -4508,6 +4558,8 @@ fn ssh_click_connects_the_system_client_end_to_end() {
     let row = &app.workspace.sidebar().rows()[0];
     assert!(row.label().starts_with("SSH-ERR "), "{}", row.label());
     assert_eq!(row.detail(), Some("connection failed"));
+}
+
 // ── Sidebar switching (supervisor-backed switching, slice 2) ────────────
 
 /// Whether the session owns a live surface: it is the active one or parked.

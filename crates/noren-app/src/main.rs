@@ -707,6 +707,11 @@ struct NorenApp {
     /// disable the spawn so the click path is exercised without launching any
     /// process, keeping the unit suite deterministic.
     ssh_spawn_enabled: bool,
+    /// Test-only override that makes the ssh spawn attempt itself fail (the
+    /// `Err` arm of `PtySession::spawn_ssh`), which cannot be forced from a
+    /// valid destination on a healthy machine. Production never sets it.
+    #[cfg(test)]
+    ssh_spawn_force_failure: bool,
     redraw_needed: bool,
     // User-initiated selection state. The renderer does not highlight it yet;
     // copy still extracts it. Any PTY output or resize invalidates it because
@@ -812,6 +817,8 @@ impl NorenApp {
             ssh_selection_status: None,
             ssh_eof_since: None,
             ssh_spawn_enabled: true,
+            #[cfg(test)]
+            ssh_spawn_force_failure: false,
             redraw_needed: true,
             selection: None,
             drag_origin: None,
@@ -1031,8 +1038,18 @@ impl NorenApp {
             }
         };
         let spawned = self.ssh_spawn_enabled && {
-            match PtySession::spawn_ssh(SshLaunchPolicy::inherit(destination), self.live_pty_size())
-            {
+            #[cfg(test)]
+            let attempt = if self.ssh_spawn_force_failure {
+                Err(noren_pty::PtyError::Backend {
+                    operation: noren_pty::PtyOperation::SpawnChild,
+                })
+            } else {
+                PtySession::spawn_ssh(SshLaunchPolicy::inherit(destination), self.live_pty_size())
+            };
+            #[cfg(not(test))]
+            let attempt =
+                PtySession::spawn_ssh(SshLaunchPolicy::inherit(destination), self.live_pty_size());
+            match attempt {
                 Ok(session) => {
                     self.retire_live_terminal();
                     self.pty = Some(session);
