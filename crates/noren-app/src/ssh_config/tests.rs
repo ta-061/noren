@@ -2417,3 +2417,98 @@ fn baseline_mixed_quadratic_measurement() {
         );
     }
 }
+
+#[test]
+fn mixed_quadratic_config_is_rejected_promptly_at_default_limits() {
+    // The 1 MiB mixed literal+wildcard file from the DoS report. The
+    // resolution-work budget must reject it as complexity, not spend
+    // minutes resolving it: measured 18-22 ms, ceiling has two orders of
+    // headroom.
+    let text = baseline_mixed_text(14_189);
+    let started = std::time::Instant::now();
+    let result = SshConfig::parse(&text);
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(
+            result,
+            Err(SshConfigError {
+                kind: SshConfigErrorKind::ResolutionComplexityExceeded,
+                ..
+            })
+        ),
+        "expected ResolutionComplexityExceeded, got {result:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "rejection took {elapsed:?}; the budget wall must fail fast"
+    );
+}
+
+#[test]
+fn mixed_wildcard_resolution_is_tractable_under_lifted_budget() {
+    // The same file with the resolution budget lifted must resolve in
+    // near-linear time. Measured 9.1 ms at 14,189 pairs after the
+    // first-character fallback filter; the ceiling keeps three orders of
+    // headroom so it cannot flake on a slow machine while still catching
+    // any return of the quadratic walk (which measured 72.6 s here).
+    let text = baseline_mixed_text(14_189);
+    let mut token_items = 0usize;
+    let blocks = parse_blocks_for_test(&text, 0, SshSourceId(0), &mut token_items, MAX_TOKEN_ITEMS)
+        .expect("baseline blocks parse");
+    let lifted = ParserLimits {
+        resolution_work: u128::MAX,
+        ..DEFAULT_LIMITS
+    };
+    let started = std::time::Instant::now();
+    let config =
+        SshConfig::from_blocks_with_limit(&blocks, vec![inline_source(SshSourceId(0))], lifted)
+            .expect("lifted budget resolves the mixed file");
+    let elapsed = started.elapsed();
+    assert_eq!(config.hosts().len(), 14_189);
+    for host in config.hosts() {
+        // Every literal block precedes its wildcard pair and sets HostName
+        // first, so first-value-wins must keep the literal value.
+        assert_eq!(host.host_name(), Some("x"));
+    }
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "resolution took {elapsed:?}; the quadratic fallback walk is back"
+    );
+}
+
+#[test]
+fn first_character_filter_preserves_wildcard_semantics() {
+    // Adversarial shapes for the first-character fallback filter: a wildcard
+    // sharing the alias's first character must still be matched; a case-folded
+    // pattern head must admit the alias; nested same-head blocks must apply in
+    // file order; and a non-ASCII alias must not be matched by any
+    // ASCII-headed wildcard.
+    let config = SshConfig::parse(
+        "Host l*\nHostName outer\nUser o\n\
+         Host lnx\nHostName literal\nPort 33\n\
+         Host l?x*\nHostName wildcard\nUser w\n\
+         Host LNX\nHostName casefold-head\nUser c\n\
+         Host ünïcode\nHostName unicode\n",
+    )
+    .expect("mixed shapes parse");
+    let lnx = config
+        .hosts()
+        .iter()
+        .find(|host| host.alias() == "lnx")
+        .expect("literal alias present");
+    // In file order: `l*` first (outer/o), the literal block is the only one
+    // that sets a Port, `l?x*` and `LNX` match but set nothing new.
+    assert_eq!(lnx.host_name(), Some("outer"));
+    assert_eq!(lnx.user(), Some("o"));
+    assert_eq!(lnx.port(), Some(33));
+    // The non-ASCII alias resolves against its own literal block only; the
+    // ASCII-headed wildcards above it must not match.
+    let unicode = config
+        .hosts()
+        .iter()
+        .find(|host| host.alias() == "ünïcode")
+        .expect("unicode alias present");
+    assert_eq!(unicode.host_name(), Some("unicode"));
+    assert_eq!(unicode.user(), None);
+    assert_eq!(unicode.port(), None);
+}
