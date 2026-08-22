@@ -2207,7 +2207,10 @@ fn included_ssh_host_selection_shows_bounded_root_relative_provenance() {
     fixture.write_new(b"Include included.conf\nHost root-only\n");
     fixture.write_sibling_new("included.conf", b"Host remote\n");
 
-    let mut app = NorenApp::default();
+    // The click attempts a real launch; the deterministic seam disables the
+    // spawn so this test observes the provenance line plus the observed
+    // launch phase without starting any process.
+    let mut app = app_with_deterministic_ssh_seam();
     app.load_ssh_hosts_from(fixture.path());
     assert_eq!(app.workspace.ssh_hosts[0].source_label, "included.conf #1");
     app.cursor_position = Some(PhysicalPosition::new(5.0, 1.0));
@@ -2219,7 +2222,7 @@ fn included_ssh_host_selection_shows_bounded_root_relative_provenance() {
     ));
     assert_eq!(
         app.ssh_selection_status.as_deref(),
-        Some("SSH partial source #1 included.conf; offline")
+        Some("SSH partial source #1 included.conf; launch failed")
     );
     assert!(
         !app.ssh_selection_status
@@ -2590,11 +2593,13 @@ fn ssh_rows_stay_distinguishable_from_local_rows() {
 }
 
 #[test]
-fn selecting_an_ssh_row_only_records_a_pending_non_connection_choice() {
+fn selecting_an_ssh_row_keeps_a_pending_choice_and_never_a_registry_connection() {
     let fixture = SshConfigFixture::new();
     fixture.write_new(b"Host staging\n");
 
-    let mut app = NorenApp::default();
+    // Deterministic seam: the click path attempts the launch, and the
+    // disabled spawn reports the attempt's failure without any process.
+    let mut app = app_with_deterministic_ssh_seam();
     app.load_ssh_hosts_from(fixture.path());
     app.workspace.create_session(SessionKind::Local);
     app.cursor_position = Some(PhysicalPosition::new(5.0, 25.0));
@@ -2607,7 +2612,10 @@ fn selecting_an_ssh_row_only_records_a_pending_non_connection_choice() {
     assert_eq!(app.workspace.selected_ssh_target(), Some("staging"));
     assert_eq!(app.workspace.registry().selected(), None);
     assert_eq!(app.workspace.registry().len(), 1);
-    assert!(app.pty.is_none(), "SSH selection must not open a PTY");
+    assert!(
+        app.pty.is_none(),
+        "the deterministic seam must leave no PTY behind"
+    );
     app.show_status = false;
     let source = app.status_row();
     assert_eq!(source, StatusRowSource::SshSelection);
@@ -2617,7 +2625,7 @@ fn selecting_an_ssh_row_only_records_a_pending_non_connection_choice() {
             app.ssh_selection_status.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
-        "SSH partial source #0 config; offline"
+        "SSH partial source #0 config; launch failed"
     );
     assert!(
         app.workspace.sidebar().viewport().is_none(),
@@ -2629,7 +2637,7 @@ fn selecting_an_ssh_row_only_records_a_pending_non_connection_choice() {
 fn ssh_selection_does_not_hide_a_runtime_failure() {
     let fixture = SshConfigFixture::new();
     fixture.write_new(b"Host staging\n");
-    let mut app = NorenApp::default();
+    let mut app = app_with_deterministic_ssh_seam();
     app.load_ssh_hosts_from(fixture.path());
     app.finish_pty("Noren PTY operation failed");
     app.cursor_position = Some(PhysicalPosition::new(5.0, 1.0));
@@ -2651,7 +2659,7 @@ fn partial_undrawn_sidebar_row_cannot_select_a_hidden_ssh_entry() {
     let fixture = SshConfigFixture::new();
     fixture.write_new(b"Host visible\nHost hidden\n");
 
-    let mut app = NorenApp::default();
+    let mut app = app_with_deterministic_ssh_seam();
     app.load_ssh_hosts_from(fixture.path());
     assert_eq!(app.workspace.sidebar().rows().len(), 2);
 
@@ -2704,7 +2712,7 @@ fn partial_undrawn_sidebar_row_cannot_select_a_hidden_ssh_entry() {
 fn sidebar_scroll_reveals_and_selects_ssh_without_terminal_mouse_output() {
     let fixture = SshConfigFixture::new();
     fixture.write_new(b"Host alpha\nHost beta\nHost gamma\n");
-    let mut app = NorenApp::default();
+    let mut app = app_with_deterministic_ssh_seam();
     for _ in 0..3 {
         let _ = app.workspace.registry.restore(SessionKind::Local);
     }
@@ -3675,4 +3683,335 @@ fn single_instance_save_has_no_persistence_false_alarm() {
     let saved = std::fs::read(&path).expect("read exact verified save");
     assert!(!saved.is_empty(), "the real save path wrote a document");
     cleanup_state_file(&path);
+}
+
+// ── SSH connect: real launches, refusals, and visible failure states ──
+
+/// Test constructor with the deterministic ssh spawn seam disabled: the
+/// click path runs its full validation and phase reporting without
+/// launching any process.
+fn app_with_deterministic_ssh_seam() -> NorenApp {
+    NorenApp {
+        ssh_spawn_enabled: false,
+        ..NorenApp::default()
+    }
+}
+
+/// Unique secret-shaped stand-in for a destination that could embed a
+/// credential. Any surface that prints it is a leak.
+fn ssh_secret_sentinel(tag: &str) -> String {
+    format!("NOREN-SSHCONN-{tag}-hunter2-{}", std::process::id())
+}
+
+#[test]
+fn ssh_click_surfaces_launch_failure_when_no_child_can_spawn() {
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(b"Host web\n");
+    let mut app = app_with_deterministic_ssh_seam();
+    app.load_ssh_hosts_from(fixture.path());
+    app.cursor_position = Some(PhysicalPosition::new(5.0, 1.0));
+
+    assert!(app.handle_sidebar_click_in_frame(
+        ElementState::Pressed,
+        MouseButton::Left,
+        PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+    ));
+
+    // The failure is first-class: runtime status row, provenance line, and
+    // the sidebar row all carry the launch failure.
+    assert_eq!(app.status, "Noren ssh launch failed");
+    assert!(app.show_status, "the launch failure must be visible");
+    assert_eq!(
+        app.ssh_selection_status.as_deref(),
+        Some("SSH partial source #0 config; launch failed")
+    );
+    let row = &app.workspace.sidebar().rows()[0];
+    assert_eq!(row.label(), "SSH-ERR web");
+    assert_eq!(row.detail(), Some("launch failed"));
+    assert!(
+        app.pty.is_none(),
+        "a failed launch must leave no PTY behind"
+    );
+    assert!(
+        app.workspace.registry().sessions().is_empty(),
+        "the refused registry must record no session"
+    );
+}
+
+#[test]
+fn ssh_click_refuses_a_raw_token_destination_without_spawning() {
+    let secret = ssh_secret_sentinel("TOKEN");
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(format!("Host %p-{secret}\n").as_bytes());
+    let mut app = app_with_deterministic_ssh_seam();
+    app.load_ssh_hosts_from(fixture.path());
+    app.cursor_position = Some(PhysicalPosition::new(5.0, 1.0));
+
+    assert!(app.handle_sidebar_click_in_frame(
+        ElementState::Pressed,
+        MouseButton::Left,
+        PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+    ));
+
+    let status = app
+        .ssh_selection_status
+        .as_deref()
+        .expect("the typed refusal is visible");
+    assert!(
+        status.contains("%p"),
+        "the refusal must name the token: {status}"
+    );
+    assert!(
+        status.contains("Port"),
+        "the refusal must name the keyword: {status}"
+    );
+    assert!(
+        !status.contains(&secret),
+        "the refusal must never carry destination content: {status}"
+    );
+    // The connect did not proceed.
+    assert!(app.pty.is_none(), "a refused destination must not spawn");
+    assert!(app.workspace.ssh_connection.is_none());
+    let row = &app.workspace.sidebar().rows()[0];
+    assert!(
+        row.label().starts_with("SSH-OFF "),
+        "the row must stay disconnected: {}",
+        row.label()
+    );
+    assert_eq!(row.detail(), Some("not connected"));
+    // No debug surface may print the destination either.
+    assert!(!format!("{:?}", app.workspace).contains(&secret));
+}
+
+#[test]
+fn ssh_exit_observation_maps_every_child_outcome_to_a_visible_phase() {
+    assert_eq!(
+        ssh_exit_observation(Some(0)),
+        SshConnectionPhase::Closed,
+        "a clean ssh exit is a close, not a failure"
+    );
+    for code in [1, 127, 255] {
+        assert_eq!(
+            ssh_exit_observation(Some(code)),
+            SshConnectionPhase::ConnectFailed,
+            "exit {code} is an unreachable-host/auth/disconnect failure"
+        );
+    }
+    assert_eq!(
+        ssh_exit_observation(None),
+        SshConnectionPhase::Disconnected,
+        "a code-less end is an immediate disconnect"
+    );
+    assert_eq!(ssh_launch_observation(true), SshConnectionPhase::Connecting);
+    assert_eq!(
+        ssh_launch_observation(false),
+        SshConnectionPhase::LaunchFailed,
+        "a failed spawn must never report success"
+    );
+
+    for phase in [
+        SshConnectionPhase::Connecting,
+        SshConnectionPhase::Connected,
+        SshConnectionPhase::Closed,
+        SshConnectionPhase::LaunchFailed,
+        SshConnectionPhase::ConnectFailed,
+        SshConnectionPhase::Disconnected,
+    ] {
+        assert!(!phase.status_text().is_empty());
+        assert!(!phase.sidebar_detail().is_empty());
+        assert_eq!(
+            phase.sidebar_prefix().chars().count(),
+            SSH_SIDEBAR_LABEL_PREFIX_CHARS,
+            "the prefix must keep the fixed label arithmetic"
+        );
+        assert!(phase.sidebar_prefix().starts_with("SSH-"));
+    }
+}
+
+#[test]
+fn ssh_sidebar_state_prefixes_encode_the_connection_phase() {
+    assert_eq!(
+        ssh_state_label(SshConnectionPhase::Connected, "abcdef"),
+        "SSH-ON  abcdef"
+    );
+    assert_eq!(
+        ssh_state_label(SshConnectionPhase::Connecting, "abcdefg"),
+        "SSH-ON  abc..."
+    );
+    assert_eq!(
+        ssh_state_label(SshConnectionPhase::ConnectFailed, "abcdefg"),
+        "SSH-ERR abc..."
+    );
+    assert_eq!(
+        ssh_state_label(SshConnectionPhase::Disconnected, "abcdef"),
+        "SSH-ERR abcdef"
+    );
+    assert_eq!(
+        ssh_state_label(SshConnectionPhase::Closed, "abcdefg"),
+        "SSH-OFF abc..."
+    );
+    // Long targets stay bounded in every phase.
+    for phase in [
+        SshConnectionPhase::Connecting,
+        SshConnectionPhase::Connected,
+        SshConnectionPhase::Closed,
+        SshConnectionPhase::LaunchFailed,
+        SshConnectionPhase::ConnectFailed,
+        SshConnectionPhase::Disconnected,
+    ] {
+        let label = ssh_state_label(phase, &"x".repeat(2048));
+        assert_eq!(label.chars().count(), SSH_SIDEBAR_LABEL_CHARS);
+    }
+}
+
+#[test]
+fn ssh_connection_marker_identifies_only_the_exact_connected_target() {
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(b"Host abcdef-first\nHost abcdef-second\n");
+    let mut workspace = WorkspaceState::new();
+    let config = SshConfig::read(fixture.path()).expect("bounded SSH fixture parses");
+    workspace.load_ssh_config(&config);
+
+    workspace.set_ssh_connection("abcdef-second", SshConnectionPhase::Connected);
+    let rows = workspace.sidebar().rows();
+    assert!(
+        rows[0].label().starts_with("SSH-OFF "),
+        "{}",
+        rows[0].label()
+    );
+    assert!(
+        rows[1].label().starts_with("SSH-ON  "),
+        "{}",
+        rows[1].label()
+    );
+    assert_eq!(rows[1].detail(), Some("connected"));
+
+    workspace.set_ssh_connection("abcdef-second", SshConnectionPhase::ConnectFailed);
+    let rows = workspace.sidebar().rows();
+    assert!(
+        rows[1].label().starts_with("SSH-ERR "),
+        "{}",
+        rows[1].label()
+    );
+    assert_eq!(rows[1].detail(), Some("connection failed"));
+}
+
+#[test]
+fn ssh_connect_flow_never_persists_or_debug_prints_the_destination() {
+    let secret = ssh_secret_sentinel("PERSIST");
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(format!("Host {secret}\n").as_bytes());
+    let path = temp_state_path();
+    let mut workspace = WorkspaceState::with_state_path(Some(path.clone()));
+    let local = workspace.create_session(SessionKind::Local);
+    workspace.observe_session(local, SessionStatus::Running);
+    let config = SshConfig::read(fixture.path()).expect("bounded SSH fixture parses");
+    workspace.load_ssh_config(&config);
+
+    // The full connect path's workspace writes: pending selection, live
+    // connection, observed failure. Row 1 is the host row: the local
+    // session occupies row 0.
+    assert!(workspace.select_ssh_sidebar_row(1));
+    workspace.set_ssh_connection(&secret, SshConnectionPhase::Connecting);
+    workspace.set_ssh_connection(&secret, SshConnectionPhase::ConnectFailed);
+    workspace.persist();
+
+    let written = std::fs::read_to_string(&path).expect("the real save path wrote a document");
+    assert!(
+        !written.contains(&secret),
+        "the persisted sessions.toml must never carry the destination: {written}"
+    );
+    assert!(
+        !written.contains("kind = \"ssh\""),
+        "an SSH launch must never enter the persisted registry: {written}"
+    );
+    assert!(
+        !format!("{workspace:?}").contains(&secret),
+        "no debug surface may carry the destination"
+    );
+    assert!(
+        workspace
+            .registry()
+            .sessions()
+            .iter()
+            .all(|descriptor| !matches!(descriptor.kind(), SessionKind::Ssh { .. })),
+        "the live registry records no SSH session for the launch"
+    );
+    cleanup_state_file(&path);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn ssh_click_connects_the_system_client_end_to_end() {
+    // The alias begins with `@`, which the system ssh client rejects during
+    // its own argument parsing: the launch, the interactive I/O path, and
+    // the failure mapping are all observed with no network access and no
+    // credential.
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(b"Host @noren-refuse\n");
+    let mut app = NorenApp::default();
+    app.load_ssh_hosts_from(fixture.path());
+    app.terminal = Some(TerminalState::new(24, 80).expect("valid grid"));
+    app.cursor_position = Some(PhysicalPosition::new(5.0, 1.0));
+
+    assert!(app.handle_sidebar_click_in_frame(
+        ElementState::Pressed,
+        MouseButton::Left,
+        PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+    ));
+
+    // The click spawned the real system ssh client in the terminal's PTY.
+    assert!(
+        app.pty.is_some(),
+        "the click must launch the system ssh client"
+    );
+    assert_eq!(
+        app.workspace.ssh_connection.as_ref().map(|(_, p)| *p),
+        Some(SshConnectionPhase::Connecting)
+    );
+    assert_eq!(app.status, "Noren ssh connecting");
+
+    // Pump the production drain loop until the child's failure surfaces.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        app.drain_pty();
+        let phase = app.workspace.ssh_connection.as_ref().map(|(_, p)| *p);
+        if matches!(
+            phase,
+            Some(
+                SshConnectionPhase::ConnectFailed
+                    | SshConnectionPhase::Disconnected
+                    | SshConnectionPhase::Closed
+            )
+        ) || std::time::Instant::now() >= deadline
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    assert_eq!(
+        app.workspace
+            .ssh_connection
+            .as_ref()
+            .map(|(_, phase)| *phase),
+        Some(SshConnectionPhase::ConnectFailed),
+        "ssh's own error exit must surface as a connection failure"
+    );
+    assert_eq!(app.status, "Noren ssh connection failed");
+    assert!(app.show_status, "the failure must own the status row");
+    assert!(app.pty.is_none(), "the failed child's PTY is retired");
+
+    // ssh's own usage diagnostic flowed through the normal terminal path.
+    let snapshot = app.terminal.as_ref().expect("terminal present").snapshot();
+    let rendered: Vec<&str> = snapshot.lines().iter().map(String::as_str).collect();
+    assert!(
+        rendered.iter().any(|line| line.contains("usage:")),
+        "the ssh diagnostic must reach the terminal content"
+    );
+
+    // The sidebar row carries the failure state.
+    let row = &app.workspace.sidebar().rows()[0];
+    assert!(row.label().starts_with("SSH-ERR "), "{}", row.label());
+    assert_eq!(row.detail(), Some("connection failed"));
 }

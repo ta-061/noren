@@ -17,8 +17,10 @@
 > exactly one local session; additional palette rows do not launch or switch
 > PTYs yet. A bounded, explicitly partial list of positive literal aliases
 > from the user's OpenSSH config is displayed in the sidebar (at most 24 rows),
-> and selecting one shows its root-relative config source without opening an
-> SSH connection or PTY. Wildcard-only and dynamic OpenSSH destinations are not
+> and selecting one launches the system `/usr/bin/ssh` client for that alias in
+> the terminal's PTY (argv is exactly `ssh -- <alias>`; no credential is ever
+> passed on the command line), replacing the current session, with launch,
+> connect, and disconnect failures shown as visible states. Wildcard-only and dynamic OpenSSH destinations are not
 > a complete browseable list. Parsed `HostName` and `User` values retain
 > unresolved tokens such as `%h`, `%p`, and `%r` and are discovery metadata
 > only; a future connection path must resolve or reject them first. `Include`

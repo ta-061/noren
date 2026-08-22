@@ -97,9 +97,11 @@ binary. What now actually happens on screen:
   `included_fifo_sources_return_promptly`).
 
 It is still **not** the full workspace product that [ADR
-0003](adr/0003-noren-zellij-responsibility-boundary.md) describes — one local
-shell at a time; configured SSH targets are now discovered and selectable in
-the sidebar, but no non-local session can launch. See "What does not work"
+0003](adr/0003-noren-zellij-responsibility-boundary.md) describes — one live
+PTY at a time; configured SSH targets are now discoverable in the sidebar, and
+selecting one launches the system `ssh` client for that alias in the single
+terminal PTY (one non-local launch path exists; there is still no
+multi-session switching). See "What does not work"
 below, which remains the more useful list. Milestones 3–8 are open on the
 [roadmap](../ROADMAP.md).
 
@@ -180,17 +182,24 @@ Each item states what you would actually see if you ran the build.
 - **Only the startup local session is actually launched.** `SessionKind` models
   `Local`, `Project`, `Worktree`, `Ssh`, and `Agent`, and `EntryKind` in
   `sidebar.rs` can describe project, worktree, SSH-connection, and agent rows —
-  but only `Local` has a launch path. The running binary now reads bounded
-  OpenSSH configuration facts, constructs `SessionKind::Ssh`, and displays
-  configured targets as `SidebarEntry::SshConnection` rows. Clicking one only
-  records a pending target; it opens neither an SSH connection nor a PTY.
+  `Local` and `Ssh` have launch paths. The running binary reads bounded
+  OpenSSH configuration facts and displays configured targets as
+  `SidebarEntry::SshConnection` rows. Clicking one validates the alias as an
+  `SshDestination` (raw `%h`/`%p`/`%r` tokens are refused with a typed error
+  naming the keyword and token) and, if accepted, launches the fixed system
+  `/usr/bin/ssh` client in the single terminal PTY — argv is exactly
+  `ssh -- <alias>`, so no credential, identity, or option is ever
+  `ps`-visible — replacing the previous session. Launch, connect, and
+  disconnect failures surface as visible per-row and status-row states; the
+  alias never enters the persisted registry, so `sessions.toml` cannot carry
+  it. Authentication, agent, and config resolution (including the user's own
+  `ProxyCommand`) remain entirely ssh's own, executed by the system binary.
   Project and worktree kinds remain modelled, while agent entries remain
-  reserved fixtures and no agent is launched. In practice: startup owns exactly
-  one local `zsh`. The palette's "New Session" currently records another local
-  model row but does not spawn a PTY, and an inactive or restored row cannot
-  take the live PTY's selection/input ownership. There is no way to open an SSH
-  host, a git worktree, or an agent from the workspace. Milestones 4 and 5 own
-  the remaining work.
+  reserved fixtures and no agent is launched. The palette's "New Session"
+  currently records another local model row but does not spawn a PTY, and an
+  inactive or restored row cannot take the live PTY's selection/input
+  ownership. There is no way to open a git worktree or an agent from the
+  workspace. Milestones 4 and 5 own the remaining work.
 - **The SSH list is not OpenSSH-equivalent discovery.** A readable config can
   legitimately name destinations that do not appear: wildcard or negated
   patterns are matching policy rather than concrete aliases, `Match` and token
