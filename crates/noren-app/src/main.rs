@@ -545,6 +545,13 @@ struct NorenApp {
     /// First workspace row currently visible in the bounded sidebar window.
     sidebar_scroll_offset: usize,
     active_session: Option<SessionId>,
+    /// The session whose final frame is still displayed after its child
+    /// exited. `finish_pty` clears `active_session` (input ownership dies
+    /// with the child) but keeps the terminal for the last frame; this field
+    /// remembers whose frame it is so closing that row runs the same
+    /// detach-and-fallback path an active close does, instead of leaving a
+    /// frozen frame behind a vanished row.
+    exited_surface_session: Option<SessionId>,
     /// Live sessions that are not the active one, keyed by session id.
     parked_sessions: HashMap<SessionId, ParkedSession>,
     /// Test-only override for the PTY child's home directory. Production
@@ -635,6 +642,7 @@ impl NorenApp {
             workspace: WorkspaceState::new(),
             sidebar_scroll_offset: 0,
             active_session: None,
+            exited_surface_session: None,
             parked_sessions: HashMap::new(),
             #[cfg(test)]
             test_pty_home: None,
@@ -852,6 +860,12 @@ impl NorenApp {
                 self.terminal = Some(terminal);
                 self.active_session = Some(id);
                 self.pty_child = PtyChildStatus::Running;
+                // Grid coordinates captured on the previous session's screen
+                // can only address the wrong content; the selection model
+                // expires them, exactly as an explicit switch does.
+                self.selection = None;
+                self.drag_origin = None;
+                self.exited_surface_session = None;
                 self.workspace
                     .select_session(id)
                     .expect("freshly spawned session is live");
@@ -993,6 +1007,7 @@ impl NorenApp {
         // only address the wrong content; the selection model expires them.
         self.selection = None;
         self.drag_origin = None;
+        self.exited_surface_session = None;
         self.redraw_needed = true;
         self.workspace.select_session(id).is_ok()
     }
@@ -1021,16 +1036,23 @@ impl NorenApp {
             return false;
         }
         let was_active = self.active_session == Some(id);
+        // The displayed frame can also belong to a session whose child has
+        // already exited: `finish_pty` keeps its final frame on screen with
+        // input ownership already gone. Closing that row must clear the
+        // surface and run the fallback too — otherwise a frozen frame stays
+        // behind a vanished row in an empty workspace.
+        let owns_displayed_surface = was_active || self.exited_surface_session == Some(id);
         // Reap a parked child first; its surface never touched the live view.
         if let Some(mut parked) = self.parked_sessions.remove(&id)
             && parked.pty.shutdown().is_err()
         {
             eprintln!("Noren closed-session PTY shutdown reached its failure fallback");
         }
-        // Detach the active surface before removing the row so the renderer
+        // Detach the displayed surface before removing the row so the renderer
         // and input routing can never observe a closed session.
-        if was_active {
+        if owns_displayed_surface {
             self.active_session = None;
+            self.exited_surface_session = None;
             self.terminal = None;
             self.pty_child = PtyChildStatus::NotLaunched;
             self.selection = None;
@@ -1044,7 +1066,7 @@ impl NorenApp {
         // The registry removes the row (and clears the selection if it pointed
         // at the closed session) and persists the structural change.
         let closed = self.workspace.close_session(id).is_ok();
-        if was_active {
+        if owns_displayed_surface {
             // Fall back to the topmost remaining live session, if any exists.
             let fallback = self.parked_sessions.keys().min().copied();
             match fallback {
@@ -1568,10 +1590,12 @@ impl NorenApp {
                 return true;
             }
             // The row has no live surface (model-only, restored, or exited):
-            // input ownership stays with the current live session.
-            if let Some(active) = self.active_session
-                && self.workspace.select_session(active).is_ok()
-            {
+            // input ownership stays with the current live session, but the
+            // CLICK selects the clicked row — the palette's close command
+            // operates on the selected row, and re-selecting the live one
+            // here would redirect a close onto a shell the user did not
+            // point at.
+            if self.workspace.select_session(id).is_ok() {
                 self.ssh_selection_status = None;
                 self.redraw_needed = true;
             }
@@ -2079,6 +2103,9 @@ impl NorenApp {
             };
             self.workspace
                 .observe_session(id, SessionStatus::Exited { code });
+            // The final frame stays displayed below; remember whose it is so
+            // closing that row detaches the surface honestly.
+            self.exited_surface_session = Some(id);
         }
         if let Some(mut session) = self.pty.take()
             && session.shutdown().is_err()
