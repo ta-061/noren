@@ -149,8 +149,9 @@ the Noren terminal." The reasoning and the decision are recorded in
   shows bounded root-relative source provenance on selection, but selecting one
   only records a pending target and opens no connection or PTY. Only
   `SessionKind::Local` reaches a
-  launch path; git worktrees remain unreachable, agents remain fixture-only,
-  and keybindings are not configurable. See [Milestone 3 status](#milestone-3-status).
+  launch path; git worktrees remain unreachable, and agents remain
+  fixture-only; keybindings ARE configurable through the `[keys]` section
+  since this milestone (see [Milestone 3 status](#milestone-3-status)).
 - **Colour rendering exists, but themes are fixed.** `renderer.rs` resolves
   each cell's SGR foreground and any explicit background through its compiled-in
   ANSI/256-colour palette or as direct RGB truecolor. The vertex layout carries

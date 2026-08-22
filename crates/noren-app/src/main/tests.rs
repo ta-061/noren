@@ -1318,9 +1318,10 @@ fn escape_dismisses_palette_without_running_a_command() {
     let count_before = app.workspace.registry().len();
 
     // Simulate Escape key: handle_palette_key checks for NamedKey::Escape.
-    // We test the effect (close_palette) directly because constructing a
-    // full winit KeyEvent requires a DeviceId that is not safely creatable
-    // in a #[forbid(unsafe)] crate.
+    // We test the effect (close_palette) directly because a full winit
+    // KeyEvent cannot be fabricated outside winit: `KeyEvent::platform_specific`
+    // is private with no public constructor (DeviceId has `dummy()`, but the
+    // event cannot be completed without that field).
     app.close_palette();
 
     assert!(!app.palette_open, "palette must be dismissed");

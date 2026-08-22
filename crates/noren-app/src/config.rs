@@ -336,12 +336,31 @@ fn parse_keys(table: &dyn TableLike, keys: &mut KeymapConfig) -> Result<(), Conf
 
 /// Parse one `[keys]` value into a chord, blaming the key and value on
 /// failure.
+///
+/// The binary claims Super+A/C/V (clipboard) and Super+D (diagnostics)
+/// ahead of every configured path — palette commands included, because
+/// `handle_key` consults them first even while the palette is open — and
+/// matches them with any combination of further modifiers held. A chord
+/// there would be dead configuration, so it is rejected here like every
+/// other unclaimable binding.
 fn parse_configured_chord(key: &str, value: &str) -> Result<Chord, ConfigError> {
-    parse_chord(value).map_err(|error| ConfigError::InvalidChord {
+    let chord = parse_chord(value).map_err(|error| ConfigError::InvalidChord {
         key: clip(key),
         value: clip(value),
         reason: clip(error.to_string()),
-    })
+    })?;
+    if chord.modifiers().is_super()
+        && matches!(
+            chord.code(),
+            KeyCode::Char('a') | KeyCode::Char('c') | KeyCode::Char('v') | KeyCode::Char('d')
+        )
+    {
+        return Err(ConfigError::ReservedChord {
+            key: clip(key),
+            value: clip(value),
+        });
+    }
+    Ok(chord)
 }
 
 /// Parse and validate one palette-command chord. The four command chords are
@@ -762,8 +781,9 @@ impl fmt::Display for ConfigError {
             ),
             Self::ReservedChord { key, value } => write!(
                 f,
-                "configuration key {key} binds chord {value} on a key the open palette \
-                 always interprets as navigation or dismissal"
+                "configuration key {key} binds chord {value} on a key the application \
+                 always claims first: the open palette reads it as navigation or dismissal, \
+                 and Super+A/C/V/D are fixed clipboard and diagnostics shortcuts"
             ),
             Self::DuplicateChord {
                 first,
@@ -1238,6 +1258,58 @@ mod tests {
                 AppConfig::parse(text),
                 Err(ConfigError::UnknownKey(name.to_owned())),
                 "{text:?} must not parse as a working setting"
+            );
+        }
+    }
+
+    /// Super+A/C/V (clipboard) and Super+D (diagnostics) are handled ahead of
+    /// every configured path, for every action, with further modifiers still
+    /// matching — a configured binding there would be dead, so it is a typed
+    /// `ReservedChord` error naming the key, never a silently shadowed accept.
+    #[test]
+    fn fixed_global_shortcuts_are_rejected_for_every_action() {
+        let actions = [
+            "palette_open",
+            "session_create",
+            "session_select",
+            "session_close",
+            "sidebar_focus",
+        ];
+        let reserved = [
+            ("super+a", 'a'),
+            ("super+c", 'c'),
+            ("super+v", 'v'),
+            ("super+d", 'd'),
+            // Shift (and any further modifier) still routes into the fixed
+            // handlers, so these are dead too.
+            ("super+shift+a", 'a'),
+            ("super+ctrl+d", 'd'),
+        ];
+        for action in actions {
+            for (chord, character) in reserved {
+                let text = format!("[keys]\n{action} = \"{chord}\"\n");
+                assert_eq!(
+                    AppConfig::parse(&text),
+                    Err(ConfigError::ReservedChord {
+                        key: action.to_owned(),
+                        value: chord.to_owned(),
+                    }),
+                    "{chord} must not be accepted for {action}"
+                );
+                let _ = character;
+            }
+        }
+        // The unmodified command keys and the default palette chord stay
+        // acceptable; only the fixed globals are refused.
+        for (action, chord) in [
+            ("session_create", "c"),
+            ("palette_open", "super+p"),
+            ("sidebar_focus", "f"),
+        ] {
+            let text = format!("[keys]\n{action} = \"{chord}\"\n");
+            assert!(
+                AppConfig::parse(&text).is_ok(),
+                "{chord} for {action} must stay accepted"
             );
         }
     }

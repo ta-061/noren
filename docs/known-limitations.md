@@ -262,7 +262,8 @@ but do hold Noren to its side of the boundary: a workspace *outside* the
 terminal. That side now has a first vertical slice — a drawn sidebar, a command
 palette over model rows, one live local PTY, and state that survives a restart
 — and the gaps that remain there (real session switching, non-local session
-kinds, configurable keybindings) are legitimate things to report.
+kinds) are legitimate things to report; keybindings are configurable through
+`[keys]` now, with the live winit dispatch gap noted above.
 
 ## What this preview is not
 
