@@ -48,6 +48,51 @@ grid (`MAX_RENDER_ROWS` by `MAX_RENDER_COLS`, 60 by 160), which is far inside
 the terminal foundation's `MAX_SCREEN_CELLS` bound, so no configuration value
 can push the grid past that ceiling.
 
+### `[keys]`
+
+Configurable key chords for workspace chrome. Every key is optional; an
+absent `[keys]` table keeps the compiled-in defaults, which are exactly the
+chords the app shipped with before configuration existed.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `palette_open` | string | `"super+p"` | Chord that opens the command palette while it is closed. |
+| `session_create` | string | `"c"` | Palette command dispatching `session.create` (New Session). |
+| `session_select` | string | `"s"` | Palette command dispatching `session.select` (Switch Session). |
+| `session_close` | string | `"x"` | Palette command dispatching `session.close` (Close Session). |
+| `sidebar_focus` | string | `"f"` | Palette command dispatching `sidebar.focus` (Focus Sidebar). |
+
+A chord is zero or more modifiers followed by exactly one key, joined with
+`+`: the modifiers are `super`, `ctrl`, `alt`, and `shift` (each at most
+once, case-insensitive), and the key is a single character (case-folded) or
+a named key — `enter`, `tab`, `backspace`, `escape`, `space`, `up`, `down`,
+`left`, `right`, `home`, `end`, `pageup`, `pagedown`, `insert`, `delete`,
+`f1` through `f24`. Examples: `super+p`, `ctrl+shift+t`, `f2`.
+
+Rejections follow the same hard-error discipline as the rest of the schema —
+never a silent fallback and never a silently dead binding:
+
+- an unparseable chord (empty text, an empty `+` part, a non-modifier before
+  the key, an unknown key name, a repeated modifier, a control or whitespace
+  character, a function key outside F1–F24) is an error naming the key and
+  the offending value;
+- an unknown action name is an unknown-key error;
+- two actions bound to the same chord are an error, including a configured
+  value that collides with an action the table left at its default;
+- `palette_open` must stay claimable: a chord that collides with the pinned
+  Zellij v0.44.3 default corpus or with the frozen `Super+Escape` exit
+  leader is an error, because Noren could never honor it;
+- the four palette command chords must not use `escape`, `enter`, `up`, or
+  `down`, which the open palette always interprets as dismissal, confirm,
+  and navigation.
+
+The four command chords apply only while the palette is open — the palette
+intercepts all keys then, so command chords never steal input from Zellij or
+the terminal — which is why only `palette_open` is validated against the
+Zellij corpus. Chords with modifiers dispatch on the exact modifier set; a
+modifier-free character binding also matches the character with any
+modifiers held, as the pre-configuration palette did.
+
 ### Rejected keys, by design
 
 - **`[terminal]` / `scrollback_lines`.** Scrollback retention is enforced
@@ -65,6 +110,10 @@ can push the grid past that ceiling.
 [font]
 cell_width = 12
 cell_height = 24
+
+[keys]
+palette_open = "super+k"
+session_create = "ctrl+shift+t"
 ```
 
 ## Error behavior
