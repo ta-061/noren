@@ -994,6 +994,70 @@ impl NorenApp {
         self.workspace.select_session(id).is_ok()
     }
 
+    /// Close session `id` for real: reap its child, remove its row, and
+    /// repair the live view.
+    ///
+    /// This is the palette `session_close` runtime. A row with a live surface
+    /// (the active one or a parked one) owns a real child; closing it runs
+    /// that child's bounded kill-and-reap shutdown *before* the row is
+    /// removed, so a closed session can never keep a process running behind a
+    /// vanished row. A row without a live surface (model-only or restored) is
+    /// closed in the registry alone, exactly as before.
+    ///
+    /// # Fallback when the active session is closed
+    ///
+    /// The live view moves to the remaining live session with the lowest id —
+    /// the topmost sidebar row — which is deterministic and matches the
+    /// row-order the user sees. When no live session remains the live view is
+    /// cleared entirely: no terminal surface, no input owner, a truthful
+    /// status line, and the sidebar's empty state. The palette can create a
+    /// new session from there; an empty workspace never shows a closed
+    /// session's frozen frame as if it were alive.
+    fn close_session(&mut self, id: SessionId) -> bool {
+        if self.workspace.registry().get(id).is_none() {
+            return false;
+        }
+        let was_active = self.active_session == Some(id);
+        // Reap a parked child first; its surface never touched the live view.
+        if let Some(mut parked) = self.parked_sessions.remove(&id)
+            && parked.pty.shutdown().is_err()
+        {
+            eprintln!("Noren closed-session PTY shutdown reached its failure fallback");
+        }
+        // Detach the active surface before removing the row so the renderer
+        // and input routing can never observe a closed session.
+        if was_active {
+            self.active_session = None;
+            self.terminal = None;
+            self.pty_child = PtyChildStatus::NotLaunched;
+            self.selection = None;
+            self.drag_origin = None;
+            if let Some(mut session) = self.pty.take()
+                && session.shutdown().is_err()
+            {
+                eprintln!("Noren closed-session PTY shutdown reached its failure fallback");
+            }
+        }
+        // The registry removes the row (and clears the selection if it pointed
+        // at the closed session) and persists the structural change.
+        let closed = self.workspace.close_session(id).is_ok();
+        if was_active {
+            // Fall back to the topmost remaining live session, if any exists.
+            let fallback = self.parked_sessions.keys().min().copied();
+            match fallback {
+                Some(next) => {
+                    self.switch_live_session(next);
+                }
+                None => {
+                    self.status = "Noren last session closed";
+                    self.show_status = true;
+                }
+            }
+        }
+        self.redraw_needed = true;
+        closed
+    }
+
     fn initialize(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -1232,27 +1296,19 @@ impl NorenApp {
                 }
             }
             WorkspaceAction::CloseSession => {
-                // A live session (the active one or a parked one) owns a real
-                // child; until close learns to reap (the next slice), the
-                // palette closes only rows without a live surface.
-                let live = |app: &Self, id| {
-                    app.active_session == Some(id) || app.parked_sessions.contains_key(&id)
-                };
-                if let Some(id) = self.workspace.registry().selected() {
-                    if !live(self, id) {
-                        let _ = self.workspace.close_session(id);
-                    }
-                } else {
-                    let ids: Vec<SessionId> = self
-                        .workspace
+                // The palette closes the selected row — live or not. A live
+                // row owns a real child; `close_session` reaps it before
+                // removing the row and repairs the live view (fallback to the
+                // topmost remaining live session, or an honest empty view).
+                let target = self.workspace.registry().selected().or_else(|| {
+                    self.workspace
                         .registry()
                         .sessions()
-                        .into_iter()
-                        .map(|d| d.id())
-                        .collect();
-                    if let Some(id) = ids.into_iter().find(|id| !live(self, *id)) {
-                        let _ = self.workspace.close_session(id);
-                    }
+                        .first()
+                        .map(|descriptor| descriptor.id())
+                });
+                if let Some(id) = target {
+                    self.close_session(id);
                 }
             }
             WorkspaceAction::FocusSidebar => {

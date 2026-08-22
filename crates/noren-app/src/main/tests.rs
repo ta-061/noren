@@ -1293,20 +1293,43 @@ fn palette_close_action_removes_the_selected_session() {
     );
 }
 
+/// Closing the row that owns the live PTY is a real close now: the child is
+/// reaped through the bounded shutdown *before* the row is removed, the live
+/// surface is detached, and — with no other live session left — the app falls
+/// back to an honest empty view (no terminal, truthful status) instead of a
+/// dead session's frozen frame.
+///
+/// This replaces `palette_close_cannot_remove_the_live_pty_owner`, which
+/// pinned the interim behaviour where close refused every live row because it
+/// could not reap a child; `close_session` can and does.
+///
+/// Mutation check: removing the reaping/detaching from `close_session`
+/// (leaving the child running behind a removed row, or leaving the closed
+/// session's surface attached) fails every assertion past the first.
 #[test]
-fn palette_close_cannot_remove_the_live_pty_owner() {
-    let mut app = NorenApp::default();
-    let active = app.workspace.create_session(SessionKind::Local);
-    app.workspace
-        .select_session(active)
-        .expect("active session is selectable");
-    app.active_session = Some(active);
+fn palette_close_reaps_the_live_owner_and_falls_back_to_an_empty_view() {
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let only = registry_ids(&app)[0];
 
     app.run_workspace_action(WorkspaceAction::CloseSession);
 
-    assert!(app.workspace.registry().get(active).is_some());
-    assert_eq!(app.workspace.registry().selected(), Some(active));
-    assert_eq!(app.active_session, Some(active));
+    assert!(
+        app.workspace.registry().get(only).is_none(),
+        "the closed row is gone from the registry"
+    );
+    assert!(
+        app.pty.is_none() && app.terminal.is_none(),
+        "no surface may outlive its session"
+    );
+    assert_eq!(app.active_session, None);
+    assert!(
+        app.parked_sessions.is_empty(),
+        "the child handle was reaped and dropped, not parked or leaked"
+    );
+    assert!(app.workspace.sidebar().is_empty());
+    assert!(app.show_status, "an empty workspace must say so honestly");
 }
 
 /// Escape dismisses the palette without running a command.
@@ -4023,4 +4046,115 @@ fn switching_expires_the_previous_sessions_selection() {
         "a selection from the previous screen must not survive the switch"
     );
     assert!(app.drag_origin.is_none());
+}
+
+// ── Closing live sessions (supervisor-backed switching, slice 3) ────────
+
+/// Closing the ACTIVE session while other live sessions exist falls back to
+/// the topmost remaining live row (the lowest id), and that row's own screen
+/// — not the closed session's — owns the live view afterwards.
+///
+/// Mutation check: skipping the reaping/detaching in `close_session` (or
+/// falling back to the closed session's own surface) fails the marker and
+/// ownership assertions.
+#[test]
+fn closing_the_active_session_falls_back_to_the_topmost_live_session() {
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let first = registry_ids(&app)[0];
+    // First session's screen gets a marker while it still owns the live view.
+    app.apply_pty_output(b"FIRST-SCREEN-9c2d\r\n");
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let second = registry_ids(&app)[1];
+    assert_eq!(app.active_session, Some(second));
+
+    // The palette closes the selected row; the newest session is both
+    // selected and active.
+    app.run_workspace_action(WorkspaceAction::CloseSession);
+
+    assert!(app.workspace.registry().get(second).is_none());
+    assert_eq!(
+        app.active_session,
+        Some(first),
+        "the live view falls back to the topmost remaining live session"
+    );
+    assert_eq!(app.workspace.registry().selected(), Some(first));
+    assert!(
+        app.pty.is_some(),
+        "the fallback session's real PTY owns the live view"
+    );
+    let text = terminal_text(app.terminal.as_ref().expect("fallback surface"));
+    assert!(
+        text.contains("FIRST-SCREEN-9c2d"),
+        "the fallback must show the first session's own screen"
+    );
+    assert_eq!(session_status(&app, first), SessionStatus::Running);
+    assert!(app.parked_sessions.is_empty());
+}
+
+/// Closing a PARKED session reaps its child and leaves the live view on the
+/// active session, untouched.
+#[test]
+fn closing_a_parked_session_reaps_it_and_keeps_the_live_view() {
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let ids = registry_ids(&app);
+    let (first, second) = (ids[0], ids[1]);
+    assert!(app.parked_sessions.contains_key(&first));
+
+    // Make the parked row the palette's target: registry selection is a
+    // model-level choice and does not move the live view.
+    app.workspace
+        .select_session(first)
+        .expect("parked row selectable");
+
+    app.run_workspace_action(WorkspaceAction::CloseSession);
+
+    assert!(app.workspace.registry().get(first).is_none());
+    assert!(
+        !app.parked_sessions.contains_key(&first),
+        "the parked child handle was reaped and removed, not left in the map"
+    );
+    assert_eq!(
+        app.active_session,
+        Some(second),
+        "the live view is untouched"
+    );
+    assert!(app.pty.is_some());
+    assert_eq!(session_status(&app, second), SessionStatus::Running);
+    assert_eq!(app.workspace.registry().selected(), None);
+}
+
+/// A structural close persists immediately: the next launch restores exactly
+/// the surviving rows as `Restored` entries, never the closed one, and never
+/// a live status for a shell that died with the previous launch.
+#[test]
+fn closing_a_session_persists_the_shrunk_sidebar_for_the_next_launch() {
+    let home = AppTestHome::new();
+    let path = temp_state_path();
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..app_with_state_path(&path)
+    };
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.run_workspace_action(WorkspaceAction::CloseSession);
+
+    let relaunched = sidebar_after_relaunch(&path);
+    assert_eq!(
+        relaunched.registry().len(),
+        1,
+        "the closed row is not saved"
+    );
+    for descriptor in relaunched.registry().sessions() {
+        assert_eq!(
+            descriptor.status().clone(),
+            SessionStatus::Restored,
+            "a relaunched row is Restored: its shell did not survive the launch"
+        );
+    }
+    cleanup_state_file(&path);
 }
