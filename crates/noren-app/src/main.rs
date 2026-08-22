@@ -1058,6 +1058,38 @@ impl NorenApp {
         closed
     }
 
+    /// Cycle the live view to the next live session in sidebar order.
+    ///
+    /// This is the palette `session_select` runtime. The live view moves from
+    /// the active session to the next live row in registry order (the order
+    /// the sidebar shows), wrapping around, through the same
+    /// [`switch_live_session`] path a sidebar click takes. With fewer than
+    /// two live sessions there is nothing to cycle to: the current live view
+    /// is re-affirmed, and input ownership never moves to a row without a
+    /// live surface.
+    fn select_next_live_session(&mut self) {
+        let live: Vec<SessionId> = self
+            .workspace
+            .registry()
+            .sessions()
+            .into_iter()
+            .map(|descriptor| descriptor.id())
+            .filter(|id| self.active_session == Some(*id) || self.parked_sessions.contains_key(id))
+            .collect();
+        let Some(next) = live
+            .iter()
+            .position(|id| self.active_session == Some(*id))
+            .and_then(|position| live.get((position + 1) % live.len()).copied())
+            .or_else(|| live.first().copied())
+        else {
+            return;
+        };
+        if self.switch_live_session(next) {
+            self.ssh_selection_status = None;
+            self.redraw_needed = true;
+        }
+    }
+
     fn initialize(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -1281,19 +1313,9 @@ impl NorenApp {
                 self.spawn_local_session();
             }
             WorkspaceAction::SelectSession => {
-                let ids: Vec<SessionId> = self
-                    .workspace
-                    .registry()
-                    .sessions()
-                    .into_iter()
-                    .map(|d| d.id())
-                    .collect();
-                let Some(active) = self.active_session else {
-                    return;
-                };
-                if ids.contains(&active) && self.workspace.select_session(active).is_ok() {
-                    self.ssh_selection_status = None;
-                }
+                // The palette cycles the live view through live sessions in
+                // sidebar order — the same switch a sidebar click performs.
+                self.select_next_live_session();
             }
             WorkspaceAction::CloseSession => {
                 // The palette closes the selected row — live or not. A live

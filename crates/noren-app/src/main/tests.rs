@@ -4158,3 +4158,64 @@ fn closing_a_session_persists_the_shrunk_sidebar_for_the_next_launch() {
     }
     cleanup_state_file(&path);
 }
+
+/// The palette's `session_select` cycles the live view through live sessions
+/// in sidebar order, wrapping around, and each switch shows the target
+/// session's own screen. With no other live session it re-affirms the current
+/// owner instead of moving input to a model-only row.
+///
+/// Mutation check: making the switch a no-op that keeps rendering the old
+/// session fails every screen-content assertion here.
+#[test]
+fn palette_select_cycles_the_live_view_between_live_sessions() {
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    // Three real sessions; each gets a marker on its own screen while it owns
+    // the live view.
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.apply_pty_output(b"MARK-A-51e0\r\n");
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.apply_pty_output(b"MARK-B-51e0\r\n");
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.apply_pty_output(b"MARK-C-51e0\r\n");
+    let ids = registry_ids(&app);
+    let (a, b, c) = (ids[0], ids[1], ids[2]);
+    assert_eq!(app.active_session, Some(c));
+
+    app.run_workspace_action(WorkspaceAction::SelectSession);
+    assert_eq!(app.active_session, Some(a), "cycles forward and wraps");
+    assert_eq!(app.workspace.registry().selected(), Some(a));
+    assert!(terminal_text(app.terminal.as_ref().expect("a attached")).contains("MARK-A-51e0"));
+
+    app.run_workspace_action(WorkspaceAction::SelectSession);
+    assert_eq!(app.active_session, Some(b));
+    assert!(terminal_text(app.terminal.as_ref().expect("b attached")).contains("MARK-B-51e0"));
+
+    app.run_workspace_action(WorkspaceAction::SelectSession);
+    assert_eq!(app.active_session, Some(c));
+    let text = terminal_text(app.terminal.as_ref().expect("c attached"));
+    assert!(text.contains("MARK-C-51e0"));
+    assert!(
+        !text.contains("MARK-A-51e0") && !text.contains("MARK-B-51e0"),
+        "the live view shows only the selected session's screen"
+    );
+}
+
+/// With a single live session, `session_select` keeps that session as the
+/// input owner; a model-only row never takes the live view through the
+/// palette either.
+#[test]
+fn palette_select_with_one_live_session_reaffirms_its_owner() {
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let live = registry_ids(&app)[0];
+    let _model = app.workspace.create_session(SessionKind::Local);
+    app.workspace.rebuild_sidebar();
+
+    app.run_workspace_action(WorkspaceAction::SelectSession);
+
+    assert_eq!(app.active_session, Some(live));
+    assert_eq!(app.workspace.registry().selected(), Some(live));
+    assert!(!has_live_surface(&app, _model));
+}
