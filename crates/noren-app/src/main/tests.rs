@@ -4219,3 +4219,51 @@ fn palette_select_with_one_live_session_reaffirms_its_owner() {
     assert_eq!(app.workspace.registry().selected(), Some(live));
     assert!(!has_live_surface(&app, _model));
 }
+
+/// Restart honesty: rows restored from disk have no live process behind them,
+/// so selecting one must not move the live view — while the persisted
+/// selection itself survives the restart untouched. Live PTYs never survive a
+/// restart and the model never pretends otherwise.
+#[test]
+fn a_restored_row_never_takes_the_live_view_from_the_running_session() {
+    let path = temp_state_path();
+    // Launch one: one real session, quit (which persists it), relaunch.
+    {
+        let home = AppTestHome::new();
+        let mut first_launch = NorenApp {
+            test_pty_home: Some(home.0.clone()),
+            ..app_with_state_path(&path)
+        };
+        first_launch.run_workspace_action(WorkspaceAction::CreateSession);
+        first_launch.teardown();
+    }
+    let home = AppTestHome::new();
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..app_with_state_path(&path)
+    };
+    // The relaunched app has one Restored row and no live surface yet.
+    let restored = registry_ids(&app)[0];
+    assert_eq!(session_status(&app, restored), SessionStatus::Restored);
+    assert_eq!(app.active_session, None);
+
+    // The user creates a new real session; it takes the live view.
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let live = registry_ids(&app)[1];
+    assert_eq!(app.active_session, Some(live));
+
+    // Clicking the Restored row is consumed but cannot take input ownership:
+    // its shell died with the previous launch.
+    assert!(
+        click_sidebar_row(&mut app, 0),
+        "the restored row is consumed"
+    );
+    assert_eq!(
+        app.active_session,
+        Some(live),
+        "a restored row has no live surface to attach"
+    );
+    assert_eq!(app.workspace.registry().selected(), Some(live));
+    assert!(app.pty.is_some(), "the live surface is untouched");
+    cleanup_state_file(&path);
+}
