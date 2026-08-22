@@ -415,6 +415,12 @@ fn plain_stroke(character: char) -> Stroke {
 
 /// Mirror of `main.rs`'s `palette_policy`: the exit leader `Super+Escape`
 /// plus the configured palette chord (`KeymapConfig::default()` is Super+p).
+///
+/// This is a hand-copy because the production `palette_policy` is a private
+/// `fn` in `main.rs` — it CAN drift from production. The production policy
+/// itself is pinned by `palette_policy_claims_exactly_super_escape_and_super_p`
+/// in `src/main/tests.rs`; if this mirror is ever edited, re-check that pin
+/// still describes what is mirrored here (found by independent review).
 fn palette_policy() -> PassthroughPolicy {
     let palette_claim = PassthroughClaim {
         id: CLAIM_ID_PALETTE,
