@@ -110,27 +110,26 @@ Measured against it, item by item:
 | Scope item | State | Evidence |
 | --- | --- | --- |
 | Sidebar drawn | Done | `SIDEBAR_COLS` reserved in `renderer.rs`; `glyph_vertices` applies the column offset; `sidebar_text_lines` formats rows |
-| — projects, git worktrees | Modelled, not launchable | `EntryKind::Project`/`Worktree`, `SessionKind::Project`/`Worktree` exist; no creation path constructs them |
+| — projects, git worktrees | Modelled, not launchable | `EntryKind::Project`/`Worktree`, `SessionKind::Project`/`Worktree` exist; no runtime path creates them, though `parse_session` will reconstruct one from a hand-written `sessions.toml` `kind` field — nothing in the product writes such an entry |
 | — SSH connections, agents | Partial configured-target list, not connected; agents fixture only | At most 24 positive literal OpenSSH aliases become `SessionKind::Ssh` and `SidebarEntry::SshConnection` rows; the status identifies partial discovery, and clicking shows bounded root-relative source provenance while opening no SSH connection or PTY; agent entries remain reserved |
 | — terminal sessions | Partial runtime | The running binary starts one `SessionKind::Local` PTY; palette-created rows are model entries only until supervisor-backed switching lands |
 | Single-session view | Done | The one live terminal is drawn beside the sidebar, narrowed to the remaining columns; inactive rows cannot claim its selection or input owner |
 | Session lifecycle | Done | `SessionStatus` advances `Starting -> Running -> Exited/Failed` via `SessionRegistry::observe`, wired in `main.rs` |
 | Sidebar-state persistence | Done | `sessions.toml` (`SESSION_STATE_FILE_NAME`) under the `config::default_path` directory, resolved by `session_state_path` |
 | Palette | Done | `Super+p` via `palette_policy`; `Palette::noren`'s four commands dispatched by `handle_palette_key` |
-| Configurable keybindings | **Not started** | `palette_policy` and `handle_palette_key` hard-code the chords; `config.rs` exposes no keymap surface |
-| Zellij pass-through | Done against a pinned corpus | `passthrough.rs` policy claims only Super-space chords that the pinned Zellij `v0.44.3` default corpus (`ZELLIJ_FIXTURE_TAG`) never binds; no test drives a live Zellij |
+| Configurable keybindings | Done for the palette surface | `[keys]` in `config.toml` (`KeymapConfig` in `config.rs`) rebinds the palette opener and the four palette command chords with the previous values as defaults; `palette_policy`/`handle_palette_key` in `main.rs` honor them, unparseable chords and unknown actions are typed errors, and the opener is validated against the pinned Zellij corpus and the exit leader. The exit leader, palette navigation keys, diagnostics chord, and clipboard shortcuts remain fixed |
+| Zellij pass-through | Done against a pinned corpus | The shipped policy (`palette_policy` in `main.rs`) claims exactly two Super-modified chords — `Super+Escape` (exit leader) and `Super+p` (palette opener) — that the pinned Zellij `v0.44.3` default corpus (`ZELLIJ_FIXTURE_TAG`) never binds; no test drives a live Zellij |
 
-Two named scope items remain unsatisfied: **configurable keybindings do not
-exist at all**, and **SSH connections and agents do not run**. Positive literal
-aliases now appear in a bounded sidebar list and a click records a
-source-attributed pending target, but opens no SSH connection or PTY; wildcard
-or dynamic destinations are not presented as a complete host inventory, and
-agent entries remain fixtures and launch no agent. Since "Only evidence-backed
-work is marked complete" and the scope line
-names both, Milestone 3 stays **In progress**. The SSH and agent session kinds
-also depend on Milestones 4 and 5; whether they are retired from Milestone 3's
-scope or carried is an open scoping decision, not something to settle by
-relabelling the status.
+One named scope item remains unsatisfied: **SSH connections and agents do
+not run**. Positive literal aliases now appear in a bounded sidebar list and
+a click records a source-attributed pending target, but opens no SSH
+connection or PTY; wildcard or dynamic destinations are not presented as a
+complete host inventory, and agent entries remain fixtures and launch no
+agent. Since "Only evidence-backed work is marked complete" and the scope
+line names it, Milestone 3 stays **In progress**. The SSH and agent session
+kinds also depend on Milestones 4 and 5; whether they are retired from
+Milestone 3's scope or carried is an open scoping decision, not something to
+settle by relabelling the status.
 
 ## What blocks a public preview
 
@@ -150,8 +149,9 @@ the Noren terminal." The reasoning and the decision are recorded in
   shows bounded root-relative source provenance on selection, but selecting one
   only records a pending target and opens no connection or PTY. Only
   `SessionKind::Local` reaches a
-  launch path; git worktrees remain unreachable, agents remain fixture-only,
-  and keybindings are not configurable. See [Milestone 3 status](#milestone-3-status).
+  launch path; git worktrees remain unreachable, and agents remain
+  fixture-only; keybindings ARE configurable through the `[keys]` section
+  since this milestone (see [Milestone 3 status](#milestone-3-status)).
 - **Colour rendering exists, but themes are fixed.** `renderer.rs` resolves
   each cell's SGR foreground and any explicit background through its compiled-in
   ANSI/256-colour palette or as direct RGB truecolor. The vertex layout carries

@@ -1090,7 +1090,7 @@ fn sidebar_boundary_and_click_boundary_agree_at_non_default_cell_width() {
 /// pinned Zellij v0.44.3 corpus never binds.
 #[test]
 fn palette_policy_claims_exactly_super_escape_and_super_p() {
-    let policy = palette_policy();
+    let policy = palette_policy(KeymapConfig::default());
     let claims = policy.claims();
     assert_eq!(claims.len(), 2, "exactly two claims");
     let corpus = passthrough::zellij_default_bindings();
@@ -1177,7 +1177,7 @@ fn leader_mismatch_replays_held_chord_bytes_in_order() {
 /// byte-identical to the pre-gate behaviour.
 #[test]
 fn closed_palette_forwarded_key_is_byte_identical_to_direct_encode() {
-    let policy = palette_policy();
+    let policy = palette_policy(KeymapConfig::default());
     let mode = InputMode::normal();
     let mut gate = PassthroughGate::new();
 
@@ -1209,7 +1209,7 @@ fn closed_palette_forwarded_key_is_byte_identical_to_direct_encode() {
 /// PTY bytes — confirming the palette claim works.
 #[test]
 fn super_p_is_intercepted_as_palette_open() {
-    let policy = palette_policy();
+    let policy = palette_policy(KeymapConfig::default());
     let mut gate = PassthroughGate::new();
     let chord =
         Chord::new(GateKeyCode::Char('p'), GateModifiers::empty().super_key()).expect("normalized");
@@ -1318,9 +1318,10 @@ fn escape_dismisses_palette_without_running_a_command() {
     let count_before = app.workspace.registry().len();
 
     // Simulate Escape key: handle_palette_key checks for NamedKey::Escape.
-    // We test the effect (close_palette) directly because constructing a
-    // full winit KeyEvent requires a DeviceId that is not safely creatable
-    // in a #[forbid(unsafe)] crate.
+    // We test the effect (close_palette) directly because a full winit
+    // KeyEvent cannot be fabricated outside winit: `KeyEvent::platform_specific`
+    // is private with no public constructor (DeviceId has `dummy()`, but the
+    // event cannot be completed without that field).
     app.close_palette();
 
     assert!(!app.palette_open, "palette must be dismissed");
@@ -1328,6 +1329,243 @@ fn escape_dismisses_palette_without_running_a_command() {
         app.workspace.registry().len(),
         count_before,
         "no command must have run"
+    );
+}
+
+// ── Configurable keybinding tests ────────────────────────────────────
+
+fn gate_chord(code: GateKeyCode, modifiers: GateModifiers) -> Chord {
+    Chord::new(code, modifiers).expect("normalized test chord")
+}
+
+fn super_chord(character: char) -> Chord {
+    gate_chord(
+        GateKeyCode::Char(character),
+        GateModifiers::empty().super_key(),
+    )
+}
+
+/// Mutation proof (b): the configured palette chord must reach the live
+/// pass-through policy. If `palette_policy` ignored the keymap and always
+/// claimed the hard-coded `super+p`, `super+k` would forward (never open)
+/// and this test would fail.
+#[test]
+fn custom_palette_chord_opens_the_palette_and_releases_the_default() {
+    let config = AppConfig::parse("[keys]\npalette_open = \"super+k\"\n")
+        .expect("super+k is a claimable, distinct opener chord");
+    let mut app = NorenApp::new(config);
+    assert!(!app.palette_open);
+
+    let consumed = app.gate_pressed_chord(super_chord('k'), InputMode::normal());
+    assert!(
+        consumed,
+        "the configured chord must be consumed by the gate"
+    );
+    assert!(
+        app.palette_open,
+        "the configured chord must open the palette"
+    );
+}
+
+#[test]
+fn custom_palette_chord_replaces_the_default_claim_in_the_policy() {
+    let config = AppConfig::parse("[keys]\npalette_open = \"super+k\"\n")
+        .expect("super+k is a claimable, distinct opener chord");
+    let app = NorenApp::new(config);
+    let mut gate = PassthroughGate::new();
+
+    let decision = gate.press(&app.passthrough_policy, super_chord('p'));
+    assert_eq!(
+        decision.kind,
+        GateKind::Forwarded,
+        "the default super+p must no longer be claimed"
+    );
+
+    let decision = gate.press(&app.passthrough_policy, super_chord('k'));
+    assert_eq!(
+        decision.kind,
+        GateKind::Intercepted(PassthroughAction::OpenCommandPalette),
+        "the configured super+k must be the palette claim"
+    );
+}
+
+/// With no `[keys]` section the binary behaves exactly as before: `super+p`
+/// opens the palette and the bare `c`/`s`/`x`/`f` characters dispatch the
+/// four commands — including under modifiers, which the pre-configuration
+/// palette ignored.
+#[test]
+fn default_keymap_keeps_the_pre_configuration_palette_behaviour() {
+    let mut app = NorenApp::default();
+    assert_eq!(app.keys, KeymapConfig::default());
+
+    assert!(app.gate_pressed_chord(super_chord('p'), InputMode::normal()));
+    assert!(
+        app.palette_open,
+        "the default super+p must still open the palette"
+    );
+
+    let before = app.workspace.registry().len();
+    app.handle_palette_key_impl(
+        &WinitKey::Character("c".into()),
+        ElementState::Pressed,
+        false,
+    );
+    assert!(!app.palette_open, "dispatch closes the palette");
+    assert_eq!(
+        app.workspace.registry().len(),
+        before + 1,
+        "the default c must still create a session"
+    );
+
+    // The legacy modifier-insensitive character match survives: the palette
+    // matched logical characters regardless of held modifiers.
+    app.open_palette();
+    app.modifiers = Modifiers::empty().ctrl();
+    app.handle_palette_key_impl(
+        &WinitKey::Character("c".into()),
+        ElementState::Pressed,
+        false,
+    );
+    assert_eq!(app.workspace.registry().len(), before + 2);
+
+    // An unbound single character still dismisses the palette.
+    app.open_palette();
+    app.handle_palette_key_impl(
+        &WinitKey::Character("z".into()),
+        ElementState::Pressed,
+        false,
+    );
+    assert!(!app.palette_open, "an unbound character still dismisses");
+    assert_eq!(app.workspace.registry().len(), before + 2);
+}
+
+/// A configured command chord with modifiers dispatches only on the exact
+/// chord: the bare character neither dispatches nor runs the wrong command.
+#[test]
+fn custom_command_chord_dispatches_only_on_the_exact_chord() {
+    let config = AppConfig::parse("[keys]\nsession_create = \"ctrl+n\"\n")
+        .expect("ctrl+n is a valid command chord");
+    let mut app = NorenApp::new(config);
+    let before = app.workspace.registry().len();
+
+    // Exact chord dispatches even though the binding carries modifiers.
+    app.open_palette();
+    app.modifiers = Modifiers::empty().ctrl();
+    app.handle_palette_key_impl(
+        &WinitKey::Character("n".into()),
+        ElementState::Pressed,
+        false,
+    );
+    assert!(!app.palette_open, "dispatch closes the palette");
+    assert_eq!(
+        app.workspace.registry().len(),
+        before + 1,
+        "the configured ctrl+n must create a session"
+    );
+
+    // The bare character does not dispatch: it dismisses without running.
+    app.open_palette();
+    app.modifiers = Modifiers::empty();
+    app.handle_palette_key_impl(
+        &WinitKey::Character("n".into()),
+        ElementState::Pressed,
+        false,
+    );
+    assert!(!app.palette_open);
+    assert_eq!(app.workspace.registry().len(), before + 1);
+
+    // The default c binding was replaced, so bare c no longer creates.
+    app.open_palette();
+    app.handle_palette_key_impl(
+        &WinitKey::Character("c".into()),
+        ElementState::Pressed,
+        false,
+    );
+    assert!(!app.palette_open);
+    assert_eq!(
+        app.workspace.registry().len(),
+        before + 1,
+        "the replaced default must not dispatch"
+    );
+}
+
+/// A command chord bound to a named key dispatches when that key is pressed
+/// inside the open palette.
+#[test]
+fn named_key_command_chord_dispatches_in_the_open_palette() {
+    let config = AppConfig::parse("[keys]\nsession_select = \"f2\"\n")
+        .expect("f2 is a valid, distinct command chord");
+    let mut app = NorenApp::new(config);
+    app.open_palette();
+    let selected = app.workspace.registry().selected();
+
+    app.handle_palette_key_impl(&WinitKey::Named(NamedKey::F2), ElementState::Pressed, false);
+    assert!(!app.palette_open, "the bound named key dispatches");
+    assert_eq!(
+        app.workspace.registry().selected(),
+        selected,
+        "session_select on an empty active session keeps the selection"
+    );
+}
+
+/// The palette's one-glyph shortcut labels follow the configured chords
+/// rather than the compiled-in characters.
+#[test]
+fn palette_labels_follow_the_configured_command_chords() {
+    let config = AppConfig::parse("[keys]\nsession_create = \"n\"\nsession_close = \"f2\"\n")
+        .expect("valid, distinct command chords");
+    let app = NorenApp::new(config);
+    // Selection 1 keeps lines 0 and 2 unselected, so each begins with the
+    // marker, the shortcut glyph, and a space.
+    let lines = palette_text_lines(app.workspace.palette(), 1, &app.keys);
+    assert!(
+        lines[0].starts_with(" N "),
+        "create bound to n must show N, got {:?}",
+        lines[0]
+    );
+    assert!(
+        lines[2].starts_with(" ? "),
+        "close bound to f2 has no glyph and must show ?, got {:?}",
+        lines[2]
+    );
+
+    let default_lines = palette_text_lines(app.workspace.palette(), 1, &KeymapConfig::default());
+    for (index, key) in ['C', 'S', 'X', 'F'].into_iter().enumerate() {
+        let glyphs: Vec<char> = default_lines[index].chars().collect();
+        assert_eq!(
+            glyphs.first(),
+            Some(&(if index == 1 { ']' } else { ' ' })),
+            "line {index} marker"
+        );
+        assert_eq!(
+            glyphs.get(1),
+            Some(&key),
+            "default line {index} must still show {key}, got {:?}",
+            default_lines[index]
+        );
+    }
+}
+
+/// The pass-through seam is the live route for the palette claim: a
+/// forwarded chord is not consumed, an intercepted one is.
+#[test]
+fn gate_pressed_chord_reports_consumption_for_each_outcome() {
+    let mut app = NorenApp::default();
+    assert!(!app.gate_pressed_chord(
+        gate_chord(GateKeyCode::Char('a'), GateModifiers::empty()),
+        InputMode::normal()
+    ));
+    assert!(
+        !app.palette_open,
+        "unclaimed chords forward without opening"
+    );
+    assert!(app.gate_pressed_chord(
+        gate_chord(GateKeyCode::Escape, GateModifiers::empty().super_key()),
+        InputMode::normal()
+    ));
+    assert!(
+        !app.palette_open,
+        "the exit leader is consumed, not palette"
     );
 }
 
@@ -1394,7 +1632,7 @@ fn observe_exited_after_running_updates_the_sidebar() {
 fn palette_text_lines_show_selection_marker() {
     let state = WorkspaceState::new();
     let palette = state.palette();
-    let lines = palette_text_lines(palette, 1);
+    let lines = palette_text_lines(palette, 1, &KeymapConfig::default());
     assert_eq!(lines.len(), 4, "four commands");
     assert!(
         lines[1].starts_with(']'),
