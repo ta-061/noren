@@ -18,7 +18,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::num::NonZeroU16;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
@@ -537,6 +537,21 @@ impl PtySession {
     /// left to ssh's own agent and configuration resolution.
     pub fn spawn_ssh(policy: SshLaunchPolicy, size: PtySize) -> Result<Self, PtyError> {
         Self::spawn_session(build_ssh_command(&policy), size)
+    }
+
+    /// Spawn `/bin/zsh` with `home` as the child's `HOME` and working
+    /// directory instead of the inherited one.
+    ///
+    /// The same fixed launch policy as [`PtySession::spawn`]: identical
+    /// program, `TERM`, and environment surgery; only the home differs, and it
+    /// is validated exactly like an inherited `HOME` (absolute, existing
+    /// directory). This is the seam higher-level test suites use to run the
+    /// child in an isolated directory: a developer's real `$HOME` may carry
+    /// startup files that take arbitrarily long or read the terminal, which
+    /// would make every shell-driving test depend on personal configuration.
+    pub fn spawn_in_home(home: &Path, size: PtySize) -> Result<Self, PtyError> {
+        let policy = validate_home(Some(home.as_os_str().to_owned()))?;
+        Self::spawn_with_policy(policy, size)
     }
 
     /// Spawn using an already validated fixed-zsh policy.
@@ -1509,5 +1524,40 @@ mod tests {
             result,
             Ok(()) | Err(PtyError::ReaderJoinTimeout | PtyError::SupervisorJoinTimeout)
         ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn spawn_in_home_uses_the_isolated_home_and_validates_it() {
+        // The public seam must reject exactly what the inherited-home path
+        // rejects, without reading or mutating the process environment.
+        let missing = std::env::temp_dir().join("noren-pty-missing-spawn-in-home");
+        assert!(matches!(
+            PtySession::spawn_in_home(&missing, PtySize::from_raw(24, 80).expect("size")),
+            Err(PtyError::HomeNotDirectory)
+        ));
+
+        let home = TestHome::new();
+        let size = PtySize::from_raw(24, 80).expect("valid initial size");
+        let mut session = PtySession::spawn_in_home(&home.0, size).expect("spawn in home");
+        // The isolated home carries no startup files, so the shell answers
+        // immediately; a real `$HOME` with slow startup files could not.
+        session
+            .send_input(b"print -r -- SPAWN_IN_HOME_OK\nexit\n")
+            .expect("drive shell");
+        let mut output = Vec::new();
+        let mut lifecycle = false;
+        poll_events(
+            &session,
+            Instant::now() + Duration::from_secs(2),
+            &mut output,
+            &mut lifecycle,
+            |_, observed| observed,
+        );
+        // Echo is on (this test never disables it), so the marker appears both
+        // as the echoed input line and as the printed output; at least one
+        // occurrence proves the isolated shell answered.
+        assert!(occurrences(&output, b"SPAWN_IN_HOME_OK") >= 1);
+        session.shutdown().expect("reap isolated-home zsh");
     }
 }

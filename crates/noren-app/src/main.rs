@@ -39,6 +39,7 @@ use noren_terminal::{
     GridPoint, Selection, SelectionMode, TerminalEngine, TerminalError, TerminalState,
 };
 use renderer::{RenderOutcome, Renderer};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -669,6 +670,21 @@ fn created_session_id(events: Vec<SessionEvent>) -> SessionId {
         .expect("SessionAction::Create yields exactly one Created event")
 }
 
+/// A live session that is not currently displayed.
+///
+/// The app holds exactly one *active* surface (`NorenApp::pty` plus
+/// `NorenApp::terminal`, owned by [`NorenApp::active_session`]); every other
+/// live session is parked here with its own PTY and terminal state. Parking
+/// keeps the child running and its screen authoritative in Noren's terminal
+/// state, so switching back shows current content. The renderer, input
+/// routing, and mouse mapping never need to know which session is focused:
+/// they operate on the active surface, and switching swaps surfaces rather
+/// than re-deriving state.
+struct ParkedSession {
+    pty: PtySession,
+    terminal: TerminalState,
+}
+
 struct NorenApp {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -706,6 +722,22 @@ struct NorenApp {
     /// First workspace row currently visible in the bounded sidebar window.
     sidebar_scroll_offset: usize,
     active_session: Option<SessionId>,
+    /// The session whose final frame is still displayed after its child
+    /// exited. `finish_pty` clears `active_session` (input ownership dies
+    /// with the child) but keeps the terminal for the last frame; this field
+    /// remembers whose frame it is so closing that row runs the same
+    /// detach-and-fallback path an active close does, instead of leaving a
+    /// frozen frame behind a vanished row.
+    exited_surface_session: Option<SessionId>,
+    /// Live sessions that are not the active one, keyed by session id.
+    parked_sessions: HashMap<SessionId, ParkedSession>,
+    /// Test-only override for the PTY child's home directory. Production
+    /// always spawns in the inherited `$HOME`; tests that drive a shell by
+    /// typing set an isolated empty directory so the shell's startup cannot
+    /// depend on the developer's personal configuration (which may take
+    /// arbitrarily long or read the terminal).
+    #[cfg(test)]
+    test_pty_home: Option<PathBuf>,
     palette_open: bool,
     palette_selection: usize,
     passthrough_gate: PassthroughGate,
@@ -789,6 +821,10 @@ impl NorenApp {
             workspace: WorkspaceState::new(),
             sidebar_scroll_offset: 0,
             active_session: None,
+            exited_surface_session: None,
+            parked_sessions: HashMap::new(),
+            #[cfg(test)]
+            test_pty_home: None,
             palette_open: false,
             palette_selection: 0,
             passthrough_gate: PassthroughGate::new(),
@@ -1042,6 +1078,341 @@ impl NorenApp {
         self.active_session = Some(session_id);
     }
 
+    /// Terminal state and PTY size for a new session at the current window
+    /// grid, or at the default window grid when no window exists yet
+    /// (headless start, application tests).
+    fn session_surfaces(&mut self) -> Option<(TerminalState, PtySize)> {
+        let changed = match self.window.as_ref() {
+            Some(window) => {
+                let size = window.inner_size();
+                self.geometry.update(Resize::new(size.width, size.height))
+            }
+            None => self
+                .geometry
+                .update(Resize::new(WINDOW_WIDTH, WINDOW_HEIGHT)),
+        };
+        // `update` returns `None` for an unchanged grid; the current grid is
+        // then exactly what a new session should use.
+        let grid = changed.or_else(|| self.geometry.current())?;
+        let runtime = RuntimeGridSize::from_window(grid);
+        Some((runtime.terminal_state()?, runtime.pty_size()?))
+    }
+
+    /// Park the active session's surface without killing it.
+    ///
+    /// The PTY keeps running and its bytes are drained into its own terminal
+    /// state by [`Self::drain_parked_sessions`], so a later switch back
+    /// re-attaches to current content rather than a stale frame.
+    fn park_active_session(&mut self) {
+        if let (Some(id), Some(pty), Some(terminal)) = (
+            self.active_session.take(),
+            self.pty.take(),
+            self.terminal.take(),
+        ) {
+            self.parked_sessions
+                .insert(id, ParkedSession { pty, terminal });
+            self.pty_child = PtyChildStatus::NotLaunched;
+        }
+    }
+
+    /// Spawn the PTY for a new session.
+    ///
+    /// Production always runs the fixed `/bin/zsh` policy in the inherited
+    /// `$HOME`. Tests that drive a shell by typing redirect the child into an
+    /// isolated empty home (see [`NorenApp::test_pty_home`]) so a developer's
+    /// startup files cannot make the test wait minutes for a prompt — the
+    /// spawn itself, the policy, and the reaping contract are identical.
+    fn spawn_pty_session(&self, size: PtySize) -> Result<PtySession, noren_pty::PtyError> {
+        #[cfg(test)]
+        if let Some(home) = &self.test_pty_home {
+            return PtySession::spawn_in_home(home, size);
+        }
+        PtySession::spawn(size)
+    }
+
+    /// Spawn a real local PTY session and give it the live view.
+    ///
+    /// This is the palette `session_create` runtime: the new sidebar row is
+    /// backed by an actual `/bin/zsh` PTY. The registry observes `Running`
+    /// when the spawn succeeds and `Failed` when it does not — creation never
+    /// claims a session is running (the registry's `Starting` contract). The
+    /// new session takes the live view and the previous one is parked, not
+    /// killed, matching the new-tab-focuses-itself convention of terminal
+    /// multiplexers.
+    fn spawn_local_session(&mut self) -> Option<SessionId> {
+        let id = self.workspace.create_session(SessionKind::Local);
+        let Some((terminal, pty_size)) = self.session_surfaces() else {
+            self.workspace.observe_session(
+                id,
+                SessionStatus::Failed {
+                    reason: "terminal surface unavailable".to_owned(),
+                },
+            );
+            return None;
+        };
+        match self.spawn_pty_session(pty_size) {
+            Ok(pty) => {
+                self.workspace.observe_session(id, SessionStatus::Running);
+                self.park_active_session();
+                self.pty = Some(pty);
+                self.terminal = Some(terminal);
+                self.active_session = Some(id);
+                self.pty_child = PtyChildStatus::Running;
+                // Grid coordinates captured on the previous session's screen
+                // can only address the wrong content; the selection model
+                // expires them, exactly as an explicit switch does.
+                self.selection = None;
+                self.drag_origin = None;
+                self.exited_surface_session = None;
+                self.workspace
+                    .select_session(id)
+                    .expect("freshly spawned session is live");
+                self.ssh_selection_status = None;
+                self.redraw_needed = true;
+                Some(id)
+            }
+            Err(_) => {
+                self.workspace.observe_session(
+                    id,
+                    SessionStatus::Failed {
+                        reason: "PTY spawn failed".to_owned(),
+                    },
+                );
+                None
+            }
+        }
+    }
+
+    /// Drain every parked session's PTY events into its own terminal state.
+    ///
+    /// A parked session keeps producing output; its bytes feed its own
+    /// authoritative terminal state under the same per-turn parse budget as
+    /// the active session, so nothing grows without bound and switching back
+    /// shows current content. A parked child that exits or errors is observed
+    /// through the registry (`Exited`/`Failed`), shut down and reaped, and
+    /// dropped from the live bookkeeping — a dead row must never stay
+    /// `Running`, in the background any more than in the foreground.
+    fn drain_parked_sessions(&mut self) {
+        let ids: Vec<SessionId> = self
+            .workspace
+            .registry()
+            .sessions()
+            .into_iter()
+            .map(|descriptor| descriptor.id())
+            .filter(|id| self.parked_sessions.contains_key(id))
+            .collect();
+        for id in ids {
+            let terminal_status = self.drain_one_parked(id);
+            if let Some(status) = terminal_status {
+                self.workspace.observe_session(id, status);
+                if let Some(mut parked) = self.parked_sessions.remove(&id)
+                    && parked.pty.shutdown().is_err()
+                {
+                    self.workspace.observe_session(
+                        id,
+                        SessionStatus::Failed {
+                            reason: "PTY shutdown failed".to_owned(),
+                        },
+                    );
+                }
+                // The sidebar detail for this row changed even though the
+                // visible frame did not.
+                self.redraw_needed = true;
+            }
+        }
+    }
+
+    /// Drain one parked session's ready events, returning the observed
+    /// terminal status when the child exited or the channel failed.
+    fn drain_one_parked(&mut self, id: SessionId) -> Option<SessionStatus> {
+        let parked = self.parked_sessions.get_mut(&id)?;
+        let mut remaining = PARSE_BUDGET_BYTES_PER_TURN;
+        loop {
+            if remaining < noren_pty::READ_CHUNK_BYTES {
+                return None;
+            }
+            match parked.pty.try_recv() {
+                Ok(None) => return None,
+                Ok(Some(PtyEvent::Output(bytes))) => {
+                    if bytes.len() > remaining {
+                        // Over-budget output stays queued for a later turn;
+                        // it is never dropped.
+                        return None;
+                    }
+                    remaining -= bytes.len();
+                    parked.terminal.feed_bytes(&bytes);
+                }
+                Ok(Some(PtyEvent::Eof)) => {
+                    return Some(SessionStatus::Exited { code: None });
+                }
+                Ok(Some(PtyEvent::Exited { code })) => {
+                    return Some(SessionStatus::Exited {
+                        code: code.map(|code| code as i32),
+                    });
+                }
+                Ok(Some(PtyEvent::Error(_))) => {
+                    return Some(SessionStatus::Failed {
+                        reason: "PTY operation failed".to_owned(),
+                    });
+                }
+                Err(_) => {
+                    return Some(SessionStatus::Failed {
+                        reason: "PTY channel closed".to_owned(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Reap every parked session's child. Bounded and idempotent per session.
+    fn shutdown_parked_sessions(&mut self) {
+        for (_, mut parked) in self.parked_sessions.drain() {
+            if parked.pty.shutdown().is_err() {
+                eprintln!("Noren PTY shutdown reached its failure fallback");
+            }
+        }
+    }
+
+    /// Switch the live view to `id`.
+    ///
+    /// The active surface is parked (its PTY keeps running) and `id`'s parked
+    /// surface is re-attached, so from the next event onward the renderer,
+    /// input routing, and mouse mapping operate on the selected session —
+    /// they read the same active fields, which now belong to `id`. Switching
+    /// back re-attaches the same terminal state, so the session shows its own
+    /// current screen, not a stale or foreign one.
+    ///
+    /// Returns `false` when `id` has no live surface (a model-only, restored,
+    /// or already exited row): nothing is detached and the current live view
+    /// keeps input ownership.
+    fn switch_live_session(&mut self, id: SessionId) -> bool {
+        if self.workspace.registry().get(id).is_none() {
+            return false;
+        }
+        if self.active_session == Some(id) {
+            // Already the live view; re-affirm the selection only.
+            return self.workspace.select_session(id).is_ok();
+        }
+        let Some(parked) = self.parked_sessions.remove(&id) else {
+            return false;
+        };
+        self.park_active_session();
+        self.pty = Some(parked.pty);
+        self.terminal = Some(parked.terminal);
+        self.active_session = Some(id);
+        self.pty_child = PtyChildStatus::Running;
+        // Grid coordinates captured on the previous session's screen can
+        // only address the wrong content; the selection model expires them.
+        self.selection = None;
+        self.drag_origin = None;
+        self.exited_surface_session = None;
+        self.redraw_needed = true;
+        self.workspace.select_session(id).is_ok()
+    }
+
+    /// Close session `id` for real: reap its child, remove its row, and
+    /// repair the live view.
+    ///
+    /// This is the palette `session_close` runtime. A row with a live surface
+    /// (the active one or a parked one) owns a real child; closing it runs
+    /// that child's bounded kill-and-reap shutdown *before* the row is
+    /// removed, so a closed session can never keep a process running behind a
+    /// vanished row. A row without a live surface (model-only or restored) is
+    /// closed in the registry alone, exactly as before.
+    ///
+    /// # Fallback when the active session is closed
+    ///
+    /// The live view moves to the remaining live session with the lowest id —
+    /// the topmost sidebar row — which is deterministic and matches the
+    /// row-order the user sees. When no live session remains the live view is
+    /// cleared entirely: no terminal surface, no input owner, a truthful
+    /// status line, and the sidebar's empty state. The palette can create a
+    /// new session from there; an empty workspace never shows a closed
+    /// session's frozen frame as if it were alive.
+    fn close_session(&mut self, id: SessionId) -> bool {
+        if self.workspace.registry().get(id).is_none() {
+            return false;
+        }
+        let was_active = self.active_session == Some(id);
+        // The displayed frame can also belong to a session whose child has
+        // already exited: `finish_pty` keeps its final frame on screen with
+        // input ownership already gone. Closing that row must clear the
+        // surface and run the fallback too — otherwise a frozen frame stays
+        // behind a vanished row in an empty workspace.
+        let owns_displayed_surface = was_active || self.exited_surface_session == Some(id);
+        // Reap a parked child first; its surface never touched the live view.
+        if let Some(mut parked) = self.parked_sessions.remove(&id)
+            && parked.pty.shutdown().is_err()
+        {
+            eprintln!("Noren closed-session PTY shutdown reached its failure fallback");
+        }
+        // Detach the displayed surface before removing the row so the renderer
+        // and input routing can never observe a closed session.
+        if owns_displayed_surface {
+            self.active_session = None;
+            self.exited_surface_session = None;
+            self.terminal = None;
+            self.pty_child = PtyChildStatus::NotLaunched;
+            self.selection = None;
+            self.drag_origin = None;
+            if let Some(mut session) = self.pty.take()
+                && session.shutdown().is_err()
+            {
+                eprintln!("Noren closed-session PTY shutdown reached its failure fallback");
+            }
+        }
+        // The registry removes the row (and clears the selection if it pointed
+        // at the closed session) and persists the structural change.
+        let closed = self.workspace.close_session(id).is_ok();
+        if owns_displayed_surface {
+            // Fall back to the topmost remaining live session, if any exists.
+            let fallback = self.parked_sessions.keys().min().copied();
+            match fallback {
+                Some(next) => {
+                    self.switch_live_session(next);
+                }
+                None => {
+                    self.status = "Noren last session closed";
+                    self.show_status = true;
+                }
+            }
+        }
+        self.redraw_needed = true;
+        closed
+    }
+
+    /// Cycle the live view to the next live session in sidebar order.
+    ///
+    /// This is the palette `session_select` runtime. The live view moves from
+    /// the active session to the next live row in registry order (the order
+    /// the sidebar shows), wrapping around, through the same
+    /// [`switch_live_session`] path a sidebar click takes. With fewer than
+    /// two live sessions there is nothing to cycle to: the current live view
+    /// is re-affirmed, and input ownership never moves to a row without a
+    /// live surface.
+    fn select_next_live_session(&mut self) {
+        let live: Vec<SessionId> = self
+            .workspace
+            .registry()
+            .sessions()
+            .into_iter()
+            .map(|descriptor| descriptor.id())
+            .filter(|id| self.active_session == Some(*id) || self.parked_sessions.contains_key(id))
+            .collect();
+        let Some(next) = live
+            .iter()
+            .position(|id| self.active_session == Some(*id))
+            .and_then(|position| live.get((position + 1) % live.len()).copied())
+            .or_else(|| live.first().copied())
+        else {
+            return;
+        };
+        if self.switch_live_session(next) {
+            self.ssh_selection_status = None;
+            self.redraw_needed = true;
+        }
+    }
+
     fn initialize(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -1283,39 +1654,27 @@ impl NorenApp {
     fn run_workspace_action(&mut self, action: WorkspaceAction) {
         match action {
             WorkspaceAction::CreateSession => {
-                let _id = self.workspace.create_session(SessionKind::Local);
+                self.spawn_local_session();
             }
             WorkspaceAction::SelectSession => {
-                let ids: Vec<SessionId> = self
-                    .workspace
-                    .registry()
-                    .sessions()
-                    .into_iter()
-                    .map(|d| d.id())
-                    .collect();
-                let Some(active) = self.active_session else {
-                    return;
-                };
-                if ids.contains(&active) && self.workspace.select_session(active).is_ok() {
-                    self.ssh_selection_status = None;
-                }
+                // The palette cycles the live view through live sessions in
+                // sidebar order — the same switch a sidebar click performs.
+                self.select_next_live_session();
             }
             WorkspaceAction::CloseSession => {
-                if let Some(id) = self.workspace.registry().selected() {
-                    if Some(id) != self.active_session {
-                        let _ = self.workspace.close_session(id);
-                    }
-                } else {
-                    let ids: Vec<SessionId> = self
-                        .workspace
+                // The palette closes the selected row — live or not. A live
+                // row owns a real child; `close_session` reaps it before
+                // removing the row and repairs the live view (fallback to the
+                // topmost remaining live session, or an honest empty view).
+                let target = self.workspace.registry().selected().or_else(|| {
+                    self.workspace
                         .registry()
                         .sessions()
-                        .into_iter()
-                        .map(|d| d.id())
-                        .collect();
-                    if let Some(id) = ids.into_iter().find(|id| Some(*id) != self.active_session) {
-                        let _ = self.workspace.close_session(id);
-                    }
+                        .first()
+                        .map(|descriptor| descriptor.id())
+                });
+                if let Some(id) = target {
+                    self.close_session(id);
                 }
             }
             WorkspaceAction::FocusSidebar => {
@@ -1521,15 +1880,19 @@ impl NorenApp {
             return false;
         };
         if let Some(id) = self.workspace.local_sidebar_session(row_index) {
-            if Some(id) != self.active_session {
-                if let Some(active) = self.active_session
-                    && self.workspace.select_session(active).is_ok()
-                {
-                    self.ssh_selection_status = None;
-                    self.redraw_needed = true;
-                }
+            // A row with a live surface takes the live view: the terminal
+            // surface, input routing, and the renderer follow the selection.
+            if self.switch_live_session(id) {
+                self.ssh_selection_status = None;
+                self.redraw_needed = true;
                 return true;
             }
+            // The row has no live surface (model-only, restored, or exited):
+            // input ownership stays with the current live session, but the
+            // CLICK selects the clicked row — the palette's close command
+            // operates on the selected row, and re-selecting the live one
+            // here would redirect a close onto a shell the user did not
+            // point at.
             if self.workspace.select_session(id).is_ok() {
                 self.ssh_selection_status = None;
                 self.redraw_needed = true;
@@ -1955,6 +2318,20 @@ impl NorenApp {
                 self.show_status = true;
             }
         }
+        // Parked sessions resize too, so switching back presents a terminal
+        // state and PTY at the current geometry instead of a stale one.
+        if let Some(size) = runtime.pty_size() {
+            for parked in self.parked_sessions.values_mut() {
+                if runtime.resize_terminal(&mut parked.terminal).is_err() {
+                    self.status = "Noren terminal resize failed";
+                    self.show_status = true;
+                }
+                if parked.pty.resize(size).is_err() {
+                    self.status = "Noren PTY resize failed";
+                    self.show_status = true;
+                }
+            }
+        }
         self.redraw_needed = true;
     }
 
@@ -2076,6 +2453,9 @@ impl NorenApp {
             };
             self.workspace
                 .observe_session(id, SessionStatus::Exited { code });
+            // The final frame stays displayed below; remember whose it is so
+            // closing that row detaches the surface honestly.
+            self.exited_surface_session = Some(id);
         }
         if let Some(mut session) = self.pty.take()
             && session.shutdown().is_err()
@@ -2166,6 +2546,9 @@ impl NorenApp {
                 eprintln!("Noren PTY shutdown reached its failure fallback");
             }
         }
+        // Parked sessions die with the app too; their rows persist as
+        // `Restored` entries for the next launch (quit is not close).
+        self.shutdown_parked_sessions();
     }
 
     fn close(&mut self, event_loop: &ActiveEventLoop) {
@@ -2229,6 +2612,7 @@ impl ApplicationHandler for NorenApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.apply_pending_resize();
         self.drain_pty();
+        self.drain_parked_sessions();
         if self.redraw_needed {
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -2242,6 +2626,7 @@ impl ApplicationHandler for NorenApp {
         if let Some(mut session) = self.pty.take() {
             let _ = session.shutdown();
         }
+        self.shutdown_parked_sessions();
     }
 }
 
