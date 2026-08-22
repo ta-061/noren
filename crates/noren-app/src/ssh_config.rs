@@ -433,6 +433,7 @@ impl SshConfig {
         let mut seen_aliases = HashSet::new();
         let mut literal_blocks = HashMap::<String, Vec<usize>>::new();
         let mut fallback_blocks = Vec::new();
+        let mut fallback_head_masks = Vec::new();
         let mut fallback_pattern_work = 0_u128;
         let mut fallback_setting_work = 0_u128;
 
@@ -443,6 +444,7 @@ impl SshConfig {
         for (block_index, block) in blocks.iter().enumerate() {
             let Some(patterns) = &block.patterns else {
                 fallback_blocks.push(block_index);
+                fallback_head_masks.push(HeadMask::ANY);
                 fallback_setting_work = fallback_setting_work.saturating_add(block.settings_work());
                 continue;
             };
@@ -497,6 +499,8 @@ impl SshConfig {
                 }
             } else {
                 fallback_blocks.push(block_index);
+                fallback_head_masks
+                    .push(HeadMask::for_patterns(patterns.iter().map(String::as_str)));
                 fallback_setting_work = fallback_setting_work.saturating_add(block.settings_work());
                 for pattern in patterns {
                     let match_pattern = pattern.strip_prefix('!').unwrap_or(pattern);
@@ -517,63 +521,139 @@ impl SshConfig {
         resolution_work.fallback_setting_work = fallback_setting_work.saturating_mul(alias_count);
         ensure_resolution_work(resolution_work, limits.resolution_work)?;
 
-        let hosts = aliases
-            .into_iter()
-            .map(|(alias, declared_source)| {
-                let mut host = SshHost {
-                    alias: alias.clone(),
-                    host_name: None,
-                    user: None,
-                    port: None,
-                    declared_source,
-                };
-
-                let indexed = literal_blocks
-                    .get(&alias.to_ascii_lowercase())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                let mut indexed_position = 0;
-                let mut fallback_position = 0;
-                // Merge both ordered views so per-keyword first-value-wins
-                // precedence remains identical to scanning all blocks.
-                while indexed_position < indexed.len() || fallback_position < fallback_blocks.len()
-                {
-                    let (block_index, needs_match) = match (
-                        indexed.get(indexed_position),
-                        fallback_blocks.get(fallback_position),
-                    ) {
-                        (Some(indexed), Some(fallback)) if indexed < fallback => {
-                            indexed_position += 1;
-                            (*indexed, false)
-                        }
-                        (Some(_), Some(fallback)) => {
-                            fallback_position += 1;
-                            (*fallback, true)
-                        }
-                        (Some(indexed), None) => {
-                            indexed_position += 1;
-                            (*indexed, false)
-                        }
-                        (None, Some(fallback)) => {
-                            fallback_position += 1;
-                            (*fallback, true)
-                        }
-                        (None, None) => unreachable!(),
+        let hosts = {
+            // Filtering the fallback list by the alias's first character skips
+            // exactly the blocks `applies_to` would reject: a block is dropped
+            // only when none of its positive patterns can match that alias, so
+            // the merged order — and with it first-value-wins precedence — is
+            // identical to scanning every block. The list is built once per
+            // distinct first character, not once per alias.
+            let mut fallback_for_head: HashMap<Option<u8>, Vec<usize>> = HashMap::new();
+            aliases
+                .into_iter()
+                .map(|(alias, declared_source)| {
+                    let mut host = SshHost {
+                        alias: alias.clone(),
+                        host_name: None,
+                        user: None,
+                        port: None,
+                        declared_source,
                     };
-                    let block = &blocks[block_index];
-                    if needs_match && !block.applies_to(&alias) {
-                        continue;
+
+                    let indexed = literal_blocks
+                        .get(&alias.to_ascii_lowercase())
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    let head = alias
+                        .chars()
+                        .next()
+                        .map(|c| c.to_ascii_lowercase())
+                        .filter(char::is_ascii);
+                    let fallbacks: &Vec<usize> = fallback_for_head
+                        .entry(head.map(|c| c as u8))
+                        .or_insert_with(|| {
+                            fallback_blocks
+                                .iter()
+                                .zip(&fallback_head_masks)
+                                .filter(|(_, mask)| mask.admits(head))
+                                .map(|(&block_index, _)| block_index)
+                                .collect()
+                        });
+                    let mut indexed_position = 0;
+                    let mut fallback_position = 0;
+                    // Merge both ordered views so per-keyword first-value-wins
+                    // precedence remains identical to scanning all blocks.
+                    while indexed_position < indexed.len() || fallback_position < fallbacks.len() {
+                        let (block_index, needs_match) = match (
+                            indexed.get(indexed_position),
+                            fallbacks.get(fallback_position),
+                        ) {
+                            (Some(indexed), Some(fallback)) if indexed < fallback => {
+                                indexed_position += 1;
+                                (*indexed, false)
+                            }
+                            (Some(_), Some(fallback)) => {
+                                fallback_position += 1;
+                                (*fallback, true)
+                            }
+                            (Some(indexed), None) => {
+                                indexed_position += 1;
+                                (*indexed, false)
+                            }
+                            (None, Some(fallback)) => {
+                                fallback_position += 1;
+                                (*fallback, true)
+                            }
+                            (None, None) => unreachable!(),
+                        };
+                        let block = &blocks[block_index];
+                        if needs_match && !block.applies_to(&alias) {
+                            continue;
+                        }
+                        apply_settings(&mut host, block);
                     }
-                    apply_settings(&mut host, block);
-                }
-                host
-            })
-            .collect();
+                    host
+                })
+                .collect()
+        };
         Ok(Self {
             hosts,
             sources,
             discovery_kind: HostDiscoveryKind::PartialLiteralPatterns,
         })
+    }
+}
+
+/// The set of ASCII first characters an alias can have for any positive
+/// pattern of a fallback block to match it. `any` is set when a positive
+/// pattern starts with `*` or `?` (or the block is global), in which case the
+/// block must be tested against every alias. Non-ASCII first characters match
+/// no ASCII pattern head, so `admits(None)` falls back to `any` alone — the
+/// same conclusion `wildcard_match` would reach, just without walking the
+/// pattern.
+#[derive(Clone, Copy)]
+struct HeadMask {
+    any: bool,
+    bits: u128,
+}
+
+impl HeadMask {
+    const ANY: Self = Self { any: true, bits: 0 };
+
+    fn for_patterns<'a>(patterns: impl Iterator<Item = &'a str>) -> Self {
+        let mut mask = Self {
+            any: false,
+            bits: 0,
+        };
+        for pattern in patterns {
+            let Some(head) = pattern.chars().next() else {
+                continue;
+            };
+            if head == '!' {
+                // Only positive patterns decide whether the block can apply.
+                continue;
+            }
+            let head = head.to_ascii_lowercase();
+            if head == '*' || head == '?' || !head.is_ascii() {
+                mask.any = true;
+            } else {
+                mask.bits |= 1_u128 << (head as u8);
+            }
+        }
+        mask
+    }
+
+    fn admits(self, head: Option<char>) -> bool {
+        if self.any {
+            return true;
+        }
+        match head {
+            Some(c) => {
+                let c = c.to_ascii_lowercase();
+                c.is_ascii() && (self.bits & (1_u128 << (c as u8))) != 0
+            }
+            None => false,
+        }
     }
 }
 

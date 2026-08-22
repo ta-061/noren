@@ -2385,11 +2385,8 @@ fn baseline_mixed_quadratic_measurement() {
         ..DEFAULT_LIMITS
     };
     let started = std::time::Instant::now();
-    let lifted_result = SshConfig::from_blocks_with_limit(
-        &blocks,
-        vec![inline_source(SshSourceId(0))],
-        lifted,
-    );
+    let lifted_result =
+        SshConfig::from_blocks_with_limit(&blocks, vec![inline_source(SshSourceId(0))], lifted);
     let lifted_elapsed = started.elapsed();
     eprintln!(
         "BASELINE lifted budget (true resolution): {:?} ({})",
@@ -2408,11 +2405,8 @@ fn baseline_mixed_quadratic_measurement() {
             parse_blocks_for_test(&text, 0, SshSourceId(0), &mut token_items, MAX_TOKEN_ITEMS)
                 .expect("baseline blocks parse");
         let started = std::time::Instant::now();
-        let result = SshConfig::from_blocks_with_limit(
-            &blocks,
-            vec![inline_source(SshSourceId(0))],
-            lifted,
-        );
+        let result =
+            SshConfig::from_blocks_with_limit(&blocks, vec![inline_source(SshSourceId(0))], lifted);
         let elapsed = started.elapsed();
         eprintln!(
             "BASELINE lifted budget {pairs} pairs: {elapsed:?} ({})",
