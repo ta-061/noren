@@ -3676,3 +3676,162 @@ fn single_instance_save_has_no_persistence_false_alarm() {
     assert!(!saved.is_empty(), "the real save path wrote a document");
     cleanup_state_file(&path);
 }
+
+// ── Live multi-session bookkeeping (supervisor-backed switching, slice 1) ──
+//
+// The palette's `session_create` now spawns a real `/bin/zsh` PTY per row.
+// These tests spawn real PTYs, following the `noren-pty` test convention; the
+// children are reaped through `PtySession`'s bounded shutdown when the app (or
+// its parked map) drops.
+
+/// Registry ids in sidebar order.
+fn registry_ids(app: &NorenApp) -> Vec<SessionId> {
+    app.workspace
+        .registry()
+        .sessions()
+        .into_iter()
+        .map(|descriptor| descriptor.id())
+        .collect()
+}
+
+/// Observed status of a live registry row.
+fn session_status(app: &NorenApp, id: SessionId) -> SessionStatus {
+    app.workspace
+        .registry()
+        .get(id)
+        .expect("session exists in the registry")
+        .status()
+        .clone()
+}
+
+/// The palette's session_create must spawn a real local PTY: the row is
+/// observed `Running` (never left `Starting`), it owns the live surface, and a
+/// second create parks the first live session instead of killing it.
+///
+/// Mutation check: making `session_create` add a model row without spawning
+/// (no PTY, no `Running` observation) fails every assertion past the first.
+#[test]
+fn palette_create_spawns_a_real_local_pty_session() {
+    let mut app = NorenApp::default();
+
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+
+    let ids = registry_ids(&app);
+    assert_eq!(ids.len(), 1);
+    let first = ids[0];
+    assert_eq!(
+        session_status(&app, first),
+        SessionStatus::Running,
+        "a spawned session must be observed Running, not left Starting"
+    );
+    assert!(
+        app.pty.is_some(),
+        "the new session must own a real live PTY surface"
+    );
+    assert_eq!(app.active_session, Some(first));
+    assert_eq!(app.workspace.registry().selected(), Some(first));
+
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let ids = registry_ids(&app);
+    assert_eq!(ids.len(), 2);
+    let second = ids[1];
+    assert_eq!(
+        session_status(&app, second),
+        SessionStatus::Running,
+        "the second spawn is also a real running session"
+    );
+    assert_eq!(
+        app.active_session,
+        Some(second),
+        "a new session takes the live view"
+    );
+    assert!(
+        app.parked_sessions.contains_key(&first),
+        "the previous live session must be parked, not dropped"
+    );
+    assert_eq!(
+        session_status(&app, first),
+        SessionStatus::Running,
+        "parking keeps the first session truthfully Running"
+    );
+}
+
+/// A parked session that exits in the background is observed through the
+/// registry, reaped, and detached — it never stays `Running` and never leaves
+/// a live-surface entry behind.
+#[test]
+fn a_parked_session_that_exits_is_observed_and_detached() {
+    let mut app = NorenApp::default();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let first = registry_ids(&app)[0];
+    // Tell the first shell to exit while it still owns the live view; the
+    // exit is only observed after the session has been parked, because
+    // nothing drains between these calls.
+    app.send_input(b"exit\n");
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let second = registry_ids(&app)[1];
+    assert!(app.parked_sessions.contains_key(&first));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while session_status(&app, first) == SessionStatus::Running {
+        app.drain_pty();
+        app.drain_parked_sessions();
+        assert!(
+            Instant::now() < deadline,
+            "the parked session's exit was never observed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(
+        matches!(session_status(&app, first), SessionStatus::Exited { .. }),
+        "an exited parked session is observed as Exited (the code is None when \
+         the reader's EOF wins the race with the supervisor's exit poll)"
+    );
+    assert!(
+        !app.parked_sessions.contains_key(&first),
+        "a dead parked session must be detached from the live bookkeeping"
+    );
+    assert_eq!(
+        app.active_session,
+        Some(second),
+        "a parked exit must not disturb the live view"
+    );
+    assert_eq!(session_status(&app, second), SessionStatus::Running);
+}
+
+/// Quitting with several real live sessions persists them all for the next
+/// launch, where they come back as `Restored` rows — live PTYs never survive a
+/// restart, and the persisted model must say so.
+#[test]
+fn quitting_persists_spawned_sessions_for_the_next_launch() {
+    let path = temp_state_path();
+    let mut app = app_with_state_path(&path);
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+
+    app.teardown();
+
+    let text = std::fs::read_to_string(&path).expect("state saved on quit");
+    assert_eq!(
+        text.matches("kind = \"local\"").count(),
+        2,
+        "both spawned sessions persist: {text}"
+    );
+
+    let relaunched = sidebar_after_relaunch(&path);
+    assert_eq!(relaunched.registry().len(), 2);
+    for descriptor in relaunched.registry().sessions() {
+        let status = descriptor.status().clone();
+        assert_eq!(
+            status,
+            SessionStatus::Restored,
+            "a relaunched row must be Restored, not Running"
+        );
+    }
+    assert!(
+        relaunched.registry().selected().is_some(),
+        "the persisted selection survives the restart"
+    );
+    cleanup_state_file(&path);
+}
