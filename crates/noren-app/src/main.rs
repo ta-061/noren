@@ -934,6 +934,42 @@ impl NorenApp {
         }
     }
 
+    /// Switch the live view to `id`.
+    ///
+    /// The active surface is parked (its PTY keeps running) and `id`'s parked
+    /// surface is re-attached, so from the next event onward the renderer,
+    /// input routing, and mouse mapping operate on the selected session —
+    /// they read the same active fields, which now belong to `id`. Switching
+    /// back re-attaches the same terminal state, so the session shows its own
+    /// current screen, not a stale or foreign one.
+    ///
+    /// Returns `false` when `id` has no live surface (a model-only, restored,
+    /// or already exited row): nothing is detached and the current live view
+    /// keeps input ownership.
+    fn switch_live_session(&mut self, id: SessionId) -> bool {
+        if self.workspace.registry().get(id).is_none() {
+            return false;
+        }
+        if self.active_session == Some(id) {
+            // Already the live view; re-affirm the selection only.
+            return self.workspace.select_session(id).is_ok();
+        }
+        let Some(parked) = self.parked_sessions.remove(&id) else {
+            return false;
+        };
+        self.park_active_session();
+        self.pty = Some(parked.pty);
+        self.terminal = Some(parked.terminal);
+        self.active_session = Some(id);
+        self.pty_child = PtyChildStatus::Running;
+        // Grid coordinates captured on the previous session's screen can
+        // only address the wrong content; the selection model expires them.
+        self.selection = None;
+        self.drag_origin = None;
+        self.redraw_needed = true;
+        self.workspace.select_session(id).is_ok()
+    }
+
     fn initialize(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -1398,16 +1434,18 @@ impl NorenApp {
             return false;
         };
         if let Some(id) = self.workspace.local_sidebar_session(row_index) {
-            if Some(id) != self.active_session {
-                if let Some(active) = self.active_session
-                    && self.workspace.select_session(active).is_ok()
-                {
-                    self.ssh_selection_status = None;
-                    self.redraw_needed = true;
-                }
+            // A row with a live surface takes the live view: the terminal
+            // surface, input routing, and the renderer follow the selection.
+            if self.switch_live_session(id) {
+                self.ssh_selection_status = None;
+                self.redraw_needed = true;
                 return true;
             }
-            if self.workspace.select_session(id).is_ok() {
+            // The row has no live surface (model-only, restored, or exited):
+            // input ownership stays with the current live session.
+            if let Some(active) = self.active_session
+                && self.workspace.select_session(active).is_ok()
+            {
                 self.ssh_selection_status = None;
                 self.redraw_needed = true;
             }

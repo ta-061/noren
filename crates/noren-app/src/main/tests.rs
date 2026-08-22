@@ -3704,6 +3704,30 @@ fn session_status(app: &NorenApp, id: SessionId) -> SessionStatus {
         .clone()
 }
 
+/// Drain the live view until the shell has produced its first output.
+///
+/// Real zsh sessions run in the inherited `$HOME`, whose startup files a user
+/// may have customized: input typed before they finish races them, so every
+/// test that drives a shell by typing first waits for its prompt.
+fn wait_for_shell_output(app: &mut NorenApp) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.drain_pty();
+        let ready = app
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.screen().display_row_count() > 0);
+        assert!(
+            Instant::now() < deadline || ready,
+            "the spawned shell never produced its prompt"
+        );
+        if ready {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// The palette's session_create must spawn a real local PTY: the row is
 /// observed `Running` (never left `Starting`), it owns the live surface, and a
 /// second create parks the first live session instead of killing it.
@@ -3764,6 +3788,11 @@ fn a_parked_session_that_exits_is_observed_and_detached() {
     let mut app = NorenApp::default();
     app.run_workspace_action(WorkspaceAction::CreateSession);
     let first = registry_ids(&app)[0];
+    // Wait for the shell to finish starting up before typing into it: input
+    // queued while zsh is still reading its startup files races them, and the
+    // real $HOME (unlike the noren-pty suite's isolated TestHome) carries a
+    // full user configuration.
+    wait_for_shell_output(&mut app);
     // Tell the first shell to exit while it still owns the live view; the
     // exit is only observed after the session has been parked, because
     // nothing drains between these calls.
@@ -3834,4 +3863,124 @@ fn quitting_persists_spawned_sessions_for_the_next_launch() {
         "the persisted selection survives the restart"
     );
     cleanup_state_file(&path);
+}
+
+// ── Sidebar switching (supervisor-backed switching, slice 2) ────────────
+
+/// Whether the session owns a live surface: it is the active one or parked.
+fn has_live_surface(app: &NorenApp, id: SessionId) -> bool {
+    app.active_session == Some(id) || app.parked_sessions.contains_key(&id)
+}
+
+/// Visible text of a terminal state, extracted through the selection path.
+fn terminal_text(terminal: &TerminalState) -> String {
+    Selection::entire_grid(terminal).extract(terminal)
+}
+
+/// Click a sidebar row in a default-sized synthetic frame.
+fn click_sidebar_row(app: &mut NorenApp, row: usize) -> bool {
+    app.cursor_position = Some(PhysicalPosition::new(
+        5.0,
+        f64::from(app.geometry.cell_height()) * row as f64 + 1.0,
+    ));
+    app.handle_sidebar_click_in_frame(
+        ElementState::Pressed,
+        MouseButton::Left,
+        PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT),
+    )
+}
+
+/// Clicking another session row must move the whole live view — the terminal
+/// surface the renderer draws and `send_input` feeds — to the clicked
+/// session, and switching back must show that session's own screen again.
+///
+/// Mutation check: making the switch a no-op that keeps rendering the old
+/// session fails the screen-content assertions after every click.
+#[test]
+fn sidebar_click_switches_the_live_surface_between_sessions() {
+    let mut app = NorenApp::default();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let ids = registry_ids(&app);
+    let (first, second) = (ids[0], ids[1]);
+    assert_eq!(app.active_session, Some(second));
+
+    // The second (live) session's screen gets a marker through the exact
+    // byte path production uses for PTY output.
+    app.apply_pty_output(b"SECOND-LIVE-7f31\r\n");
+
+    assert!(click_sidebar_row(&mut app, 0), "row 0 is consumed");
+    assert_eq!(app.active_session, Some(first), "the live view moved");
+    assert_eq!(app.workspace.registry().selected(), Some(first));
+    let text = terminal_text(app.terminal.as_ref().expect("first surface attached"));
+    assert!(
+        !text.contains("SECOND-LIVE-7f31"),
+        "the live view must show the first session's screen, not the previous one"
+    );
+    assert!(
+        has_live_surface(&app, second),
+        "the parked session stays live"
+    );
+
+    // Each session's screen keeps its own bytes after a switch.
+    app.apply_pty_output(b"FIRST-LIVE-7f31\r\n");
+    assert!(click_sidebar_row(&mut app, 1));
+    assert_eq!(app.active_session, Some(second));
+    let text = terminal_text(app.terminal.as_ref().expect("second surface attached"));
+    assert!(text.contains("SECOND-LIVE-7f31"));
+    assert!(!text.contains("FIRST-LIVE-7f31"));
+
+    assert!(click_sidebar_row(&mut app, 0));
+    assert_eq!(app.active_session, Some(first));
+    let text = terminal_text(app.terminal.as_ref().expect("first surface attached"));
+    assert!(
+        text.contains("FIRST-LIVE-7f31"),
+        "switching back re-attaches the first session's own screen"
+    );
+    assert!(!text.contains("SECOND-LIVE-7f31"));
+}
+
+/// A row without a live surface (model-only, restored, or exited) is consumed
+/// but cannot take input ownership: the current live session keeps it.
+#[test]
+fn switching_to_a_row_without_a_live_surface_keeps_the_current_owner() {
+    let mut app = NorenApp::default();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let live = registry_ids(&app)[0];
+    // A model-only row straight from the registry seam: no PTY behind it.
+    let _model = app.workspace.create_session(SessionKind::Local);
+    app.workspace.rebuild_sidebar();
+
+    assert!(click_sidebar_row(&mut app, 1), "the model row is consumed");
+
+    assert_eq!(
+        app.active_session,
+        Some(live),
+        "a row without a live surface must not take the live view"
+    );
+    assert_eq!(app.workspace.registry().selected(), Some(live));
+    assert!(app.pty.is_some(), "the live surface is untouched");
+    assert!(!has_live_surface(&app, _model));
+}
+
+/// Switching expires selections captured on the previous session's screen:
+/// grid coordinates only address the content they were captured on.
+#[test]
+fn switching_expires_the_previous_sessions_selection() {
+    let mut app = NorenApp::default();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let ids = registry_ids(&app);
+    app.apply_pty_output(b"SELECT-7f31");
+    app.select_entire_grid();
+    assert!(app.selection.is_some());
+
+    assert!(click_sidebar_row(&mut app, 0));
+
+    assert_eq!(app.active_session, Some(ids[0]));
+    assert!(
+        app.selection.is_none(),
+        "a selection from the previous screen must not survive the switch"
+    );
+    assert!(app.drag_origin.is_none());
 }
