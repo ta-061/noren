@@ -1,9 +1,17 @@
 //! Noren-owned process and PTY boundary for the macOS local-shell PoC.
 //!
 //! The public API deliberately exposes no `portable-pty` types. A session
-//! always launches `/bin/zsh` without caller-controlled arguments or `-c`,
-//! moves blocking I/O off the UI thread, bounds every queue and payload, and
-//! owns child termination and reaping in one supervisor thread.
+//! launches either the fixed `/bin/zsh` shell or the fixed system SSH client
+//! (`/usr/bin/ssh`) — in both cases without caller-controlled arguments or
+//! `-c`, moves blocking I/O off the UI thread, bounds every queue and payload,
+//! and owns child termination and reaping in one supervisor thread.
+//!
+//! The SSH launch path drives the system `ssh` binary only. Noren never
+//! reimplements the SSH protocol and never passes a credential, key, or
+//! password on the command line: argv is exactly `ssh -- <destination>`, and
+//! authentication relies on ssh's own agent and configuration resolution. A
+//! destination is accepted only through [`SshDestination`], whose typed
+//! refusals carry no destination content.
 
 use portable_pty::{CommandBuilder, PtySize as PortablePtySize, native_pty_system};
 use std::ffi::OsString;
@@ -31,6 +39,14 @@ pub const REPLY_BYTES_PER_SECOND: usize = 64 * 1024;
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
 
 const ZSH_PROGRAM: &str = "/bin/zsh";
+/// Fixed system SSH client. An absolute path deliberately bypasses `PATH`
+/// so a writable `PATH` entry cannot substitute a different binary.
+const SSH_PROGRAM: &str = "/usr/bin/ssh";
+/// End-of-options marker. Combined with the destination validation this makes
+/// option injection through a hostile alias impossible, not just unlikely.
+const SSH_END_OF_OPTIONS: &str = "--";
+/// Maximum accepted SSH destination bytes before the launch is refused.
+const MAX_SSH_DESTINATION_BYTES: usize = 1024;
 const TERM_VALUE: &str = "xterm-256color";
 const TERM_PROGRAM_VALUE: &str = "Noren-PoC";
 const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
@@ -166,6 +182,225 @@ fn build_zsh_command(policy: &ZshLaunchPolicy) -> CommandBuilder {
     command
 }
 
+/// An unexpanded OpenSSH percent token found in a destination.
+///
+/// OpenSSH expands these inside configuration keywords (never in the
+/// destination argument), so a token that survived into the destination
+/// string is by definition unexpanded. Each token names the keyword whose
+/// value could have carried it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SshPercentToken {
+    /// `%h`: the remote hostname, as written in a `HostName` value.
+    Host,
+    /// `%p`: the remote port, as written in a `Port`-derived value.
+    Port,
+    /// `%r`: the remote username, as written in a `User` value.
+    RemoteUser,
+}
+
+impl SshPercentToken {
+    /// The literal OpenSSH token spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "%h",
+            Self::Port => "%p",
+            Self::RemoteUser => "%r",
+        }
+    }
+
+    /// The configuration keyword whose value could have carried this token.
+    #[must_use]
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            Self::Host => "HostName",
+            Self::Port => "Port",
+            Self::RemoteUser => "User",
+        }
+    }
+
+    /// The first token `destination` contains, if any.
+    ///
+    /// The scan is deliberately conservative: it does not honour OpenSSH's
+    /// `%%` escaping, because a destination that merely contains a token
+    /// spelling has no legitimate origin in this application.
+    fn first_in(destination: &str) -> Option<Self> {
+        [Self::Host, Self::Port, Self::RemoteUser]
+            .into_iter()
+            .find(|token| destination.contains(token.as_str()))
+    }
+}
+
+impl fmt::Display for SshPercentToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Typed refusal of a destination string, carrying no destination content.
+///
+/// Every message is a fixed string: the rejected bytes never appear in an
+/// error, so a destination that happens to embed a secret cannot leak through
+/// `Display`, `Debug`, or a log line that prints either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshDestinationError {
+    /// The destination was empty.
+    Empty,
+    /// The destination exceeded [`MAX_SSH_DESTINATION_BYTES`].
+    Oversize,
+    /// The destination began with `-`, so ssh could parse it as an option.
+    LeadingHyphen,
+    /// The destination contained an ASCII control character or whitespace.
+    ControlOrWhitespace,
+    /// The destination contained an unexpanded OpenSSH percent token. The
+    /// connect must not proceed.
+    RawToken {
+        /// Which token was found.
+        token: SshPercentToken,
+    },
+}
+
+impl fmt::Display for SshDestinationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("SSH destination must not be empty"),
+            Self::Oversize => f.write_str("SSH destination exceeds its byte limit"),
+            Self::LeadingHyphen => f.write_str(
+                "SSH destination must not begin with a hyphen; ssh would parse it as an option",
+            ),
+            Self::ControlOrWhitespace => {
+                f.write_str("SSH destination must not contain control characters or whitespace")
+            }
+            Self::RawToken { token } => write!(
+                f,
+                "SSH destination contains the unexpanded OpenSSH token {} ({} keyword); \
+                 the connect must not proceed",
+                token.as_str(),
+                token.keyword()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SshDestinationError {}
+
+/// A validated SSH destination (`ssh -- <destination>` final argument).
+///
+/// Validation is the argv-injection boundary, so it is deliberately stricter
+/// than what OpenSSH would accept: the destination must be non-empty, at most
+/// [`MAX_SSH_DESTINATION_BYTES`] bytes, free of ASCII control characters and
+/// whitespace, must not begin with `-` (an alias like `-oProxyCommand=…`
+/// parsed out of a hostile `Host` directive must never reach argv as an
+/// option), and must not contain an unexpanded `%h`/`%p`/`%r` token (see
+/// [`SshPercentToken`]). Combined with the fixed `--` end-of-options marker,
+/// no accepted destination can be interpreted as an ssh option.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SshDestination {
+    destination: String,
+}
+
+impl SshDestination {
+    /// Validate `destination` for the fixed ssh argv, or reject it with a
+    /// typed, content-free error.
+    pub fn new(destination: &str) -> Result<Self, SshDestinationError> {
+        if destination.is_empty() {
+            return Err(SshDestinationError::Empty);
+        }
+        if destination.len() > MAX_SSH_DESTINATION_BYTES {
+            return Err(SshDestinationError::Oversize);
+        }
+        if let Some(token) = SshPercentToken::first_in(destination) {
+            return Err(SshDestinationError::RawToken { token });
+        }
+        if destination.starts_with('-') {
+            return Err(SshDestinationError::LeadingHyphen);
+        }
+        if destination
+            .chars()
+            .any(|c| c.is_ascii_control() || c.is_whitespace())
+        {
+            return Err(SshDestinationError::ControlOrWhitespace);
+        }
+        Ok(Self {
+            destination: destination.to_owned(),
+        })
+    }
+
+    /// The validated destination string.
+    ///
+    /// This accessor exists to build the child argv, not for display: the
+    /// [`fmt::Debug`] implementation is redacted so a destination that embeds
+    /// a secret can never reach a log through a debug print.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.destination
+    }
+}
+
+impl fmt::Debug for SshDestination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The destination may embed a secret-shaped value and has no business
+        // in any debug surface, so it is redacted exactly like the zsh
+        // policy's home directory.
+        f.debug_struct("SshDestination")
+            .field("destination", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Fixed system-ssh launch policy.
+///
+/// The child inherits the caller's environment unchanged (except the fixed
+/// `TERM`/`TERM_PROGRAM` overrides below) so ssh performs its own agent, key,
+/// and config resolution. There is deliberately no home-override seam like
+/// [`ZshLaunchPolicy`]'s: OpenSSH resolves its per-user configuration through
+/// the passwd database rather than `$HOME`, so an env override would not
+/// isolate anything while suggesting it does.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SshLaunchPolicy {
+    destination: SshDestination,
+}
+
+impl SshLaunchPolicy {
+    /// Launch the system ssh client to `destination`, inheriting HOME and the
+    /// agent environment from this process.
+    #[must_use]
+    pub fn inherit(destination: SshDestination) -> Self {
+        Self { destination }
+    }
+
+    /// The validated destination this policy connects to.
+    #[must_use]
+    pub fn destination(&self) -> &SshDestination {
+        &self.destination
+    }
+}
+
+impl fmt::Debug for SshLaunchPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SshLaunchPolicy")
+            .field("destination", &self.destination)
+            .finish()
+    }
+}
+
+/// Build the fixed ssh command. Security invariants, pinned by tests:
+///
+/// - argv is exactly `[SSH_PROGRAM, "--", destination]` — no options, so no
+///   credential, identity, or command can ever appear in argv (`ps`-visible).
+/// - `HOME` is not overridden (ssh needs the real agent/config resolution);
+///   `COLUMNS`/`LINES` are dropped exactly like the zsh policy.
+fn build_ssh_command(policy: &SshLaunchPolicy) -> CommandBuilder {
+    let mut command = CommandBuilder::new(SSH_PROGRAM);
+    command.arg(SSH_END_OF_OPTIONS);
+    command.arg(policy.destination.as_str());
+    command.env("TERM", TERM_VALUE);
+    command.env("TERM_PROGRAM", TERM_PROGRAM_VALUE);
+    command.env_remove("COLUMNS");
+    command.env_remove("LINES");
+    command
+}
+
 /// PTY operations named by payload-free errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PtyOperation {
@@ -294,6 +529,16 @@ impl PtySession {
         Self::spawn_with_policy(ZshLaunchPolicy::from_environment()?, size)
     }
 
+    /// Spawn the fixed system ssh client for `destination` at the supplied
+    /// initial non-zero size, so the remote shell is interactive.
+    ///
+    /// argv is exactly `ssh -- <destination>` (see [`build_ssh_command`]);
+    /// no credential is ever passed on the command line and authentication is
+    /// left to ssh's own agent and configuration resolution.
+    pub fn spawn_ssh(policy: SshLaunchPolicy, size: PtySize) -> Result<Self, PtyError> {
+        Self::spawn_session(build_ssh_command(&policy), size)
+    }
+
     /// Spawn `/bin/zsh` with `home` as the child's `HOME` and working
     /// directory instead of the inherited one.
     ///
@@ -311,6 +556,11 @@ impl PtySession {
 
     /// Spawn using an already validated fixed-zsh policy.
     fn spawn_with_policy(policy: ZshLaunchPolicy, size: PtySize) -> Result<Self, PtyError> {
+        Self::spawn_session(build_zsh_command(&policy), size)
+    }
+
+    /// Common bounded supervisor wiring for every fixed launch policy.
+    fn spawn_session(command: CommandBuilder, size: PtySize) -> Result<Self, PtyError> {
         let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::sync_channel(OUTPUT_CHANNEL_CAPACITY);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -322,7 +572,7 @@ impl PtySession {
             .name("noren-pty-supervisor".to_owned())
             .spawn(move || {
                 supervisor_main(
-                    policy,
+                    command,
                     size,
                     command_rx,
                     event_tx,
@@ -455,7 +705,7 @@ fn validate_reply(bytes: &[u8]) -> Result<(), PtyError> {
 }
 
 fn supervisor_main(
-    policy: ZshLaunchPolicy,
+    command: CommandBuilder,
     size: PtySize,
     command_rx: Receiver<SupervisorCommand>,
     event_tx: SyncSender<PtyEvent>,
@@ -463,7 +713,7 @@ fn supervisor_main(
     done_tx: SyncSender<Result<(), PtyError>>,
     closing: Arc<AtomicBool>,
 ) {
-    let setup = setup_pty(&policy, size, &event_tx, Arc::clone(&closing));
+    let setup = setup_pty(command, size, &event_tx, Arc::clone(&closing));
     let (master, writer, mut child, reader, reader_done) = match setup {
         Ok(parts) => {
             let _ = ready_tx.send(Ok(()));
@@ -609,7 +859,7 @@ type PtyParts = (
 );
 
 fn setup_pty(
-    policy: &ZshLaunchPolicy,
+    command: CommandBuilder,
     size: PtySize,
     event_tx: &SyncSender<PtyEvent>,
     closing: Arc<AtomicBool>,
@@ -628,7 +878,6 @@ fn setup_pty(
     let writer = pair.master.take_writer().map_err(|_| PtyError::Backend {
         operation: PtyOperation::TakeWriter,
     })?;
-    let command = build_zsh_command(policy);
     let mut child = pair
         .slave
         .spawn_command(command)
@@ -894,6 +1143,229 @@ mod tests {
         assert_eq!(command.get_env("COLUMNS"), None);
         assert_eq!(command.get_env("LINES"), None);
         fs::remove_dir(directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn ssh_destination_accepts_plain_targets_and_rejects_injection_classes() {
+        assert!(SshDestination::new("web1.example").is_ok());
+        assert!(SshDestination::new("user@10.0.0.9").is_ok());
+        assert!(SshDestination::new(&"a".repeat(MAX_SSH_DESTINATION_BYTES)).is_ok());
+
+        assert_eq!(SshDestination::new(""), Err(SshDestinationError::Empty));
+        assert_eq!(
+            SshDestination::new(&"a".repeat(MAX_SSH_DESTINATION_BYTES + 1)),
+            Err(SshDestinationError::Oversize)
+        );
+        assert_eq!(
+            SshDestination::new("-oProxyCommand=evil"),
+            Err(SshDestinationError::LeadingHyphen)
+        );
+        for rejected in [
+            "space here",
+            "tab\there",
+            "nl\nhere",
+            "nul\0here",
+            "esc\u{1b}here",
+        ] {
+            assert_eq!(
+                SshDestination::new(rejected),
+                Err(SshDestinationError::ControlOrWhitespace),
+                "control/whitespace destination must be rejected: {rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_destination_rejects_every_unexpanded_percent_token_by_keyword() {
+        assert_eq!(
+            SshDestination::new("user@%h.example"),
+            Err(SshDestinationError::RawToken {
+                token: SshPercentToken::Host
+            })
+        );
+        assert_eq!(
+            SshDestination::new("host.example:%p"),
+            Err(SshDestinationError::RawToken {
+                token: SshPercentToken::Port
+            })
+        );
+        assert_eq!(
+            SshDestination::new("%r@host.example"),
+            Err(SshDestinationError::RawToken {
+                token: SshPercentToken::RemoteUser
+            })
+        );
+    }
+
+    #[test]
+    fn ssh_destination_error_messages_name_keyword_and_token_without_content() {
+        const SECRET: &str = "hunter2-token";
+
+        for (destination, token) in [
+            (format!("{SECRET}@%h.example"), SshPercentToken::Host),
+            (format!("host.example:%p-{SECRET}"), SshPercentToken::Port),
+            (
+                format!("%r-{SECRET}@host.example"),
+                SshPercentToken::RemoteUser,
+            ),
+        ] {
+            let error = SshDestination::new(&destination).expect_err("token-bearing destination");
+            let text = error.to_string();
+            assert!(
+                text.contains(token.as_str()),
+                "the message must name the token: {text}"
+            );
+            assert!(
+                text.contains(token.keyword()),
+                "the message must name the keyword: {text}"
+            );
+            assert!(
+                !text.contains(SECRET),
+                "the message must never carry destination content: {text}"
+            );
+            assert!(!format!("{error:?}").contains(SECRET));
+        }
+
+        for (destination, expected) in [
+            ("", SshDestinationError::Empty),
+            (
+                &"a".repeat(MAX_SSH_DESTINATION_BYTES + 1),
+                SshDestinationError::Oversize,
+            ),
+            ("-Wevil", SshDestinationError::LeadingHyphen),
+            ("a b", SshDestinationError::ControlOrWhitespace),
+        ] {
+            let error = SshDestination::new(destination).expect_err("rejected destination");
+            assert_eq!(error, expected);
+            assert!(error.to_string().starts_with("SSH destination"));
+            assert!(!error.to_string().contains("a".repeat(8).as_str()));
+        }
+    }
+
+    #[test]
+    fn ssh_destination_and_policy_debug_never_carry_the_destination() {
+        const SECRET: &str = "noren-debug-secret-9f21";
+
+        let destination =
+            SshDestination::new(&format!("{SECRET}@example.com")).expect("secret-shaped target");
+        assert!(!format!("{destination:?}").contains(SECRET));
+        assert!(format!("{destination:?}").contains("<redacted>"));
+
+        let policy = SshLaunchPolicy::inherit(destination);
+        let inspected = format!("{policy:?}");
+        assert!(
+            !inspected.contains(SECRET),
+            "debug must be redacted: {inspected}"
+        );
+        assert!(inspected.contains("<redacted>"));
+    }
+
+    #[test]
+    fn ssh_command_argv_is_exactly_the_fixed_program_marker_and_destination() {
+        let destination = SshDestination::new("deploy@web1.example").expect("valid destination");
+        let policy = SshLaunchPolicy::inherit(destination);
+        let command = build_ssh_command(&policy);
+
+        assert_eq!(
+            command.get_argv(),
+            &[
+                OsString::from(SSH_PROGRAM),
+                OsString::from(SSH_END_OF_OPTIONS),
+                OsString::from("deploy@web1.example"),
+            ]
+        );
+        assert!(
+            command.get_cwd().is_none(),
+            "the ssh launch must not pin a working directory"
+        );
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new(TERM_VALUE))
+        );
+        assert_eq!(
+            command.get_env("TERM_PROGRAM"),
+            Some(std::ffi::OsStr::new(TERM_PROGRAM_VALUE))
+        );
+        assert_eq!(command.get_env("COLUMNS"), None);
+        assert_eq!(command.get_env("LINES"), None);
+        // The child's HOME is the caller's HOME, byte for byte: ssh's own
+        // agent and per-user configuration resolution must be inherited, not
+        // redirected.
+        assert_eq!(
+            command.get_env("HOME"),
+            std::env::var_os("HOME").as_deref(),
+            "the ssh launch must inherit HOME unchanged"
+        );
+    }
+
+    #[test]
+    fn ssh_command_argv_carries_no_credential_shaped_option() {
+        // Whatever the destination looks like, argv length is fixed at three
+        // and no argument can be interpreted as an option: the marker ends
+        // option parsing and the destination is the final argument.
+        for target in ["plain", "user@host", "host:2222", "equals=x", "quotes'q"] {
+            let destination = SshDestination::new(target).expect("valid destination");
+            let command = build_ssh_command(&SshLaunchPolicy::inherit(destination));
+            let argv = command.get_argv();
+            assert_eq!(argv.len(), 3, "argv must stay fixed for {target:?}");
+            assert_eq!(argv[0], OsString::from(SSH_PROGRAM));
+            assert_eq!(argv[1], OsString::from(SSH_END_OF_OPTIONS));
+            assert_eq!(argv[2], OsString::from(target));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn spawn_ssh_drives_the_system_client_and_surfaces_a_fast_failure() {
+        // Drive the real /usr/bin/ssh through the production argv. A
+        // destination beginning with `@` is rejected by ssh's own argument
+        // parsing before any name resolution or connection, so the process
+        // exits 255 with its usage diagnostic in milliseconds — deterministically,
+        // with no network access and no credential. The test observes the real
+        // fixed argv reaching the real binary and the failure flowing through
+        // the normal PTY output path.
+        const SSH_ARG_FAILURE: &str = "@noren-usage-refusal";
+
+        let destination = SshDestination::new(SSH_ARG_FAILURE).expect("valid destination");
+        let size = PtySize::from_raw(24, 80).expect("valid initial size");
+        let mut session = PtySession::spawn_ssh(SshLaunchPolicy::inherit(destination), size)
+            .expect("spawn the fixed system ssh client");
+
+        let mut output = Vec::new();
+        let mut saw_eof = false;
+        let mut exit_code: Option<u32> = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && exit_code.is_none() {
+            match session.try_recv().expect("receive PTY event") {
+                Some(PtyEvent::Output(bytes)) => output.extend_from_slice(&bytes),
+                Some(PtyEvent::Eof) => saw_eof = true,
+                Some(PtyEvent::Exited { code }) => exit_code = code,
+                Some(PtyEvent::Error(error)) => panic!("unexpected typed PTY error: {error}"),
+                None => thread::sleep(Duration::from_millis(2)),
+            }
+        }
+
+        let code =
+            exit_code.unwrap_or_else(|| {
+                panic!(
+                    "the system ssh client must terminate after its usage refusal; eof={saw_eof} output={}",
+                    String::from_utf8_lossy(&output)
+                )
+            });
+        assert_eq!(
+            code, 255,
+            "ssh reports its own argument-parsing failure as its error exit"
+        );
+        assert!(
+            output.windows(b"usage:".len()).any(|w| w == b"usage:"),
+            "the ssh client's own diagnostic must flow through the normal PTY output path"
+        );
+        assert!(
+            saw_eof,
+            "the reader must observe EOF after the child terminates"
+        );
+        session.shutdown().expect("bounded shutdown after ssh exit");
+        session.shutdown().expect("shutdown remains idempotent");
     }
 
     #[test]

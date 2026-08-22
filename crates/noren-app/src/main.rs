@@ -32,12 +32,15 @@ use noren_app::{
     sidebar::{SidebarEntry, SidebarView},
     ssh_config::{HostDiscoveryKind, SshConfig},
 };
-use noren_pty::{PtyEvent, PtySession, PtySize};
+use noren_pty::{
+    PtyEvent, PtySession, PtySize, SshDestination, SshDestinationError, SshLaunchPolicy,
+};
 use noren_terminal::{
     GridPoint, Selection, SelectionMode, TerminalEngine, TerminalError, TerminalState,
 };
 use renderer::{RenderOutcome, Renderer};
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -66,6 +69,108 @@ const SSH_SIDEBAR_TARGET_CHARS: usize = SSH_SIDEBAR_LABEL_CHARS - SSH_SIDEBAR_LA
 const SSH_SIDEBAR_TRUNCATED_TARGET_CHARS: usize =
     SSH_SIDEBAR_TARGET_CHARS - SSH_SIDEBAR_TRUNCATION_MARKER_CHARS;
 const SSH_SIDEBAR_DETAIL: &str = "not connected";
+/// Sidebar prefix while an ssh child owns the terminal (8 ASCII chars, so
+/// the label arithmetic in [`ssh_state_label`] is unchanged).
+const SSH_SIDEBAR_PREFIX_CONNECTED: &str = "SSH-ON  ";
+/// Sidebar prefix after a launch or connection failure (8 ASCII chars).
+const SSH_SIDEBAR_PREFIX_FAILED: &str = "SSH-ERR ";
+/// How long an ssh session may sit between EOF and its reaped exit event
+/// before it is classified as an immediate disconnect.
+const SSH_EOF_REAP_GRACE: Duration = Duration::from_secs(2);
+/// Status-row text for each SSH connection phase. Fixed strings only: a
+/// destination may embed a secret-shaped value, so no phase message may ever
+/// name it.
+const SSH_STATUS_CONNECTING: &str = "Noren ssh connecting";
+const SSH_STATUS_CLOSED: &str = "Noren ssh session closed";
+const SSH_STATUS_CONNECT_FAILED: &str = "Noren ssh connection failed";
+const SSH_STATUS_DISCONNECTED: &str = "Noren ssh connection lost";
+const SSH_STATUS_LAUNCH_FAILED: &str = "Noren ssh launch failed";
+const SSH_STATUS_REFUSED: &str = "Noren ssh connect refused";
+
+/// Observed state of the one live SSH launch. This is application-local
+/// runtime state, deliberately outside the session registry: the registry
+/// persists to `sessions.toml`, and a destination — which may embed a
+/// secret-shaped value — must never be persisted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SshConnectionPhase {
+    /// The system ssh client was spawned and owns the terminal; no output
+    /// has been observed yet.
+    Connecting,
+    /// The remote side has produced output through the normal PTY path, so
+    /// an interactive session is under way.
+    Connected,
+    /// ssh exited cleanly (exit code 0); the terminal is back offline.
+    Closed,
+    /// The ssh child could not be spawned at all.
+    LaunchFailed,
+    /// ssh exited non-zero: unreachable host, authentication failure, or a
+    /// refused destination.
+    ConnectFailed,
+    /// The PTY closed without a reaped exit code: an immediate disconnect.
+    Disconnected,
+}
+
+impl SshConnectionPhase {
+    /// Whether this phase owns the terminal with a live ssh child.
+    const fn is_live(self) -> bool {
+        matches!(self, Self::Connecting | Self::Connected)
+    }
+
+    /// The bounded ASCII sidebar prefix (8 chars).
+    const fn sidebar_prefix(self) -> &'static str {
+        match self {
+            Self::Connecting | Self::Connected => SSH_SIDEBAR_PREFIX_CONNECTED,
+            Self::Closed => SSH_SIDEBAR_LABEL_PREFIX,
+            Self::LaunchFailed | Self::ConnectFailed | Self::Disconnected => {
+                SSH_SIDEBAR_PREFIX_FAILED
+            }
+        }
+    }
+
+    /// The bounded ASCII sidebar detail text.
+    const fn sidebar_detail(self) -> &'static str {
+        match self {
+            Self::Connecting => "connecting",
+            Self::Connected => "connected",
+            Self::Closed => SSH_SIDEBAR_DETAIL,
+            Self::LaunchFailed => "launch failed",
+            Self::ConnectFailed => "connection failed",
+            Self::Disconnected => "disconnected",
+        }
+    }
+
+    /// The status-row text for this phase.
+    const fn status_text(self) -> &'static str {
+        match self {
+            Self::Connecting => SSH_STATUS_CONNECTING,
+            Self::Connected => SSH_STATUS_CONNECTING,
+            Self::Closed => SSH_STATUS_CLOSED,
+            Self::LaunchFailed => SSH_STATUS_LAUNCH_FAILED,
+            Self::ConnectFailed => SSH_STATUS_CONNECT_FAILED,
+            Self::Disconnected => SSH_STATUS_DISCONNECTED,
+        }
+    }
+}
+
+/// Classify the terminal observation of an ended ssh child. This is the
+/// failure-mapping seam: every non-clean outcome is a visible failure phase,
+/// never a silent hang or a fake success.
+fn ssh_exit_observation(code: Option<u32>) -> SshConnectionPhase {
+    match code {
+        Some(0) => SshConnectionPhase::Closed,
+        Some(_) => SshConnectionPhase::ConnectFailed,
+        None => SshConnectionPhase::Disconnected,
+    }
+}
+
+/// Classify a spawn attempt for the fixed system ssh client.
+fn ssh_launch_observation(spawned: bool) -> SshConnectionPhase {
+    if spawned {
+        SshConnectionPhase::Connecting
+    } else {
+        SshConnectionPhase::LaunchFailed
+    }
+}
 /// Keep the complete source identity and the partial-discovery warning visible
 /// together on ordinary terminal widths. The stable source tag is placed first
 /// so path truncation cannot make two retained sources indistinguishable.
@@ -76,6 +181,14 @@ const SSH_STATUS_SOURCE_CHARS: usize = 40;
 /// so this helper does the same and looks at one scalar beyond the untruncated
 /// target budget solely to decide whether the ASCII marker is needed.
 fn ssh_sidebar_label(target: &str) -> String {
+    ssh_state_label(SshConnectionPhase::Closed, target)
+}
+
+/// Build the bounded sidebar label for an SSH target in `phase`.
+///
+/// The prefix encodes the connection state; the target text is bounded
+/// exactly like the offline label.
+fn ssh_state_label(phase: SshConnectionPhase, target: &str) -> String {
     let inspected: Vec<char> = target
         .chars()
         .take(SSH_SIDEBAR_TARGET_CHARS.saturating_add(1))
@@ -87,7 +200,7 @@ fn ssh_sidebar_label(target: &str) -> String {
         inspected.len()
     };
     let mut label = String::with_capacity(SSH_SIDEBAR_LABEL_CHARS.saturating_mul(4));
-    label.push_str(SSH_SIDEBAR_LABEL_PREFIX);
+    label.push_str(phase.sidebar_prefix());
     label.extend(inspected.into_iter().take(visible_target_chars));
     if truncated {
         label.push_str(SSH_SIDEBAR_TRUNCATION_MARKER);
@@ -198,6 +311,10 @@ struct WorkspaceState {
     ssh_hosts_omitted: usize,
     selected_ssh_target: Option<String>,
     selected_ssh_source_label: Option<String>,
+    /// The one live SSH launch's target and phase, mirrored here only so
+    /// [`Self::rebuild_sidebar`] can mark the matching configured row. The
+    /// target never enters the registry, so it is never persisted.
+    ssh_connection: Option<(String, SshConnectionPhase)>,
     /// Owned by the workspace; dispatched when the palette opens.
     palette: Palette<WorkspaceAction>,
     /// Where sidebar state is persisted. `None` in tests and when `HOME` is
@@ -207,6 +324,36 @@ struct WorkspaceState {
     /// Exact comparison baseline plus persistence diagnostics. Baseline
     /// validity is explicit so failures cannot reuse stale or assumed bytes.
     persistence: PersistenceState,
+}
+
+impl fmt::Debug for WorkspaceState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The selected and connected SSH targets may embed secret-shaped
+        // values, so every debug surface redacts them. The provenance label
+        // is bounded root-relative display text and stays visible.
+        f.debug_struct("WorkspaceState")
+            .field("registry", &self.registry.len())
+            .field("registry_selection", &self.registry.selected())
+            .field("sidebar", &self.sidebar)
+            .field("ssh_hosts", &self.ssh_hosts.len())
+            .field("ssh_hosts_omitted", &self.ssh_hosts_omitted)
+            .field(
+                "selected_ssh_target",
+                &self.selected_ssh_target.as_deref().map(|_| "<redacted>"),
+            )
+            .field("selected_ssh_source_label", &self.selected_ssh_source_label)
+            .field(
+                "ssh_connection",
+                &self
+                    .ssh_connection
+                    .as_ref()
+                    .map(|(_, phase)| format!("<redacted target, phase={phase:?}>")),
+            )
+            .field("palette", &self.palette)
+            .field("state_path", &self.state_path)
+            .field("persistence", &self.persistence)
+            .finish()
+    }
 }
 
 impl Default for WorkspaceState {
@@ -233,6 +380,7 @@ impl WorkspaceState {
             ssh_hosts_omitted: 0,
             selected_ssh_target: None,
             selected_ssh_source_label: None,
+            ssh_connection: None,
             palette: Palette::noren(
                 WorkspaceAction::CreateSession,
                 WorkspaceAction::SelectSession,
@@ -398,6 +546,17 @@ impl WorkspaceState {
         true
     }
 
+    /// Record the phase of the one live SSH launch and refresh the sidebar.
+    ///
+    /// The target is compared against the configured host rows to mark the
+    /// matching row's state. It is held in memory only: the registry is the
+    /// only persisted state and it never sees an SSH launch, so the target
+    /// cannot reach `sessions.toml`.
+    fn set_ssh_connection(&mut self, target: &str, phase: SshConnectionPhase) {
+        self.ssh_connection = Some((target.to_owned(), phase));
+        self.rebuild_sidebar();
+    }
+
     /// Resolve the local session id at a stable sidebar position.
     ///
     /// Session rows precede SSH facts and are generated from the registry's
@@ -448,9 +607,20 @@ impl WorkspaceState {
             let selected =
                 !pending_marked && self.selected_ssh_target.as_deref() == Some(target.as_str());
             pending_marked |= selected;
+            // The one live connection, if any, is matched by exact target so
+            // colliding truncated labels cannot mark the wrong row.
+            let phase = self
+                .ssh_connection
+                .as_ref()
+                .filter(|(connected, _)| connected == target)
+                .map(|(_, phase)| *phase);
+            let (label, detail) = match phase {
+                Some(phase) => (ssh_state_label(phase, target), phase.sidebar_detail()),
+                None => (ssh_sidebar_label(target), SSH_SIDEBAR_DETAIL),
+            };
             Some(SidebarEntry::SshConnection {
-                label: ssh_sidebar_label(target),
-                host: SSH_SIDEBAR_DETAIL.to_string(),
+                label,
+                host: detail.to_owned(),
                 selected,
             })
         }));
@@ -473,8 +643,8 @@ impl WorkspaceState {
     }
 
     /// The configured host that was selected, if any. Selection is a pending
-    /// UI choice and deliberately does not imply a connection or viewport.
-    #[cfg(test)]
+    /// UI choice; when a launch follows, the click path also drives
+    /// [`Self::set_ssh_connection`] for the same target.
     fn selected_ssh_target(&self) -> Option<&str> {
         self.selected_ssh_target.as_deref()
     }
@@ -530,6 +700,18 @@ struct NorenApp {
     diagnostics_line: String,
     ssh_diagnostic: Option<String>,
     ssh_selection_status: Option<String>,
+    /// When EOF was observed on a live ssh child whose reaped exit event has
+    /// not arrived yet; drives the immediate-disconnect classification.
+    ssh_eof_since: Option<Instant>,
+    /// Production spawns the real system ssh client. The binary test seam can
+    /// disable the spawn so the click path is exercised without launching any
+    /// process, keeping the unit suite deterministic.
+    ssh_spawn_enabled: bool,
+    /// Test-only override that makes the ssh spawn attempt itself fail (the
+    /// `Err` arm of `PtySession::spawn_ssh`), which cannot be forced from a
+    /// valid destination on a healthy machine. Production never sets it.
+    #[cfg(test)]
+    ssh_spawn_force_failure: bool,
     redraw_needed: bool,
     // User-initiated selection state. The renderer does not highlight it yet;
     // copy still extracts it. Any PTY output or resize invalidates it because
@@ -633,6 +815,10 @@ impl NorenApp {
             diagnostics_line: String::new(),
             ssh_diagnostic: None,
             ssh_selection_status: None,
+            ssh_eof_since: None,
+            ssh_spawn_enabled: true,
+            #[cfg(test)]
+            ssh_spawn_force_failure: false,
             redraw_needed: true,
             selection: None,
             drag_origin: None,
@@ -763,6 +949,135 @@ impl NorenApp {
         self.ssh_diagnostic = Some(line);
         self.redraw_needed = true;
     }
+
+    /// Whether the live PTY is owned by an ssh child of a live launch.
+    fn ssh_live(&self) -> bool {
+        self.workspace
+            .ssh_connection
+            .as_ref()
+            .is_some_and(|(_, phase)| phase.is_live())
+    }
+
+    /// The PTY size for a new launch: the authoritative terminal grid, or a
+    /// safe default before a terminal exists.
+    fn live_pty_size(&self) -> PtySize {
+        self.terminal
+            .as_ref()
+            .and_then(|terminal| {
+                let (rows, cols) = terminal.size();
+                PtySize::from_raw(rows, cols)
+            })
+            .unwrap_or_else(|| PtySize::from_raw(24, 80).expect("24x80 is a valid size"))
+    }
+
+    /// Retire the current terminal owner: the local session is observed as
+    /// exited (its process is terminated) and its PTY is shut down bounded.
+    fn retire_live_terminal(&mut self) {
+        if let Some(id) = self.active_session.take() {
+            self.workspace
+                .observe_session(id, SessionStatus::Exited { code: None });
+        }
+        if let Some(mut previous) = self.pty.take() {
+            let _ = previous.shutdown();
+        }
+    }
+
+    /// Surface a typed destination refusal. The typed error names the OpenSSH
+    /// keyword and token for token-bearing destinations; it never carries the
+    /// destination itself, so a secret-shaped target cannot leak here.
+    fn report_ssh_connect_refusal(&mut self, error: SshDestinationError) {
+        self.ssh_selection_status = Some(format!("SSH connect refused: {error}"));
+        // Show the typed refusal in preference to the static runtime text.
+        self.status = SSH_STATUS_REFUSED;
+        self.show_status = false;
+        self.redraw_needed = true;
+    }
+
+    /// Record an observed phase of the live SSH launch and make it visible.
+    fn apply_ssh_phase(&mut self, phase: SshConnectionPhase) {
+        let Some(target) = self
+            .workspace
+            .ssh_connection
+            .as_ref()
+            .map(|(target, _)| target.clone())
+        else {
+            return;
+        };
+        self.workspace.set_ssh_connection(&target, phase);
+        if !phase.is_live() {
+            self.status = phase.status_text();
+            self.show_status = true;
+        } else if phase == SshConnectionPhase::Connected {
+            // The remote side is producing output through the normal PTY
+            // path; the terminal content is the interface now.
+            self.show_status = false;
+        }
+        self.redraw_needed = true;
+    }
+
+    /// Launch the system ssh client for `target` in the terminal's PTY.
+    ///
+    /// The destination is validated first: a refused destination never tears
+    /// down the running terminal and never spawns a child. A successful spawn
+    /// replaces the current terminal owner; a failed spawn leaves the current
+    /// terminal untouched and surfaces [`SshConnectionPhase::LaunchFailed`].
+    fn connect_ssh_target(&mut self, target: &str) -> SshConnectOutcome {
+        if self
+            .workspace
+            .ssh_connection
+            .as_ref()
+            .is_some_and(|(connected, phase)| connected == target && phase.is_live())
+        {
+            return SshConnectOutcome::AlreadyLive;
+        }
+        let destination = match SshDestination::new(target) {
+            Ok(destination) => destination,
+            Err(error) => {
+                self.report_ssh_connect_refusal(error);
+                return SshConnectOutcome::Refused;
+            }
+        };
+        let spawned = self.ssh_spawn_enabled && {
+            #[cfg(test)]
+            let attempt = if self.ssh_spawn_force_failure {
+                Err(noren_pty::PtyError::Backend {
+                    operation: noren_pty::PtyOperation::SpawnChild,
+                })
+            } else {
+                PtySession::spawn_ssh(SshLaunchPolicy::inherit(destination), self.live_pty_size())
+            };
+            #[cfg(not(test))]
+            let attempt =
+                PtySession::spawn_ssh(SshLaunchPolicy::inherit(destination), self.live_pty_size());
+            match attempt {
+                Ok(session) => {
+                    self.retire_live_terminal();
+                    self.pty = Some(session);
+                    self.pty_child = PtyChildStatus::Running;
+                    true
+                }
+                Err(_) => false,
+            }
+        };
+        let phase = ssh_launch_observation(spawned);
+        self.ssh_eof_since = None;
+        self.workspace.set_ssh_connection(target, phase);
+        self.status = phase.status_text();
+        self.show_status = true;
+        self.redraw_needed = true;
+        SshConnectOutcome::Launched(phase)
+    }
+}
+
+/// Result of a sidebar click's connect attempt, for status-row wording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SshConnectOutcome {
+    /// A spawn was attempted; the phase says whether it took.
+    Launched(SshConnectionPhase),
+    /// The destination was refused; the typed refusal is already visible.
+    Refused,
+    /// The same target already owns the terminal with a live child.
+    AlreadyLive,
 }
 
 impl NorenApp {
@@ -1602,12 +1917,25 @@ impl NorenApp {
             return true;
         }
         if self.workspace.select_ssh_sidebar_row(row_index) {
+            let target = self.workspace.selected_ssh_target().map(str::to_owned);
             let source = self
                 .workspace
                 .selected_ssh_source_label()
                 .map(ssh_status_source_label)
                 .unwrap_or_else(|| "#? source unavailable".to_owned());
             self.ssh_selection_status = Some(format!("SSH partial source {source}; offline"));
+            let outcome = match target.as_deref() {
+                Some(target) => self.connect_ssh_target(target),
+                None => return true,
+            };
+            // A refusal keeps its typed message; otherwise refresh the
+            // provenance line with the launch's observed phase word.
+            if let SshConnectOutcome::Launched(phase) = outcome {
+                self.ssh_selection_status = Some(format!(
+                    "SSH partial source {source}; {}",
+                    phase.sidebar_detail()
+                ));
+            }
             self.redraw_needed = true;
             return true;
         }
@@ -2030,6 +2358,17 @@ impl NorenApp {
         if let Some(terminal) = &mut self.terminal {
             terminal.feed_bytes(bytes);
         }
+        // First output from an ssh child means the remote side is talking
+        // through the normal I/O path: the launch is interactive now.
+        if self.ssh_live()
+            && self
+                .workspace
+                .ssh_connection
+                .as_ref()
+                .is_some_and(|(_, phase)| matches!(phase, SshConnectionPhase::Connecting))
+        {
+            self.apply_ssh_phase(SshConnectionPhase::Connected);
+        }
         self.redraw_needed = true;
     }
 
@@ -2060,12 +2399,22 @@ impl NorenApp {
                 }
                 PtyEvent::Eof => {
                     self.pty_child = PtyChildStatus::Exited { code: None };
-                    terminal_status = Some("Noren shell reached EOF");
-                    break;
+                    if self.ssh_live() {
+                        // The reader hit EOF; the supervisor's reaped exit
+                        // event follows within one poll. Wait for it (and
+                        // its honest code) instead of guessing now.
+                        self.ssh_eof_since.get_or_insert(Instant::now());
+                    } else {
+                        terminal_status = Some("Noren shell reached EOF");
+                    }
                 }
                 PtyEvent::Exited { code } => {
                     self.pty_child = PtyChildStatus::Exited { code };
-                    terminal_status = Some(if code == Some(0) {
+                    terminal_status = Some(if self.ssh_live() {
+                        let phase = ssh_exit_observation(code);
+                        self.apply_ssh_phase(phase);
+                        phase.status_text()
+                    } else if code == Some(0) {
                         "Noren shell exited"
                     } else {
                         "Noren shell exited with failure"
@@ -2073,9 +2422,26 @@ impl NorenApp {
                     break;
                 }
                 PtyEvent::Error(_) => {
-                    terminal_status = Some("Noren PTY operation failed");
+                    terminal_status = Some(if self.ssh_live() {
+                        self.apply_ssh_phase(SshConnectionPhase::Disconnected);
+                        SSH_STATUS_DISCONNECTED
+                    } else {
+                        "Noren PTY operation failed"
+                    });
                     break;
                 }
+            }
+        }
+        // An ssh child whose reaped exit never arrived after EOF is an
+        // immediate disconnect; surface it rather than waiting forever.
+        if terminal_status.is_none()
+            && let Some(eof_since) = self.ssh_eof_since
+            && eof_since.elapsed() >= SSH_EOF_REAP_GRACE
+        {
+            self.ssh_eof_since = None;
+            if self.ssh_live() {
+                self.apply_ssh_phase(SshConnectionPhase::Disconnected);
+                terminal_status = Some(SSH_STATUS_DISCONNECTED);
             }
         }
         // Any output may have moved or overwritten the selected content; the
@@ -2096,6 +2462,7 @@ impl NorenApp {
         self.status = status;
         self.show_status = true;
         self.redraw_needed = true;
+        self.ssh_eof_since = None;
         if let Some(id) = self.active_session.take() {
             let code = match self.pty_child {
                 PtyChildStatus::Exited { code } => code.map(|c| c as i32),
