@@ -103,8 +103,10 @@ const MAX_ERROR_DETAIL_CHARS: usize = 120;
 
 /// Typed persistence failure without file contents.
 ///
-/// Every variant renders a bounded message; hostile keys, kinds, and parser
-/// details are clipped by [`clip`] before they are stored.
+/// Every variant renders a bounded message: hostile keys and kinds are
+/// clipped by [`clip`] before they are stored, and a TOML parse failure
+/// keeps only the 1-based position computed by [`toml_error_position`],
+/// never the third-party parser's text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionPersistenceError {
     /// The state file does not exist. Internal to [`load`], which turns
@@ -122,7 +124,16 @@ pub enum SessionPersistenceError {
     /// The file is not valid UTF-8.
     NotUtf8,
     /// The file is not valid TOML (including truncation).
-    Parse(String),
+    ///
+    /// Only the 1-based position of the first offending token is retained.
+    /// The third-party parser's message is never forwarded: it quotes the
+    /// offending source line, and a source line is file content.
+    Parse {
+        /// The 1-based line where parsing stopped.
+        line: usize,
+        /// The 1-based column where parsing stopped.
+        column: usize,
+    },
     /// The file omits a required key.
     MissingKey(String),
     /// The file names a key this format does not define.
@@ -163,7 +174,10 @@ impl fmt::Display for SessionPersistenceError {
             Self::NotAFile => f.write_str("session state path does not resolve to a regular file"),
             Self::TooLarge => write!(f, "session state exceeds {MAX_SESSION_STATE_BYTES} bytes"),
             Self::NotUtf8 => f.write_str("session state is not valid UTF-8"),
-            Self::Parse(detail) => write!(f, "session state is not valid TOML: {detail}"),
+            Self::Parse { line, column } => write!(
+                f,
+                "session state is not valid TOML at line {line}, column {column}"
+            ),
             Self::MissingKey(key) => write!(f, "session state is missing key: {key}"),
             Self::UnknownKey(key) => write!(f, "unknown session state key: {key}"),
             Self::WrongType { key } => {
@@ -382,7 +396,8 @@ fn toml_string(value: &str) -> String {
 /// never partially parsed.
 fn decode(text: &str) -> Result<(Vec<SessionKind>, Option<usize>), SessionPersistenceError> {
     let document: DocumentMut = text.parse().map_err(|error: toml_edit::TomlError| {
-        SessionPersistenceError::Parse(clip(error.to_string()))
+        let (line, column) = toml_error_position(text, &error);
+        SessionPersistenceError::Parse { line, column }
     })?;
     let root = document.as_table();
 
@@ -615,6 +630,36 @@ fn clip(text: impl AsRef<str>) -> String {
         clipped.push('…');
     }
     clipped
+}
+
+/// Reduce a third-party TOML parse error to a content-free position.
+///
+/// `toml_edit`'s `Display` quotes the offending source line — file content —
+/// so none of its text is forwarded here. Only its byte span is consumed:
+/// the span's start is translated into a 1-based line and column counted
+/// from the document text itself (mirroring the line/column arithmetic of
+/// `toml_edit`'s own rendering), which keeps the error actionable for a
+/// user fixing the file without echoing any of it. A spanless error falls
+/// back to position 1, 1 rather than guessing.
+fn toml_error_position(text: &str, error: &toml_edit::TomlError) -> (usize, usize) {
+    let Some(span) = error.span() else {
+        return (1, 1);
+    };
+    let bytes = text.as_bytes();
+    // An eof span points one past the last byte; clamp onto it like
+    // `toml_edit` does so the position names the final character.
+    let offset = span.start.min(bytes.len().saturating_sub(1));
+    let line_start = bytes[..offset]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    let line = 1 + bytes[..line_start]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    let column = 1 + std::str::from_utf8(&bytes[line_start..=offset])
+        .map_or(offset - line_start, |tail| tail.chars().count() - 1);
+    (line, column)
 }
 
 #[cfg(test)]

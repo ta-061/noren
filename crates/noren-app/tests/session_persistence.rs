@@ -325,7 +325,7 @@ fn truncated_files_error_cleanly() {
     }));
     let loaded = result.expect("loading must never panic");
     assert!(
-        matches!(loaded, Err(SessionPersistenceError::Parse(_))),
+        matches!(loaded, Err(SessionPersistenceError::Parse { .. })),
         "a truncated document must fail parsing, got {loaded:?}"
     );
     assert!(registry.is_empty());
@@ -352,7 +352,7 @@ fn malformed_documents_error_cleanly() {
         assert!(
             matches!(
                 loaded,
-                Err(SessionPersistenceError::Parse(_)
+                Err(SessionPersistenceError::Parse { .. }
                     | SessionPersistenceError::MissingKey(_)
                     | SessionPersistenceError::UnknownKey(_)
                     | SessionPersistenceError::WrongType { .. })
