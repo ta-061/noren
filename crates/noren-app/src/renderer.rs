@@ -954,9 +954,17 @@ fn latin1_rows(character: char) -> Option<[u8; 7]> {
         '\u{00d9}' => top_marked_ascii('U', GRAVE),
         '\u{00da}' => top_marked_ascii('U', ACUTE),
         '\u{00db}' => top_marked_ascii('U', CIRCUMFLEX),
-        '\u{00dc}' => top_marked_ascii('U', DIAERESIS),
+        // `top_marked_ascii` cannot express an umlauted U: every U body row
+        // is 0b10001 — the same bits as DIAERESIS — so the compressed glyph
+        // would be pixel-identical to plain U and the diaeresis invisible.
+        // The U is therefore shortened by one row and a blank separator row
+        // keeps the two dots readable as a floating diaeresis.
+        '\u{00dc}' => [DIAERESIS, 0, 17, 17, 17, 17, 14],
         '\u{00dd}' => top_marked_ascii('Y', ACUTE),
-        '\u{00de}' => [16, 16, 30, 17, 30, 16, 16],
+        // Uppercase thorn keeps a full-height stem but drops its bowl one
+        // row below cap height, staying distinct from both `P` and the
+        // x-height-bowled lowercase `þ` below.
+        '\u{00de}' => [16, 30, 17, 17, 30, 16, 16],
         '\u{00df}' => [12, 18, 18, 28, 18, 18, 29],
         '\u{00e0}' => top_marked_ascii('a', GRAVE),
         '\u{00e1}' => top_marked_ascii('a', ACUTE),
