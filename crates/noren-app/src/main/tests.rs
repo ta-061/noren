@@ -3492,6 +3492,89 @@ fn ssh_connect_flow_never_persists_or_debug_prints_the_destination() {
     cleanup_state_file(&path);
 }
 
+#[test]
+fn workspace_debug_holds_no_nested_content_through_the_sidebar_and_persistence() {
+    // Issue #146: the guard must survive nesting. Sentinels are planted in
+    // the NESTED leaves — the configured-host sidebar rows, the persistence
+    // baseline bytes — and in the workspace's own content fields, then the
+    // OUTER WorkspaceState is formatted directly with `{:?}` (per PR #142,
+    // the guard never depends on a production formatter existing).
+    let secret = ssh_secret_sentinel("NESTED");
+    // Short enough to survive the sidebar's bounded-target truncation, so a
+    // leaked row label carries it in full.
+    let short_secret = format!("Ns{}", std::process::id() % 10_000);
+
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(format!("Host {short_secret}\n").as_bytes());
+    let mut workspace = WorkspaceState::with_state_path(Some(PathBuf::from(format!(
+        "/tmp/{secret}-sessions.toml"
+    ))));
+    let config = SshConfig::read(fixture.path()).expect("bounded SSH fixture parses");
+    workspace.load_ssh_config(&config);
+    assert!(
+        workspace.select_ssh_sidebar_row(0),
+        "row 0 is the configured host (the registry is empty)"
+    );
+    workspace.set_ssh_connection(&short_secret, SshConnectionPhase::Connecting);
+    // Direct plants for fields no public seam reaches from this scenario.
+    workspace.selected_ssh_source_label = Some(secret.clone());
+    let sentinel_bytes = secret.as_bytes().to_vec();
+    workspace
+        .persistence
+        .restore_succeeded(Some(sentinel_bytes.clone()));
+
+    let rendered = format!("{workspace:?}");
+    assert!(
+        !rendered.contains(&secret),
+        "workspace debug leaked the long sentinel: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&short_secret),
+        "workspace debug leaked the sidebar-visible sentinel: {rendered}"
+    );
+    assert!(
+        !rendered.contains(&format!("{:?}", sentinel_bytes.as_slice())),
+        "workspace debug leaked the persisted bytes as a byte list: {rendered}"
+    );
+    // Not vacuous: the workspace still describes its shape.
+    assert!(rendered.contains("WorkspaceState"), "{rendered}");
+    assert!(rendered.contains("SidebarView"), "{rendered}");
+    assert!(rendered.contains("PersistenceState"), "{rendered}");
+    assert!(rendered.contains("selected_row: Some(0)"), "{rendered}");
+    assert!(
+        rendered.contains("ssh_connection: Some(Connecting)"),
+        "the fixed connection phase is safe shape: {rendered}"
+    );
+}
+
+#[test]
+fn configured_ssh_host_debug_reports_shape_without_target_or_source() {
+    // Issue #146 triage: ConfiguredSshHost holds the SSH target and its
+    // config-path provenance inside WorkspaceState itself — the same
+    // secret, one container field away from Debug. The leaf must be safe
+    // by construction, with the discriminant and lengths only.
+    let secret = ssh_secret_sentinel("CFGHOST");
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(format!("Host {secret}\n").as_bytes());
+    let mut workspace = WorkspaceState::new();
+    let config = SshConfig::read(fixture.path()).expect("bounded SSH fixture parses");
+    workspace.load_ssh_config(&config);
+
+    let rendered = format!("{:?}", workspace.ssh_hosts);
+    assert!(
+        !rendered.contains(&secret),
+        "configured host debug leaked the target or source: {rendered}"
+    );
+    assert!(
+        rendered.contains("ConfiguredSshHost { kind: \"ssh\""),
+        "the launch-shape discriminant stays visible: {rendered}"
+    );
+    assert!(
+        rendered.contains("source_label_chars"),
+        "the provenance length stays visible: {rendered}"
+    );
+}
+
 // ── Live multi-session bookkeeping (supervisor-backed switching, slice 1) ──
 //
 // The palette's `session_create` now spawns a real `/bin/zsh` PTY per row.

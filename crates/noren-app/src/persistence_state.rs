@@ -4,6 +4,8 @@
 //! records only what those boundaries proved about the latest save and any
 //! external replacement observed along the way.
 
+use std::fmt;
+
 /// One bounded state-file observation. Errors carry no untrusted details
 /// here; the I/O boundary reports the typed error before using `Unavailable`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,13 +50,42 @@ enum Baseline {
 
 /// Persistence diagnostics and the exact baseline that makes conflict
 /// comparisons meaningful.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub(super) struct PersistenceState {
     baseline: Baseline,
     /// Sticky once an external replacement is definitively observed.
     conflict: bool,
     /// Describes only the latest restore or persistence attempt.
     unverified: bool,
+}
+
+/// Shape-only [`Debug`] (issue #146): baseline validity and byte count,
+/// conflict and verification flags — never the persisted bytes.
+///
+/// The baseline and the save observations hold the exact `sessions.toml`
+/// document, which embeds user-derived workspace text; printing those bytes
+/// through `Debug` would leak what the persistence boundary keeps out of
+/// diagnostics. Any holder of a `PersistenceState` is safe by construction
+/// instead of by a redacting container.
+impl fmt::Debug for PersistenceState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut shape = f.debug_struct("PersistenceState");
+        match &self.baseline {
+            Baseline::Invalid => {
+                shape.field("baseline", &format_args!("invalid"));
+            }
+            Baseline::Verified(None) => {
+                shape.field("baseline", &format_args!("absent"));
+            }
+            Baseline::Verified(Some(bytes)) => {
+                shape.field("baseline", &format_args!("{} bytes", bytes.len()));
+            }
+        }
+        shape
+            .field("conflict", &self.conflict)
+            .field("unverified", &self.unverified)
+            .finish()
+    }
 }
 
 impl PersistenceState {
@@ -328,5 +359,49 @@ mod tests {
         assert!(!state.conflict());
         assert!(!state.unverified());
         assert_eq!(state.baseline, Baseline::Verified(Some(restored.to_vec())));
+    }
+
+    // ── Debug is shape-only (issue #146) ──
+    //
+    // The baseline holds the exact persisted document (user-derived
+    // workspace text). The guard asserts directly on `format!("{:?}")` —
+    // per PR #142 it must not depend on a production formatter existing —
+    // so the sentinel bytes must not appear in any rendering, including
+    // the decimal byte-list a derived impl would print.
+
+    #[test]
+    fn debug_reports_baseline_shape_without_persisted_bytes() {
+        let sentinel = format!("NOREN-PERSIST-SENTINEL-{}", std::process::id());
+        let mut state = PersistenceState::default();
+        state.restore_succeeded(Some(sentinel.clone().into_bytes()));
+
+        let rendered = format!("{state:?}");
+        assert!(
+            !rendered.contains(&sentinel),
+            "debug leaked the document as text: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{:?}", sentinel.as_bytes())),
+            "debug leaked the document as a byte list: {rendered}"
+        );
+        // Not vacuous: the baseline's validity and size stay visible.
+        assert!(rendered.contains("PersistenceState"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("baseline: {} bytes", sentinel.len())),
+            "{rendered}"
+        );
+        assert!(rendered.contains("conflict: false"), "{rendered}");
+        assert!(rendered.contains("unverified: false"), "{rendered}");
+    }
+
+    #[test]
+    fn debug_reports_invalid_and_absent_baselines_by_name() {
+        let invalid = format!("{:?}", PersistenceState::default());
+        assert!(invalid.contains("baseline: invalid"), "{invalid}");
+
+        let mut absent = PersistenceState::default();
+        absent.restore_succeeded(None);
+        let rendered = format!("{absent:?}");
+        assert!(rendered.contains("baseline: absent"), "{rendered}");
     }
 }

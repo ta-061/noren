@@ -245,13 +245,35 @@ fn ssh_status_source_label(label: &str) -> String {
     result
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct ConfiguredSshHost {
     /// Shared session vocabulary used for target identity; this is still only
     /// a configured fact and is never inserted into the live registry.
     kind: SessionKind,
     /// Bounded, root-relative provenance supplied by `SshConfig`.
     source_label: String,
+}
+
+/// Shape-only [`Debug`] (issue #146 triage): the launch-shape discriminant
+/// and a provenance length, never the target or the config path text.
+///
+/// This is the configured-target leaf held directly by `WorkspaceState`
+/// next to the fields its Debug used to redact; with this impl the vec can
+/// be handed to Debug without a container-side guard.
+impl fmt::Debug for ConfiguredSshHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match &self.kind {
+            SessionKind::Local => "local",
+            SessionKind::Project { .. } => "project",
+            SessionKind::Worktree { .. } => "worktree",
+            SessionKind::Ssh { .. } => "ssh",
+            SessionKind::Agent { .. } => "agent",
+        };
+        f.debug_struct("ConfiguredSshHost")
+            .field("kind", &kind)
+            .field("source_label_chars", &self.source_label.chars().count())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The dispatchable intent behind each palette command.
@@ -343,29 +365,29 @@ struct WorkspaceState {
 
 impl fmt::Debug for WorkspaceState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The selected and connected SSH targets may embed secret-shaped
-        // values, so every debug surface redacts them. The provenance label
-        // is bounded root-relative display text and stays visible.
+        // Every nested leaf this struct reaches (SidebarView,
+        // PersistenceState) is shape-only by construction, so no per-field
+        // redaction is needed for them. The remaining direct content fields
+        // — the selected and connected SSH targets, their provenance label,
+        // and the state-file path — print presence only; the connection
+        // phase is a fixed enum and safe to name.
         f.debug_struct("WorkspaceState")
             .field("registry", &self.registry.len())
             .field("registry_selection", &self.registry.selected())
             .field("sidebar", &self.sidebar)
             .field("ssh_hosts", &self.ssh_hosts.len())
             .field("ssh_hosts_omitted", &self.ssh_hosts_omitted)
+            .field("selected_ssh_target", &self.selected_ssh_target.is_some())
             .field(
-                "selected_ssh_target",
-                &self.selected_ssh_target.as_deref().map(|_| "<redacted>"),
+                "selected_ssh_source_label",
+                &self.selected_ssh_source_label.is_some(),
             )
-            .field("selected_ssh_source_label", &self.selected_ssh_source_label)
             .field(
                 "ssh_connection",
-                &self
-                    .ssh_connection
-                    .as_ref()
-                    .map(|(_, phase)| format!("<redacted target, phase={phase:?}>")),
+                &self.ssh_connection.as_ref().map(|(_, phase)| *phase),
             )
             .field("palette", &self.palette)
-            .field("state_path", &self.state_path)
+            .field("state_path", &self.state_path.is_some())
             .field("persistence", &self.persistence)
             .finish()
     }
