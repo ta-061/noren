@@ -35,7 +35,7 @@ use noren_app::config::{AppConfig, CONFIG_ENV_VAR};
 use noren_app::diagnostics::{self, PtyChildStatus};
 use noren_app::{Key, KeyEncoder, KeyInput, KeyPhase, Modifiers};
 use noren_pty::{PtyEvent, PtySession, PtySize};
-use noren_terminal::TerminalState;
+use noren_terminal::{Cell, TerminalState};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -141,6 +141,74 @@ fn scanner_flags_planted_leaks_and_accepts_clean_output() {
         let polluted = format!("some log line carrying {fragment}");
         assert_eq!(leaked_fragment(&polluted, &sentinels), Some(fragment));
     }
+}
+
+/// Guard the latent `Debug` surface itself. This deliberately formats each
+/// content-bearing value directly instead of depending on production to grow
+/// a log statement first; mutation M4 (`#[derive(Debug)]`) must fail here.
+#[test]
+fn terminal_content_debug_is_redacted_without_a_production_formatter() {
+    let sentinels = Sentinels::new();
+    let content_cell = Cell::new(sentinels.output.clone(), 1);
+
+    let mut terminal = TerminalState::new(2, 160).expect("2x160 is a valid grid");
+    terminal.feed_bytes(sentinels.output.as_bytes());
+    terminal.feed_bytes(b"\r\n");
+    terminal.feed_bytes(sentinels.output.as_bytes());
+    terminal.feed_bytes(b"\r\n");
+    let snapshot = terminal.snapshot();
+    assert!(
+        snapshot
+            .lines()
+            .iter()
+            .any(|line| line.contains(&sentinels.output)),
+        "fixture must retain the output sentinel on screen"
+    );
+    assert!(
+        snapshot
+            .scrollback_lines()
+            .iter()
+            .any(|line| line.contains(&sentinels.output)),
+        "fixture must retain the output sentinel in scrollback"
+    );
+
+    let cell_debug = format!("{content_cell:?}");
+    let screen_debug = format!("{:?}", snapshot.screen());
+    let snapshot_debug = format!("{snapshot:?}");
+    let event_debug = format!(
+        "{:?}",
+        PtyEvent::Output(sentinels.output.as_bytes().to_vec())
+    );
+
+    for (carrier, inspected) in [
+        ("Cell", cell_debug.as_str()),
+        ("ScreenBuffer", screen_debug.as_str()),
+        ("TerminalSnapshot", snapshot_debug.as_str()),
+        ("PtyEvent", event_debug.as_str()),
+    ] {
+        assert!(
+            leaked_fragment(inspected, &sentinels).is_none(),
+            "{carrier} Debug leaked terminal content: {inspected}"
+        );
+    }
+    assert!(
+        cell_debug.contains(&format!("text_bytes: {}", sentinels.output.len())),
+        "Cell Debug must retain byte-count shape: {cell_debug}"
+    );
+    assert_eq!(
+        screen_debug,
+        "ScreenBuffer { rows: 2, cols: 160, cell_count: 320 }"
+    );
+    assert!(
+        snapshot_debug.contains("size: (2, 160)")
+            && snapshot_debug.contains("cursor: Cursor { row: 1, column: 0 }")
+            && snapshot_debug.contains("scrollback_rows: 1"),
+        "TerminalSnapshot Debug must retain grid shape: {snapshot_debug}"
+    );
+    assert_eq!(
+        event_debug,
+        format!("Output {{ byte_count: {} }}", sentinels.output.len())
+    );
 }
 
 /// The diagnostics claim under test: PTY content placed where diagnostics

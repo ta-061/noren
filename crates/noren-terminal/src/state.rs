@@ -79,11 +79,21 @@ pub const MAX_SCROLLBACK_LINES: usize = 10_000;
 /// zero-width continuation cell that renders as nothing and is never an
 /// independent character; zero-width combining characters are appended to the
 /// preceding cell's text without changing its width.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Cell {
     text: String,
     width: u8,
     attributes: CellAttributes,
+}
+
+impl fmt::Debug for Cell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Cell")
+            .field("text_bytes", &self.text.len())
+            .field("width", &self.width)
+            .field("attributes", &self.attributes)
+            .finish()
+    }
 }
 
 impl Cell {
@@ -336,11 +346,21 @@ impl TerminalModes {
 }
 
 /// Fixed-size visible screen buffer in row-major order.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ScreenBuffer {
     rows: u16,
     cols: u16,
     cells: Vec<Cell>,
+}
+
+impl fmt::Debug for ScreenBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScreenBuffer")
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .field("cell_count", &self.cells.len())
+            .finish()
+    }
 }
 
 impl ScreenBuffer {
@@ -1453,7 +1473,7 @@ impl fmt::Debug for TerminalState {
 }
 
 /// Immutable snapshot passed to renderers and deterministic test oracles.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct TerminalSnapshot {
     screen: ScreenBuffer,
     cursor: Cursor,
@@ -1463,6 +1483,24 @@ pub struct TerminalSnapshot {
     lines: Vec<String>,
     display_lines: Vec<String>,
     scrollback: Vec<Vec<Cell>>,
+}
+
+impl fmt::Debug for TerminalSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let scrollback_cells = self.scrollback.iter().map(Vec::len).sum::<usize>();
+        f.debug_struct("TerminalSnapshot")
+            .field("size", &(self.rows(), self.cols()))
+            .field("cursor", &self.cursor)
+            .field("scroll_region", &self.scroll_region)
+            .field("wrap_pending", &self.wrap_pending)
+            .field("modes", &self.modes)
+            .field("screen_cells", &self.screen.cells.len())
+            .field("visible_line_count", &self.lines.len())
+            .field("display_line_count", &self.display_lines.len())
+            .field("scrollback_rows", &self.scrollback.len())
+            .field("scrollback_cells", &scrollback_cells)
+            .finish_non_exhaustive()
+    }
 }
 
 impl TerminalSnapshot {
@@ -1722,6 +1760,68 @@ fn visible_display_row_count(screen: &ScreenBuffer) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mutation M4 (restoring `#[derive(Debug)]` on any content carrier) must
+    /// fail here even though production does not currently format these types.
+    #[test]
+    fn terminal_content_debug_reports_shape_without_content() {
+        const SECRET: &str = "NOREN-DBG-S3CR3T";
+
+        let content_cell = Cell::new(SECRET, 1);
+        let cell_debug = format!("{content_cell:?}");
+        assert!(!cell_debug.contains(SECRET), "cell leaked: {cell_debug}");
+        assert!(
+            cell_debug.contains(&format!("text_bytes: {}", SECRET.len())),
+            "cell shape is missing: {cell_debug}"
+        );
+
+        let mut state = TerminalState::new(2, 32).expect("valid terminal");
+        state.feed_bytes(SECRET.as_bytes());
+        state.feed_bytes(b"\r\n");
+        state.feed_bytes(SECRET.as_bytes());
+        state.feed_bytes(b"\r\n");
+        let snapshot = state.snapshot();
+        assert!(
+            snapshot.lines().iter().any(|line| line.contains(SECRET)),
+            "fixture must retain the secret on screen"
+        );
+        assert!(
+            snapshot
+                .scrollback_lines()
+                .iter()
+                .any(|line| line.contains(SECRET)),
+            "fixture must retain the secret in scrollback"
+        );
+
+        let screen_debug = format!("{:?}", snapshot.screen());
+        assert_eq!(
+            screen_debug,
+            "ScreenBuffer { rows: 2, cols: 32, cell_count: 64 }"
+        );
+
+        let snapshot_debug = format!("{snapshot:?}");
+        assert!(
+            !snapshot_debug.contains(SECRET),
+            "snapshot leaked: {snapshot_debug}"
+        );
+        assert!(
+            snapshot_debug.contains("size: (2, 32)")
+                && snapshot_debug.contains("cursor: Cursor { row: 1, column: 0 }")
+                && snapshot_debug.contains("scrollback_rows: 1"),
+            "snapshot shape is missing: {snapshot_debug}"
+        );
+        for content_field in [
+            "TerminalSnapshot { screen:",
+            ", lines:",
+            ", display_lines:",
+            ", scrollback:",
+        ] {
+            assert!(
+                !snapshot_debug.contains(content_field),
+                "snapshot exposes content field {content_field}: {snapshot_debug}"
+            );
+        }
+    }
 
     #[test]
     fn basic_ascii_and_controls_update_owned_state() {
