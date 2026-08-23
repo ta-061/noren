@@ -343,29 +343,29 @@ struct WorkspaceState {
 
 impl fmt::Debug for WorkspaceState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The selected and connected SSH targets may embed secret-shaped
-        // values, so every debug surface redacts them. The provenance label
-        // is bounded root-relative display text and stays visible.
+        // Every nested leaf this struct reaches (SidebarView,
+        // PersistenceState) is shape-only by construction, so no per-field
+        // redaction is needed for them. The remaining direct content fields
+        // — the selected and connected SSH targets, their provenance label,
+        // and the state-file path — print presence only; the connection
+        // phase is a fixed enum and safe to name.
         f.debug_struct("WorkspaceState")
             .field("registry", &self.registry.len())
             .field("registry_selection", &self.registry.selected())
             .field("sidebar", &self.sidebar)
             .field("ssh_hosts", &self.ssh_hosts.len())
             .field("ssh_hosts_omitted", &self.ssh_hosts_omitted)
+            .field("selected_ssh_target", &self.selected_ssh_target.is_some())
             .field(
-                "selected_ssh_target",
-                &self.selected_ssh_target.as_deref().map(|_| "<redacted>"),
+                "selected_ssh_source_label",
+                &self.selected_ssh_source_label.is_some(),
             )
-            .field("selected_ssh_source_label", &self.selected_ssh_source_label)
             .field(
                 "ssh_connection",
-                &self
-                    .ssh_connection
-                    .as_ref()
-                    .map(|(_, phase)| format!("<redacted target, phase={phase:?}>")),
+                &self.ssh_connection.as_ref().map(|(_, phase)| *phase),
             )
             .field("palette", &self.palette)
-            .field("state_path", &self.state_path)
+            .field("state_path", &self.state_path.is_some())
             .field("persistence", &self.persistence)
             .finish()
     }
