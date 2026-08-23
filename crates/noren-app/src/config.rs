@@ -239,9 +239,10 @@ impl AppConfig {
     /// Unknown keys, wrong value types, and out-of-range values are errors so
     /// a typo or hostile value can never masquerade as a working setting.
     pub fn parse(text: &str) -> Result<Self, ConfigError> {
-        let document: DocumentMut = text
-            .parse()
-            .map_err(|error: toml_edit::TomlError| ConfigError::Parse(clip(error.to_string())))?;
+        let document: DocumentMut = text.parse().map_err(|error: toml_edit::TomlError| {
+            let (line, column) = toml_error_position(text, &error);
+            ConfigError::Parse { line, column }
+        })?;
         let mut config = Self::default();
         for (key, item) in document.as_table().iter() {
             let table = item
@@ -703,10 +704,42 @@ fn clip(text: impl AsRef<str>) -> String {
     clipped
 }
 
+/// Reduce a third-party TOML parse error to a content-free position.
+///
+/// `toml_edit`'s `Display` quotes the offending source line — file content —
+/// so none of its text is forwarded here. Only its byte span is consumed:
+/// the span's start is translated into a 1-based line and column counted
+/// from the document text itself (mirroring the line/column arithmetic of
+/// `toml_edit`'s own rendering), which keeps the error actionable for a
+/// user fixing the file without echoing any of it. A spanless error falls
+/// back to position 1, 1 rather than guessing.
+fn toml_error_position(text: &str, error: &toml_edit::TomlError) -> (usize, usize) {
+    let Some(span) = error.span() else {
+        return (1, 1);
+    };
+    let bytes = text.as_bytes();
+    // An eof span points one past the last byte; clamp onto it like
+    // `toml_edit` does so the position names the final character.
+    let offset = span.start.min(bytes.len().saturating_sub(1));
+    let line_start = bytes[..offset]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |newline| newline + 1);
+    let line = 1 + bytes[..line_start]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count();
+    let column = 1 + std::str::from_utf8(&bytes[line_start..=offset])
+        .map_or(offset - line_start, |tail| tail.chars().count() - 1);
+    (line, column)
+}
+
 /// Typed configuration failure without file contents.
 ///
-/// Every variant renders a bounded message; hostile key names and parser
-/// details are clipped by [`clip`] before they are stored.
+/// Every variant renders a bounded message: hostile key names are clipped
+/// by [`clip`] before they are stored, and a TOML parse failure keeps only
+/// the 1-based position computed by [`toml_error_position`], never the
+/// third-party parser's text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigError {
     /// An explicitly requested configuration file does not exist.
@@ -720,7 +753,16 @@ pub enum ConfigError {
     /// The file is not valid UTF-8.
     NotUtf8,
     /// The file is not valid TOML.
-    Parse(String),
+    ///
+    /// Only the 1-based position of the first offending token is retained;
+    /// the third-party parser's message quotes the offending source line —
+    /// file content — so none of its text is forwarded.
+    Parse {
+        /// The 1-based line where parsing stopped.
+        line: usize,
+        /// The 1-based column where parsing stopped.
+        column: usize,
+    },
     /// The file names a key this schema does not define.
     UnknownKey(String),
     /// A key holds the wrong TOML type.
@@ -758,7 +800,10 @@ impl fmt::Display for ConfigError {
             Self::NotAFile => f.write_str("configuration path does not resolve to a regular file"),
             Self::TooLarge => write!(f, "configuration exceeds {MAX_CONFIG_BYTES} bytes"),
             Self::NotUtf8 => f.write_str("configuration is not valid UTF-8"),
-            Self::Parse(detail) => write!(f, "configuration is not valid TOML: {detail}"),
+            Self::Parse { line, column } => write!(
+                f,
+                "configuration is not valid TOML at line {line}, column {column}"
+            ),
             Self::UnknownKey(key) => write!(f, "unknown configuration key: {key}"),
             Self::WrongType { key } => {
                 write!(f, "configuration key {key} must be an integer")
@@ -935,7 +980,7 @@ mod tests {
             let result = std::panic::catch_unwind(|| AppConfig::parse(text));
             let parsed = result.expect("parsing must never panic");
             assert!(
-                matches!(parsed, Err(ConfigError::Parse(_))),
+                matches!(parsed, Err(ConfigError::Parse { .. })),
                 "{text:?} must fail parsing, got {parsed:?}"
             );
         }
