@@ -7,7 +7,9 @@
 
 use std::collections::BTreeSet;
 
-use noren_app::session::{SessionDescriptor, SessionId, SessionRegistry, SessionStatus};
+use noren_app::session::{
+    SessionDescriptor, SessionId, SessionKind, SessionRegistry, SessionStatus,
+};
 use noren_app::sidebar::{
     EMPTY_SIDEBAR_MESSAGE, EmptyState, EntryKind, SessionViewport, SidebarEntry, SidebarRow,
     SidebarView, fixtures,
@@ -260,4 +262,118 @@ fn non_session_entries_render_without_any_sessions() {
     assert_eq!(view.viewport(), None);
     assert_eq!(view.empty_state(), None);
     assert!(!view.is_empty());
+}
+
+// ── Debug is shape-only (issue #146) ──
+//
+// The sidebar's payloads are user- or environment-derived text (project
+// names and roots, branch names, SSH labels that embed the target, host
+// details) plus shared session descriptors. These guards assert directly on
+// `format!("{:?}")` — per PR #142, the guard must not depend on a
+// production formatter existing — so the sentinel must not appear even
+// while no production code path formats these types yet.
+
+/// Unique content stand-in: any debug surface that prints it is a leak.
+fn leak_sentinel() -> String {
+    format!("NOREN-SIDEBAR-SENTINEL-{}", std::process::id())
+}
+
+/// One entry of every kind, each carrying the sentinel in every payload
+/// field the type has, plus the id of the session entry.
+fn sentinel_entries(sentinel: &str) -> (Vec<SidebarEntry>, SessionId) {
+    let mut registry = SessionRegistry::new();
+    let id = registry.create(SessionKind::Project {
+        root: sentinel.parse().expect("sentinel parses as a path"),
+    });
+    registry
+        .observe(
+            id,
+            SessionStatus::Failed {
+                reason: sentinel.to_string(),
+            },
+        )
+        .expect("a fresh session may be observed failed");
+    let descriptor: SessionDescriptor = registry.get(id).expect("created id is live").clone();
+    (
+        vec![
+            SidebarEntry::Project {
+                name: sentinel.to_string(),
+                root: sentinel.to_string(),
+            },
+            SidebarEntry::Worktree {
+                name: sentinel.to_string(),
+                branch: sentinel.to_string(),
+            },
+            SidebarEntry::SshConnection {
+                label: sentinel.to_string(),
+                host: sentinel.to_string(),
+                selected: true,
+            },
+            SidebarEntry::Agent {
+                label: sentinel.to_string(),
+            },
+            SidebarEntry::Session(descriptor),
+        ],
+        id,
+    )
+}
+
+#[test]
+fn entry_debug_reports_shape_without_content() {
+    let sentinel = leak_sentinel();
+    for entry in sentinel_entries(&sentinel).0 {
+        let rendered = format!("{entry:?}");
+        assert!(
+            !rendered.contains(&sentinel),
+            "entry debug leaked content: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn entry_debug_keeps_useful_shape() {
+    let sentinel = leak_sentinel();
+    let entries = sentinel_entries(&sentinel).0;
+    let ssh = format!("{:?}", &entries[2]);
+    assert!(ssh.contains("SshConnection"), "variant name: {ssh}");
+    assert!(ssh.contains("selected: true"), "selection state: {ssh}");
+
+    let mut registry = SessionRegistry::new();
+    let id = registry.create(SessionKind::Local);
+    let session = format!(
+        "{:?}",
+        SidebarEntry::Session(registry.get(id).expect("id live").clone())
+    );
+    assert!(session.contains("Session"), "variant name: {session}");
+    assert!(
+        session.contains(&format!("{id:?}")),
+        "the registry-generated id is safe shape: {session}"
+    );
+    assert!(
+        !session.contains("Local"),
+        "the launch shape may carry paths or targets: {session}"
+    );
+}
+
+#[test]
+fn view_debug_reports_shape_without_content() {
+    let sentinel = leak_sentinel();
+    let (entries, session_id) = sentinel_entries(&sentinel);
+    let view = SidebarView::build(&entries, Some(session_id));
+
+    let rendered = format!("{view:?}");
+    assert!(
+        !rendered.contains(&sentinel),
+        "view debug leaked content: {rendered}"
+    );
+    // Not vacuous: the shape a renderer bug report needs stays visible.
+    assert!(rendered.contains("row_count: 5"), "{rendered}");
+    assert!(rendered.contains("row_kinds: ["), "{rendered}");
+    assert!(rendered.contains("\"ssh\""), "kind names: {rendered}");
+    assert!(rendered.contains("selected_row: Some(2)"), "{rendered}");
+    assert!(rendered.contains("empty_state: false"), "{rendered}");
+    assert!(
+        rendered.contains(&format!("viewport: Some({session_id:?})")),
+        "the viewport id is safe shape: {rendered}"
+    );
 }

@@ -22,6 +22,7 @@
 //! launches an agent.
 
 use crate::session::{SessionDescriptor, SessionId, SessionKind, SessionStatus};
+use std::fmt;
 
 /// The entry classes the sidebar can list.
 ///
@@ -41,6 +42,24 @@ pub enum EntryKind {
     Agent,
     /// A live terminal session described by a `SessionDescriptor`.
     Session,
+}
+
+impl EntryKind {
+    /// The fixed, content-free name of this kind.
+    ///
+    /// For diagnostics that name row classes without ever touching the
+    /// user-derived text a row carries; [`Debug`](std::fmt::Debug) output of
+    /// this module's types uses it instead of formatting payloads.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Worktree => "worktree",
+            Self::SshConnection => "ssh",
+            Self::Agent => "agent",
+            Self::Session => "session",
+        }
+    }
 }
 
 /// One sidebar row: what to show, not how to draw it.
@@ -89,7 +108,7 @@ impl SidebarRow {
 /// plain text facts describing workspace items that are not live sessions.
 /// Construction is data-only: no variant opens a connection or launches a
 /// process.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum SidebarEntry {
     /// A project anchored at `root`.
     Project {
@@ -124,6 +143,34 @@ pub enum SidebarEntry {
     },
     /// A live terminal session, described by the shared contract descriptor.
     Session(SessionDescriptor),
+}
+
+/// Shape-only [`Debug`] (issue #146): variant names and selection state,
+/// never payload content.
+///
+/// Every payload here is user- or environment-derived text — project names
+/// and roots, branch names, and, for `SshConnection`, a `label` that embeds
+/// the (truncated) SSH target and a `host` detail — or a shared
+/// [`SessionDescriptor`]. The label is therefore user-controlled content,
+/// not a safe fixed string, and printing any payload through `Debug` would
+/// leak exactly what the workspace keeps out of diagnostics. With this
+/// impl, any holder of a `SidebarEntry` is safe by construction instead of
+/// by a redacting container.
+impl fmt::Debug for SidebarEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Project { .. } => f.debug_struct("Project").finish_non_exhaustive(),
+            Self::Worktree { .. } => f.debug_struct("Worktree").finish_non_exhaustive(),
+            Self::SshConnection { selected, .. } => f
+                .debug_struct("SshConnection")
+                .field("selected", selected)
+                .finish_non_exhaustive(),
+            Self::Agent { .. } => f.debug_struct("Agent").finish_non_exhaustive(),
+            // The registry-generated id (e.g. `session-1`) is safe shape; the
+            // descriptor's kind, status, and title stay unformatted.
+            Self::Session(descriptor) => f.debug_tuple("Session").field(&descriptor.id()).finish(),
+        }
+    }
 }
 
 /// The view shown when the sidebar has no entries.
@@ -199,11 +246,40 @@ impl SessionViewport {
 ///    this actual viewport. A restored entry has no live process to attach to,
 ///    so selecting it does not create a viewport.
 /// 4. A selection that matches no entry is dropped, never rendered dangling.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SidebarView {
     rows: Vec<SidebarRow>,
     empty_state: Option<EmptyState>,
     viewport: Option<SessionViewport>,
+}
+
+/// Shape-only [`Debug`] (issue #146): row count, row kinds, selection
+/// index, empty-state and viewport presence — never row or viewport
+/// content.
+///
+/// Row labels and details are user- or environment-derived text (project
+/// roots, branch names, and bounded SSH-target text), and the viewport
+/// carries a [`SessionDescriptor`]; the only values printed here are the
+/// fixed [`EntryKind`] names and the registry-generated viewport id. Any
+/// holder of a `SidebarView` is safe by construction instead of by a
+/// redacting container.
+impl fmt::Debug for SidebarView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let row_kinds: Vec<&'static str> = self.rows.iter().map(|row| row.kind().name()).collect();
+        f.debug_struct("SidebarView")
+            .field("row_count", &self.rows.len())
+            .field("row_kinds", &row_kinds)
+            .field(
+                "selected_row",
+                &self.rows.iter().position(|row| row.is_selected()),
+            )
+            .field("empty_state", &self.empty_state.is_some())
+            .field(
+                "viewport",
+                &self.viewport.as_ref().map(SessionViewport::session_id),
+            )
+            .finish()
+    }
 }
 
 impl SidebarView {
