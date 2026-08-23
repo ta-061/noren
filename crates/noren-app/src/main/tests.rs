@@ -3547,6 +3547,34 @@ fn workspace_debug_holds_no_nested_content_through_the_sidebar_and_persistence()
     );
 }
 
+#[test]
+fn configured_ssh_host_debug_reports_shape_without_target_or_source() {
+    // Issue #146 triage: ConfiguredSshHost holds the SSH target and its
+    // config-path provenance inside WorkspaceState itself — the same
+    // secret, one container field away from Debug. The leaf must be safe
+    // by construction, with the discriminant and lengths only.
+    let secret = ssh_secret_sentinel("CFGHOST");
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(format!("Host {secret}\n").as_bytes());
+    let mut workspace = WorkspaceState::new();
+    let config = SshConfig::read(fixture.path()).expect("bounded SSH fixture parses");
+    workspace.load_ssh_config(&config);
+
+    let rendered = format!("{:?}", workspace.ssh_hosts);
+    assert!(
+        !rendered.contains(&secret),
+        "configured host debug leaked the target or source: {rendered}"
+    );
+    assert!(
+        rendered.contains("ConfiguredSshHost { kind: \"ssh\""),
+        "the launch-shape discriminant stays visible: {rendered}"
+    );
+    assert!(
+        rendered.contains("source_label_chars"),
+        "the provenance length stays visible: {rendered}"
+    );
+}
+
 // ── Live multi-session bookkeeping (supervisor-backed switching, slice 1) ──
 //
 // The palette's `session_create` now spawns a real `/bin/zsh` PTY per row.

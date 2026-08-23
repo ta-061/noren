@@ -245,13 +245,35 @@ fn ssh_status_source_label(label: &str) -> String {
     result
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct ConfiguredSshHost {
     /// Shared session vocabulary used for target identity; this is still only
     /// a configured fact and is never inserted into the live registry.
     kind: SessionKind,
     /// Bounded, root-relative provenance supplied by `SshConfig`.
     source_label: String,
+}
+
+/// Shape-only [`Debug`] (issue #146 triage): the launch-shape discriminant
+/// and a provenance length, never the target or the config path text.
+///
+/// This is the configured-target leaf held directly by `WorkspaceState`
+/// next to the fields its Debug used to redact; with this impl the vec can
+/// be handed to Debug without a container-side guard.
+impl fmt::Debug for ConfiguredSshHost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match &self.kind {
+            SessionKind::Local => "local",
+            SessionKind::Project { .. } => "project",
+            SessionKind::Worktree { .. } => "worktree",
+            SessionKind::Ssh { .. } => "ssh",
+            SessionKind::Agent { .. } => "agent",
+        };
+        f.debug_struct("ConfiguredSshHost")
+            .field("kind", &kind)
+            .field("source_label_chars", &self.source_label.chars().count())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The dispatchable intent behind each palette command.
