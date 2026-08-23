@@ -748,8 +748,11 @@ struct Target {
     metrics: CellMetrics,
 }
 
-/// Emit the 5×7 bitmap glyph for `character` at grid cell `(col, row)`,
-/// converting each lit pixel bit to a 2×2 rectangle of vertices in `color`.
+/// Emit the 5×7 bitmap glyph for `character` at grid cell `(col, row)`.
+///
+/// Text glyphs keep the historical 2×2 pixels and top inset. Box-drawing
+/// glyphs instead scale their bitmap across the whole cell: a line ending at a
+/// cell edge must meet the next frame cell without the text glyph's padding.
 fn push_glyph(
     vertices: &mut Vec<Vertex>,
     character: char,
@@ -760,20 +763,41 @@ fn push_glyph(
 ) {
     let cell_width = target.metrics.width();
     let cell_height = target.metrics.height();
+    let cell_x = u32::try_from(col).unwrap_or(u32::MAX) * cell_width;
+    let cell_y = u32::try_from(row).unwrap_or(u32::MAX) * cell_height;
+    let fills_cell = is_box_drawing(character);
     let glyph = glyph_rows(character);
     for (glyph_y, bits) in glyph.into_iter().enumerate() {
         for glyph_x in 0..5 {
             if bits & (1 << (4 - glyph_x)) == 0 {
                 continue;
             }
-            let x = u32::try_from(col).unwrap_or(u32::MAX) * cell_width
-                + u32::try_from(glyph_x).unwrap_or(0) * GLYPH_SCALE;
-            let y = u32::try_from(row).unwrap_or(u32::MAX) * cell_height
-                + GLYPH_TOP
-                + u32::try_from(glyph_y).unwrap_or(0) * GLYPH_SCALE;
-            push_rect(vertices, x, y, GLYPH_SCALE, GLYPH_SCALE, color, target);
+            let (x, y, width, height) = if fills_cell {
+                let (x, width) = scaled_bitmap_segment(glyph_x, 5, cell_width);
+                let (y, height) = scaled_bitmap_segment(glyph_y, 7, cell_height);
+                (cell_x + x, cell_y + y, width, height)
+            } else {
+                (
+                    cell_x + u32::try_from(glyph_x).unwrap_or(0) * GLYPH_SCALE,
+                    cell_y + GLYPH_TOP + u32::try_from(glyph_y).unwrap_or(0) * GLYPH_SCALE,
+                    GLYPH_SCALE,
+                    GLYPH_SCALE,
+                )
+            };
+            push_rect(vertices, x, y, width, height, color, target);
         }
     }
+}
+
+/// Return one proportional bitmap segment without overflowing at `u32::MAX`.
+fn scaled_bitmap_segment(index: usize, segments: u32, length: u32) -> (u32, u32) {
+    let boundary = |position: usize| {
+        (u64::try_from(position).unwrap_or(u64::MAX) * u64::from(length) / u64::from(segments))
+            as u32
+    };
+    let start = boundary(index);
+    let end = boundary(index + 1);
+    (start, end - start)
 }
 
 fn push_rect(
@@ -831,6 +855,209 @@ pub(crate) fn vertex_bytes(vertices: &[Vertex]) -> Vec<u8> {
         }
     }
     bytes
+}
+
+const QUESTION_MARK_GLYPH: [u8; 7] = [14, 17, 1, 2, 4, 0, 4];
+
+fn is_box_drawing(character: char) -> bool {
+    matches!(character, '\u{2500}'..='\u{257f}')
+}
+
+#[derive(Clone, Copy)]
+enum BoxStroke {
+    None,
+    Light,
+    Heavy,
+    Double,
+}
+
+/// Rasterize up/right/down/left box-drawing arms around the bitmap centre.
+///
+/// Light strokes occupy one pixel, heavy strokes occupy three, and double
+/// strokes occupy the two pixels either side of the centre. The bitmap is
+/// stretched across the whole terminal cell by [`push_glyph`], so every arm
+/// reaches and joins the corresponding edge of an adjacent cell.
+fn box_stroke_rows(up: BoxStroke, right: BoxStroke, down: BoxStroke, left: BoxStroke) -> [u8; 7] {
+    fn vertical_arm(rows: &mut [u8; 7], stroke: BoxStroke, start: usize, end: usize) {
+        let mask = match stroke {
+            BoxStroke::None => 0,
+            BoxStroke::Light => 0b00100,
+            BoxStroke::Heavy => 0b01110,
+            BoxStroke::Double => 0b01010,
+        };
+        for row in &mut rows[start..=end] {
+            *row |= mask;
+        }
+    }
+
+    fn horizontal_arm(rows: &mut [u8; 7], stroke: BoxStroke, start: usize, end: usize) {
+        let mut mask = 0;
+        for column in start..=end {
+            mask |= 1 << (4 - column);
+        }
+        match stroke {
+            BoxStroke::None => {}
+            BoxStroke::Light => rows[3] |= mask,
+            BoxStroke::Heavy => {
+                for row in &mut rows[2..=4] {
+                    *row |= mask;
+                }
+            }
+            BoxStroke::Double => {
+                rows[2] |= mask;
+                rows[4] |= mask;
+            }
+        }
+    }
+
+    let mut rows = [0; 7];
+    vertical_arm(&mut rows, up, 0, 3);
+    horizontal_arm(&mut rows, right, 2, 4);
+    vertical_arm(&mut rows, down, 3, 6);
+    horizontal_arm(&mut rows, left, 0, 2);
+    rows
+}
+
+/// Bitmap coverage for the complete Unicode Box Drawing block
+/// (`U+2500..=U+257F`). Weight variants share a topology rasterizer; dashed,
+/// rounded, and diagonal forms have explicit bitmaps where arm weights are not
+/// enough to describe their appearance.
+#[rustfmt::skip]
+fn box_drawing_rows(character: char) -> Option<[u8; 7]> {
+    use BoxStroke::{Double as D, Heavy as H, Light as L, None as N};
+
+    let rows = match character {
+        '\u{2500}' => box_stroke_rows(N, L, N, L),
+        '\u{2501}' => box_stroke_rows(N, H, N, H),
+        '\u{2502}' => box_stroke_rows(L, N, L, N),
+        '\u{2503}' => box_stroke_rows(H, N, H, N),
+        '\u{2504}' => [0, 0, 0, 0b11011, 0, 0, 0],
+        '\u{2505}' => [0, 0, 0b11011, 0b11011, 0b11011, 0, 0],
+        '\u{2506}' => [4, 4, 0, 4, 4, 0, 4],
+        '\u{2507}' => [14, 14, 0, 14, 14, 0, 14],
+        '\u{2508}' => [0, 0, 0, 0b10101, 0, 0, 0],
+        '\u{2509}' => [0, 0, 0b10101, 0b10101, 0b10101, 0, 0],
+        '\u{250a}' => [4, 0, 4, 0, 4, 0, 4],
+        '\u{250b}' => [14, 0, 14, 0, 14, 0, 14],
+        '\u{250c}' => box_stroke_rows(N, L, L, N),
+        '\u{250d}' => box_stroke_rows(N, H, L, N),
+        '\u{250e}' => box_stroke_rows(N, L, H, N),
+        '\u{250f}' => box_stroke_rows(N, H, H, N),
+        '\u{2510}' => box_stroke_rows(N, N, L, L),
+        '\u{2511}' => box_stroke_rows(N, N, L, H),
+        '\u{2512}' => box_stroke_rows(N, N, H, L),
+        '\u{2513}' => box_stroke_rows(N, N, H, H),
+        '\u{2514}' => box_stroke_rows(L, L, N, N),
+        '\u{2515}' => box_stroke_rows(L, H, N, N),
+        '\u{2516}' => box_stroke_rows(H, L, N, N),
+        '\u{2517}' => box_stroke_rows(H, H, N, N),
+        '\u{2518}' => box_stroke_rows(L, N, N, L),
+        '\u{2519}' => box_stroke_rows(L, N, N, H),
+        '\u{251a}' => box_stroke_rows(H, N, N, L),
+        '\u{251b}' => box_stroke_rows(H, N, N, H),
+        '\u{251c}' => box_stroke_rows(L, L, L, N),
+        '\u{251d}' => box_stroke_rows(L, H, L, N),
+        '\u{251e}' => box_stroke_rows(H, L, L, N),
+        '\u{251f}' => box_stroke_rows(L, L, H, N),
+        '\u{2520}' => box_stroke_rows(H, L, H, N),
+        '\u{2521}' => box_stroke_rows(H, H, L, N),
+        '\u{2522}' => box_stroke_rows(L, H, H, N),
+        '\u{2523}' => box_stroke_rows(H, H, H, N),
+        '\u{2524}' => box_stroke_rows(L, N, L, L),
+        '\u{2525}' => box_stroke_rows(L, N, L, H),
+        '\u{2526}' => box_stroke_rows(H, N, L, L),
+        '\u{2527}' => box_stroke_rows(L, N, H, L),
+        '\u{2528}' => box_stroke_rows(H, N, H, L),
+        '\u{2529}' => box_stroke_rows(H, N, L, H),
+        '\u{252a}' => box_stroke_rows(L, N, H, H),
+        '\u{252b}' => box_stroke_rows(H, N, H, H),
+        '\u{252c}' => box_stroke_rows(N, L, L, L),
+        '\u{252d}' => box_stroke_rows(N, L, L, H),
+        '\u{252e}' => box_stroke_rows(N, H, L, L),
+        '\u{252f}' => box_stroke_rows(N, H, L, H),
+        '\u{2530}' => box_stroke_rows(N, L, H, L),
+        '\u{2531}' => box_stroke_rows(N, L, H, H),
+        '\u{2532}' => box_stroke_rows(N, H, H, L),
+        '\u{2533}' => box_stroke_rows(N, H, H, H),
+        '\u{2534}' => box_stroke_rows(L, L, N, L),
+        '\u{2535}' => box_stroke_rows(L, L, N, H),
+        '\u{2536}' => box_stroke_rows(L, H, N, L),
+        '\u{2537}' => box_stroke_rows(L, H, N, H),
+        '\u{2538}' => box_stroke_rows(H, L, N, L),
+        '\u{2539}' => box_stroke_rows(H, L, N, H),
+        '\u{253a}' => box_stroke_rows(H, H, N, L),
+        '\u{253b}' => box_stroke_rows(H, H, N, H),
+        '\u{253c}' => box_stroke_rows(L, L, L, L),
+        '\u{253d}' => box_stroke_rows(L, L, L, H),
+        '\u{253e}' => box_stroke_rows(L, H, L, L),
+        '\u{253f}' => box_stroke_rows(L, H, L, H),
+        '\u{2540}' => box_stroke_rows(H, L, L, L),
+        '\u{2541}' => box_stroke_rows(L, L, H, L),
+        '\u{2542}' => box_stroke_rows(H, L, H, L),
+        '\u{2543}' => box_stroke_rows(H, L, L, H),
+        '\u{2544}' => box_stroke_rows(H, H, L, L),
+        '\u{2545}' => box_stroke_rows(L, L, H, H),
+        '\u{2546}' => box_stroke_rows(L, H, H, L),
+        '\u{2547}' => box_stroke_rows(H, H, L, H),
+        '\u{2548}' => box_stroke_rows(L, H, H, H),
+        '\u{2549}' => box_stroke_rows(H, L, H, H),
+        '\u{254a}' => box_stroke_rows(H, H, H, L),
+        '\u{254b}' => box_stroke_rows(H, H, H, H),
+        '\u{254c}' => [0, 0, 0, 0b11101, 0, 0, 0],
+        '\u{254d}' => [0, 0, 0b11101, 0b11101, 0b11101, 0, 0],
+        '\u{254e}' => [4, 4, 4, 0, 4, 4, 4],
+        '\u{254f}' => [14, 14, 14, 0, 14, 14, 14],
+        '\u{2550}' => box_stroke_rows(N, D, N, D),
+        '\u{2551}' => box_stroke_rows(D, N, D, N),
+        '\u{2552}' => box_stroke_rows(N, D, L, N),
+        '\u{2553}' => box_stroke_rows(N, L, D, N),
+        '\u{2554}' => box_stroke_rows(N, D, D, N),
+        '\u{2555}' => box_stroke_rows(N, N, L, D),
+        '\u{2556}' => box_stroke_rows(N, N, D, L),
+        '\u{2557}' => box_stroke_rows(N, N, D, D),
+        '\u{2558}' => box_stroke_rows(L, D, N, N),
+        '\u{2559}' => box_stroke_rows(D, L, N, N),
+        '\u{255a}' => box_stroke_rows(D, D, N, N),
+        '\u{255b}' => box_stroke_rows(L, N, N, D),
+        '\u{255c}' => box_stroke_rows(D, N, N, L),
+        '\u{255d}' => box_stroke_rows(D, N, N, D),
+        '\u{255e}' => box_stroke_rows(L, D, L, N),
+        '\u{255f}' => box_stroke_rows(D, L, D, N),
+        '\u{2560}' => box_stroke_rows(D, D, D, N),
+        '\u{2561}' => box_stroke_rows(L, N, L, D),
+        '\u{2562}' => box_stroke_rows(D, N, D, L),
+        '\u{2563}' => box_stroke_rows(D, N, D, D),
+        '\u{2564}' => box_stroke_rows(N, D, L, D),
+        '\u{2565}' => box_stroke_rows(N, L, D, L),
+        '\u{2566}' => box_stroke_rows(N, D, D, D),
+        '\u{2567}' => box_stroke_rows(L, D, N, D),
+        '\u{2568}' => box_stroke_rows(D, L, N, L),
+        '\u{2569}' => box_stroke_rows(D, D, N, D),
+        '\u{256a}' => box_stroke_rows(L, D, L, D),
+        '\u{256b}' => box_stroke_rows(D, L, D, L),
+        '\u{256c}' => box_stroke_rows(D, D, D, D),
+        '\u{256d}' => [0, 0, 2, 7, 4, 4, 4],
+        '\u{256e}' => [0, 0, 8, 28, 4, 4, 4],
+        '\u{256f}' => [4, 4, 4, 28, 8, 0, 0],
+        '\u{2570}' => [4, 4, 4, 7, 2, 0, 0],
+        '\u{2571}' => [1, 2, 2, 4, 8, 8, 16],
+        '\u{2572}' => [16, 8, 8, 4, 2, 2, 1],
+        '\u{2573}' => [17, 10, 10, 4, 10, 10, 17],
+        '\u{2574}' => box_stroke_rows(N, N, N, L),
+        '\u{2575}' => box_stroke_rows(L, N, N, N),
+        '\u{2576}' => box_stroke_rows(N, L, N, N),
+        '\u{2577}' => box_stroke_rows(N, N, L, N),
+        '\u{2578}' => box_stroke_rows(N, N, N, H),
+        '\u{2579}' => box_stroke_rows(H, N, N, N),
+        '\u{257a}' => box_stroke_rows(N, H, N, N),
+        '\u{257b}' => box_stroke_rows(N, N, H, N),
+        '\u{257c}' => box_stroke_rows(N, H, N, L),
+        '\u{257d}' => box_stroke_rows(L, N, H, N),
+        '\u{257e}' => box_stroke_rows(N, L, N, H),
+        '\u{257f}' => box_stroke_rows(H, N, L, N),
+        _ => return None,
+    };
+    Some(rows)
 }
 
 #[rustfmt::skip]
@@ -919,7 +1146,7 @@ fn glyph_rows(character: char) -> [u8; 7] {
         '<' => [2, 4, 8, 16, 8, 4, 2],
         '>' => [8, 4, 2, 1, 2, 4, 8],
         '!' => [4, 4, 4, 4, 4, 0, 4],
-        '?' => [14, 17, 1, 2, 4, 0, 4],
+        '?' => QUESTION_MARK_GLYPH,
         '"' => [10, 10, 10, 0, 0, 0, 0],
         '\'' => [4, 4, 8, 0, 0, 0, 0],
         '`' => [8, 4, 2, 0, 0, 0, 0],
@@ -931,7 +1158,7 @@ fn glyph_rows(character: char) -> [u8; 7] {
         '^' => [4, 10, 17, 0, 0, 0, 0],
         '&' => [12, 18, 20, 8, 21, 18, 13],
         '*' => [0, 21, 14, 31, 14, 21, 0],
-        _ => [14, 17, 1, 2, 4, 0, 4],
+        _ => box_drawing_rows(character).unwrap_or(QUESTION_MARK_GLYPH),
     }
 }
 
@@ -1360,6 +1587,67 @@ mod tests {
         }
 
         assert_eq!(seen.len(), 95, "printable ASCII must contain 95 glyphs");
+    }
+
+    #[test]
+    fn complete_box_drawing_block_avoids_the_question_mark_fallback() {
+        for scalar in 0x2500..=0x257f {
+            let character = char::from_u32(scalar).expect("box-drawing scalar is valid");
+            let rows = box_drawing_rows(character)
+                .unwrap_or_else(|| panic!("missing box-drawing glyph U+{scalar:04X}"));
+            assert_eq!(
+                glyph_rows(character),
+                rows,
+                "U+{scalar:04X} is not reachable through the production lookup"
+            );
+            assert_ne!(
+                rows, QUESTION_MARK_GLYPH,
+                "U+{scalar:04X} aliases the unsupported-character fallback"
+            );
+        }
+        assert!(
+            box_drawing_rows('\u{2580}').is_none(),
+            "coverage must stop at the documented U+257F boundary"
+        );
+    }
+
+    #[test]
+    fn common_box_drawing_glyphs_preserve_topology_and_weight() {
+        assert_eq!(glyph_rows('─'), [0, 0, 0, 31, 0, 0, 0]);
+        assert_eq!(glyph_rows('│'), [4, 4, 4, 4, 4, 4, 4]);
+        assert_eq!(glyph_rows('┌'), [0, 0, 0, 7, 4, 4, 4]);
+        assert_eq!(glyph_rows('┼'), [4, 4, 4, 31, 4, 4, 4]);
+        assert_eq!(glyph_rows('═'), [0, 0, 31, 0, 31, 0, 0]);
+        assert_eq!(glyph_rows('║'), [10, 10, 10, 10, 10, 10, 10]);
+        assert_ne!(glyph_rows('─'), glyph_rows('━'));
+        assert_ne!(glyph_rows('│'), glyph_rows('┃'));
+        assert_ne!(glyph_rows('┌'), glyph_rows('╭'));
+        assert_ne!(glyph_rows('╱'), glyph_rows('╲'));
+    }
+
+    #[test]
+    fn box_drawing_strokes_reach_cell_edges_through_the_vertex_path() {
+        let metrics = poc_metrics();
+        let width = metrics.width();
+        let height = metrics.height();
+        let vertices_for = |text: &str| {
+            let terminal = snapshot(1, 1, text.as_bytes());
+            glyph_vertices(Some(&terminal), None, None, width, height, metrics)
+        };
+
+        let horizontal = vertices_for("─");
+        assert!(
+            horizontal.iter().any(|vertex| vertex.position[0] == -1.0)
+                && horizontal.iter().any(|vertex| vertex.position[0] == 1.0),
+            "horizontal frame stroke must span both cell edges"
+        );
+
+        let vertical = vertices_for("│");
+        assert!(
+            vertical.iter().any(|vertex| vertex.position[1] == 1.0)
+                && vertical.iter().any(|vertex| vertex.position[1] == -1.0),
+            "vertical frame stroke must span both cell edges"
+        );
     }
 
     /// The encoded vertex stride must match what the pipeline's vertex buffer
