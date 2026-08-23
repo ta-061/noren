@@ -1,26 +1,39 @@
 //! macOS entry point for the bounded local-zsh PTY PoC.
 
+mod frame_geometry;
+mod input_translation;
 mod persistence_state;
 mod renderer;
 
+use frame_geometry::{pixel_row_index, sidebar_pixel_width, terminal_cols, terminal_column_at};
+#[cfg(test)]
+use input_translation::{
+    app_modifiers_from_gate, gate_key_to_app, keypad_key, translate_logical_key,
+};
+use input_translation::{
+    chord_from_event, chord_from_logical, diagnostics_chord_pressed, encode_button, encode_chord,
+    palette_command_for, translate_key, translate_keypad_key, wheel_clicks,
+};
 use persistence_state::{AttemptOutcome, Observation, PersistenceState, SaveOutcome};
 
+#[cfg(test)]
 use noren_app::{
-    Arrow, CellMetrics, CursorKeyMode, FunctionKey, GridGeometry, GridSize, InputMode, Key,
-    KeyDropReason, KeyEncoder, KeyInput, KeyPhase, KeypadInput, KeypadKey, KeypadMode,
-    MAX_RENDER_COLS, Modifiers, PARSE_BUDGET_BYTES_PER_TURN, PasteReject, Resize, SystemClipboard,
+    Arrow, CellMetrics, FunctionKey, Key, KeyDropReason, KeyInput, KeyPhase, KeypadInput,
+    KeypadKey, MAX_RENDER_COLS,
+    mouse::{MouseButton as EncoderButton, WheelDirection},
+    passthrough::Modifiers as GateModifiers,
+};
+use noren_app::{
+    CursorKeyMode, GridGeometry, GridSize, InputMode, KeyEncoder, KeypadMode, Modifiers,
+    PARSE_BUDGET_BYTES_PER_TURN, PasteReject, Resize, SystemClipboard,
     config::{AppConfig, KeymapConfig},
     diagnostics::{self, PtyChildStatus},
     encode_paste,
-    mouse::{
-        MouseButton as EncoderButton, MouseEncoder, MouseGrid, MouseModes, PointerEvent,
-        PointerModifiers, WheelDirection,
-    },
+    mouse::{MouseEncoder, MouseGrid, MouseModes, PointerEvent, PointerModifiers},
     palette::{CommandId, Palette},
     passthrough::{
-        CLAIM_ID_PALETTE, Chord, ChordSeq, GateKind, KeyCode as GateKeyCode,
-        Modifiers as GateModifiers, PassthroughAction, PassthroughClaim, PassthroughGate,
-        PassthroughPolicy, default_exit_claim,
+        CLAIM_ID_PALETTE, Chord, ChordSeq, GateKind, KeyCode as GateKeyCode, PassthroughAction,
+        PassthroughClaim, PassthroughGate, PassthroughPolicy, default_exit_claim,
     },
     session::{
         SessionAction, SessionError, SessionEvent, SessionId, SessionKind, SessionRegistry,
@@ -48,7 +61,9 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{Key as WinitKey, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey};
+#[cfg(test)]
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 const WINDOW_WIDTH: u32 = 900;
@@ -851,21 +866,6 @@ impl NorenApp {
         } else {
             StatusRowSource::Runtime
         }
-    }
-
-    /// Whether the permanent status chrome has enough room to own a row.
-    fn status_row_present(window_rows: u16) -> bool {
-        window_rows > 1
-    }
-
-    /// Terminal rows available after reserving permanent application chrome.
-    ///
-    /// The PTY, terminal state, renderer, and pointer mapper must all agree on
-    /// this value. A one-row window cannot reserve its only row for chrome;
-    /// keeping one terminal row is safer than constructing an invalid zero-row
-    /// PTY, so the status line is temporarily suppressed there.
-    fn content_terminal_rows(window_rows: u16) -> u16 {
-        window_rows - u16::from(Self::status_row_present(window_rows))
     }
 
     fn rendered_status_row(&self, window_rows: u16) -> Option<StatusRowSource> {
@@ -2574,21 +2574,6 @@ impl NorenApp {
     }
 }
 
-/// Super+D press toggles diagnostics. Super chords are dropped by the key
-/// encoder anyway, so this intercept consumes no terminal input.
-fn diagnostics_chord_pressed(
-    logical_key: &WinitKey,
-    state: ElementState,
-    repeat: bool,
-    modifiers: Modifiers,
-) -> bool {
-    state == ElementState::Pressed
-        && !repeat
-        && modifiers.is_super()
-        && matches!(logical_key,
-            WinitKey::Character(text) if text.eq_ignore_ascii_case("d"))
-}
-
 impl ApplicationHandler for NorenApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         self.initialize(event_loop);
@@ -2679,25 +2664,6 @@ impl RuntimeGridSize {
     }
 }
 
-/// Terminal column count for a given window column count, reserving
-/// [`renderer::SIDEBAR_COLS`] columns on the left for the sidebar and clamping
-/// the remainder to the renderer's drawable budget. The PTY winsize, terminal
-/// state's column count, and the renderer's drawn region all use this value so
-/// they never disagree.
-///
-/// Reserve the sidebar first, then clamp the terminal to
-/// `MAX_RENDER_COLS - SIDEBAR_COLS` (floored at one). The sidebar sits *inside*
-/// the renderer's `MAX_RENDER_COLS` ceiling, so the terminal must never be told
-/// it owns more columns than the renderer can draw beside the sidebar —
-/// otherwise columns are clipped invisibly. `renderer::glyph_vertices` applies
-/// the identical formula independently; the sidebar geometry test pins that the
-/// two sites agree.
-fn terminal_cols(window_cols: u16) -> u16 {
-    let sidebar = u16::try_from(renderer::SIDEBAR_COLS).unwrap_or(u16::MAX);
-    let budget = MAX_RENDER_COLS.saturating_sub(sidebar).max(1);
-    window_cols.saturating_sub(sidebar).clamp(1, budget)
-}
-
 /// Convert the sidebar view into text lines the renderer can draw.
 ///
 /// Each row is prefixed with `>` when selected, space otherwise, followed by
@@ -2781,346 +2747,6 @@ fn command_shortcut(id: CommandId, keys: &KeymapConfig) -> char {
         GateKeyCode::Char(character) => character.to_ascii_uppercase(),
         _ => '?',
     }
-}
-
-/// Map a winit key event and app modifiers to a pass-through chord.
-///
-/// Returns `None` for keys that cannot be normalized into a [`Chord`]
-/// (whitespace characters, dead keys, multi-codepoint IME sequences). Such
-/// keys bypass the gate and follow the normal encode-and-send path.
-fn chord_from_event(event: &KeyEvent, modifiers: Modifiers) -> Option<Chord> {
-    chord_from_logical(&event.logical_key, modifiers)
-}
-
-/// Map a logical key and app modifiers to a pass-through chord.
-///
-/// The window-free core of [`chord_from_event`], shared by the pass-through
-/// gate and the open palette's command-chord matching.
-fn chord_from_logical(key: &WinitKey, modifiers: Modifiers) -> Option<Chord> {
-    let code = winit_to_gate_key(key)?;
-    let gate_mods = gate_modifiers(modifiers);
-    Chord::new(code, gate_mods).ok()
-}
-
-/// Resolve a pressed key inside the open palette to its command.
-///
-/// An exact chord match honors configured modifiers. A modifier-free
-/// character binding additionally matches by logical character regardless of
-/// held modifiers, preserving the palette's pre-configuration behavior for
-/// the default `c`/`s`/`x`/`f` bindings; `bare` is `None` for non-character
-/// keys, which only ever match exactly.
-fn palette_command_for(
-    keys: &KeymapConfig,
-    pressed: Option<Chord>,
-    bare: Option<GateKeyCode>,
-) -> Option<CommandId> {
-    let bindings = [
-        (keys.session_create(), CommandId::SESSION_CREATE),
-        (keys.session_select(), CommandId::SESSION_SELECT),
-        (keys.session_close(), CommandId::SESSION_CLOSE),
-        (keys.sidebar_focus(), CommandId::SIDEBAR_FOCUS),
-    ];
-    for (binding, id) in bindings {
-        if pressed == Some(binding) {
-            return Some(id);
-        }
-        if binding.modifiers() == GateModifiers::empty()
-            && bare.is_some_and(|bare| binding.code() == bare)
-        {
-            return Some(id);
-        }
-    }
-    None
-}
-
-/// Encode a pass-through chord into PTY bytes for replay.
-///
-/// Used when a held leader prefix is replayed after a mismatch. The encoding
-/// mirrors what [`KeyEncoder::encode_with`] would produce for the equivalent
-/// key event. Returns `None` for chords that the encoder would drop (e.g.
-/// Super-modified chords, which produce no PTY bytes).
-fn encode_chord(chord: &Chord, mode: InputMode) -> Option<Vec<u8>> {
-    let key = gate_key_to_app(chord.code())?;
-    let mods = app_modifiers_from_gate(chord.modifiers());
-    let input = KeyInput::new(key, KeyPhase::Pressed, mods);
-    KeyEncoder::encode_with(input, mode).ok()
-}
-
-fn winit_to_gate_key(key: &WinitKey) -> Option<GateKeyCode> {
-    match key {
-        WinitKey::Character(text) => {
-            let ch = text.chars().next()?;
-            if text.chars().count() > 1 {
-                return None;
-            }
-            Some(GateKeyCode::Char(ch))
-        }
-        WinitKey::Named(NamedKey::Escape) => Some(GateKeyCode::Escape),
-        WinitKey::Named(NamedKey::Enter) => Some(GateKeyCode::Enter),
-        WinitKey::Named(NamedKey::Tab) => Some(GateKeyCode::Tab),
-        WinitKey::Named(NamedKey::Backspace) => Some(GateKeyCode::Backspace),
-        WinitKey::Named(NamedKey::Space) => Some(GateKeyCode::Space),
-        WinitKey::Named(NamedKey::ArrowUp) => Some(GateKeyCode::Up),
-        WinitKey::Named(NamedKey::ArrowDown) => Some(GateKeyCode::Down),
-        WinitKey::Named(NamedKey::ArrowLeft) => Some(GateKeyCode::Left),
-        WinitKey::Named(NamedKey::ArrowRight) => Some(GateKeyCode::Right),
-        WinitKey::Named(NamedKey::Home) => Some(GateKeyCode::Home),
-        WinitKey::Named(NamedKey::End) => Some(GateKeyCode::End),
-        WinitKey::Named(NamedKey::PageUp) => Some(GateKeyCode::PageUp),
-        WinitKey::Named(NamedKey::PageDown) => Some(GateKeyCode::PageDown),
-        WinitKey::Named(NamedKey::Delete) => Some(GateKeyCode::Delete),
-        WinitKey::Named(NamedKey::Insert) => Some(GateKeyCode::Insert),
-        // Function keys F1–F24 round out the chord vocabulary the keymap
-        // parser accepts (`f1`–`f24`); higher F-keys stay unmapped.
-        WinitKey::Named(NamedKey::F1) => Some(GateKeyCode::Function(1)),
-        WinitKey::Named(NamedKey::F2) => Some(GateKeyCode::Function(2)),
-        WinitKey::Named(NamedKey::F3) => Some(GateKeyCode::Function(3)),
-        WinitKey::Named(NamedKey::F4) => Some(GateKeyCode::Function(4)),
-        WinitKey::Named(NamedKey::F5) => Some(GateKeyCode::Function(5)),
-        WinitKey::Named(NamedKey::F6) => Some(GateKeyCode::Function(6)),
-        WinitKey::Named(NamedKey::F7) => Some(GateKeyCode::Function(7)),
-        WinitKey::Named(NamedKey::F8) => Some(GateKeyCode::Function(8)),
-        WinitKey::Named(NamedKey::F9) => Some(GateKeyCode::Function(9)),
-        WinitKey::Named(NamedKey::F10) => Some(GateKeyCode::Function(10)),
-        WinitKey::Named(NamedKey::F11) => Some(GateKeyCode::Function(11)),
-        WinitKey::Named(NamedKey::F12) => Some(GateKeyCode::Function(12)),
-        WinitKey::Named(NamedKey::F13) => Some(GateKeyCode::Function(13)),
-        WinitKey::Named(NamedKey::F14) => Some(GateKeyCode::Function(14)),
-        WinitKey::Named(NamedKey::F15) => Some(GateKeyCode::Function(15)),
-        WinitKey::Named(NamedKey::F16) => Some(GateKeyCode::Function(16)),
-        WinitKey::Named(NamedKey::F17) => Some(GateKeyCode::Function(17)),
-        WinitKey::Named(NamedKey::F18) => Some(GateKeyCode::Function(18)),
-        WinitKey::Named(NamedKey::F19) => Some(GateKeyCode::Function(19)),
-        WinitKey::Named(NamedKey::F20) => Some(GateKeyCode::Function(20)),
-        WinitKey::Named(NamedKey::F21) => Some(GateKeyCode::Function(21)),
-        WinitKey::Named(NamedKey::F22) => Some(GateKeyCode::Function(22)),
-        WinitKey::Named(NamedKey::F23) => Some(GateKeyCode::Function(23)),
-        WinitKey::Named(NamedKey::F24) => Some(GateKeyCode::Function(24)),
-        _ => None,
-    }
-}
-
-fn gate_key_to_app(code: GateKeyCode) -> Option<Key> {
-    match code {
-        GateKeyCode::Char(ch) => Some(Key::Character(ch)),
-        GateKeyCode::Enter => Some(Key::Enter),
-        GateKeyCode::Tab => Some(Key::Tab),
-        GateKeyCode::Backspace => Some(Key::Backspace),
-        GateKeyCode::Escape => Some(Key::Escape),
-        GateKeyCode::Space => Some(Key::Character(' ')),
-        GateKeyCode::Up => Some(Key::Arrow(Arrow::Up)),
-        GateKeyCode::Down => Some(Key::Arrow(Arrow::Down)),
-        GateKeyCode::Left => Some(Key::Arrow(Arrow::Left)),
-        GateKeyCode::Right => Some(Key::Arrow(Arrow::Right)),
-        GateKeyCode::Home => Some(Key::Home),
-        GateKeyCode::End => Some(Key::End),
-        GateKeyCode::PageUp => Some(Key::PageUp),
-        GateKeyCode::PageDown => Some(Key::PageDown),
-        GateKeyCode::Delete => Some(Key::Delete),
-        GateKeyCode::Insert => Some(Key::Insert),
-        GateKeyCode::Function(_) => None,
-    }
-}
-
-fn gate_modifiers(mods: Modifiers) -> GateModifiers {
-    let mut gate = GateModifiers::empty();
-    if mods.is_ctrl() {
-        gate = gate.ctrl();
-    }
-    if mods.is_alt() {
-        gate = gate.alt();
-    }
-    if mods.is_shift() {
-        gate = gate.shift();
-    }
-    if mods.is_super() {
-        gate = gate.super_key();
-    }
-    gate
-}
-
-fn app_modifiers_from_gate(mods: GateModifiers) -> Modifiers {
-    let mut app = Modifiers::empty();
-    if mods.is_ctrl() {
-        app = app.ctrl();
-    }
-    if mods.is_alt() {
-        app = app.alt();
-    }
-    if mods.is_shift() {
-        app = app.shift();
-    }
-    if mods.is_super() {
-        app = app.super_key();
-    }
-    app
-}
-
-/// Index of the cell row containing a non-negative pixel coordinate, or
-/// `None` when the coordinate is not finite. The cast saturates on overflow,
-/// and downstream clamping keeps any saturated index inside the grid.
-fn pixel_row_index(pixel: f64, cell_size: u32) -> Option<usize> {
-    if !pixel.is_finite() {
-        return None;
-    }
-    Some((pixel / f64::from(cell_size)) as usize)
-}
-
-/// Pixel width of the sidebar's left strip: `SIDEBAR_COLS` cell columns. The
-/// terminal is drawn to the right of this edge, so a click at exactly this x is
-/// the first terminal column.
-fn sidebar_pixel_width(cell_width: u32) -> f64 {
-    f64::from((renderer::SIDEBAR_COLS as u32) * cell_width)
-}
-
-/// Terminal cell column under pixel x, or `None` when the click lands in the
-/// sidebar strip, on a non-finite coordinate, or past the grid. The sidebar
-/// boundary is exclusive: x exactly at [`sidebar_pixel_width`] is the first
-/// terminal column and maps to cell 0; anything strictly left of it is the
-/// sidebar and is rejected.
-fn terminal_column_at(pixel_x: f64, terminal_cols: u16, cell_width: u32) -> Option<usize> {
-    let edge = sidebar_pixel_width(cell_width);
-    if !pixel_x.is_finite() || pixel_x < edge {
-        return None;
-    }
-    pixel_row_index(pixel_x - edge, cell_width)
-        .map(|raw| raw.min(usize::from(terminal_cols).saturating_sub(1)))
-}
-
-/// Map a winit mouse button to the encoder's button type. `Back`, `Forward`,
-/// and `Other` are not reportable and return `None`.
-fn encode_button(button: MouseButton) -> Option<EncoderButton> {
-    match button {
-        MouseButton::Left => Some(EncoderButton::Left),
-        MouseButton::Middle => Some(EncoderButton::Middle),
-        MouseButton::Right => Some(EncoderButton::Right),
-        MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => None,
-    }
-}
-
-/// Convert a winit scroll delta to a sequence of wheel directions (one per
-/// line scrolled).
-///
-/// Both `LineDelta` and `PixelDelta` share the same vertical sign convention.
-/// From the winit 0.30 source (`event.rs`, `MouseScrollDelta`):
-///
-///   LineDelta:   "Positive values indicate that the content that is being
-///                 scrolled should move right and down (revealing more content
-///                 left and up)."
-///   PixelDelta:  "Positive values indicate that the content being scrolled
-///                 should move right/down."
-///
-/// Positive y therefore means the user scrolled **up** (content moves down,
-/// revealing earlier content). xterm sends button 4 (`Cb=64`,
-/// `WheelDirection::Up`) for scroll-up; negative y is scroll-down (`Cb=65`).
-///
-/// A non-zero delta that rounds to zero lines still produces one click so a
-/// single-notch wheel is never lost.
-///
-/// `metrics` carries the configured cell height — the same runtime
-/// [`CellMetrics`] the renderer and the click-to-grid mappers read — so a
-/// `PixelDelta` is converted to lines at the configured stride. Dividing by a
-/// compile-time constant instead would convert at the PoC height regardless of
-/// `[font] cell_height`, halving the line count at the default and doubling it
-/// wherever the height is raised.
-fn wheel_clicks(delta: MouseScrollDelta, metrics: CellMetrics) -> Vec<WheelDirection> {
-    let lines = match delta {
-        MouseScrollDelta::LineDelta(_, y) => y,
-        MouseScrollDelta::PixelDelta(pos) => (pos.y / f64::from(metrics.height())) as f32,
-    };
-    let count = lines.abs().floor().max(0.0) as usize;
-    let count = if count == 0 && lines != 0.0 { 1 } else { count };
-    let direction = if lines < 0.0 {
-        WheelDirection::Down
-    } else {
-        WheelDirection::Up
-    };
-    vec![direction; count]
-}
-
-fn translate_key(event: &KeyEvent, modifiers: Modifiers) -> Result<KeyInput, KeyDropReason> {
-    translate_logical_key(&event.logical_key, key_phase(event), modifiers)
-}
-
-fn key_phase(event: &KeyEvent) -> KeyPhase {
-    match event.state {
-        ElementState::Released => KeyPhase::Released,
-        ElementState::Pressed if event.repeat => KeyPhase::Repeat,
-        ElementState::Pressed => KeyPhase::Pressed,
-    }
-}
-
-fn translate_keypad_key(event: &KeyEvent) -> Option<KeypadInput> {
-    keypad_key(event.physical_key).map(|key| KeypadInput::new(key, key_phase(event)))
-}
-
-fn keypad_key(physical_key: PhysicalKey) -> Option<KeypadKey> {
-    Some(match physical_key {
-        PhysicalKey::Code(KeyCode::Numpad0) => KeypadKey::Zero,
-        PhysicalKey::Code(KeyCode::Numpad1) => KeypadKey::One,
-        PhysicalKey::Code(KeyCode::Numpad2) => KeypadKey::Two,
-        PhysicalKey::Code(KeyCode::Numpad3) => KeypadKey::Three,
-        PhysicalKey::Code(KeyCode::Numpad4) => KeypadKey::Four,
-        PhysicalKey::Code(KeyCode::Numpad5) => KeypadKey::Five,
-        PhysicalKey::Code(KeyCode::Numpad6) => KeypadKey::Six,
-        PhysicalKey::Code(KeyCode::Numpad7) => KeypadKey::Seven,
-        PhysicalKey::Code(KeyCode::Numpad8) => KeypadKey::Eight,
-        PhysicalKey::Code(KeyCode::Numpad9) => KeypadKey::Nine,
-        PhysicalKey::Code(KeyCode::NumpadDecimal) => KeypadKey::Decimal,
-        PhysicalKey::Code(KeyCode::NumpadAdd) => KeypadKey::Plus,
-        PhysicalKey::Code(KeyCode::NumpadSubtract) => KeypadKey::Minus,
-        PhysicalKey::Code(KeyCode::NumpadMultiply) => KeypadKey::Star,
-        PhysicalKey::Code(KeyCode::NumpadDivide) => KeypadKey::Slash,
-        PhysicalKey::Code(KeyCode::NumpadEnter) => KeypadKey::Enter,
-        _ => return None,
-    })
-}
-
-fn translate_logical_key(
-    logical_key: &WinitKey,
-    phase: KeyPhase,
-    modifiers: Modifiers,
-) -> Result<KeyInput, KeyDropReason> {
-    let key = match logical_key {
-        WinitKey::Character(text) => {
-            let mut characters = text.chars();
-            let character = characters.next().ok_or(KeyDropReason::UnsupportedKey)?;
-            if characters.next().is_some() {
-                return Err(KeyDropReason::ImeOrDeadKey);
-            }
-            Key::Character(character)
-        }
-        WinitKey::Named(NamedKey::Enter) => Key::Enter,
-        WinitKey::Named(NamedKey::Backspace) => Key::Backspace,
-        WinitKey::Named(NamedKey::Tab) => Key::Tab,
-        WinitKey::Named(NamedKey::Escape) => Key::Escape,
-        WinitKey::Named(NamedKey::Space) => Key::Character(' '),
-        WinitKey::Named(NamedKey::ArrowUp) => Key::Arrow(Arrow::Up),
-        WinitKey::Named(NamedKey::ArrowDown) => Key::Arrow(Arrow::Down),
-        WinitKey::Named(NamedKey::ArrowLeft) => Key::Arrow(Arrow::Left),
-        WinitKey::Named(NamedKey::ArrowRight) => Key::Arrow(Arrow::Right),
-        WinitKey::Named(NamedKey::Delete) => Key::Delete,
-        WinitKey::Named(NamedKey::Insert) => Key::Insert,
-        WinitKey::Named(NamedKey::Home) => Key::Home,
-        WinitKey::Named(NamedKey::End) => Key::End,
-        WinitKey::Named(NamedKey::PageUp) => Key::PageUp,
-        WinitKey::Named(NamedKey::PageDown) => Key::PageDown,
-        WinitKey::Named(NamedKey::F1) => Key::Function(FunctionKey::F1),
-        WinitKey::Named(NamedKey::F2) => Key::Function(FunctionKey::F2),
-        WinitKey::Named(NamedKey::F3) => Key::Function(FunctionKey::F3),
-        WinitKey::Named(NamedKey::F4) => Key::Function(FunctionKey::F4),
-        WinitKey::Named(NamedKey::F5) => Key::Function(FunctionKey::F5),
-        WinitKey::Named(NamedKey::F6) => Key::Function(FunctionKey::F6),
-        WinitKey::Named(NamedKey::F7) => Key::Function(FunctionKey::F7),
-        WinitKey::Named(NamedKey::F8) => Key::Function(FunctionKey::F8),
-        WinitKey::Named(NamedKey::F9) => Key::Function(FunctionKey::F9),
-        WinitKey::Named(NamedKey::F10) => Key::Function(FunctionKey::F10),
-        WinitKey::Named(NamedKey::F11) => Key::Function(FunctionKey::F11),
-        WinitKey::Named(NamedKey::F12) => Key::Function(FunctionKey::F12),
-        WinitKey::Dead(_) => return Err(KeyDropReason::ImeOrDeadKey),
-        _ => return Err(KeyDropReason::UnsupportedKey),
-    };
-    Ok(KeyInput::new(key, phase, modifiers))
 }
 
 fn main() {
