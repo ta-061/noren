@@ -858,6 +858,142 @@ pub(crate) fn vertex_bytes(vertices: &[Vertex]) -> Vec<u8> {
 }
 
 const QUESTION_MARK_GLYPH: [u8; 7] = [14, 17, 1, 2, 4, 0, 4];
+const UNICODE_REPLACEMENT_GLYPH: [u8; 7] = [4, 10, 17, 21, 17, 10, 4];
+
+/// Add one visible diacritic row to an ASCII base glyph.
+///
+/// Uppercase glyphs already consume all seven rows, so their repeated lower
+/// body row is compressed out while the final baseline row is retained.
+/// Lowercase accented letters have room above their x-height; replacing row
+/// zero also replaces the dot on `i` with the requested accent.
+fn top_marked_ascii(base: char, mark: u8) -> [u8; 7] {
+    let rows = glyph_rows(base);
+    if base.is_ascii_uppercase() {
+        [mark, rows[0], rows[1], rows[2], rows[3], rows[4], rows[6]]
+    } else {
+        [mark, rows[1], rows[2], rows[3], rows[4], rows[5], rows[6]]
+    }
+}
+
+fn bottom_marked_ascii(base: char, mark: u8) -> [u8; 7] {
+    let rows = glyph_rows(base);
+    [rows[0], rows[1], rows[2], rows[3], rows[4], rows[6], mark]
+}
+
+/// Bitmap coverage for the complete Latin-1 Supplement block
+/// (`U+00A0..=U+00FF`). Precomposed letters retain their ASCII base shape and
+/// encode their accent in the spare top or bottom row; Latin-1 punctuation and
+/// symbols use compact 5×7 approximations.
+#[rustfmt::skip]
+fn latin1_rows(character: char) -> Option<[u8; 7]> {
+    const GRAVE: u8 = 0b01000;
+    const ACUTE: u8 = 0b00010;
+    const CIRCUMFLEX: u8 = 0b01010;
+    const TILDE: u8 = 0b01011;
+    const DIAERESIS: u8 = 0b10001;
+    const RING: u8 = 0b00100;
+
+    let rows = match character {
+        '\u{00a0}' => [0, 0, 0, 0, 0, 0, 0],
+        '\u{00a1}' => [4, 0, 4, 4, 4, 4, 4],
+        '\u{00a2}' => [4, 14, 20, 20, 21, 14, 4],
+        '\u{00a3}' => [6, 8, 8, 30, 8, 8, 31],
+        '\u{00a4}' => [0, 17, 14, 10, 14, 17, 0],
+        '\u{00a5}' => [17, 10, 4, 31, 4, 31, 4],
+        '\u{00a6}' => [4, 4, 4, 0, 4, 4, 4],
+        '\u{00a7}' => [14, 16, 12, 18, 6, 1, 14],
+        '\u{00a8}' => [17, 0, 0, 0, 0, 0, 0],
+        '\u{00a9}' => [14, 17, 23, 20, 23, 17, 14],
+        '\u{00aa}' => [4, 10, 14, 10, 0, 14, 0],
+        '\u{00ab}' => [0, 5, 10, 20, 10, 5, 0],
+        '\u{00ac}' => [0, 0, 31, 1, 1, 0, 0],
+        '\u{00ad}' => [0, 0, 0, 14, 0, 0, 0],
+        '\u{00ae}' => [14, 17, 30, 21, 18, 17, 14],
+        '\u{00af}' => [31, 0, 0, 0, 0, 0, 0],
+        '\u{00b0}' => [6, 9, 9, 6, 0, 0, 0],
+        '\u{00b1}' => [4, 4, 31, 4, 4, 0, 31],
+        '\u{00b2}' => [6, 9, 2, 4, 15, 0, 0],
+        '\u{00b3}' => [14, 1, 6, 1, 14, 0, 0],
+        '\u{00b4}' => [2, 4, 0, 0, 0, 0, 0],
+        '\u{00b5}' => [0, 0, 17, 17, 19, 29, 16],
+        '\u{00b6}' => [15, 29, 29, 13, 5, 5, 5],
+        '\u{00b7}' => [0, 0, 0, 4, 0, 0, 0],
+        '\u{00b8}' => [0, 0, 0, 0, 0, 4, 8],
+        '\u{00b9}' => [4, 12, 4, 4, 14, 0, 0],
+        '\u{00ba}' => [4, 10, 4, 10, 0, 14, 0],
+        '\u{00bb}' => [0, 20, 10, 5, 10, 20, 0],
+        '\u{00bc}' => [8, 24, 9, 2, 5, 7, 1],
+        '\u{00bd}' => [8, 24, 9, 2, 7, 1, 7],
+        '\u{00be}' => [24, 8, 25, 2, 5, 7, 1],
+        '\u{00bf}' => [4, 0, 4, 8, 16, 17, 14],
+        '\u{00c0}' => top_marked_ascii('A', GRAVE),
+        '\u{00c1}' => top_marked_ascii('A', ACUTE),
+        '\u{00c2}' => top_marked_ascii('A', CIRCUMFLEX),
+        '\u{00c3}' => top_marked_ascii('A', TILDE),
+        '\u{00c4}' => top_marked_ascii('A', DIAERESIS),
+        '\u{00c5}' => top_marked_ascii('A', RING),
+        '\u{00c6}' => [14, 21, 20, 30, 20, 21, 23],
+        '\u{00c7}' => bottom_marked_ascii('C', 4),
+        '\u{00c8}' => top_marked_ascii('E', GRAVE),
+        '\u{00c9}' => top_marked_ascii('E', ACUTE),
+        '\u{00ca}' => top_marked_ascii('E', CIRCUMFLEX),
+        '\u{00cb}' => top_marked_ascii('E', DIAERESIS),
+        '\u{00cc}' => top_marked_ascii('I', GRAVE),
+        '\u{00cd}' => top_marked_ascii('I', ACUTE),
+        '\u{00ce}' => top_marked_ascii('I', CIRCUMFLEX),
+        '\u{00cf}' => top_marked_ascii('I', DIAERESIS),
+        '\u{00d0}' => [30, 9, 9, 29, 9, 9, 30],
+        '\u{00d1}' => top_marked_ascii('N', TILDE),
+        '\u{00d2}' => top_marked_ascii('O', GRAVE),
+        '\u{00d3}' => top_marked_ascii('O', ACUTE),
+        '\u{00d4}' => top_marked_ascii('O', CIRCUMFLEX),
+        '\u{00d5}' => top_marked_ascii('O', TILDE),
+        '\u{00d6}' => top_marked_ascii('O', DIAERESIS),
+        '\u{00d7}' => [0, 17, 10, 4, 10, 17, 0],
+        '\u{00d8}' => [15, 19, 21, 21, 21, 25, 30],
+        '\u{00d9}' => top_marked_ascii('U', GRAVE),
+        '\u{00da}' => top_marked_ascii('U', ACUTE),
+        '\u{00db}' => top_marked_ascii('U', CIRCUMFLEX),
+        '\u{00dc}' => top_marked_ascii('U', DIAERESIS),
+        '\u{00dd}' => top_marked_ascii('Y', ACUTE),
+        '\u{00de}' => [16, 16, 30, 17, 30, 16, 16],
+        '\u{00df}' => [12, 18, 18, 28, 18, 18, 29],
+        '\u{00e0}' => top_marked_ascii('a', GRAVE),
+        '\u{00e1}' => top_marked_ascii('a', ACUTE),
+        '\u{00e2}' => top_marked_ascii('a', CIRCUMFLEX),
+        '\u{00e3}' => top_marked_ascii('a', TILDE),
+        '\u{00e4}' => top_marked_ascii('a', DIAERESIS),
+        '\u{00e5}' => top_marked_ascii('a', RING),
+        '\u{00e6}' => [0, 0, 14, 5, 15, 20, 15],
+        '\u{00e7}' => bottom_marked_ascii('c', 4),
+        '\u{00e8}' => top_marked_ascii('e', GRAVE),
+        '\u{00e9}' => top_marked_ascii('e', ACUTE),
+        '\u{00ea}' => top_marked_ascii('e', CIRCUMFLEX),
+        '\u{00eb}' => top_marked_ascii('e', DIAERESIS),
+        '\u{00ec}' => top_marked_ascii('i', GRAVE),
+        '\u{00ed}' => top_marked_ascii('i', ACUTE),
+        '\u{00ee}' => top_marked_ascii('i', CIRCUMFLEX),
+        '\u{00ef}' => top_marked_ascii('i', DIAERESIS),
+        '\u{00f0}' => [2, 4, 14, 3, 15, 17, 14],
+        '\u{00f1}' => top_marked_ascii('n', TILDE),
+        '\u{00f2}' => top_marked_ascii('o', GRAVE),
+        '\u{00f3}' => top_marked_ascii('o', ACUTE),
+        '\u{00f4}' => top_marked_ascii('o', CIRCUMFLEX),
+        '\u{00f5}' => top_marked_ascii('o', TILDE),
+        '\u{00f6}' => top_marked_ascii('o', DIAERESIS),
+        '\u{00f7}' => [0, 4, 0, 31, 0, 4, 0],
+        '\u{00f8}' => [0, 0, 15, 19, 21, 25, 30],
+        '\u{00f9}' => top_marked_ascii('u', GRAVE),
+        '\u{00fa}' => top_marked_ascii('u', ACUTE),
+        '\u{00fb}' => top_marked_ascii('u', CIRCUMFLEX),
+        '\u{00fc}' => top_marked_ascii('u', DIAERESIS),
+        '\u{00fd}' => top_marked_ascii('y', ACUTE),
+        '\u{00fe}' => [16, 16, 30, 17, 30, 16, 16],
+        '\u{00ff}' => top_marked_ascii('y', DIAERESIS),
+        _ => return None,
+    };
+    Some(rows)
+}
 
 fn is_box_drawing(character: char) -> bool {
     matches!(character, '\u{2500}'..='\u{257f}')
@@ -1158,7 +1294,9 @@ fn glyph_rows(character: char) -> [u8; 7] {
         '^' => [4, 10, 17, 0, 0, 0, 0],
         '&' => [12, 18, 20, 8, 21, 18, 13],
         '*' => [0, 21, 14, 31, 14, 21, 0],
-        _ => box_drawing_rows(character).unwrap_or(QUESTION_MARK_GLYPH),
+        _ => latin1_rows(character)
+            .or_else(|| box_drawing_rows(character))
+            .unwrap_or(UNICODE_REPLACEMENT_GLYPH),
     }
 }
 
@@ -1567,10 +1705,12 @@ mod tests {
     }
 
     #[test]
-    fn ascii_glyphs_are_distinct_and_unknown_is_question_mark() {
+    fn ascii_glyphs_are_distinct_and_unknown_unicode_uses_replacement() {
         assert_ne!(glyph_rows('A'), glyph_rows('B'));
         assert_ne!(glyph_rows('a'), glyph_rows('A'));
-        assert_eq!(glyph_rows('界'), glyph_rows('?'));
+        assert_eq!(glyph_rows('界'), UNICODE_REPLACEMENT_GLYPH);
+        assert_eq!(glyph_rows('日'), UNICODE_REPLACEMENT_GLYPH);
+        assert_ne!(glyph_rows('界'), glyph_rows('?'));
     }
 
     #[test]
@@ -1587,6 +1727,37 @@ mod tests {
         }
 
         assert_eq!(seen.len(), 95, "printable ASCII must contain 95 glyphs");
+    }
+
+    #[test]
+    fn complete_latin1_supplement_is_reachable_without_unicode_fallback() {
+        for scalar in 0x00a0..=0x00ff {
+            let character = char::from_u32(scalar).expect("Latin-1 scalar is valid");
+            let rows = latin1_rows(character)
+                .unwrap_or_else(|| panic!("missing Latin-1 glyph U+{scalar:04X}"));
+            assert_eq!(
+                glyph_rows(character),
+                rows,
+                "U+{scalar:04X} is not reachable through the production lookup"
+            );
+            assert_ne!(
+                rows, UNICODE_REPLACEMENT_GLYPH,
+                "U+{scalar:04X} aliases the unsupported-Unicode fallback"
+            );
+            assert!(
+                rows.iter().all(|row| *row <= 0b1_1111),
+                "U+{scalar:04X} escapes the five-bit bitmap width"
+            );
+        }
+
+        assert_eq!(glyph_rows('\u{00a0}'), glyph_rows(' '));
+        assert_ne!(glyph_rows('É'), glyph_rows('E'));
+        assert_ne!(glyph_rows('é'), glyph_rows('e'));
+        assert_ne!(glyph_rows('ø'), glyph_rows('o'));
+        assert!(
+            latin1_rows('\u{0100}').is_none(),
+            "coverage must stop at the documented U+00FF boundary"
+        );
     }
 
     #[test]
@@ -1718,7 +1889,11 @@ mod tests {
     #[test]
     fn wide_output_renders_like_the_equivalent_single_width_layout() {
         let wide = snapshot(1, 6, "a日b".as_bytes());
-        let aligned = snapshot(1, 6, b"a? b");
+        // U+FFFD is a narrow scalar that intentionally uses the same explicit
+        // replacement bitmap as unsupported wide U+65E5. The intervening
+        // space models the wide character's continuation column without
+        // reviving the old (and now invalid) assumption that fallback is '?'.
+        let aligned = snapshot(1, 6, "a\u{fffd} b".as_bytes());
         let m = poc_metrics();
         assert_eq!(
             glyph_vertices(Some(&wide), None, None, 900, 600, m),

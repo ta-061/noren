@@ -47,8 +47,9 @@
 //!
 //! - `lowercase_distinct_from_uppercase` guards the fixed case-folding defect:
 //!   `a` and `A` must render differently.
-//! - `non_ascii_glyph_is_not_the_question_mark`: every non-ASCII code point
-//!   falls to the `?` default arm, so `日` renders as `?`.
+//! - `non_ascii_glyph_is_not_the_question_mark` guards the fixed fallback
+//!   defect: unsupported Unicode such as `日` uses a visible replacement glyph,
+//!   while Latin-1 Supplement and Box Drawing have built-in coverage.
 
 #[path = "../src/renderer_capture.rs"]
 mod renderer_capture;
@@ -784,15 +785,10 @@ fn lowercase_distinct_from_uppercase() {
 }
 
 #[test]
-#[ignore = "known defect: every non-ASCII code point falls through to the '?' \
-            arm, so '日' and '?' draw identically. Ignored rather than deleted \
-            or weakened — this assertion is the executable specification of the \
-            fix. `cargo test -- --ignored` confirms it still fails; remove this \
-            attribute when a real font stack lands."]
 fn non_ascii_glyph_is_not_the_question_mark() {
-    // DEFECT (reported): every non-ASCII code point hits the `?` default arm in
-    // `glyph_rows`, so '日' renders as '?'. A correct UTF-8 terminal must at
-    // least draw a different glyph for a different character.
+    // Full CJK is intentionally outside this fixed bitmap font. Unsupported
+    // Unicode uses a visible replacement glyph, which must not impersonate a
+    // literal question mark typed by the terminal application.
     let renderer = OffscreenRenderer::new().expect("offscreen renderer");
     let kanji = snapshot(1, 4, "日".as_bytes());
     let question = snapshot(1, 4, b"?");
