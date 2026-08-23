@@ -835,7 +835,7 @@ pub(crate) fn vertex_bytes(vertices: &[Vertex]) -> Vec<u8> {
 
 #[rustfmt::skip]
 fn glyph_rows(character: char) -> [u8; 7] {
-    match character.to_ascii_uppercase() {
+    match character {
         ' ' => [0, 0, 0, 0, 0, 0, 0],
         'A' => [14, 17, 17, 31, 17, 17, 17],
         'B' => [30, 17, 17, 30, 17, 17, 30],
@@ -863,6 +863,32 @@ fn glyph_rows(character: char) -> [u8; 7] {
         'X' => [17, 17, 10, 4, 10, 17, 17],
         'Y' => [17, 17, 10, 4, 4, 4, 4],
         'Z' => [31, 1, 2, 4, 8, 16, 31],
+        'a' => [0, 0, 14, 1, 15, 17, 15],
+        'b' => [16, 16, 22, 25, 17, 17, 30],
+        'c' => [0, 0, 14, 17, 16, 17, 14],
+        'd' => [1, 1, 13, 19, 17, 17, 15],
+        'e' => [0, 0, 14, 17, 31, 16, 14],
+        'f' => [6, 9, 8, 28, 8, 8, 8],
+        'g' => [0, 0, 15, 17, 15, 1, 14],
+        'h' => [16, 16, 22, 25, 17, 17, 17],
+        'i' => [4, 0, 12, 4, 4, 4, 14],
+        'j' => [2, 0, 6, 2, 2, 18, 12],
+        'k' => [16, 16, 18, 20, 24, 20, 18],
+        'l' => [12, 4, 4, 4, 4, 4, 14],
+        'm' => [0, 0, 26, 21, 21, 17, 17],
+        'n' => [0, 0, 30, 17, 17, 17, 17],
+        'o' => [0, 0, 14, 17, 17, 17, 14],
+        'p' => [0, 0, 30, 17, 30, 16, 16],
+        'q' => [0, 0, 15, 17, 15, 1, 1],
+        'r' => [0, 0, 22, 25, 16, 16, 16],
+        's' => [0, 0, 15, 16, 14, 1, 30],
+        't' => [8, 8, 28, 8, 8, 9, 6],
+        'u' => [0, 0, 17, 17, 17, 19, 13],
+        'v' => [0, 0, 17, 17, 17, 10, 4],
+        'w' => [0, 0, 17, 17, 21, 21, 10],
+        'x' => [0, 0, 17, 10, 4, 10, 17],
+        'y' => [0, 0, 17, 17, 15, 1, 14],
+        'z' => [0, 0, 31, 2, 4, 8, 31],
         '0' => [14, 17, 19, 21, 25, 17, 14],
         '1' => [4, 12, 4, 4, 4, 4, 14],
         '2' => [14, 17, 1, 2, 4, 8, 31],
@@ -1316,8 +1342,24 @@ mod tests {
     #[test]
     fn ascii_glyphs_are_distinct_and_unknown_is_question_mark() {
         assert_ne!(glyph_rows('A'), glyph_rows('B'));
-        assert_eq!(glyph_rows('a'), glyph_rows('A'));
+        assert_ne!(glyph_rows('a'), glyph_rows('A'));
         assert_eq!(glyph_rows('界'), glyph_rows('?'));
+    }
+
+    #[test]
+    fn every_printable_ascii_glyph_is_pairwise_distinct() {
+        let mut seen = std::collections::HashMap::new();
+
+        for byte in b' '..=b'~' {
+            let character = char::from(byte);
+            let rows = glyph_rows(character);
+            assert!(
+                seen.insert(rows, character).is_none(),
+                "printable ASCII glyph {character:?} collides with an earlier glyph"
+            );
+        }
+
+        assert_eq!(seen.len(), 95, "printable ASCII must contain 95 glyphs");
     }
 
     /// The encoded vertex stride must match what the pipeline's vertex buffer
