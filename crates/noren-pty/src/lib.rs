@@ -481,7 +481,6 @@ impl fmt::Display for PtyError {
 impl std::error::Error for PtyError {}
 
 /// Events delivered from the PTY workers to the application.
-#[derive(Debug)]
 pub enum PtyEvent {
     /// Opaque, bounded PTY bytes.
     Output(Vec<u8>),
@@ -491,6 +490,20 @@ pub enum PtyEvent {
     Exited { code: Option<u32> },
     /// A safe typed error.
     Error(PtyError),
+}
+
+impl fmt::Debug for PtyEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Output(bytes) => f
+                .debug_struct("Output")
+                .field("byte_count", &bytes.len())
+                .finish(),
+            Self::Eof => f.write_str("Eof"),
+            Self::Exited { code } => f.debug_struct("Exited").field("code", code).finish(),
+            Self::Error(error) => f.debug_tuple("Error").field(error).finish(),
+        }
+    }
 }
 
 enum SupervisorCommand {
@@ -1081,6 +1094,33 @@ mod tests {
             .windows(needle.len())
             .filter(|window| *window == needle)
             .count()
+    }
+
+    /// Mutation M4 (restoring `#[derive(Debug)]`) must expose the numeric byte
+    /// list and fail here without relying on a production log statement.
+    #[test]
+    fn pty_event_debug_reports_output_shape_without_bytes() {
+        const SECRET: &[u8] = b"NOREN-PTY-DBG-S3CR3T";
+
+        let output_debug = format!("{:?}", PtyEvent::Output(SECRET.to_vec()));
+        assert_eq!(
+            output_debug,
+            format!("Output {{ byte_count: {} }}", SECRET.len())
+        );
+        assert!(
+            !output_debug.contains(&format!("{SECRET:?}")),
+            "PTY output bytes leaked: {output_debug}"
+        );
+
+        assert_eq!(format!("{:?}", PtyEvent::Eof), "Eof");
+        assert_eq!(
+            format!("{:?}", PtyEvent::Exited { code: Some(17) }),
+            "Exited { code: Some(17) }"
+        );
+        assert_eq!(
+            format!("{:?}", PtyEvent::Error(PtyError::InvalidSize)),
+            "Error(InvalidSize)"
+        );
     }
 
     #[test]
