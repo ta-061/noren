@@ -41,16 +41,15 @@
 //! same shader + glyph vertex generation, so a vertex/glyph/grid defect in the
 //! binary is caught here, not hidden behind a parallel implementation.
 //!
-//! ## Defects surfaced (reported, not fixed)
+//! ## Defects surfaced
 //!
-//! The assertions below are written the way a *correct* renderer requires. Two
-//! of them fail today and are reported as defects rather than weakened:
+//! The assertions below are written the way a *correct* renderer requires:
 //!
-//! - `lowercase_distinct_from_uppercase`: the bitmap font folds lower to upper
-//!   case (`renderer.rs` `glyph_rows` uses `to_ascii_uppercase`), so `a` and
-//!   `A` render identically.
-//! - `non_ascii_glyph_is_not_the_question_mark`: every non-ASCII code point
-//!   falls to the `?` default arm, so `日` renders as `?`.
+//! - `lowercase_distinct_from_uppercase` guards the fixed case-folding defect:
+//!   `a` and `A` must render differently.
+//! - `non_ascii_glyph_is_not_the_question_mark` guards the fixed fallback
+//!   defect: unsupported Unicode such as `日` uses a visible replacement glyph,
+//!   while Latin-1 Supplement and Box Drawing have built-in coverage.
 
 #[path = "../src/renderer_capture.rs"]
 mod renderer_capture;
@@ -761,20 +760,14 @@ fn colour_follows_the_cell_across_wide_characters_and_rows() {
 }
 
 // ===========================================================================
-// Defect tests: written the way a correct renderer requires. Both fail today;
-// see the module docs and the report. They are NOT weakened to pass.
+// Defect tests: written the way a correct renderer requires. They are not
+// weakened to pass; fixed behaviours are removed from the ignored set.
 // ===========================================================================
 
 #[test]
-#[ignore = "known defect: the bitmap font case-folds, so 'a' and 'A' draw the \
-            same glyph. Ignored rather than deleted or weakened — this assertion \
-            is the executable specification of the fix. `cargo test -- --ignored` \
-            confirms it still fails; remove this attribute when a real font \
-            stack lands."]
 fn lowercase_distinct_from_uppercase() {
-    // DEFECT (reported): the bitmap font folds case via `to_ascii_uppercase`
-    // (renderer.rs `glyph_rows`), so 'a' and 'A' produce identical pixels. A
-    // correct terminal font must distinguish them.
+    // Regression guard: the bitmap font used to fold case via
+    // `to_ascii_uppercase`, making 'a' and 'A' produce identical pixels.
     let renderer = OffscreenRenderer::new().expect("offscreen renderer");
     let lower = snapshot(1, 2, b"a");
     let upper = snapshot(1, 2, b"A");
@@ -792,15 +785,10 @@ fn lowercase_distinct_from_uppercase() {
 }
 
 #[test]
-#[ignore = "known defect: every non-ASCII code point falls through to the '?' \
-            arm, so '日' and '?' draw identically. Ignored rather than deleted \
-            or weakened — this assertion is the executable specification of the \
-            fix. `cargo test -- --ignored` confirms it still fails; remove this \
-            attribute when a real font stack lands."]
 fn non_ascii_glyph_is_not_the_question_mark() {
-    // DEFECT (reported): every non-ASCII code point hits the `?` default arm in
-    // `glyph_rows`, so '日' renders as '?'. A correct UTF-8 terminal must at
-    // least draw a different glyph for a different character.
+    // Full CJK is intentionally outside this fixed bitmap font. Unsupported
+    // Unicode uses a visible replacement glyph, which must not impersonate a
+    // literal question mark typed by the terminal application.
     let renderer = OffscreenRenderer::new().expect("offscreen renderer");
     let kanji = snapshot(1, 4, "日".as_bytes());
     let question = snapshot(1, 4, b"?");

@@ -133,21 +133,25 @@ Each item states what you would actually see if you ran the build.
   `config.rs` exposes no palette or theme setting. In practice, SGR foreground
   and explicit background colours appear, but users cannot select or customise
   a light, dark, high-contrast, or colour-vision-friendly theme.
-- **The font cannot distinguish case.** Glyphs are a hand-built 5x7 ASCII
-  bitmap indexed through `character.to_ascii_uppercase()` inside the
-  `glyph_rows` function (`crates/noren-app/src/renderer.rs`); the test
-  `ascii_glyphs_are_distinct_and_unknown_is_question_mark` asserts
-  `glyph_rows('a') == glyph_rows('A')`. `a` and `A`
-  are pixel-identical, so code, filenames, and password prompts lose case
-  visually.
-- **All non-ASCII renders as `?`.** Every character outside the bitmap table
-  falls through to the question-mark glyph — the final `_ =>` default arm of
-  `glyph_rows` (`crates/noren-app/src/renderer.rs`) — asserted by the same
-  `ascii_glyphs_are_distinct_and_unknown_is_question_mark` test. CJK text,
-  accented characters, box-drawing output, and
-  emoji all appear as `?` — even though the terminal state core measures their
-  display width correctly (Unicode/CJK display width, recorded in the
-  [roadmap](../ROADMAP.md)).
+- **The bitmap font is coverage-bounded, and seven glyph pairs are visually
+  identical.** Glyphs are a hand-built 5x7 bitmap in `glyph_rows`
+  (`crates/noren-app/src/renderer.rs`): printable ASCII keeps distinct
+  upper/lower case, the Latin-1 Supplement (`U+00A0..=U+00FF`) and Box
+  Drawing (`U+2500..=U+257F`) blocks have per-character bitmaps, and every
+  other code point draws a visible replacement glyph rather than `?` — so
+  CJK text and emoji still do not render, even though the terminal state
+  core measures their display width correctly (Unicode/CJK display width,
+  recorded in the [roadmap](../ROADMAP.md)). Coverage is deliberately **not**
+  claimed collision-free: seven pairs of distinct characters are visually
+  identical because at 5x7 their pixel grids genuinely coincide —
+  space/`U+00A0` (both blank), and hyphen/`─`, slash/`╱`, equals/`═`,
+  backslash/`╲`, bar/`│`, broken-bar/`╎` against their box-drawing
+  equivalents. The test
+  `covered_range_glyph_collisions_match_the_hardcoded_allowlist` in
+  `renderer.rs` enumerates every pair across the three covered ranges and
+  pins the collision set to exactly that hardcoded allowlist, so a future
+  glyph edit cannot reintroduce a case-blind or diacritic-losing collision
+  (or invent a new box-drawing alias) silently.
 - **IME input is discarded.** `WindowEvent::Ime(_)` is dropped without reaching
   the terminal — the `WindowEvent::Ime(_)` arm in `main.rs`'s event handler
   drops the event without forwarding it. Japanese, Chinese, and
@@ -289,13 +293,13 @@ colour-aware assertions also cover distinct SGR foregrounds, unchanged defaults,
 ANSI/256-colour and direct RGB resolution, explicit truecolor backgrounds,
 background-only spaces, and indexed/background equivalence. It does **not**
 assert an `A` looks like an A — only that the structure and resolved pixel
-colours are right. Its two `#[ignore]`d tests (`lowercase_distinct_from_uppercase`,
-`non_ascii_glyph_is_not_the_question_mark`) are the executable specifications of
-the two font defects listed above — case-blindness and non-ASCII falling
-through to `?` — left failing rather than weakened, and their `#[ignore]`
-attributes say so in the source. The oracle needs
-a headless Metal adapter and reports `offscreen=blocked` honestly when the host
-has none.
+colours are right. Its two former defect specifications
+(`lowercase_distinct_from_uppercase`, `non_ascii_glyph_is_not_the_question_mark`)
+are no longer `#[ignore]`d and no longer failing: the bitmap font now
+distinguishes case, Latin-1 Supplement and Box Drawing have built-in coverage,
+and unsupported Unicode draws a replacement glyph instead of `?`. The oracle
+needs a headless Metal adapter and reports `offscreen=blocked` honestly when
+the host has none.
 
 What this evidence does **not** cover: there is still **no key injection into
 the real window**, so live input is unverified end-to-end — the byte-level
