@@ -1,8 +1,9 @@
 //! Parse-error sentinel verification for TOML state files: when the
 //! malformed token is a key, table header, or unterminated string, the
 //! third-party parser's message quotes the offending source line — file
-//! content — so `SessionPersistenceError::Parse` must carry only a
-//! classification and a position, never the parser's text (Issue #145).
+//! content — so the `Parse` variants of both `SessionPersistenceError`
+//! and `ConfigError` must carry only a classification and a position,
+//! never the parser's text (Issue #145).
 //!
 //! Modeled on `tests/ssh_security_no_leak.rs`: one unique sentinel is
 //! planted into every malformed shape and both `Display` and `Debug` of
@@ -26,10 +27,13 @@
 //! carry no payload by design; probes for those shapes are included as
 //! regression guards so the split cannot silently rot.
 //!
-//! The final check exercises the real sink: `main.rs` prints the error
-//! with `eprintln!("Noren could not restore sidebar state: {error}")`;
-//! that exact string is reconstructed and scanned.
+//! Both real sinks are exercised: `main.rs` prints the session-state
+//! error with `eprintln!("Noren could not restore sidebar state:
+//! {error}")` and the configuration error with `eprintln!("Noren
+//! configuration is unusable: {error}")`; those exact strings are
+//! reconstructed and scanned.
 
+use noren_app::config::{AppConfig, ConfigError};
 use noren_app::session::SessionRegistry;
 use noren_app::session_persistence::{SessionPersistenceError, load_bytes};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -194,5 +198,91 @@ fn the_string_main_prints_on_restore_failure_carries_no_file_content() {
         .expect_err("the malformed document must fail");
     // Byte-for-byte the format `main.rs` uses on the restore-failure path.
     let stderr_line = format!("Noren could not restore sidebar state: {error}");
+    assert!(!leaked(&stderr_line, &secret), "{stderr_line}");
+}
+
+// ── The same leak class through the configuration surface ──────────────────
+//
+// `ConfigError::Parse` forwarded the identical `toml_edit` text, and
+// `main.rs` prints it live at startup
+// (`eprintln!("Noren configuration is unusable: {error}")`). The same
+// five shapes apply, with the sentinel placed where a configuration
+// file's content would be.
+
+/// Push one malformed configuration through `AppConfig::parse` and scan
+/// both error renders for the sentinel; pins the `Parse` variant so a
+/// shape that silently became valid cannot pass vacuously.
+fn assert_no_config_leak(document: &str) {
+    let secret = sentinel();
+    let text = document.replace("SENTINEL", &secret);
+    let error = AppConfig::parse(&text).expect_err("every config probe must fail to parse");
+    assert!(
+        matches!(error, ConfigError::Parse { .. }),
+        "the config probe must fail as a TOML parse error, got {error:?} for {text:?}"
+    );
+    assert!(
+        !leaked(&error.to_string(), &secret),
+        "Display leaked file content: {error} (document {text:?})"
+    );
+    assert!(
+        !leaked(&format!("{error:?}"), &secret),
+        "Debug leaked file content: {error:?} (document {text:?})"
+    );
+}
+
+#[test]
+fn a_sentinel_in_a_malformed_config_bare_key_never_reaches_display_or_debug() {
+    assert_no_config_leak("[font]\ncell_width = 12\nSENTINEL notakey = 2\n");
+}
+
+#[test]
+fn a_sentinel_as_a_config_bare_value_never_reaches_display_or_debug() {
+    assert_no_config_leak("[font]\ncell_width = SENTINEL\n");
+}
+
+#[test]
+fn a_sentinel_in_a_malformed_config_table_name_never_reaches_display_or_debug() {
+    assert_no_config_leak("[SENTINEL table]\ncell_width = 12\n");
+}
+
+#[test]
+fn a_sentinel_inside_an_unterminated_config_string_never_reaches_display_or_debug() {
+    assert_no_config_leak("[keys]\nsession_create = \"SENTINEL");
+}
+
+#[test]
+fn a_sentinel_in_a_duplicate_config_key_never_reaches_display_or_debug() {
+    assert_no_config_leak("[font]\ncell_width = 12\nSENTINEL = 1\nSENTINEL = 2\n");
+}
+
+#[test]
+fn config_parse_errors_keep_a_1_based_line_and_column() {
+    let error = AppConfig::parse("[font]\ncell_width = 12\nnot a key\n")
+        .expect_err("the malformed configuration must fail");
+    let ConfigError::Parse { line, column } = error else {
+        panic!("expected a parse error, got {error:?}");
+    };
+    assert_eq!(line, 3, "the malformed token is on the third line");
+    assert!(column >= 1, "columns are 1-based, got {column}");
+    let display = error.to_string();
+    let expected_prefix = "configuration is not valid TOML at line 3, column ";
+    assert!(
+        display.starts_with(expected_prefix),
+        "Display must name the position, got {display:?}"
+    );
+    let tail = &display[expected_prefix.len()..];
+    assert!(
+        tail.parse::<usize>().is_ok(),
+        "Display must end in the column number, got {display:?}"
+    );
+}
+
+#[test]
+fn the_string_main_prints_on_config_failure_carries_no_file_content() {
+    let secret = sentinel();
+    let document = format!("[font]\ncell_width = 12\n{secret} notakey = 2\n");
+    let error = AppConfig::parse(&document).expect_err("the malformed config must fail");
+    // Byte-for-byte the format `main.rs` uses on the startup-failure path.
+    let stderr_line = format!("Noren configuration is unusable: {error}");
     assert!(!leaked(&stderr_line, &secret), "{stderr_line}");
 }

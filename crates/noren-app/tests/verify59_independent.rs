@@ -147,14 +147,20 @@ fn verify_scrollback_cap_constant_is_unchanged() {
 fn verify_broken_toml_is_an_error_not_a_panic() {
     let result = std::panic::catch_unwind(|| AppConfig::parse("[font\n"));
     let parsed = result.expect("must not panic");
-    assert!(matches!(parsed, Err(ConfigError::Parse(_))), "{parsed:?}");
+    assert!(
+        matches!(parsed, Err(ConfigError::Parse { .. })),
+        "{parsed:?}"
+    );
 }
 
 #[test]
 fn verify_truncated_assignment_is_an_error_not_a_panic() {
     let result = std::panic::catch_unwind(|| AppConfig::parse("[font]\ncell_width = "));
     let parsed = result.expect("must not panic");
-    assert!(matches!(parsed, Err(ConfigError::Parse(_))), "{parsed:?}");
+    assert!(
+        matches!(parsed, Err(ConfigError::Parse { .. })),
+        "{parsed:?}"
+    );
 }
 
 #[test]
