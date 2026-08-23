@@ -1737,6 +1737,46 @@ mod tests {
         assert_eq!(seen.len(), 95, "printable ASCII must contain 95 glyphs");
     }
 
+    /// Distinct covered characters may share a bitmap only where a 5×7 grid
+    /// genuinely cannot tell them apart. Every acceptable pair is hardcoded
+    /// below, so a future glyph edit that reintroduces a case-blind or
+    /// diacritic-losing collision — or invents a new box-drawing alias —
+    /// fails here instead of passing silently.
+    #[test]
+    fn covered_range_glyph_collisions_match_the_hardcoded_allowlist() {
+        // A space and a non-breaking space are both blank cells.
+        // At 5×7 an ASCII hyphen, slash, equals sign, backslash, and bar are
+        // pixel-identical to their box-drawing equivalents, and a broken bar
+        // matches the dashed U+254E column.
+        let allowlist: [(char, char); 7] = [
+            (' ', '\u{00a0}'),
+            ('-', '\u{2500}'),
+            ('/', '\u{2571}'),
+            ('=', '\u{2550}'),
+            ('\\', '\u{2572}'),
+            ('|', '\u{2502}'),
+            ('\u{00a6}', '\u{254e}'),
+        ];
+
+        let mut covered: Vec<char> = (0x20u8..=0x7e).map(char::from).collect();
+        covered.extend((0x00a0..=0x00ff).filter_map(char::from_u32));
+        covered.extend((0x2500..=0x257f).filter_map(char::from_u32));
+
+        let mut collisions = Vec::new();
+        for (index, &first) in covered.iter().enumerate() {
+            for &second in &covered[index + 1..] {
+                if glyph_rows(first) == glyph_rows(second) {
+                    collisions.push((first, second));
+                }
+            }
+        }
+
+        assert_eq!(
+            collisions, allowlist,
+            "covered-range glyph collisions must equal the accepted list exactly"
+        );
+    }
+
     #[test]
     fn complete_latin1_supplement_is_reachable_without_unicode_fallback() {
         for scalar in 0x00a0..=0x00ff {
