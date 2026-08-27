@@ -93,6 +93,54 @@ Zellij corpus. Chords with modifiers dispatch on the exact modifier set; a
 modifier-free character binding also matches the character with any
 modifiers held, as the pre-configuration palette did.
 
+### `[theme]`
+
+Selects the built-in colour palette. The table is optional; an absent
+`[theme]` keeps `dark`, which is exactly the palette the app shipped with
+before themes existed — rendering stays byte-identical.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `name` | string | `"dark"` | Which built-in palette drawing resolves colours through. |
+
+Accepted names, matched exactly (case-sensitive, closed vocabulary):
+
+- `dark` — the xterm default ANSI colours on the near-black background
+  (today's behaviour);
+- `light` — an off-white background with darkened ANSI entries; every
+  theme-owned foreground keeps WCAG AA (≥ 4.5:1) on the default
+  background;
+- `high-contrast` — pure white on pure black with pastel ANSI entries;
+  every theme-owned foreground keeps WCAG AAA (≥ 7:1), strictly exceeding
+  the other themes' measured minima.
+
+Rejections follow the hard-error discipline: a non-string value is an
+error naming the key, and an unknown name is a typed error naming the
+offending value (clipped to 120 characters, like the `[keys]` chord echo:
+a theme name is closed-vocabulary grammar text, never a credential) —
+never a silent fallback to `dark`. Near-misses such as `Dark` or
+`highcontrast` are rejected for the same reason.
+
+The contrast contract: the checked set is every theme-owned foreground —
+the default foreground and the sixteen ANSI entries — against the theme's
+default background, the colours programs use for ordinary text on the
+screen they are given. The floor is WCAG AA for normal text (4.5:1)
+because terminal glyphs are normal-size text; `high-contrast` targets AAA
+(7:1). Program-paired colours (`SGR 31;41`) and the shared 256-colour
+cube (`16..=255`) are outside any palette's control (identical colours
+are 1:1 by definition; the cube's black corner fails on every possible
+background) and are therefore not part of the checked set.
+
+**Known finding, reported not fixed:** the default `dark` palette fails
+the 4.5:1 floor for five ANSI slots on its own background — black at
+1.06:1, blue at 2.10:1, red at 3.38:1, bright blue at 4.16:1, and
+magenta at 4.21:1. The values stay frozen because the no-`[theme]`
+default must render byte-identically to the pre-theme renderer; changing
+them is a separate, deliberate decision. Users who need AA on every slot
+today can select `high-contrast` (measured minimum 7.84:1). The measured
+minima are pinned by tests (`crates/noren-app/tests/theme.rs`), so any
+palette change — fix or regression — is a visible failure.
+
 ### Rejected keys, by design
 
 - **`[terminal]` / `scrollback_lines`.** Scrollback retention is enforced
@@ -114,6 +162,9 @@ cell_height = 24
 [keys]
 palette_open = "super+k"
 session_create = "ctrl+shift+t"
+
+[theme]
+name = "light"
 ```
 
 ## Error behavior

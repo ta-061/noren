@@ -50,11 +50,14 @@ enum ValueEcho {
     /// Echo allowlist: the variant may carry `[keys]` chord text, clipped
     /// to 120 characters, for the reason documented on the variant itself.
     ChordText,
+    /// Echo allowlist: the variant may carry `[theme]` name text, clipped
+    /// to 120 characters, for the reason documented on the variant itself.
+    ThemeName,
 }
 
 /// Pinned variant count of [`ConfigError`]; a new variant must extend both
 /// the classifier and the sample table.
-const CONFIG_ERROR_VARIANTS: usize = 14;
+const CONFIG_ERROR_VARIANTS: usize = 16;
 /// Pinned variant count of [`SessionPersistenceError`].
 const SESSION_ERROR_VARIANTS: usize = 14;
 /// Pinned variant count of [`ChordParseError`].
@@ -68,6 +71,9 @@ const PTY_ERROR_VARIANTS: usize = 16;
 /// Pinned allowlist size across every file-derived enum. Raising this
 /// number is the reviewed decision to admit a new value echo.
 const CHORD_ALLOWLIST_SIZE: usize = 6;
+/// Pinned size of the `[theme]` name echo allowlist; see
+/// [`CHORD_ALLOWLIST_SIZE`] for the policy.
+const THEME_NAME_ALLOWLIST_SIZE: usize = 1;
 /// Sample payload convention (policed by the pin test): key-shaped sample
 /// fields carry `sample_key` and may render; any **value-shaped** sample
 /// field must carry this sentinel so the test can check the classification
@@ -89,6 +95,11 @@ fn classify_config(error: &ConfigError) -> ValueEcho {
         ConfigError::WrongType { .. } => ValueEcho::Never,
         ConfigError::OutOfRange { .. } => ValueEcho::Never,
         ConfigError::ChordNotAString { .. } => ValueEcho::Never,
+        ConfigError::ThemeNotAString { .. } => ValueEcho::Never,
+        // Allowlist: the theme name vocabulary — a closed set the schema
+        // publishes — and naming the failed value is the point of the
+        // error, exactly the `[keys]` chord argument.
+        ConfigError::UnknownTheme { .. } => ValueEcho::ThemeName,
         // Allowlist: unparsed chord text plus its clipped parse reason —
         // naming the failed binding is the point of the error.
         ConfigError::InvalidChord { .. } => ValueEcho::ChordText,
@@ -217,6 +228,16 @@ fn config_samples() -> Vec<(ConfigError, ValueEcho)> {
         (
             ConfigError::ChordNotAString { key: key() },
             ValueEcho::Never,
+        ),
+        (
+            ConfigError::ThemeNotAString { key: key() },
+            ValueEcho::Never,
+        ),
+        (
+            ConfigError::UnknownTheme {
+                value: VALUE_SENTINEL.to_owned(),
+            },
+            ValueEcho::ThemeName,
         ),
         (
             ConfigError::InvalidChord {
@@ -461,6 +482,12 @@ fn every_file_derived_variant_is_classified_and_the_allowlist_is_pinned() {
                 "an allowlisted variant must echo its chord text: {sample}"
             );
         }
+        ValueEcho::ThemeName => {
+            assert!(
+                sample.contains(VALUE_SENTINEL),
+                "an allowlisted variant must echo its theme name text: {sample}"
+            );
+        }
     };
     for (sample, class) in &config {
         assert_rendering(sample.to_string(), format!("{sample:?}"), *class);
@@ -497,6 +524,18 @@ fn every_file_derived_variant_is_classified_and_the_allowlist_is_pinned() {
         allowlist, CHORD_ALLOWLIST_SIZE,
         "the echo allowlist changed size; admitting a new value echo is a \
          reviewed decision (update this pin and the variant docs together)"
+    );
+
+    let theme_allowlist = config
+        .iter()
+        .map(|(_, class)| *class)
+        .filter(|class| *class == ValueEcho::ThemeName)
+        .count();
+    assert_eq!(
+        theme_allowlist, THEME_NAME_ALLOWLIST_SIZE,
+        "the [theme] name echo allowlist changed size; admitting a new value \
+         echo is a reviewed decision (update this pin and the variant docs \
+         together)"
     );
 }
 
@@ -625,6 +664,44 @@ fn allowlisted_chord_variants_still_echo_the_offending_chord() {
     assert!(
         display.contains("chord n"),
         "DuplicateChord must show the shared chord: {display}"
+    );
+}
+
+/// The theme-name allowlist is not vacuous either: an unknown theme echoes
+/// the offending name (bounded, like every echo), while a wrong-typed value
+/// names its key only.
+#[test]
+fn unknown_theme_echoes_the_offending_name_and_wrong_types_name_only_the_key() {
+    let error =
+        AppConfig::parse("[theme]\nname = \"sepia\"\n").expect_err("an unknown theme must fail");
+    let display = error.to_string();
+    assert!(
+        display.contains("sepia"),
+        "UnknownTheme must show the offending name: {display}"
+    );
+    assert!(
+        display.contains("dark") && display.contains("light") && display.contains("high-contrast"),
+        "UnknownTheme must name the accepted vocabulary: {display}"
+    );
+
+    // A hostile value stays bounded in the rendered message.
+    let mut hostile = String::new();
+    hostile.extend(std::iter::repeat_n('a', 10_000));
+    let error = AppConfig::parse(&format!("[theme]\nname = \"{hostile}\"\n"))
+        .expect_err("a hostile theme value must fail");
+    assert!(
+        error.to_string().chars().count() < 1024,
+        "the rendered message must stay bounded: {} chars",
+        error.to_string().chars().count()
+    );
+
+    // A wrong-typed value never echoes: only the key name appears.
+    let error = AppConfig::parse("[theme]\nname = 12345\n")
+        .expect_err("a non-string theme value must fail");
+    let display = error.to_string();
+    assert!(
+        display.contains("name") && !display.contains("12345"),
+        "ThemeNotAString must name the key and not the value: {display}"
     );
 }
 
