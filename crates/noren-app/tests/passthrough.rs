@@ -245,6 +245,28 @@ fn corpus_is_pinned_and_contains_the_documented_anchors() {
     );
 }
 
+/// The live-Zellij workflow resolves the pinned tag from this crate's source
+/// with `sed -n 's/^pub const ZELLIJ_FIXTURE_TAG: &str = "\(.*\)";$/\1/p'`
+/// (.github/workflows/zellij-live.yml): the download, the artifact cache key,
+/// and the version assertion are all DERIVED from that one line. The parse
+/// fails CLOSED today (an empty tag aborts the job), but a rustfmt-legal
+/// rewrap of the line would surface only in CI as a confusing "tag not
+/// found" error far from its cause. This test mirrors the parse — a
+/// line-anchored exact match on the declaration — so a reformat fails HERE
+/// first, naming the line the workflow reads.
+#[test]
+fn ci_sed_parse_of_the_fixture_tag_line_still_matches() {
+    let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/passthrough.rs"));
+    let expected = format!("pub const ZELLIJ_FIXTURE_TAG: &str = \"{ZELLIJ_FIXTURE_TAG}\";");
+    assert!(
+        source.lines().any(|line| line == expected),
+        "the line the zellij-live workflow's sed extracts is no longer exactly \
+         `{expected}` — the CI resolve step would fail closed with a confusing \
+         'tag not found' error; keep the declaration on one line, or update the \
+         workflow's sed pattern with it"
+    );
+}
+
 // ── Collision assertions against Zellij's documented defaults ──────────
 
 #[test]

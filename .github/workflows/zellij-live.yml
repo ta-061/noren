@@ -1,0 +1,187 @@
+name: Zellij live
+
+# Live pass-through evidence against the pinned upstream Zellij (issue #153).
+# This workflow is intentionally separate from `rust.yml`: `rust.yml` owns
+# build/lint/test and runs with no Zellij on PATH, so the live suite in
+# `crates/noren-app/tests/zellij_live.rs` skips there by design. This job
+# installs the exact Zellij release the default-binding corpus is pinned to
+# and runs that suite for real, so a failed install or a silent skip can
+# never read as gathered evidence.
+#
+# Advisory by choice (issue #153, "decisions to make, not assume"): this job
+# is NOT added to the branch-protection required-check list. The pinned
+# artifact lives upstream, so a Zellij release or hosting change could turn
+# every Noren PR red with no Noren change; drift still cannot hide, because
+# the install step hard-fails unless the binary reports exactly the pinned
+# version and the evidence guard fails the job on any skip notice.
+#
+# Triggers: every PR and push to main, so a Noren change that breaks
+# pass-through is caught before merge — plus a nightly schedule, because
+# pass-through drift is also driven by Zellij releases and runner-image
+# changes rather than Noren commits, which a per-PR gate alone notices
+# only belatedly. Both cost the same job; the artifact cache below keeps
+# the marginal runs cheap. `workflow_dispatch` allows running the job on a
+# branch without opening a PR first.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "30 15 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# `github.event_name` in the group keeps the nightly schedule and pushes to
+# main apart: both carry `github.ref` == refs/heads/main, so a ref-only group
+# let a nightly run cancel a push run mid-flight (or vice versa), discarding
+# one run's gathered evidence for no benefit. Same-event runs of the same ref
+# still cancel each other — a superseded push, or an over-long nightly by the
+# next one — which is the desired behaviour.
+concurrency:
+  group: zellij-live-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  live:
+    name: Live Zellij pass-through suite (macOS arm64)
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The suite is one `cargo test` target, but it compiles the whole
+      # dependency tree from scratch on every PR, push, and nightly run
+      # (~5 CI minutes each; issue #153 review). rust-cache shares the
+      # compiled dependencies across runs — the same economics the artifact
+      # cache below applies to the Zellij download — and its key derives
+      # from the lockfile and toolchain, so a dependency bump misses by
+      # design and a stale cache can never satisfy a new lockfile. Pinned
+      # by SHA like every action here; dependabot bumps it weekly.
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      # The corpus fixture and the live binary must not be able to drift
+      # apart silently, so the download is DERIVED from `ZELLIJ_FIXTURE_TAG`
+      # in `crates/noren-app/src/passthrough.rs` rather than re-hard-coded
+      # here (the same read-it-from-the-source discipline as the MSRV
+      # resolution in audit.yml). Bumping the constant is the single move
+      # that updates the corpus, this download, and the version assertion
+      # below together.
+      - name: Resolve pinned Zellij fixture tag
+        id: pin
+        run: |
+          tag="$(sed -n 's/^pub const ZELLIJ_FIXTURE_TAG: &str = "\(.*\)";$/\1/p' crates/noren-app/src/passthrough.rs)"
+          if [ -z "$tag" ]; then
+            echo "::error::ZELLIJ_FIXTURE_TAG not found in crates/noren-app/src/passthrough.rs"
+            exit 1
+          fi
+          case "$tag" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::ZELLIJ_FIXTURE_TAG is not a release tag: ${tag}"; exit 1 ;;
+          esac
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "Pinned Zellij fixture tag: ${tag}"
+      # The ~15 MB release tarball is fetched from github.com on every run
+      # without this, which is slow and rate-limitable (issue #153). The
+      # cache key IS the pinned tag, and cache keys are immutable, so a tag
+      # bump is guaranteed to miss and re-download the new artifact. The
+      # .sha256sum check in the install step still verifies a restored
+      # artifact, so a corrupted cache cannot read as good evidence.
+      - name: Cache the pinned Zellij release artifact
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/noren-zellij
+          key: zellij-aarch64-apple-darwin-${{ steps.pin.outputs.tag }}
+      # A failed download must fail THIS job loudly (issue #153): falling
+      # through to the suite's own "Zellij absent, skipping" path would look
+      # green while gathering no evidence. curl --fail plus the explicit
+      # ::error annotation makes the failure unmissable in the job log. The
+      # upstream .sha256sum asset pins the artifact's integrity even when it
+      # came from the runner cache.
+      - name: Install the pinned Zellij release
+        run: |
+          set -euo pipefail
+          dir="$HOME/.cache/noren-zellij"
+          mkdir -p "$dir"
+          base="https://github.com/zellij-org/zellij/releases/download/${PINNED_TAG}"
+          cd "$dir"
+          if [ ! -f zellij-aarch64-apple-darwin.tar.gz ]; then
+            echo "No cached artifact for ${PINNED_TAG}; downloading the release."
+            curl --fail --location --retry 3 --retry-delay 5 \
+              -o zellij-aarch64-apple-darwin.tar.gz \
+              "${base}/zellij-aarch64-apple-darwin.tar.gz" \
+              || { echo "::error::Could not download the pinned Zellij ${PINNED_TAG} release artifact; live pass-through evidence was NOT gathered and this job must not pass."; exit 1; }
+            curl --fail --location --retry 3 --retry-delay 5 \
+              -o zellij-aarch64-apple-darwin.sha256sum \
+              "${base}/zellij-aarch64-apple-darwin.sha256sum" \
+              || { echo "::error::Could not download the checksum for Zellij ${PINNED_TAG}; live pass-through evidence was NOT gathered and this job must not pass."; exit 1; }
+          fi
+          # The upstream .sha256sum pins the BINARY inside the tarball (its
+          # stored path is the pre-archive `target/...` build path), so the
+          # extracted binary's hash is compared to the recorded token.
+          mkdir -p "$dir/bin"
+          tar -xzf zellij-aarch64-apple-darwin.tar.gz -C "$dir/bin"
+          expected="$(awk '{print $1}' zellij-aarch64-apple-darwin.sha256sum)"
+          actual="$(shasum -a 256 bin/zellij | awk '{print $1}')"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Checksum mismatch for the pinned Zellij ${PINNED_TAG} artifact (expected ${expected}, got ${actual}); live pass-through evidence was NOT gathered and this job must not pass."
+            exit 1
+          fi
+          echo "$dir/bin" >> "$GITHUB_PATH"
+        env:
+          PINNED_TAG: ${{ steps.pin.outputs.tag }}
+      # Drift gate: the suite's corpus assertions are only valid against the
+      # pinned version, and the suite itself only REPORTS a version mismatch.
+      # This step makes a mismatch fail the job instead.
+      - name: Assert the installed Zellij is exactly the pinned version
+        run: |
+          set -euo pipefail
+          installed="$(zellij --version | awk '{print $NF}')"
+          echo "zellij --version -> ${installed} (pinned: ${PINNED_VERSION})"
+          if [ "$installed" != "${PINNED_VERSION}" ]; then
+            echo "::error::Installed Zellij ${installed} differs from the pinned ZELLIJ_FIXTURE_TAG ${PINNED_VERSION}; the corpus fixture and the live binary have drifted."
+            exit 1
+          fi
+        env:
+          PINNED_VERSION: ${{ steps.pin.outputs.version }}
+      - name: Run the live-Zellij pass-through suite
+        run: |
+          set -euo pipefail
+          cargo test -p noren-app --test zellij_live 2>&1 | tee /tmp/zellij_live.log
+      # Evidence guard (issue #153): with Zellij installed the suite skips
+      # nothing, so a skip notice in the log means the environment lied
+      # (e.g. PATH broke between steps) and a green run would prove nothing.
+      # The grep token is the suite's own `SKIP_NOTICE_PREFIX` constant,
+      # pinned to this line by `ci_skip_guard_greps_for_the_exact_notice_prefix`
+      # in zellij_live.rs: rewording the notice fails that test (locally and
+      # in every CI test job) instead of silently disarming this guard. `-F`
+      # matches the prefix as a fixed string, so no regex quoting can wedge
+      # itself between the two sides.
+      - name: Guard against a silent skip reading as a pass
+        run: |
+          set -euo pipefail
+          if grep -qF 'SKIP [' /tmp/zellij_live.log; then
+            echo "::error::The live suite printed a skip notice: pass-through evidence was NOT gathered even though Zellij was installed."
+            exit 1
+          fi
+          grep -q 'test result: ok' /tmp/zellij_live.log \
+            || { echo "::error::No 'test result: ok' line from the live suite; it did not run to completion."; exit 1; }
+          # Zero-test runs also read as green (review path #15): a suite whose
+          # every test was deleted or gated out emits no skip notice and exits
+          # 0, so the guards above pass while the job verified nothing. Fail
+          # unless at least one test actually reported ok. grep -c exits 1 on
+          # a zero count, hence the || true under set -e.
+          ok_count="$(grep -c '^test .* \.\.\. ok$' /tmp/zellij_live.log || true)"
+          if [ "$ok_count" -eq 0 ]; then
+            echo "::error::The live suite passed ZERO tests; every test in zellij_live.rs is deleted or gated out, so pass-through evidence was NOT gathered."
+            exit 1
+          fi
+          echo "Live pass-through evidence gathered against Zellij ${PINNED_VERSION}: ${ok_count} tests ok."
+        env:
+          PINNED_VERSION: ${{ steps.pin.outputs.version }}
