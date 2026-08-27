@@ -28,6 +28,14 @@
 //! `Super+Escape` exit leader) is [`ConfigError::UnclaimableChord`] rather
 //! than a silently dead binding.
 //!
+//! The `[theme]` table selects the built-in colour palette. It follows the
+//! same discipline: an absent table keeps `dark` — exactly the colours the
+//! app shipped with before themes existed — a non-string value is
+//! [`ConfigError::ThemeNotAString`], and a name outside the closed
+//! vocabulary (`dark`, `light`, `high-contrast`) is
+//! [`ConfigError::UnknownTheme`] naming the offending value, never a
+//! silent fallback to the default.
+//!
 //! # Privacy
 //!
 //! Configuration carries no secrets: no supported key names a credential,
@@ -39,6 +47,7 @@ use crate::passthrough::{
     CLAIM_ID_PALETTE, Chord, ChordError, ChordSeq, KeyCode, Modifiers, PassthroughAction,
     PassthroughClaim, PassthroughPolicy, default_exit_claim,
 };
+use crate::theme::{Theme, ThemeName};
 use crate::{POC_CELL_HEIGHT, POC_CELL_WIDTH};
 use std::env;
 use std::fmt;
@@ -178,6 +187,30 @@ fn default_chord(code: KeyCode, modifiers: Modifiers) -> Chord {
     Chord::new(code, modifiers).expect("default keymap chords are normalized constants")
 }
 
+/// Colour theme selection.
+///
+/// [`ThemeConfig::default`] is `dark`: exactly the palette the app shipped
+/// with before themes existed, so an absent `[theme]` table preserves the
+/// pre-theme rendering bit-for-bit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ThemeConfig {
+    name: ThemeName,
+}
+
+impl ThemeConfig {
+    /// The selected built-in theme name; defaults to `dark`.
+    #[must_use]
+    pub const fn name(self) -> ThemeName {
+        self.name
+    }
+
+    /// The concrete palette the selected name resolves to.
+    #[must_use]
+    pub const fn palette(self) -> Theme {
+        self.name.palette()
+    }
+}
+
 /// Validated application configuration.
 ///
 /// [`AppConfig::default`] is byte-for-byte the behavior the app had before
@@ -186,6 +219,7 @@ fn default_chord(code: KeyCode, modifiers: Modifiers) -> Chord {
 pub struct AppConfig {
     font: FontConfig,
     keys: KeymapConfig,
+    theme: ThemeConfig,
 }
 
 impl AppConfig {
@@ -199,6 +233,12 @@ impl AppConfig {
     #[must_use]
     pub const fn keys(self) -> KeymapConfig {
         self.keys
+    }
+
+    /// Colour theme settings.
+    #[must_use]
+    pub const fn theme(self) -> ThemeConfig {
+        self.theme
     }
 
     /// Load configuration from the standard path or the [`CONFIG_ENV_VAR`]
@@ -251,6 +291,7 @@ impl AppConfig {
             match key {
                 "font" => parse_font(table, &mut config.font)?,
                 "keys" => parse_keys(table, &mut config.keys)?,
+                "theme" => parse_theme(table, &mut config.theme)?,
                 // `[terminal]` historically attracted a `scrollback_lines` key.
                 // The terminal foundation has no configurable retention cap yet,
                 // so the table is rejected instead of parsed-and-ignored.
@@ -296,6 +337,29 @@ fn integer_in_range(key: &str, item: &Item, min: usize, max: usize) -> Result<us
         .filter(|value| (min..=max).contains(value))
         .ok_or_else(|| ConfigError::OutOfRange { key: clip(key) })?;
     Ok(value)
+}
+
+/// Apply the `[theme]` table to the theme selection.
+///
+/// Every value must be a TOML string naming one of the built-in themes,
+/// matched exactly (the vocabulary is closed and case-sensitive). An
+/// unknown name is [`ConfigError::UnknownTheme`] naming the offending
+/// value — never a silent fallback to `dark`, because a typo would
+/// otherwise masquerade as a working setting.
+fn parse_theme(table: &dyn TableLike, theme: &mut ThemeConfig) -> Result<(), ConfigError> {
+    for (key, item) in table.iter() {
+        match key {
+            "name" => {
+                let value = item
+                    .as_str()
+                    .ok_or_else(|| ConfigError::ThemeNotAString { key: clip(key) })?;
+                theme.name = ThemeName::parse(value)
+                    .ok_or_else(|| ConfigError::UnknownTheme { value: clip(value) })?;
+            }
+            _ => return Err(ConfigError::UnknownKey(clip(key))),
+        }
+    }
+    Ok(())
 }
 
 /// Apply the `[keys]` table to the keymap.
@@ -791,6 +855,20 @@ pub enum ConfigError {
     OutOfRange { key: String },
     /// A `[keys]` action is bound to a value that is not a TOML string.
     ChordNotAString { key: String },
+    /// A `[theme]` value is not a TOML string.
+    ThemeNotAString { key: String },
+    /// A `[theme]` name is not one of the built-in themes.
+    ///
+    /// **Echo allowlist** (issue #150): `value` carries the `[theme]` name
+    /// text, clipped to 120 characters by [`clip`]. A theme name is drawn
+    /// from a closed, published vocabulary (`dark`, `light`,
+    /// `high-contrast`) — keybinding-grammar text, never a credential,
+    /// key, or path — and the schema deliberately exposes no setting where
+    /// a secret is plausible, so the residual risk of a secret pasted into
+    /// `[theme]` by mistake is accepted for the same reason the `[keys]`
+    /// chord echo is: an error that cannot say which name failed is not
+    /// actionable.
+    UnknownTheme { value: String },
     /// A `[keys]` value does not parse as a chord.
     ///
     /// **Echo allowlist** (issue #150): `value` and `reason` carry `[keys]`
@@ -855,6 +933,15 @@ impl fmt::Display for ConfigError {
             Self::ChordNotAString { key } => write!(
                 f,
                 "configuration key {key} must be a chord string like \"super+p\""
+            ),
+            Self::ThemeNotAString { key } => write!(
+                f,
+                "configuration key {key} must be a theme name string like \"light\""
+            ),
+            Self::UnknownTheme { value } => write!(
+                f,
+                "configuration theme {value} is not a built-in theme; expected one of \
+                 dark, light, high-contrast"
             ),
             Self::InvalidChord { key, value, reason } => write!(
                 f,
@@ -1634,6 +1721,145 @@ mod tests {
         assert_eq!(
             chord_text(KeymapConfig::default().palette_open()),
             "super+p"
+        );
+    }
+
+    // ── [theme] theme tests ───────────────────────────────────────────
+
+    /// With no `[theme]` surface at all, the selection is `dark` — exactly
+    /// the palette the app shipped with before themes existed.
+    #[test]
+    fn default_theme_is_dark_the_pre_theme_palette() {
+        assert_eq!(ThemeConfig::default().name(), ThemeName::Dark);
+        assert_eq!(AppConfig::default().theme().name(), ThemeName::Dark);
+        assert_eq!(
+            AppConfig::parse("# nothing\n")
+                .expect("valid")
+                .theme()
+                .name(),
+            ThemeName::Dark
+        );
+        // The default config's palette is the dark theme constant itself.
+        assert_eq!(
+            AppConfig::default().theme().palette(),
+            ThemeName::Dark.palette()
+        );
+    }
+
+    /// An empty `[theme]` table is presence without content: the default.
+    #[test]
+    fn empty_theme_table_keeps_the_default_selection() {
+        let config = AppConfig::parse("[theme]\n").expect("an empty table is valid");
+        assert_eq!(config.theme(), ThemeConfig::default());
+    }
+
+    /// Each documented name selects its own palette.
+    #[test]
+    fn every_documented_theme_name_selects_its_own_palette() {
+        for (text, name) in [
+            ("dark", ThemeName::Dark),
+            ("light", ThemeName::Light),
+            ("high-contrast", ThemeName::HighContrast),
+        ] {
+            let config = AppConfig::parse(&format!("[theme]\nname = \"{text}\"\n")).expect("valid");
+            assert_eq!(config.theme().name(), name, "{text:?}");
+            assert_eq!(config.theme().palette(), name.palette());
+        }
+    }
+
+    /// An unknown theme name is a typed error naming the offending value —
+    /// never a silent fallback to the default. Near-misses included.
+    #[test]
+    fn unknown_theme_names_are_rejected_naming_the_offending_value() {
+        for text in [
+            "[theme]\nname = \"sepia\"\n",
+            "[theme]\nname = \"solarized-dark\"\n",
+            // Case and spelling near-misses: the vocabulary is closed and
+            // case-sensitive, so these must not quietly select a theme.
+            "[theme]\nname = \"Dark\"\n",
+            "[theme]\nname = \"highcontrast\"\n",
+            "[theme]\nname = \"\"\n",
+        ] {
+            let error = AppConfig::parse(text).expect_err("must not parse");
+            assert!(
+                matches!(&error, ConfigError::UnknownTheme { .. }),
+                "{text:?} must be UnknownTheme, got {error:?}"
+            );
+        }
+        let error = AppConfig::parse("[theme]\nname = \"sepia\"\n").expect_err("rejected");
+        assert_eq!(
+            error,
+            ConfigError::UnknownTheme {
+                value: "sepia".to_owned()
+            }
+        );
+    }
+
+    /// A hostile theme value is clipped in the error, like every echo.
+    #[test]
+    fn hostile_theme_values_are_clipped_in_errors() {
+        let mut hostile = String::new();
+        hostile.extend(std::iter::repeat_n('a', 10_000));
+        let text = format!("[theme]\nname = \"{hostile}\"\n");
+        let error = AppConfig::parse(&text).expect_err("a huge name must fail");
+        let ConfigError::UnknownTheme { value } = &error else {
+            panic!("expected UnknownTheme, got {error:?}");
+        };
+        assert!(
+            value.chars().count() <= MAX_ERROR_DETAIL_CHARS + 1,
+            "hostile theme name must be clipped: {value}"
+        );
+    }
+
+    /// Wrong value types and unknown keys are rejected with the section's
+    /// own typed errors.
+    #[test]
+    fn theme_table_rejects_wrong_types_and_unknown_keys() {
+        let cases = [
+            (
+                "[theme]\nname = 3\n",
+                ConfigError::ThemeNotAString {
+                    key: "name".to_owned(),
+                },
+            ),
+            (
+                "[theme]\nname = 12.5\n",
+                ConfigError::ThemeNotAString {
+                    key: "name".to_owned(),
+                },
+            ),
+            (
+                "[theme]\nname = true\n",
+                ConfigError::ThemeNotAString {
+                    key: "name".to_owned(),
+                },
+            ),
+            (
+                "[theme]\npalette = \"light\"\n",
+                ConfigError::UnknownKey("palette".to_owned()),
+            ),
+            (
+                "theme = \"light\"\n",
+                ConfigError::WrongType {
+                    key: "theme".to_owned(),
+                },
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(AppConfig::parse(text), Err(expected), "{text:?}");
+        }
+    }
+
+    /// `[theme]` composes with the other sections without interference.
+    #[test]
+    fn theme_applies_alongside_font_and_keys() {
+        let text = "[font]\ncell_width = 12\n\n[theme]\nname = \"light\"\n\n[keys]\nsession_create = \"t\"\n";
+        let config = AppConfig::parse(text).expect("all sections are valid together");
+        assert_eq!(config.font().cell_width(), 12);
+        assert_eq!(config.theme().name(), ThemeName::Light);
+        assert_eq!(
+            config.keys().session_create(),
+            chord(KeyCode::Char('t'), Modifiers::empty())
         );
     }
 }

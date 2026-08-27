@@ -48,10 +48,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 
-use noren_app::CellMetrics;
 use noren_terminal::TerminalSnapshot;
 use renderer_source::{
-    CLEAR_COLOR, SHADER, VERTEX_ATTRIBUTES, VERTEX_BYTES, glyph_vertices, vertex_bytes,
+    SHADER, Target, VERTEX_ATTRIBUTES, VERTEX_BYTES, glyph_vertices_for, theme_clear_color,
+    vertex_bytes,
 };
 
 /// Linear RGBA8 (non-sRGB) offscreen target.
@@ -237,25 +237,31 @@ impl OffscreenRenderer {
         })
     }
 
-    /// Render the given terminal snapshot to an offscreen `width` x `height`
+    /// Render the given terminal snapshot to an offscreen `target`-sized
     /// texture and return its RGBA pixels.
     ///
-    /// `width`/`height` should be exact multiples of the PoC cell size so the
+    /// The target should be exact multiples of the PoC cell size so the
     /// rendered grid is exactly the state grid. The pipeline, vertex
-    /// generation, and clear colour are the shipped renderer's.
+    /// generation, and clear colour are the shipped renderer's, all read from
+    /// the target's [`Theme`] — the same value the binary's `Renderer` holds —
+    /// so the oracle exercises the exact colour path configuration selects.
+    ///
+    /// [`Theme`]: noren_app::theme::Theme
     pub(crate) fn capture(
         &self,
+        target: Target,
         terminal: Option<&TerminalSnapshot>,
         sidebar: Option<&[String]>,
         status: Option<&str>,
-        width: u32,
-        height: u32,
-        metrics: CellMetrics,
     ) -> CapturedFrame {
-        assert!(width > 0 && height > 0, "capture target must be non-zero");
+        assert!(
+            target.width > 0 && target.height > 0,
+            "capture target must be non-zero"
+        );
 
-        let vertices = glyph_vertices(terminal, sidebar, status, width, height, metrics);
+        let vertices = glyph_vertices_for(target, terminal, sidebar, status);
         let bytes = vertex_bytes(&vertices);
+        let (width, height) = (target.width, target.height);
 
         let vertex_buffer = if bytes.is_empty() {
             None
@@ -308,7 +314,7 @@ impl OffscreenRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                        load: wgpu::LoadOp::Clear(theme_clear_color(&target.theme)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

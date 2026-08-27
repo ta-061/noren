@@ -90,13 +90,16 @@ fn assert_three_consumers_agree_at(width: u32, metrics: CellMetrics) {
     // compile-time default is exposed at a non-default size.
     let snapshot = terminal.snapshot();
     let sidebar: Vec<String> = Vec::new();
-    let vertices = renderer::glyph_vertices(
+    let vertices = renderer::glyph_vertices_for(
+        renderer::Target::new(
+            &noren_app::theme::Theme::default(),
+            width,
+            height,
+            metrics,
+        ),
         Some(&snapshot),
         Some(sidebar.as_slice()),
         None,
-        width,
-        height,
-        metrics,
     );
     let drawn = rendered_terminal_columns(&vertices, width, cell_width);
     assert_eq!(
@@ -232,13 +235,16 @@ fn terminal_cols_and_renderer_floor_at_one_below_the_sidebar() {
     terminal.feed_bytes(&vec![b'B'; usize::from(cols)]);
     let snapshot = terminal.snapshot();
     let sidebar: Vec<String> = Vec::new();
-    let vertices = renderer::glyph_vertices(
+    let vertices = renderer::glyph_vertices_for(
+        renderer::Target::new(
+            &noren_app::theme::Theme::default(),
+            width,
+            height,
+            GridGeometry::poc().cell_metrics(),
+        ),
         Some(&snapshot),
         Some(sidebar.as_slice()),
         None,
-        width,
-        height,
-        GridGeometry::poc().cell_metrics(),
     );
     let drawn = rendered_terminal_columns(&vertices, width, cell_width);
     assert_eq!(
