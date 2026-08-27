@@ -992,11 +992,13 @@ impl NorenApp {
     /// Discover the git worktrees of the repository Noren was launched in.
     ///
     /// A launch directory outside any git repository is the common case and
-    /// is silent (like a missing SSH config): no rows, no notice. Every
-    /// other failure — git unavailable, unreadable or malformed output — is
-    /// a bounded, content-free status line that never stops startup. A
-    /// repository with more worktrees than the sidebar cap reports the cap
-    /// and the omitted count.
+    /// is silent (like a missing SSH config): no rows, no notice. A missing
+    /// or non-directory launch path is reported as `LaunchDirectoryUnavailable`
+    /// (not `GitUnavailable`): git may be installed, the directory is not.
+    /// Every other failure — git unavailable, unreadable or malformed
+    /// output — is a bounded, content-free status line that never stops
+    /// startup. A repository with more worktrees than the sidebar cap
+    /// reports the cap and the omitted count.
     fn load_git_worktrees(&mut self) {
         let launch_dir = std::env::current_dir()
             .map_err(|_| WorktreeListError::LaunchDirectoryUnavailable)

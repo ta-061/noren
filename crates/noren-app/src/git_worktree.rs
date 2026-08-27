@@ -374,6 +374,9 @@ pub fn parse_worktree_porcelain(text: &str) -> Result<Vec<RawWorktree>, Worktree
 /// [`WorktreeDiscovery`], whose rows include registered-but-deleted
 /// worktrees marked [`DiscoveredWorktree::directory_present`] == `false`.
 pub fn discover_worktrees(launch_dir: &Path) -> Result<WorktreeDiscovery, WorktreeListError> {
+    if !launch_dir.is_dir() {
+        return Err(WorktreeListError::LaunchDirectoryUnavailable);
+    }
     let output = Command::new(GIT_PROGRAM)
         .args(GIT_WORKTREE_ARGS)
         .current_dir(launch_dir)

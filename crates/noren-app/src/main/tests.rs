@@ -4549,7 +4549,37 @@ fn a_launch_directory_outside_a_repository_is_silent() {
     let _ = std::fs::remove_dir(&dir);
 }
 
-/// A repository with exactly one worktree (no links) lists that one row.
+/// A nonexistent launch directory must report `LaunchDirectoryUnavailable`,
+/// not `GitUnavailable`: git may be installed, the directory is not. The
+/// `discover_worktrees` function checks `is_dir()` before spawning git, so
+/// a path that does not exist reaches `LaunchDirectoryUnavailable` through
+/// the normal error path.
+#[test]
+fn a_nonexistent_launch_directory_reports_launch_directory_unavailable() {
+    let nonexistent = std::env::temp_dir().join(format!(
+        "noren-nonexistent-dir-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let mut app = NorenApp::default();
+    app.load_git_worktrees_from(&nonexistent);
+    let diagnostic = app
+        .worktree_diagnostic
+        .as_deref()
+        .expect("a nonexistent dir must produce a diagnostic");
+    assert!(
+        diagnostic.contains("launch directory"),
+        "the diagnostic must mention the directory, not git: {diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("git is unavailable"),
+        "a nonexistent dir must not be reported as git unavailable: {diagnostic}"
+    );
+}
 #[test]
 fn a_single_worktree_repository_lists_one_row() {
     let Some(fixture) = GitWorktreeFixture::new() else {
