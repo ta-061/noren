@@ -101,12 +101,18 @@ const TMP_SUFFIX: &str = ".tmp";
 /// Maximum characters of hostile input echoed inside any error message.
 const MAX_ERROR_DETAIL_CHARS: usize = 120;
 
-/// Typed persistence failure without file contents.
+/// Typed persistence failure under the file-echo contract (TM-08,
+/// issue #150).
 ///
-/// Every variant renders a bounded message: hostile keys and kinds are
-/// clipped by [`clip`] before they are stored, and a TOML parse failure
-/// keeps only the 1-based position computed by [`toml_error_position`],
-/// never the third-party parser's text.
+/// `main` prints this error straight to live stderr, so every variant is a
+/// disclosure surface. The contract: file **key names** and parse
+/// **positions** may appear, clipped to 120 characters by [`clip`] — a key
+/// name is where the user must look — but file **values** are never
+/// echoed. No variant of this type is on the echo allowlist the config
+/// loader keeps for `[keys]` chord text: a `sessions.toml` value has no
+/// grammar that bounds what it can hold. `tests/error_echo_contract.rs`
+/// classifies every variant; a new variant cannot compile without the
+/// classifier acknowledging it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionPersistenceError {
     /// The state file does not exist. Internal to [`load`], which turns
@@ -156,8 +162,14 @@ pub enum SessionPersistenceError {
     /// path could only be saved through a lossy conversion — persisting a
     /// different path than the live one is corruption, so the save refuses.
     NonUtf8Path,
-    /// A `kind` string names no [`SessionKind`] variant.
-    UnknownKind(String),
+    /// The `kind` value names no [`SessionKind`] variant.
+    ///
+    /// Only the key and the accepted kinds are reported, never the file's
+    /// own spelling: a `kind` value is arbitrary text (an SSH target pasted
+    /// into the wrong field would land here), so echoing it would put file
+    /// content on stderr. Unlike a chord there is no usability loss — the
+    /// accepted set is small enough to name in full (issue #150).
+    UnknownKind,
     /// The file claims a format version this build does not speak, past or
     /// future. The document is rejected whole, never partially parsed.
     UnsupportedVersion(i64),
@@ -189,7 +201,10 @@ impl fmt::Display for SessionPersistenceError {
             Self::NonUtf8Path => {
                 f.write_str("session path is not valid UTF-8 and cannot be persisted without loss")
             }
-            Self::UnknownKind(kind) => write!(f, "unknown session kind: {kind}"),
+            Self::UnknownKind => write!(
+                f,
+                "session kind is not one of: local, project, worktree, ssh, agent"
+            ),
             Self::UnsupportedVersion(version) => write!(
                 f,
                 "session state version {version} is not supported; this build speaks version {SESSION_STATE_VERSION}"
@@ -485,7 +500,7 @@ fn parse_session(table: &Table) -> Result<SessionKind, SessionPersistenceError> 
         "agent" => Ok(SessionKind::Agent {
             name: payload(table, "name")?,
         }),
-        other => Err(SessionPersistenceError::UnknownKind(clip(other))),
+        _other => Err(SessionPersistenceError::UnknownKind),
     }
 }
 

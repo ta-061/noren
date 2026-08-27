@@ -123,8 +123,13 @@ session_create = "ctrl+shift+t"
 - Existing file with invalid TOML, invalid UTF-8, unknown keys, wrong types,
   out-of-range values, or a size above 64 KiB: the app prints a clear
   one-line error to standard error and exits without opening a window.
-- Error messages never embed file contents; hostile key names and parser
-  details are clipped to a bounded length.
+- Error messages never embed file contents: hostile key names and parser
+  details are clipped to a bounded length, and file values are not echoed.
+  The one deliberate exception is `[keys]` chord text (issue #150): a
+  chord is keybinding grammar, never a credential, and an error that
+  cannot show the offending binding — which value fails to parse, which
+  one collides with a pinned Zellij default — is not actionable. Chord
+  text is clipped to 120 characters like key names.
 
 ## What configuration deliberately cannot do
 

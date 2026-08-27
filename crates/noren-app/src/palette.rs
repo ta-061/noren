@@ -91,6 +91,15 @@ impl fmt::Display for CommandId {
 ///
 /// The action type `A` is owned by the wiring layer (see the crate-level
 /// docs); this module never instantiates a session or sidebar action itself.
+///
+/// # Echo contract (issue #150)
+///
+/// The derived `Debug` prints `id` and `label`. Both are `&'static str` by
+/// construction, and that is load-bearing: a compile-time string cannot
+/// hold file-derived text, so palette `Debug` output cannot echo config or
+/// session values. If a runtime (`String`) label is ever needed, `Debug`
+/// must be hand-written to exclude it; `tests/error_echo_contract.rs`
+/// fails to compile otherwise.
 #[derive(Clone, Debug)]
 pub struct Command<A> {
     id: CommandId,
