@@ -75,8 +75,9 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Child as StdChild, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -292,6 +293,11 @@ struct LiveZellij {
     _master: Box<dyn MasterPty + Send>,
     events: Receiver<Vec<u8>>,
     dirs: ZellijDirs,
+    /// Deathwatch planted before the client exists and disarmed after
+    /// teardown confirmed the server is gone (see [`ServerWatchdog`]).
+    /// `None` only when `sh` could not be planted, in which case the
+    /// startup sweep is the remaining backstop.
+    watchdog: Option<ServerWatchdog>,
 }
 
 impl LiveZellij {
@@ -303,6 +309,12 @@ impl LiveZellij {
     /// over the pane area (issue #147).
     fn spawn(version: &str) -> Self {
         let dirs = ZellijDirs::new();
+
+        // Plant the deathwatch BEFORE anything that could spawn the server,
+        // so there is no window — including a panic mid-spawn, or the
+        // harness being SIGKILLed a millisecond later — in which this run's
+        // server could appear with nobody left to reap it (issue #157).
+        let watchdog = ServerWatchdog::plant(&format!("zellij --server {}", dirs.socket.display()));
 
         let mut dump = Command::new("zellij");
         dump.args(["setup", "--dump-config"]);
@@ -380,6 +392,7 @@ impl LiveZellij {
             _master: pair.master,
             events,
             dirs,
+            watchdog,
         }
     }
 
@@ -519,6 +532,122 @@ fn run_command_bounded(command: &mut Command, budget: Duration) -> Option<bool> 
     }
 }
 
+/// The POSIX `sh` script a [`ServerWatchdog`] runs once the harness's file
+/// table closes: block on stdin EOF (the only write end lives inside the
+/// harness), give an in-flight server spawn a grace window to settle, then
+/// round `pgrep` + `kill -9` after this run's server until it is gone or
+/// [`SERVER_REAP_ATTEMPTS`] is spent. `read` returns instantly on EOF, so
+/// the script costs nothing while the harness lives and fires immediately
+/// when it dies.
+///
+/// The pattern travels in the [`WATCHDOG_PATTERN_ENV`] environment variable,
+/// NOT in the script text: `pgrep -f` matches full command lines, and a
+/// literal pattern would make the watchdog match — and SIGKILL — itself
+/// before finishing its kill list. The environment never shows up in a
+/// command line, so the watchdog cannot match its own pattern.
+fn server_reap_script() -> String {
+    format!(
+        "read x\n\
+         sleep 0.2\n\
+         i=0\n\
+         while [ $i -lt {SERVER_REAP_ATTEMPTS} ]\n\
+         do\n\
+         \tpids=$(pgrep -f \"$ZN157_WATCHDOG_PATTERN\" 2>/dev/null || true)\n\
+         \t[ -z \"$pids\" ] && exit 0\n\
+         \tkill -9 $pids 2>/dev/null || true\n\
+         \ti=$((i+1))\n\
+         \tsleep 0.2\n\
+         done\n"
+    )
+}
+
+/// Environment variable carrying the watchdog's kill pattern (see
+/// [`server_reap_script`]).
+const WATCHDOG_PATTERN_ENV: &str = "ZN157_WATCHDOG_PATTERN";
+
+/// A deathwatch for this run's Zellij server (issue #157): a tiny detached
+/// `sh` process whose only job is to reap `zellij --server <this run's
+/// socket dir>` when the harness dies WITHOUT unwinding.
+///
+/// Why a deathwatch is needed at all: every teardown that lives inside the
+/// test binary — including [`LiveZellij`]'s [`Drop`] guard — is unreachable
+/// once the binary dies by signal. Reproduced for issue #157 on this
+/// harness: SIGINT to a `cargo test` process group (a terminal Ctrl-C),
+/// SIGTERM, SIGKILL, and SIGHUP each leaked every up-server (3/3: the
+/// spawn tests run in parallel), while every unwind path (a panicking
+/// test, a failed assertion) reaped cleanly through the guard. That is why
+/// the leak read as "intermittent" in review: the leak COUNT is whatever
+/// number of sessions happened to be up when the signal landed (the wild
+/// state found while diagnosing: 28 leaked servers in pairs, every owning
+/// pid dead). A user-space handler cannot run after SIGKILL by definition,
+/// so the reap decision is planted OUTSIDE the dying process.
+///
+/// Mechanism: the watchdog's stdin is a pipe whose only write end is the
+/// [`ChildStdin`] held here. The script's `read` blocks until that write
+/// end closes — when this handle drops (normal teardown stands the
+/// watchdog down first via [`ServerWatchdog::disarm`]), or when the kernel
+/// closes the harness's whole file table on death, any signal included. No
+/// polling, no timer, no runtime cost while the harness lives.
+///
+/// Scoping (the #152 invariant, unchanged): the kill pattern is this run's
+/// unique socket dir (`zellij --server /tmp/zn-live-<pid>-<n>/s`), which a
+/// developer's own Zellij session never matches; concurrent harness runs
+/// use different dirs. The watchdog runs in its own process group (a
+/// Ctrl-C kills the harness's foreground group, not the watchdog's) with
+/// null stdio, and exits by itself once no process matches the pattern, so
+/// it cannot linger past its purpose.
+struct ServerWatchdog {
+    child: StdChild,
+    /// The pipe write end: dropping it is the watchdog's death trigger.
+    /// Deliberately NOT dropped by a `Drop` impl — an abandoned watchdog
+    /// (harness died mid-panic-unwind before `LiveZellij` was built) must
+    /// FIRE, not stand down.
+    _stdin: ChildStdin,
+}
+
+impl ServerWatchdog {
+    /// Plant a watchdog for `pattern` (the `zellij --server <socket dir>`
+    /// command-line prefix). `None` when `sh` cannot be spawned: the harness
+    /// degrades to the in-process teardown plus the startup sweep, the same
+    /// degradation [`LiveZellij::reap_session_server`] has for a missing
+    /// `pgrep`/`kill`.
+    fn plant(pattern: &str) -> Option<Self> {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(server_reap_script())
+            .env(WATCHDOG_PATTERN_ENV, pattern)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().ok()?;
+        let stdin = child.stdin.take()?;
+        Some(Self {
+            child,
+            _stdin: stdin,
+        })
+    }
+
+    /// Stand the watchdog down after in-process teardown confirmed the
+    /// server is gone: the pattern matches nothing, so letting the script
+    /// run would be harmless, but a normal run should not leave even a
+    /// no-op `sh` behind.
+    fn disarm(mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// Fire the watchdog on purpose: drop the pipe write end (the same
+    /// event as harness death) and hand back the child for observation.
+    /// Used by the unit tests; production code only disarms.
+    fn abandon(self) -> StdChild {
+        let Self { child, _stdin } = self;
+        drop(_stdin);
+        child
+    }
+}
+
 impl Drop for LiveZellij {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -530,7 +659,11 @@ impl Drop for LiveZellij {
             cleanup.env(key, value);
         }
         let _ = run_zellij_bounded(&mut cleanup);
-        self.reap_session_server();
+        if self.reap_session_server() {
+            if let Some(watchdog) = self.watchdog.take() {
+                watchdog.disarm();
+            }
+        }
     }
 }
 
@@ -561,26 +694,52 @@ impl LiveZellij {
     /// is missing, teardown degrades to the delete-all-sessions path above
     /// and a visible notice is printed — never a panic: this runs during
     /// unwind.
-    fn reap_session_server(&self) {
+    ///
+    /// Returns `true` only when the server is CONFIRMED gone (pgrep found
+    /// nothing after a kill round, or there never was one). `false` means
+    /// uncertain — tools missing, or the server still listed after
+    /// [`SERVER_REAP_ATTEMPTS`] rounds — and the caller must leave the
+    /// [`ServerWatchdog`] armed so it retries as this process exits.
+    fn reap_session_server(&self) -> bool {
         let pattern = format!("zellij --server {}", self.dirs.socket.display());
         for _ in 0..SERVER_REAP_ATTEMPTS {
             let Ok(pgrep) = Command::new("pgrep").arg("-f").arg(&pattern).output() else {
-                return;
+                self.report_reap_degraded(&pattern, "`pgrep` could not be run");
+                return false;
             };
             let pids = String::from_utf8_lossy(&pgrep.stdout);
             let pids: Vec<&str> = pids.split_whitespace().collect();
             if pids.is_empty() {
-                return;
+                return true;
             }
             for pid in &pids {
-                let _ = Command::new("kill").arg("-9").arg(pid).status();
+                if let Err(error) = Command::new("kill").arg("-9").arg(pid).status() {
+                    self.report_reap_degraded(
+                        &pattern,
+                        &format!("`kill` could not be run: {error}"),
+                    );
+                    return false;
+                }
             }
             thread::sleep(Duration::from_millis(100));
         }
         write_raw_stderr(&format!(
             "NOTICE [zellij_live]: a Zellij server for socket dir {} is still alive after \
              teardown; it pins ~100 MB RSS and, if left to accumulate across runs, starves \
-             later live runs (issue #147). Kill it manually: pkill -9 -f '{pattern}'",
+             later live runs (issue #147). Kill it manually: pkill -9 -f '{pattern}'. The \
+             planted deathwatch also retries the kill as this run exits (issue #157).",
+            self.dirs.socket.display()
+        ));
+        false
+    }
+
+    /// The degradation notice for a reap that could not be verified: printed
+    /// to the real stderr, never a panic (this runs during unwind).
+    fn report_reap_degraded(&self, pattern: &str, why: &str) {
+        write_raw_stderr(&format!(
+            "NOTICE [zellij_live]: could not verify the Zellij server for socket dir {} is \
+             gone ({why}); if it survived, kill it manually: pkill -9 -f '{pattern}' \
+             (issue #157)",
             self.dirs.socket.display()
         ));
     }
@@ -981,4 +1140,81 @@ fn bounded_runner_reports_a_fast_subprocess() {
         Some(true),
         "a promptly exiting successful subprocess must be reported as such"
     );
+}
+
+/// The issue #157 core pin: when the harness dies without unwinding, the
+/// planted deathwatch still reaps this run's process — the pipe write end
+/// closing is the harness-death event, reproduced here by dropping it. The
+/// target is a stand-in process whose command line carries the watchdog's
+/// pattern, exactly how the real server is matched.
+#[test]
+fn watchdog_reaps_only_its_own_pattern_when_the_harness_dies() {
+    let target_marker = format!("zn157-{}-t", std::process::id());
+    let bystander_marker = format!("zn157-{}-u", std::process::id());
+    // The stand-in is `sh -c 'sleep 30; true' <marker>`: it stays alive for
+    // the test's window and carries the marker in its command line exactly
+    // the way the real server carries its socket dir. The trailing `; true`
+    // is load-bearing: a single-command `sh -c` exec-optimizes into `sleep`,
+    // erasing the marker from the command line (found while debugging this
+    // very test), and macOS `sleep` cannot take a second operand.
+    let mut target = Command::new("sh")
+        .arg("-c")
+        .arg("sleep 30; true")
+        .arg(&target_marker)
+        .spawn()
+        .expect("spawn the pattern-carrying stand-in process");
+    let mut bystander = Command::new("sh")
+        .arg("-c")
+        .arg("sleep 30; true")
+        .arg(&bystander_marker)
+        .spawn()
+        .expect("spawn a non-matching bystander process");
+    let watchdog =
+        ServerWatchdog::plant(&target_marker).expect("plant the watchdog for the pattern");
+
+    // Simulate harness death without unwinding: the kernel closes every fd
+    // of the dying process, the pipe's write end included.
+    let mut child = watchdog.abandon();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while target.try_wait().expect("probe the target").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the watchdog did not reap the matching process after the death event"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.wait();
+    assert!(
+        bystander.try_wait().expect("probe the bystander").is_none(),
+        "the watchdog must not touch processes that do not match its pattern"
+    );
+    let _ = bystander.kill();
+    let _ = bystander.wait();
+}
+
+/// A disarmed watchdog is inert: after a clean teardown disarms it, the
+/// script must never run, so nothing matching the pattern may die.
+#[test]
+fn disarmed_watchdog_leaves_matching_processes_alive() {
+    let marker = format!("zn157-{}-d", std::process::id());
+    let mut target = Command::new("sh")
+        .arg("-c")
+        .arg("sleep 30; true")
+        .arg(&marker)
+        .spawn()
+        .expect("spawn the pattern-carrying stand-in process");
+    let watchdog = ServerWatchdog::plant(&marker).expect("plant the watchdog");
+
+    watchdog.disarm();
+
+    // The script's own grace window is 0.2 s; past that, an inert watchdog
+    // has no remaining way to fire.
+    thread::sleep(Duration::from_millis(600));
+    assert!(
+        target.try_wait().expect("probe the target").is_none(),
+        "a disarmed watchdog must not kill anything"
+    );
+    let _ = target.kill();
+    let _ = target.wait();
 }
