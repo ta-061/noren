@@ -64,10 +64,11 @@ impl fmt::Display for SessionId {
 
 /// The launch shape of a session.
 ///
-/// Conforms to D-M3-001: five variants. [`Local`] is the only kind with an
-/// implemented launch path; [`Project`], [`Worktree`], [`Ssh`], and [`Agent`]
-/// are carried as data so the enum is stable for exhaustive matching — no code
-/// in this module launches any of them.
+/// Conforms to D-M3-001: five variants. [`Local`] and [`Worktree`] have
+/// implemented launch paths (a worktree session is a local PTY whose working
+/// directory is the worktree checkout); [`Project`], [`Ssh`], and [`Agent`]
+/// are carried as data so the enum is stable for exhaustive matching — no
+/// code in this module launches any of them.
 ///
 /// D-M3-001 records the concrete payloads used here: `root`/`path` for the
 /// local-rooted kinds and `target`/`name` for the remote/agent kinds.
@@ -77,7 +78,14 @@ impl fmt::Display for SessionId {
 /// [`Worktree`]: SessionKind::Worktree
 /// [`Ssh`]: SessionKind::Ssh
 /// [`Agent`]: SessionKind::Agent
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// # Debug discipline
+///
+/// [`fmt::Debug`] is shape-only (the #142/#146/#148 discipline): every
+/// payload is user- or environment-derived text, and a worktree path can
+/// embed a username or a private directory name, so no variant prints its
+/// payload. Use the field accessors for real values.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub enum SessionKind {
     /// A local PTY session backed by a process on this machine.
     #[default]
@@ -104,14 +112,31 @@ pub enum SessionKind {
     },
 }
 
+/// Shape-only [`Debug`]: variant name and payload presence, never the
+/// payload (a root, path, target, or name can embed a username or another
+/// private value).
+impl fmt::Debug for SessionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Local => f.write_str("Local"),
+            Self::Project { .. } => f.debug_struct("Project").finish_non_exhaustive(),
+            Self::Worktree { .. } => f.debug_struct("Worktree").finish_non_exhaustive(),
+            Self::Ssh { .. } => f.debug_struct("Ssh").finish_non_exhaustive(),
+            Self::Agent { .. } => f.debug_struct("Agent").finish_non_exhaustive(),
+        }
+    }
+}
+
 impl SessionKind {
     /// Whether this kind has an implemented launch path.
     ///
-    /// Only [`Local`](SessionKind::Local) does today. The spawn layer gates on
-    /// this rather than guessing; the other kinds are carried as reserved data.
+    /// [`Local`](SessionKind::Local) and [`Worktree`](SessionKind::Worktree)
+    /// do today — a worktree session launches the fixed zsh policy in the
+    /// worktree directory. The spawn layer gates on this rather than
+    /// guessing; the other kinds are carried as reserved data.
     #[must_use]
     pub const fn is_launchable(&self) -> bool {
-        matches!(self, Self::Local)
+        matches!(self, Self::Local | Self::Worktree { .. })
     }
 }
 
@@ -495,17 +520,21 @@ mod tests {
     }
 
     #[test]
-    fn only_local_kind_is_launchable() {
+    fn local_and_worktree_kinds_are_launchable() {
+        // The worktree kind gained a real launch path (a local PTY whose
+        // working directory is the worktree checkout); the other kinds stay
+        // reserved data. A mutation reverting Worktree to non-launchable
+        // fails this test.
         assert!(SessionKind::Local.is_launchable());
         assert!(
-            !SessionKind::Project {
-                root: PathBuf::from("/p")
+            SessionKind::Worktree {
+                path: PathBuf::from("/w")
             }
             .is_launchable()
         );
         assert!(
-            !SessionKind::Worktree {
-                path: PathBuf::from("/w")
+            !SessionKind::Project {
+                root: PathBuf::from("/p")
             }
             .is_launchable()
         );
@@ -521,6 +550,45 @@ mod tests {
             }
             .is_launchable()
         );
+    }
+
+    #[test]
+    fn session_kind_debug_is_shape_only() {
+        // A worktree path (or project root, SSH target, agent name) can
+        // embed a username or private directory name; Debug never prints it.
+        let secret = "NOREN-KIND-hunter2";
+        for rendered in [
+            format!(
+                "{:?}",
+                SessionKind::Worktree {
+                    path: PathBuf::from(format!("/Users/{secret}/wt"))
+                }
+            ),
+            format!(
+                "{:?}",
+                SessionKind::Project {
+                    root: PathBuf::from(format!("/Users/{secret}/p"))
+                }
+            ),
+            format!(
+                "{:?}",
+                SessionKind::Ssh {
+                    target: format!("{secret}@host")
+                }
+            ),
+            format!(
+                "{:?}",
+                SessionKind::Agent {
+                    name: format!("agent-{secret}")
+                }
+            ),
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "SessionKind Debug leaked payload text: {rendered}"
+            );
+        }
+        assert_eq!(format!("{:?}", SessionKind::Local), "Local");
     }
 
     #[test]

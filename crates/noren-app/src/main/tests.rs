@@ -1940,6 +1940,7 @@ fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_
         source.text(
             app.status,
             app.ssh_selection_status.as_deref(),
+            app.worktree_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
         diagnostic
@@ -1971,6 +1972,7 @@ fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_
     let status = source.text(
         app.status,
         app.ssh_selection_status.as_deref(),
+        app.worktree_diagnostic.as_deref(),
         app.ssh_diagnostic.as_deref(),
     );
     let vertices = renderer::glyph_vertices(
@@ -2057,6 +2059,7 @@ fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_
         source.text(
             app.status,
             app.ssh_selection_status.as_deref(),
+            app.worktree_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
         "Noren PTY operation failed",
@@ -2125,6 +2128,7 @@ fn selecting_an_ssh_row_keeps_a_pending_choice_and_never_a_registry_connection()
         source.text(
             app.status,
             app.ssh_selection_status.as_deref(),
+            app.worktree_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
         "SSH partial source #0 config; launch failed"
@@ -4298,3 +4302,373 @@ fn a_restored_row_never_takes_the_live_view_from_the_running_session() {
     );
     cleanup_state_file(&path);
 }
+
+// ── Git worktree discovery and worktree sessions ────────────────────────
+//
+// The live fixtures drive the real `git` binary (never a scraped fixture of
+// its output): every worktree case the ROADMAP names — not a repository, a
+// single worktree, a registered-but-deleted directory, a detached HEAD, and
+// paths with spaces or non-ASCII — is created with real git plumbing and
+// discovered through the production `git worktree list --porcelain` child.
+// Skip policy follows the live Zellij harness: when git is not usable the
+// live tests print a visible skip notice on stderr and return early — a
+// skip is never mistaken for gathered evidence.
+
+static WT_SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether the real `git` binary is usable on this machine.
+fn git_usable() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Print the visible skip notice shared by every live git test.
+fn report_worktree_skip(test: &str) {
+    let notice = format!(
+        "SKIP [{test}]: git is not installed (or `git --version` failed); \
+         live worktree evidence was NOT gathered. This is a skip, not a pass."
+    );
+    use std::io::Write;
+    match std::fs::OpenOptions::new().write(true).open("/dev/stderr") {
+        Ok(mut file) => {
+            let _ = file.write_all(notice.as_bytes());
+            let _ = file.write_all(b"\n");
+        }
+        Err(_) => eprintln!("{notice}"),
+    }
+}
+
+/// A private git repository fixture driven through the real `git` binary.
+///
+/// `root` is the main worktree; linked worktrees are created on demand as
+/// siblings under the fixture's private base directory. The initial commit
+/// is made on a fixed branch name so no assertion depends on the machine's
+/// `init.defaultBranch`. Identity is supplied with per-command `-c` config
+/// so the developer's global git configuration is never read or required.
+struct GitWorktreeFixture {
+    /// Private base directory holding the main worktree and its links.
+    base: PathBuf,
+    /// The main worktree, also the repository root.
+    root: PathBuf,
+    /// Per-fixture branch counter so linked-branch names are deterministic
+    /// (`wt-1`, `wt-2`, ...) regardless of process-wide test ordering.
+    branch_sequence: std::cell::Cell<usize>,
+}
+
+impl GitWorktreeFixture {
+    /// The main worktree on branch `noren-trunk` with one empty commit, or
+    /// `None` when git is unusable (the caller reports the skip).
+    fn new() -> Option<Self> {
+        if !git_usable() {
+            return None;
+        }
+        let sequence = WT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "noren-app-wt-fixture-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&base).expect("create private worktree fixture base");
+        let root = base.join("main");
+        let root_text = root.display().to_string();
+        Self::git(None, &["init", &root_text]).expect("git init the fixture repository");
+        // Fixed branch name + per-command identity: independent of the
+        // machine's init.defaultBranch and global git config.
+        Self::git(Some(&root), &["checkout", "-b", "noren-trunk"])
+            .expect("create the fixed fixture branch");
+        Self::git(
+            Some(&root),
+            &[
+                "-c",
+                "user.name=Noren",
+                "-c",
+                "user.email=noren@example",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        )
+        .expect("create the initial fixture commit");
+
+        Some(Self {
+            base,
+            root,
+            branch_sequence: std::cell::Cell::new(0),
+        })
+    }
+
+    /// Run one real `git` command, optionally inside `dir`.
+    fn git(dir: Option<&std::path::Path>, args: &[&str]) -> std::io::Result<()> {
+        let mut command = std::process::Command::new("git");
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
+        command.args(args);
+        let output = command.output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("git fixture command failed"))
+        }
+    }
+
+    /// Add a linked worktree and return its path and branch name. The
+    /// branch is named from the fixture's sequence (git refnames cannot
+    /// carry spaces); the PATH deliberately may contain spaces and
+    /// non-ASCII because git must round-trip them.
+    fn add_worktree(&self, name: &str) -> (PathBuf, String) {
+        let path = self.base.join(name);
+        let branch = format!(
+            "wt-{}",
+            self.branch_sequence.replace(self.branch_sequence.get() + 1) + 1
+        );
+        let path_text = path.display().to_string();
+        Self::git(
+            Some(&self.root),
+            &["worktree", "add", "-b", &branch, &path_text],
+        )
+        .unwrap_or_else(|error| panic!("add worktree fixture {name}: {error}"));
+        (path, branch)
+    }
+
+    /// Add a linked worktree with a detached HEAD and return its path.
+    fn add_detached_worktree(&self, name: &str) -> PathBuf {
+        let path = self.base.join(name);
+        let path_text = path.display().to_string();
+        Self::git(
+            Some(&self.root),
+            &["worktree", "add", "--detach", &path_text],
+        )
+        .unwrap_or_else(|error| panic!("add detached worktree fixture {name}: {error}"));
+        path
+    }
+
+    /// The worktree at `path` stays REGISTERED while its directory is
+    /// deleted from disk — the common stale case until `git worktree prune`.
+    /// Equivalent to the user's `rm -rf` of a scratch checkout: the whole
+    /// directory (including the `.git` link file) goes, the registration in
+    /// the main repository's metadata stays.
+    fn delete_worktree_directory(&self, path: &std::path::Path) {
+        std::fs::remove_dir_all(path).expect("delete the worktree directory only");
+    }
+}
+
+impl Drop for GitWorktreeFixture {
+    fn drop(&mut self) {
+        // The linked worktrees are siblings under the base, so one removal
+        // takes the whole fixture; failures are ignored because a stale
+        // worktree directory can already be gone.
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
+
+/// A temp directory that is NOT a git repository (no git child needed).
+fn non_repository_directory() -> PathBuf {
+    let sequence = WT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "noren-app-not-a-repo-{}-{sequence}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&path).expect("create plain fixture directory");
+    path
+}
+
+/// Discovered worktree rows appear as `EntryKind::Worktree` sidebar rows a
+/// user SEES on launch: the main worktree first with its branch, then the
+/// linked worktrees, branched or detached, with spaces and non-ASCII in
+/// paths intact. A detached HEAD shows the fixed placeholder, never a panic.
+#[test]
+fn discovered_worktrees_appear_as_sidebar_rows() {
+    let Some(fixture) = GitWorktreeFixture::new() else {
+        report_worktree_skip("discovered_worktrees_appear_as_sidebar_rows");
+        return;
+    };
+    let (plain_path, plain_branch) = fixture.add_worktree("plain");
+    let (_spaced_path, spaced_branch) = fixture.add_worktree("spaced 名前 wt");
+    let detached_path = fixture.add_detached_worktree("detached-only");
+
+    let mut app = NorenApp::default();
+    app.load_git_worktrees_from(&fixture.root);
+
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(rows.len(), 4, "the main worktree plus three linked ones");
+    // The main worktree is always listed first; the order of the linked
+    // worktrees is git's readdir order, so they are found by path, not
+    // position. Git prints resolved paths (/private/var on macOS), so the
+    // fixture paths are canonicalized before comparing. Worktree facts and
+    // sidebar rows are index-aligned (the registry is empty).
+    assert_eq!(rows[0].kind(), EntryKind::Worktree);
+    assert_eq!(rows[0].label(), "main");
+    assert_eq!(rows[0].detail(), Some("noren-trunk"));
+    let row_of = |path: &std::path::Path| -> usize {
+        let canonical = std::fs::canonicalize(path).expect("canonicalize fixture path");
+        app.workspace
+            .worktrees
+            .iter()
+            .position(|worktree| worktree.path() == canonical)
+            .unwrap_or_else(|| panic!("no discovered worktree for {canonical:?}"))
+    };
+    assert_eq!(
+        rows[row_of(&plain_path)].detail(),
+        Some(plain_branch.as_str())
+    );
+    assert_eq!(
+        rows[row_of(&detached_path)].detail(),
+        Some("(detached)"),
+        "a detached HEAD reports the fixed placeholder"
+    );
+    let spaced_index = app
+        .workspace
+        .worktrees
+        .iter()
+        .position(|worktree| worktree.name_display() == "spaced 名前 wt")
+        .expect("a path with spaces and non-ASCII round-trips into discovery");
+    assert_eq!(rows[spaced_index].label(), "spaced 名前 wt");
+    assert_eq!(rows[spaced_index].detail(), Some(spaced_branch.as_str()));
+    assert!(
+        app.worktree_diagnostic.is_none(),
+        "an in-cap discovery adds no notice"
+    );
+}
+
+/// A launch directory outside any git repository is the common case: no
+/// rows, no diagnostic, no panic — like a missing SSH config.
+#[test]
+fn a_launch_directory_outside_a_repository_is_silent() {
+    let dir = non_repository_directory();
+    let mut app = NorenApp::default();
+    app.load_git_worktrees_from(&dir);
+    assert_eq!(app.workspace.sidebar().rows().len(), 0);
+    assert!(app.workspace.worktrees.is_empty());
+    assert!(
+        app.worktree_diagnostic.is_none(),
+        "not-a-repository is silent, exactly like a missing SSH config"
+    );
+    let _ = std::fs::remove_dir(&dir);
+}
+
+/// A repository with exactly one worktree (no links) lists that one row.
+#[test]
+fn a_single_worktree_repository_lists_one_row() {
+    let Some(fixture) = GitWorktreeFixture::new() else {
+        report_worktree_skip("a_single_worktree_repository_lists_one_row");
+        return;
+    };
+    let mut app = NorenApp::default();
+    app.load_git_worktrees_from(&fixture.root);
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind(), EntryKind::Worktree);
+    assert_eq!(rows[0].detail(), Some("noren-trunk"));
+}
+
+/// The stale case the ROADMAP names: a worktree whose directory was deleted
+/// from disk but is still registered. Discovery must list it (marked
+/// missing), the sidebar must show the marker, and selecting the row must
+/// refuse the launch before any session or child exists — no panic, no
+/// hang, an honest visible status.
+///
+/// Mutation check (B): making discovery panic on a missing directory (for
+/// example an `.expect` on the directory's presence) fails this test.
+#[test]
+fn a_registered_but_deleted_worktree_is_marked_and_refused() {
+    let Some(fixture) = GitWorktreeFixture::new() else {
+        report_worktree_skip("a_registered_but_deleted_worktree_is_marked_and_refused");
+        return;
+    };
+    let (stale, stale_branch) = fixture.add_worktree("gone-wt");
+    // Resolve before deleting: the canonical path is what git prints (and
+    // what discovery retains), but a deleted directory can no longer be
+    // canonicalized through the filesystem.
+    let stale_canonical =
+        std::fs::canonicalize(&stale).expect("canonicalize the stale worktree path");
+    fixture.delete_worktree_directory(&stale);
+    let _live = fixture.add_worktree("present-wt");
+
+    let mut app = NorenApp::default();
+    // Discovery over a real registration whose directory is gone must not
+    // panic (a panic here fails the test) and must not hang (the runner is
+    // one bounded git listing).
+    app.load_git_worktrees_from(&fixture.root);
+
+    let worktrees = &app.workspace.worktrees;
+    assert_eq!(
+        worktrees.len(),
+        3,
+        "main, the stale link, and the live link"
+    );
+    let stale_index = worktrees
+        .iter()
+        .position(|worktree| worktree.path() == stale_canonical)
+        .expect("the stale registration is still listed");
+    let stale_row = &worktrees[stale_index];
+    assert!(!stale_row.directory_present());
+    assert_eq!(
+        stale_row.branch_display(),
+        format!("{stale_branch} (missing)")
+    );
+    assert!(
+        worktrees
+            .iter()
+            .any(|worktree| worktree.directory_present()),
+        "the live link is still present"
+    );
+
+    // The sidebar row the user sees carries the missing marker.
+    let missing_detail = format!("{stale_branch} (missing)");
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(rows[stale_index].detail(), Some(missing_detail.as_str()));
+
+    // Selecting it refuses the launch: no session, no PTY, a visible status.
+    assert!(click_sidebar_row(&mut app, stale_index));
+    assert_eq!(app.status, "Noren worktree directory missing");
+    assert!(app.show_status, "the refusal must own the status row");
+    assert!(app.workspace.registry().sessions().is_empty());
+    assert!(app.pty.is_none(), "a stale worktree must not spawn a child");
+}
+
+/// A repository with more worktrees than the sidebar cap keeps the first
+/// rows in git listing order and reports the cap and the omitted count,
+/// exactly like the bounded SSH host list.
+#[test]
+fn many_worktrees_are_capped_and_the_omitted_count_is_reported() {
+    let Some(fixture) = GitWorktreeFixture::new() else {
+        report_worktree_skip("many_worktrees_are_capped_and_the_omitted_count_is_reported");
+        return;
+    };
+    // main + (cap + 2) linked worktrees = cap + 3 total; 3 are omitted.
+    for index in 0..(MAX_WORKTREE_SIDEBAR_TEST_ROWS + 2) {
+        fixture.add_worktree(&format!("capped-{index:02}"));
+    }
+    let mut app = NorenApp::default();
+    app.load_git_worktrees_from(&fixture.root);
+
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(
+        rows.len(),
+        MAX_WORKTREE_SIDEBAR_TEST_ROWS,
+        "the sidebar keeps exactly the capped row count"
+    );
+    assert_eq!(
+        rows[0].label(),
+        "main",
+        "the main worktree is always retained"
+    );
+    assert_eq!(
+        app.workspace.worktrees_omitted, 3,
+        "beyond-cap worktrees are counted, not silently dropped"
+    );
+    let notice = app
+        .worktree_diagnostic
+        .as_deref()
+        .expect("the cap is reported on the status row");
+    assert!(
+        notice.contains("showing first 24") && notice.contains("3 omitted"),
+        "the notice names the cap and the omitted count: {notice}"
+    );
+}
+
+/// Bound constant for the live cap test; must equal the shipped cap.
+const MAX_WORKTREE_SIDEBAR_TEST_ROWS: usize = noren_app::git_worktree::MAX_WORKTREE_SIDEBAR_ROWS;
