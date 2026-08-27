@@ -17,7 +17,7 @@
 //!   ordering: encode first, gate-decide, forward on `GateKind::Forwarded`.
 //!
 //! Skip policy: when `zellij` is not on `PATH`, each live test returns early
-//! after printing `SKIP: [...]` to the REAL stderr (bypassing the harness's
+//! after printing `SKIP [...]` to the REAL stderr (bypassing the harness's
 //! output capture) — CI without Zellij stays green while the output states
 //! explicitly that live evidence was NOT gathered. A skip is never reported
 //! as gathered evidence.
@@ -271,6 +271,29 @@ fn parse_version_line(line: &str) -> Option<&str> {
         .filter(|token| token.starts_with(|c: char| c.is_ascii_digit()))
 }
 
+/// The prefix every live skip notice starts with (`SKIP [<test>]: ...`).
+///
+/// CI coupling (issue #153): the live-Zellij workflow's evidence guard greps
+/// the suite log for exactly this prefix (`grep -qF 'SKIP ['` in
+/// `.github/workflows/zellij-live.yml`) and fails the job when it appears,
+/// because a green run that skipped is a green run that gathered nothing.
+/// YAML cannot import a Rust constant, so the coupling is pinned from this
+/// side: [`ci_skip_guard_greps_for_the_exact_notice_prefix`] fails unless the
+/// workflow file contains the grep token built from this constant AND the
+/// printed notice really starts with it. A reworded notice therefore fails a
+/// test instead of silently disarming the CI guard.
+const SKIP_NOTICE_PREFIX: &str = "SKIP [";
+
+/// Build the skip notice shared by every live test when Zellij is absent.
+/// The notice starts with [`SKIP_NOTICE_PREFIX`] by construction, which is
+/// what the CI evidence guard keys on.
+fn skip_notice(test: &str) -> String {
+    format!(
+        "{SKIP_NOTICE_PREFIX}{test}]: zellij is not installed (or `zellij --version` failed); \
+         live pass-through evidence was NOT gathered. This is a skip, not a pass."
+    )
+}
+
 /// Print the skip notice shared by every live test when Zellij is absent.
 ///
 /// The notice is written straight to the process's stderr file descriptor so
@@ -278,11 +301,7 @@ fn parse_version_line(line: &str) -> Option<&str> {
 /// otherwise reads as a silent pass under default `cargo test` output, and a
 /// skip must never be mistaken for gathered evidence.
 fn report_skip(test: &str) {
-    let notice = format!(
-        "SKIP [{test}]: zellij is not installed (or `zellij --version` failed); \
-         live pass-through evidence was NOT gathered. This is a skip, not a pass."
-    );
-    write_raw_stderr(&notice);
+    write_raw_stderr(&skip_notice(test));
 }
 
 /// Write a notice to the real stderr file descriptor, bypassing the test
@@ -1272,6 +1291,37 @@ fn version_line_parser_reads_zellij_output_shape() {
     assert_eq!(parse_version_line("zellij 0.41.2\r\n"), Some("0.41.2"));
     assert_eq!(parse_version_line("zellij\n"), None);
     assert_eq!(parse_version_line(""), None);
+}
+
+/// Issue #153 pin: the workflow's evidence guard greps the suite log for the
+/// exact skip-notice prefix, and nothing in YAML can import the constant —
+/// so a reworded notice used to disarm that guard SILENTLY (the job stayed
+/// green while skipping every test). This test reads the workflow file at
+/// compile time and fails unless the guard's grep token is built from
+/// [`SKIP_NOTICE_PREFIX`] and the printed notice really starts with it, so
+/// the two sides can no longer drift apart unnoticed. It runs in every
+/// `cargo test --workspace` CI job, so the drift is caught before the live
+/// job even starts.
+#[test]
+fn ci_skip_guard_greps_for_the_exact_notice_prefix() {
+    let workflow = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../.github/workflows/zellij-live.yml"
+    ));
+    let guard = format!("grep -qF '{SKIP_NOTICE_PREFIX}'");
+    assert!(
+        workflow.contains(&guard),
+        "the live-Zellij workflow no longer greps for `{guard}`; its skip guard \
+         has drifted from the notice this suite prints, so a skip would read as \
+         a pass again (issue #153). Restore the fixed-string grep of \
+         `{SKIP_NOTICE_PREFIX}` or move the notice prefix on BOTH sides"
+    );
+    assert!(
+        skip_notice("ci-pin").starts_with(SKIP_NOTICE_PREFIX),
+        "the printed skip notice must start with `{SKIP_NOTICE_PREFIX}` — the \
+         exact token the CI guard greps for; a reworded notice must change \
+         SKIP_NOTICE_PREFIX (and the workflow grep) with it, not bypass it"
+    );
 }
 
 /// A teardown subprocess that ignores its budget is killed, not waited on

@@ -447,6 +447,14 @@ impl WorkspaceState {
         }
     }
 
+    /// Wire where sidebar state persists, ahead of [`Self::restore`].
+    ///
+    /// The seam `load_sidebar_state` uses: it keeps the path field private to
+    /// this impl, so the binary cannot rewrite persistence mid-run.
+    fn set_state_path(&mut self, state_path: Option<PathBuf>) {
+        self.state_path = state_path;
+    }
+
     /// Load saved sidebar state from [`state_path`](Self::state_path) into the
     /// registry before the sidebar is first observed.
     ///
@@ -736,6 +744,15 @@ impl WorkspaceState {
         self.selected_ssh_source_label.as_deref()
     }
 
+    /// The one live SSH launch's target and phase, if one is recorded.
+    ///
+    /// Read seam for the application layer: the phase predicates and the
+    /// target of the next [`Self::set_ssh_connection`] update resolve through
+    /// here, so the field never has to leave this impl.
+    fn ssh_connection(&self) -> Option<&(String, SshConnectionPhase)> {
+        self.ssh_connection.as_ref()
+    }
+
     #[cfg(test)]
     fn ssh_hosts_omitted(&self) -> usize {
         self.ssh_hosts_omitted
@@ -978,7 +995,7 @@ impl NorenApp {
     /// the app starts with an empty sidebar and a working terminal, never a
     /// crash. A missing file (the first run) is silent.
     fn load_sidebar_state(&mut self, path: Option<PathBuf>) {
-        self.workspace.state_path = path;
+        self.workspace.set_state_path(path);
         if let Err(error) = self.workspace.restore() {
             eprintln!("Noren could not restore sidebar state: {error}");
             eprintln!("starting with an empty sidebar; the existing file was left in place");
@@ -1092,8 +1109,7 @@ impl NorenApp {
     /// Whether the live PTY is owned by an ssh child of a live launch.
     fn ssh_live(&self) -> bool {
         self.workspace
-            .ssh_connection
-            .as_ref()
+            .ssh_connection()
             .is_some_and(|(_, phase)| phase.is_live())
     }
 
@@ -1136,8 +1152,7 @@ impl NorenApp {
     fn apply_ssh_phase(&mut self, phase: SshConnectionPhase) {
         let Some(target) = self
             .workspace
-            .ssh_connection
-            .as_ref()
+            .ssh_connection()
             .map(|(target, _)| target.clone())
         else {
             return;
@@ -1163,8 +1178,7 @@ impl NorenApp {
     fn connect_ssh_target(&mut self, target: &str) -> SshConnectOutcome {
         if self
             .workspace
-            .ssh_connection
-            .as_ref()
+            .ssh_connection()
             .is_some_and(|(connected, phase)| connected == target && phase.is_live())
         {
             return SshConnectOutcome::AlreadyLive;
@@ -2601,8 +2615,7 @@ impl NorenApp {
         if self.ssh_live()
             && self
                 .workspace
-                .ssh_connection
-                .as_ref()
+                .ssh_connection()
                 .is_some_and(|(_, phase)| matches!(phase, SshConnectionPhase::Connecting))
         {
             self.apply_ssh_phase(SshConnectionPhase::Connected);

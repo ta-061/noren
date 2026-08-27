@@ -3363,7 +3363,7 @@ fn ssh_click_refuses_a_raw_token_destination_without_spawning() {
     );
     // The connect did not proceed.
     assert!(app.pty.is_none(), "a refused destination must not spawn");
-    assert!(app.workspace.ssh_connection.is_none());
+    assert!(app.workspace.ssh_connection().is_none());
     let row = &app.workspace.sidebar().rows()[0];
     assert!(
         row.label().starts_with("SSH-OFF "),
@@ -3893,7 +3893,7 @@ fn ssh_click_connects_the_system_client_end_to_end() {
         "the click must launch the system ssh client"
     );
     assert_eq!(
-        app.workspace.ssh_connection.as_ref().map(|(_, p)| *p),
+        app.workspace.ssh_connection().map(|(_, p)| *p),
         Some(SshConnectionPhase::Connecting)
     );
     assert_eq!(app.status, "Noren ssh connecting");
@@ -3902,7 +3902,7 @@ fn ssh_click_connects_the_system_client_end_to_end() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         app.drain_pty();
-        let phase = app.workspace.ssh_connection.as_ref().map(|(_, p)| *p);
+        let phase = app.workspace.ssh_connection().map(|(_, p)| *p);
         if matches!(
             phase,
             Some(
@@ -3918,10 +3918,7 @@ fn ssh_click_connects_the_system_client_end_to_end() {
     }
 
     assert_eq!(
-        app.workspace
-            .ssh_connection
-            .as_ref()
-            .map(|(_, phase)| *phase),
+        app.workspace.ssh_connection().map(|(_, phase)| *phase),
         Some(SshConnectionPhase::ConnectFailed),
         "ssh's own error exit must surface as a connection failure"
     );

@@ -5,7 +5,7 @@ This document exists so that the first thing a reader meets is what Noren
 first artifact is an explicitly dated developer preview, not a
 `0.1.0-preview` of the product; this page is the substance behind that framing.
 This page retains a 2026-08-08 verification baseline and was re-verified clause
-by clause against the working tree at the 2026-08-20 milestone-gate sync.
+by clause against the working tree at the 2026-08-27 milestone-gate sync.
 Citations point at the file, function, type, constant, or test that establishes
 them.
 Names are used rather than line numbers, which rot; where a count is genuinely
@@ -197,9 +197,9 @@ Each item states what you would actually see if you ran the build.
   terminal. (The app crate has no `cfg(target_os)` gating, so it may well
   compile elsewhere; compiling is not the barrier, running is.)
   The PTY launches `/bin/zsh` with a fixed policy and no caller-controlled
-  arguments (`ZSH_PROGRAM` in `crates/noren-pty/src/lib.rs`). Linux support and SSH/remote
-  sessions are roadmap intent (Milestones 4 and 6), not current capability.
-- **Only local and worktree sessions are actually launched.** `SessionKind` models
+  arguments (`ZSH_PROGRAM` in `crates/noren-pty/src/lib.rs`). Linux support is roadmap intent
+  (Milestone 6), not current capability.
+- **Project and agent sessions are not launched.** `SessionKind` models
   `Local`, `Project`, `Worktree`, `Ssh`, and `Agent`, and `EntryKind` in
   `sidebar.rs` can describe project, worktree, SSH-connection, and agent rows —
   `Local`, `Worktree`, and `Ssh` have launch paths. The running binary reads bounded
@@ -219,8 +219,12 @@ Each item states what you would actually see if you ran the build.
   rows (at most 24; a larger list reports the omitted count). Clicking a
   present row starts a real `SessionKind::Worktree` session: a `/bin/zsh`
   PTY whose child's working directory IS that worktree (verified by reading
-  the child's own `pwd` back through the terminal). A registered worktree
-  whose directory was deleted from disk is listed with a `(missing)` marker
+  the child's own `pwd` back through the terminal; note that the PTY-level
+  `spawn_in_dir_runs_the_child_in_that_directory` test cannot by itself
+  distinguish an honoured working directory from portable-pty's HOME
+  fallback, issue #162 — the app-level `pwd` proof is the guarantee). A
+  registered worktree whose directory was deleted from disk is listed with a
+  `(missing)` marker
   and refused on selection — no panic, no child. Worktree sessions persist
   and restore through `sessions.toml` exactly like local ones.
   Project and agent kinds remain modelled, while agent entries remain
@@ -290,7 +294,10 @@ Each item states what you would actually see if you ran the build.
   tests that fail if secret material reaches a log, error, or Debug sink),
   and `zellij_live.rs` (live pass-through evidence against an INSTALLED
   Zellij in a real PTY; each test prints a visible SKIP to the real stderr
-  and gathers no live evidence when no `zellij` is on `PATH`).
+  and gathers no live evidence when no `zellij` is on `PATH` — and even
+  where Zellij is installed, the suite currently runs on no machine that
+  gates a merge, so live pass-through evidence is gathered only where a
+  developer happens to run it: issue #153).
 - **Four CI gates** required by branch protection (see the
   [roadmap](../ROADMAP.md) and `.github/workflows/`): the Rust workflow
   (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
@@ -318,9 +325,13 @@ colours are right. Its two former defect specifications
 (`lowercase_distinct_from_uppercase`, `non_ascii_glyph_is_not_the_question_mark`)
 are no longer `#[ignore]`d and no longer failing: the bitmap font now
 distinguishes case, Latin-1 Supplement and Box Drawing have built-in coverage,
-and unsupported Unicode draws a replacement glyph instead of `?`. The oracle
-needs a headless Metal adapter and reports `offscreen=blocked` honestly when
-the host has none.
+and unsupported Unicode draws a replacement glyph instead of `?`. The oracle's
+GPU dependence is real and remains: it needs a headless Metal adapter. A
+machine with no adapter at all skips each oracle test visibly (a `SKIP`
+notice on the real stderr stating that rendered-frame evidence was NOT
+gathered — a skip is never reported as a pass), while an adapter that exists
+but fails to yield a device stays red as `offscreen=blocked`; the skip policy
+itself is exercised by the `NOREN_FRAME_ORACLE_ADAPTER` modes.
 
 What this evidence does **not** cover: there is still **no key injection into
 the real window**, so live input is unverified end-to-end — the byte-level
