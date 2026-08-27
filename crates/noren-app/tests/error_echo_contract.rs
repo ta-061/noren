@@ -16,7 +16,13 @@
 //!    classifier arm breaks this target's build — the failure mode for a
 //!    silent echo is a compile error, not a code review hoping to notice.
 //!    The per-enum variant counts and the total allowlist size are pinned,
-//!    so admitting a new echo is a visible decision.
+//!    so admitting a new echo is a visible decision, and the classification
+//!    itself is policed against the real rendering via the sample payload
+//!    convention (`VALUE-sentinel`). The known residual: sample tables and
+//!    classifiers are two lists kept in sync by these pins; a new variant
+//!    cannot skip the classifier (compile error), and cannot misclassify a
+//!    value-carrying sample (rendering assertion), so the only path to a
+//!    silent echo runs through deliberately bypassing this file's rules.
 //! 3. Sentinel probes verify the classification behaviorally through the
 //!    real loaders, on both the `Display` and the derived `Debug` rendering
 //!    of each error — `Debug` is a print surface too.
@@ -56,6 +62,12 @@ const SSH_ERROR_KINDS: usize = 13;
 /// Pinned allowlist size across every file-derived enum. Raising this
 /// number is the reviewed decision to admit a new value echo.
 const CHORD_ALLOWLIST_SIZE: usize = 6;
+/// Sample payload convention (policed by the pin test): key-shaped sample
+/// fields carry `sample_key` and may render; any **value-shaped** sample
+/// field must carry this sentinel so the test can check the classification
+/// against the actual rendering — a `Never` variant that renders it, on
+/// either surface, is a contract violation on the spot.
+const VALUE_SENTINEL: &str = "VALUE-sentinel";
 
 /// Classify every [`ConfigError`] variant. Exhaustive by design: a new
 /// variant fails this file's build until it is classified here.
@@ -165,7 +177,7 @@ fn config_samples() -> Vec<(ConfigError, ValueEcho)> {
         (
             ConfigError::InvalidChord {
                 key: key(),
-                value: "sample".to_owned(),
+                value: VALUE_SENTINEL.to_owned(),
                 reason: "sample reason".to_owned(),
             },
             ValueEcho::ChordText,
@@ -173,14 +185,14 @@ fn config_samples() -> Vec<(ConfigError, ValueEcho)> {
         (
             ConfigError::UnclaimableChord {
                 key: key(),
-                value: "sample".to_owned(),
+                value: VALUE_SENTINEL.to_owned(),
             },
             ValueEcho::ChordText,
         ),
         (
             ConfigError::ReservedChord {
                 key: key(),
-                value: "sample".to_owned(),
+                value: VALUE_SENTINEL.to_owned(),
             },
             ValueEcho::ChordText,
         ),
@@ -236,15 +248,15 @@ fn chord_parse_samples() -> Vec<(ChordParseError, ValueEcho)> {
         (ChordParseError::EmptyToken, ValueEcho::Never),
         (ChordParseError::MissingKey, ValueEcho::Never),
         (
-            ChordParseError::NotAModifier("sample".to_owned()),
+            ChordParseError::NotAModifier(VALUE_SENTINEL.to_owned()),
             ValueEcho::ChordText,
         ),
         (
-            ChordParseError::UnknownKey("sample".to_owned()),
+            ChordParseError::UnknownKey(VALUE_SENTINEL.to_owned()),
             ValueEcho::ChordText,
         ),
         (
-            ChordParseError::RepeatedModifier("sample".to_owned()),
+            ChordParseError::RepeatedModifier(VALUE_SENTINEL.to_owned()),
             ValueEcho::ChordText,
         ),
         (
@@ -316,6 +328,45 @@ fn every_file_derived_variant_is_classified_and_the_allowlist_is_pinned() {
     }
     for (sample, expected) in &ssh {
         assert_eq!(&classify_ssh_kind(sample), expected, "{sample:?}");
+    }
+
+    // Police the classification against the actual rendering, on both
+    // surfaces, using the sample payload convention: a Never-classified
+    // variant must not render the value sentinel anywhere (derived Debug
+    // included), and an allowlisted variant must actually carry it in
+    // Display — an allowlist entry that never echoes is a classification
+    // error, and usability probe below pins the real loader paths.
+    let assert_rendering = |sample: String, debug: String, class: ValueEcho| match class {
+        ValueEcho::Never => {
+            assert!(
+                !sample.contains(VALUE_SENTINEL),
+                "a Never variant must not render file values: {sample}"
+            );
+            assert!(
+                !debug.contains(VALUE_SENTINEL),
+                "a Never variant must not carry file values in Debug: {debug}"
+            );
+        }
+        ValueEcho::ChordText => {
+            assert!(
+                sample.contains(VALUE_SENTINEL),
+                "an allowlisted variant must echo its chord text: {sample}"
+            );
+        }
+    };
+    for (sample, class) in &config {
+        assert_rendering(sample.to_string(), format!("{sample:?}"), *class);
+    }
+    for (sample, class) in &session {
+        assert_rendering(sample.to_string(), format!("{sample:?}"), *class);
+    }
+    for (sample, class) in &chords {
+        assert_rendering(sample.to_string(), format!("{sample:?}"), *class);
+    }
+    for (sample, class) in &ssh {
+        // The kinds have no Display of their own; SshConfigError renders
+        // them with `{:?}`, so Debug is the rendering surface here.
+        assert_rendering(format!("{sample:?}"), format!("{sample:?}"), *class);
     }
 
     let allowlist = config
