@@ -101,13 +101,18 @@ const TMP_SUFFIX: &str = ".tmp";
 /// Maximum characters of hostile input echoed inside any error message.
 const MAX_ERROR_DETAIL_CHARS: usize = 120;
 
-/// Typed persistence failure without file contents.
+/// Typed persistence failure under the file-echo contract (TM-08,
+/// issue #150).
 ///
-/// Every variant renders a bounded message: hostile key names are clipped
-/// by [`clip`] before they are stored, a TOML parse failure keeps only the
-/// 1-based position computed by [`toml_error_position`], never the
-/// third-party parser's text, and no variant carries a file *value* — the
-/// `kind` value is reported by name and accepted set only (issue #150).
+/// `main` prints this error straight to live stderr, so every variant is a
+/// disclosure surface. The contract: file **key names** and parse
+/// **positions** may appear, clipped to 120 characters by [`clip`] — a key
+/// name is where the user must look — but file **values** are never
+/// echoed. No variant of this type is on the echo allowlist the config
+/// loader keeps for `[keys]` chord text: a `sessions.toml` value has no
+/// grammar that bounds what it can hold. `tests/error_echo_contract.rs`
+/// classifies every variant; a new variant cannot compile without the
+/// classifier acknowledging it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionPersistenceError {
     /// The state file does not exist. Internal to [`load`], which turns

@@ -597,6 +597,13 @@ fn key_code_text(code: KeyCode) -> String {
 /// Why chord text could not be parsed.
 ///
 /// Every failure is typed; none falls back to a default chord.
+///
+/// **Echo allowlist** (issue #150): `NotAModifier`, `UnknownKey`, and
+/// `RepeatedModifier` carry tokens of the `[keys]` value — chord grammar
+/// text, not secret-bearing data (see the contract on [`ConfigError`]).
+/// The only path to stderr is the clipped `reason` of
+/// [`ConfigError::InvalidChord`]; this type's own display is unbounded and
+/// must never be printed to a live stream unclipped.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChordParseError {
     /// The chord text is empty.
@@ -734,12 +741,25 @@ fn toml_error_position(text: &str, error: &toml_edit::TomlError) -> (usize, usiz
     (line, column)
 }
 
-/// Typed configuration failure without file contents.
+/// Typed configuration failure under the file-echo contract (TM-08,
+/// issue #150).
 ///
-/// Every variant renders a bounded message: hostile key names are clipped
-/// by [`clip`] before they are stored, and a TOML parse failure keeps only
-/// the 1-based position computed by [`toml_error_position`], never the
-/// third-party parser's text.
+/// `main` prints this error straight to live stderr, so every variant is a
+/// disclosure surface. The contract:
+///
+/// * file **key names** and parse **positions** may appear, clipped to
+///   120 characters by [`clip`] — a key name is where the user must look,
+///   and is the most actionable thing an error can say;
+/// * file **values** are never echoed, with one allowlist: the `[keys]`
+///   chord variants marked **Echo allowlist** below. A chord is keybinding
+///   grammar, and the schema deliberately exposes no credential or path
+///   key, so no legitimate `[keys]` value is secret material — while an
+///   error that cannot show the offending binding is not actionable.
+///
+/// `tests/error_echo_contract.rs` classifies every variant against this
+/// contract: a new variant cannot compile without the classifier
+/// acknowledging it, and the allowlist size is pinned there so admitting a
+/// new echo is a reviewed decision, not a silent one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigError {
     /// An explicitly requested configuration file does not exist.
@@ -772,6 +792,13 @@ pub enum ConfigError {
     /// A `[keys]` action is bound to a value that is not a TOML string.
     ChordNotAString { key: String },
     /// A `[keys]` value does not parse as a chord.
+    ///
+    /// **Echo allowlist** (issue #150): `value` and `reason` carry `[keys]`
+    /// chord text. `value` is unparsed, so it is arbitrary text clipped to
+    /// 120 characters — the residual risk of a secret pasted into `[keys]`
+    /// by mistake is accepted because naming the binding that failed is
+    /// the entire point of this error. `reason` is the clipped
+    /// [`ChordParseError`] display, which names the exact failing token.
     InvalidChord {
         key: String,
         value: String,
@@ -780,11 +807,25 @@ pub enum ConfigError {
     /// A `[keys]` palette chord parses but could never be claimed: it
     /// collides with a pinned Zellij default or the frozen `Super+Escape`
     /// exit leader.
+    ///
+    /// **Echo allowlist** (issue #150): `value` has already parsed as a
+    /// chord, so the echoed text is bounded by the chord grammar itself —
+    /// only the four modifier names and known key names, case-insensitive,
+    /// can appear. Arbitrary file text cannot reach this variant, and
+    /// without the value the user could not tell which binding collides.
     UnclaimableChord { key: String, value: String },
     /// A `[keys]` palette command chord uses a key the open palette always
     /// interprets structurally, so the binding could never fire.
+    ///
+    /// **Echo allowlist** (issue #150): same bound as
+    /// [`ConfigError::UnclaimableChord`] — the value has already parsed,
+    /// so only grammar-bounded chord text can appear.
     ReservedChord { key: String, value: String },
     /// Two `[keys]` actions are bound to the same chord.
+    ///
+    /// No file text appears: `first` and `second` are compile-time action
+    /// names, and `chord` is canonical text regenerated from the parsed
+    /// chord by `chord_text`, never the file's own spelling.
     DuplicateChord {
         first: String,
         second: String,

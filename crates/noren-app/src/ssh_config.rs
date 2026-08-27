@@ -713,7 +713,11 @@ fn apply_settings(host: &mut SshHost, block: &Block) {
     }
 }
 
-/// Safe, content-free parser failure.
+/// Safe, content-free parser failure under the file-echo contract
+/// (TM-08, issue #150): the struct carries only a 1-based line number and
+/// a [`SshConfigErrorKind`] whose variants are all unit, so no `~/.ssh`
+/// source text can reach stderr through it.
+/// `tests/error_echo_contract.rs` classifies every kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SshConfigError {
     line: usize,
