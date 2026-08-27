@@ -16,13 +16,20 @@ name: Zellij live
 # version and the evidence guard fails the job on any skip notice.
 #
 # Triggers: every PR and push to main, so a Noren change that breaks
-# pass-through is caught before merge.
+# pass-through is caught before merge — plus a nightly schedule, because
+# pass-through drift is also driven by Zellij releases and runner-image
+# changes rather than Noren commits, which a per-PR gate alone notices
+# only belatedly. Both cost the same job; the artifact cache below keeps
+# the marginal runs cheap. `workflow_dispatch` allows running the job on a
+# branch without opening a PR first.
 
 on:
   pull_request:
   push:
     branches:
       - main
+  schedule:
+    - cron: "30 15 * * *"
   workflow_dispatch:
 
 permissions:
@@ -64,6 +71,17 @@ jobs:
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
           echo "Pinned Zellij fixture tag: ${tag}"
+      # The ~15 MB release tarball is fetched from github.com on every run
+      # without this, which is slow and rate-limitable (issue #153). The
+      # cache key IS the pinned tag, and cache keys are immutable, so a tag
+      # bump is guaranteed to miss and re-download the new artifact. The
+      # .sha256sum check in the install step still verifies a restored
+      # artifact, so a corrupted cache cannot read as good evidence.
+      - name: Cache the pinned Zellij release artifact
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/noren-zellij
+          key: zellij-aarch64-apple-darwin-${{ steps.pin.outputs.tag }}
       # A failed download must fail THIS job loudly (issue #153): falling
       # through to the suite's own "Zellij absent, skipping" path would look
       # green while gathering no evidence. curl --fail plus the explicit
