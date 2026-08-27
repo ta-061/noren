@@ -156,6 +156,16 @@ jobs:
           fi
           grep -q 'test result: ok' /tmp/zellij_live.log \
             || { echo "::error::No 'test result: ok' line from the live suite; it did not run to completion."; exit 1; }
-          echo "Live pass-through evidence gathered against Zellij ${PINNED_VERSION}: $(grep -c '^test .* \.\.\. ok$' /tmp/zellij_live.log) tests ok."
+          # Zero-test runs also read as green (review path #15): a suite whose
+          # every test was deleted or gated out emits no skip notice and exits
+          # 0, so the guards above pass while the job verified nothing. Fail
+          # unless at least one test actually reported ok. grep -c exits 1 on
+          # a zero count, hence the || true under set -e.
+          ok_count="$(grep -c '^test .* \.\.\. ok$' /tmp/zellij_live.log || true)"
+          if [ "$ok_count" -eq 0 ]; then
+            echo "::error::The live suite passed ZERO tests; every test in zellij_live.rs is deleted or gated out, so pass-through evidence was NOT gathered."
+            exit 1
+          fi
+          echo "Live pass-through evidence gathered against Zellij ${PINNED_VERSION}: ${ok_count} tests ok."
         env:
           PINNED_VERSION: ${{ steps.pin.outputs.version }}
