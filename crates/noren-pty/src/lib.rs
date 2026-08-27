@@ -1927,21 +1927,32 @@ mod tests {
     #[test]
     fn spawn_in_dir_runs_the_child_in_that_directory() {
         let worktree = temp_directory_with("worktree-cwd");
+        // The home must DIFFER from the requested cwd (issue #162).
+        // `portable-pty` falls back to the child's `HOME` when a launch
+        // carries no cwd, so a home that equalled the worktree let a
+        // dropped `command.cwd` pass unnoticed: the fallback landed in
+        // the very directory the test demanded. A distinct home keeps the
+        // discrimination the test's name claims while preserving #156's
+        // isolation — a controlled empty HOME, never the developer's
+        // real one, whose startup files (oh-my-zsh, conda, nvm, …) could
+        // outlast the deadline or read the terminal.
+        let home = temp_directory_with("worktree-home");
 
         // The production entry `spawn_in_dir` inherits HOME unchanged so the
-        // user's shell config applies, and a developer's real `$HOME` may
-        // carry startup files (oh-my-zsh, conda, nvm, …) that take longer
-        // than the deadline or read the terminal. This live check drives the
+        // user's shell config applies; this live check drives the
         // `spawn_in_dir_with_home` seam — the same `DirLaunchPolicy`, the
         // same fixed builder, and the same session machinery, with HOME
         // pinned to the empty fixture directory — so the shell finds no
         // startup files and answers immediately. Unlike an env swap, the
         // seam never mutates process-global environment, which races the
         // parallel tests that read HOME (this exact race was observed:
-        // `ssh_command_argv_...` failed while HOME was swapped). The cwd is
-        // still independently verified by the pwd check below.
+        // `ssh_command_argv_...` failed while HOME was swapped).
+        //
+        // Mutation check: dropping `command.cwd` from the builder makes the
+        // child land in the home fixture instead, and the pwd assertion
+        // below fails — the fallback can no longer mask a missing cwd.
         let size = PtySize::from_raw(24, 80).expect("valid initial size");
-        let mut session = PtySession::spawn_in_dir_with_home(&worktree, &worktree, size)
+        let mut session = PtySession::spawn_in_dir_with_home(&worktree, &home, size)
             .expect("spawn zsh in the worktree");
 
         session.send_input(b"pwd\nexit\n").expect("ask for the cwd");
@@ -1967,5 +1978,6 @@ mod tests {
         );
         session.shutdown().expect("reap worktree zsh");
         fs::remove_dir_all(&worktree).expect("remove worktree fixture");
+        fs::remove_dir_all(&home).expect("remove home fixture");
     }
 }

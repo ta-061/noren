@@ -9,7 +9,7 @@ Only evidence-backed work is marked complete.
 | 1 — Requirements and design | Independent proposals, critiques, integrated requirements, architecture, threat model, tests, RFCs, ADRs | Complete |
 | 2 — Terminal foundation | Window, PTY, shell, terminal state/rendering, input, resize, scrollback, selection, copy/paste/search, configuration and diagnostics | Complete |
 | 3 — Workspace | External workspace management (sidebar: projects, git worktrees, SSH connections, agents, terminal sessions), single-session view, session lifecycle, sidebar-state persistence, palette, configurable keybindings, Zellij pass-through — no native tabs/panes/layout (delegated to Zellij per [ADR 0003](docs/adr/0003-noren-zellij-responsibility-boundary.md)) | In progress — vertical slice landed; see [Milestone 3 status](#milestone-3-status) |
-| 4 — SSH and remote | OpenSSH configuration, connections, reconnect, remote panes, daemon decision/PoC and recovery | In progress — bounded, explicitly partial literal-alias discovery and source-attributed sidebar selection landed; no connection or remote PTY |
+| 4 — SSH and remote | OpenSSH configuration, connections, reconnect, remote panes, daemon decision/PoC and recovery | In progress — bounded, explicitly partial literal-alias discovery landed, and selecting an alias launches the fixed system `ssh` client in the terminal's PTY (PR #138); reconnect, remote panes, the daemon decision/PoC, and recovery are not started |
 | 5 — Agent experience | Launchers, verified adapters, trustworthy state, notifications and jump-to-source | Not started |
 | 6 — Themes and accessibility | Light/dark/high-contrast palettes, contrast checks, IME/CJK/HiDPI and keyboard/accessibility work | Not started |
 | 7 — Quality | Unit/integration/compatibility/fault/security/visual tests, fuzzing, soak tests and benchmarks | Not started |
@@ -72,10 +72,14 @@ cells are dark, distinct glyphs have distinct lit patterns, glyphs do not bleed
 into neighbouring cells, and the drawn grid agrees with the terminal-state
 snapshot — plus colour behaviour: distinct SGR foregrounds, fixed-palette ANSI
 and 256-colour values, direct RGB truecolor, explicit backgrounds, and unchanged
-defaults. It does **not** verify that an `A` is shaped like an A, and two of its
-tests are `#[ignore]`d because they document real font defects (case-folding in
-the bitmap font, and every non-ASCII code point falling through to the `?`
-glyph). Key injection into the real window still does not exist, so live
+defaults. It does **not** verify that an `A` is shaped like an A. Its two former
+defect tests (`lowercase_distinct_from_uppercase`,
+`non_ascii_glyph_is_not_the_question_mark`) are no longer `#[ignore]`d: PR #141
+retired both font defects — upper/lower case are now distinct glyphs, the
+Latin-1 Supplement and Box Drawing blocks have per-character bitmaps, and every
+other code point draws a visible replacement glyph instead of `?` — and the
+tests now guard those fixes. Key injection into the real window still does not
+exist, so live
 keyboard input remains unverified by automation; the byte-level input contract
 is covered by tests instead. Mouse reporting is no longer encoder-only:
 `MouseEncoder::encode` (`crates/noren-app/src/mouse.rs`) is now reached from the
@@ -119,18 +123,38 @@ Measured against it, item by item:
 | Sidebar-state persistence | Done | `sessions.toml` (`SESSION_STATE_FILE_NAME`) under the `config::default_path` directory, resolved by `session_state_path` |
 | Palette | Done | `Super+p` via `palette_policy`; `Palette::noren`'s four commands dispatched by `handle_palette_key` |
 | Configurable keybindings | Done for the palette surface | `[keys]` in `config.toml` (`KeymapConfig` in `config.rs`) rebinds the palette opener and the four palette command chords with the previous values as defaults; `palette_policy`/`handle_palette_key` in `main.rs` honor them, unparseable chords and unknown actions are typed errors, and the opener is validated against the pinned Zellij corpus and the exit leader. The exit leader, palette navigation keys, diagnostics chord, and clipboard shortcuts remain fixed |
-| Zellij pass-through | Done against a pinned corpus and a live installed Zellij | The shipped policy (`palette_policy` in `main.rs`) claims exactly two Super-modified chords — `Super+Escape` (exit leader) and `Super+p` (palette opener) — that the pinned Zellij `v0.44.3` default corpus (`ZELLIJ_FIXTURE_TAG`) never binds, and `tests/zellij_live.rs` drives an INSTALLED Zellij in a real PTY through the same parser, gate, and key encoder: attach enables mouse tracking in `TerminalState`, gated `Ctrl+t`/`n`/`Ctrl+p` reach Zellij and render tab #2 and pane #2, typed text reaches the pane's shell, and the installed version's default keybinds bind nothing in the Super/Cmd/Meta space. The harness skips (visibly, on the real stderr) when no `zellij` is on `PATH`. Empirical wire-shape note: Zellij 0.44.3 sends `1002`/`1006` as separate single-parameter DECSETs across its whole lifecycle and does not forward a pane program's multi-parameter DECSET to the host terminal, so the multi-parameter form `CSI ? 1002;1006 h` (the PR #113 regression site) is pinned as a co-located regression guard beside the live assertions, with the live multi-parameter count printed as drift telemetry |
+| Zellij pass-through | Done against a pinned corpus and a live installed Zellij | The shipped policy (`palette_policy` in `main.rs`) claims exactly two Super-modified chords — `Super+Escape` (exit leader) and `Super+p` (palette opener) — that the pinned Zellij `v0.44.3` default corpus (`ZELLIJ_FIXTURE_TAG`) never binds, and `tests/zellij_live.rs` drives an INSTALLED Zellij in a real PTY through the same parser, gate, and key encoder: attach enables mouse tracking in `TerminalState`, gated `Ctrl+t`/`n`/`Ctrl+p` reach Zellij and render tab #2 and pane #2, typed text reaches the pane's shell, and the installed version's default keybinds bind nothing in the Super/Cmd/Meta space. The harness skips (visibly, on the real stderr) when no `zellij` is on `PATH`. Empirical wire-shape note: Zellij 0.44.3 sends `1002`/`1006` as separate single-parameter DECSETs across its whole lifecycle and does not forward a pane program's multi-parameter DECSET to the host terminal, so the multi-parameter form `CSI ? 1002;1006 h` (the PR #113 regression site) is pinned as a co-located regression guard beside the live assertions, with the live multi-parameter count printed as drift telemetry. Beyond the skip, the suite today runs only where a developer runs it — no gating machine executes it (issue #153) |
 
-One named scope item remains unsatisfied: **agents do not run**. Positive
+Two named scope items remain unsatisfied: **projects are not reachable** and
+**agents do not run**. No runtime path constructs an `EntryKind::Project` row
+or a `SessionKind::Project` session — the model, `parse_session` for a
+hand-written `sessions.toml`, and the tests are the only constructors — and
+`SidebarEntry::Agent` is likewise never emitted by the running binary, so no
+agent is ever launched. Positive
 literal aliases appear in a bounded sidebar list and a click launches a real
 system-ssh connection (PR #138), but wildcard or dynamic destinations are
-not presented as a complete host inventory, and agent entries remain
-fixtures and launch no
-agent. Since "Only evidence-backed work is marked complete" and the scope
-line names it, Milestone 3 stays **In progress**. The agent session
-kind also depends on Milestone 5; whether it is retired from
-Milestone 3's scope or carried is an open scoping decision, not something to
-settle by relabelling the status.
+not presented as a complete host inventory. Configurable keybindings are
+satisfied for the palette surface only; the exit leader, palette navigation,
+diagnostics chord, and clipboard shortcuts remain compiled in. Since
+"Only evidence-backed work is marked complete" and the scope line names the
+two unsatisfied items, Milestone 3 stays **In progress**. The agent session
+kind also depends on Milestone 5; whether it and the project row are retired
+from Milestone 3's scope or carried is an open scoping decision, not something
+to settle by relabelling the status.
+
+Open engineering issues a reader of this section should know about: the
+behavior-preserving split of the oversized binary and SSH-parser modules
+([#123](https://github.com/ta-061/noren/issues/123)) is still open — the
+binary test module and the SSH-parser tests have been extracted, and the
+remaining production-side splits are tracked there; the live-Zellij
+pass-through suite runs on no machine that gates a merge
+([#153](https://github.com/ta-061/noren/issues/153)) — its evidence is
+gathered only where a developer happens to run it; and the PTY-level
+`spawn_in_dir_runs_the_child_in_that_directory` test cannot distinguish an
+honoured working directory from portable-pty's HOME fallback
+([#162](https://github.com/ta-061/noren/issues/162)), so the app-level `pwd`
+proof cited in the worktree row above is the real guarantee that a worktree
+session's child starts in the worktree.
 
 ## What blocks a public preview
 
@@ -139,21 +163,21 @@ concluded that the current tree cannot honestly be released as "0.1.0-preview of
 the Noren terminal." The reasoning and the decision are recorded in
 [D-M8-001](docs/coordination/decisions/D-M8-001-preview-scope.md). In short:
 
-  - **The workspace is a slice, not a product.** The Milestone 3 modules now
-    reach the binary: the sidebar is drawn, the palette opens on `Super+p`,
-    local sessions spawn real PTYs that switch, park, and close through the
-    live view, mouse reports reach the active PTY, and sidebar state persists
-    across a restart. What is still missing is breadth —
-    bounded OpenSSH configuration now produces an explicitly partial list of at
-    most 24 positive literal aliases as `SessionKind::Ssh` values and
-    `SidebarEntry::SshConnection` rows, and selecting one launches the fixed
-    system `ssh` client in the terminal's PTY. Git
-    worktrees of the launch repository ARE reachable now (discovered from
-    `git worktree list --porcelain`, shown as bounded rows, and launched as
-    worktree-scoped sessions), while project rows remain unreachable and
-    agents remain
-    fixture-only; keybindings ARE configurable through the `[keys]` section
-    since this milestone (see [Milestone 3 status](#milestone-3-status)).
+- **The workspace is a slice, not a product.** The Milestone 3 modules now
+  reach the binary: the sidebar is drawn, the palette opens on `Super+p`,
+  local sessions spawn real PTYs that switch, park, and close through the
+  live view, mouse reports reach the active PTY, and sidebar state persists
+  across a restart. What is still missing is breadth —
+  bounded OpenSSH configuration now produces an explicitly partial list of at
+  most 24 positive literal aliases as `SessionKind::Ssh` values and
+  `SidebarEntry::SshConnection` rows, and selecting one launches the fixed
+  system `ssh` client in the terminal's PTY. Git
+  worktrees of the launch repository ARE reachable now (discovered from
+  `git worktree list --porcelain`, shown as bounded rows, and launched as
+  worktree-scoped sessions), while project rows remain unreachable and
+  agents remain fixture-only; keybindings ARE configurable through the
+  `[keys]` section since this milestone (see
+  [Milestone 3 status](#milestone-3-status)).
 - **Colour rendering exists, but themes are fixed.** `renderer.rs` resolves
   each cell's SGR foreground and any explicit background through its compiled-in
   ANSI/256-colour palette or as direct RGB truecolor. The vertex layout carries
@@ -161,14 +185,23 @@ the Noren terminal." The reasoning and the decision are recorded in
   input. There is no configuration surface for the default palette or theme,
   so light, dark, high-contrast, and colour-vision-friendly themes remain
   Milestone 6 work.
-- **The font is ASCII-only and case-blind.** Non-ASCII renders as `?`, and the
-  `renderer.rs` test `ascii_glyphs_are_distinct_and_unknown_is_question_mark`
-  asserts `glyph_rows('a') == glyph_rows('A')`.
+- **The font is a hand-built 5x7 bitmap with bounded coverage.** Printable
+  ASCII keeps distinct upper/lower case, and the Latin-1 Supplement
+  (`U+00A0..=U+00FF`) and Box Drawing (`U+2500..=U+257F`) blocks have
+  per-character bitmaps, but every other code point — CJK text and emoji
+  included — draws a fixed replacement glyph, and seven glyph pairs are
+  visually identical by an allowlisted collision set (pinned by
+  `covered_range_glyph_collisions_match_the_hardcoded_allowlist` in
+  `renderer.rs`'s tests). Both former font defects — case-folding and
+  non-ASCII rendering as `?` — were retired by PR #141 and are now guarded by
+  running tests, not `#[ignore]`d ones.
 - **The FR-005 rendered-frame oracle now exists** (PR #89). It drives the real
   pipeline offscreen; active colour-aware assertions cover SGR foregrounds,
   ANSI/256-colour and direct RGB resolution, defaults, and explicit backgrounds.
-  Its `#[ignore]`d defect tests still record the font's case-fold and
-  non-ASCII-`?` failures — the same defects above.
+  Its former defect tests (`lowercase_distinct_from_uppercase`,
+  `non_ascii_glyph_is_not_the_question_mark`) now run and pass, guarding the
+  PR #141 font fixes — see the font bullet above for what the font still cannot
+  do.
 - **NFR-009 requires release-integrity gates** — signing, notarization,
   packaging — to pass before any Preview claim.
 

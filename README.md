@@ -11,11 +11,13 @@
 > Per-cell SGR foreground and explicit background colours now reach drawing:
 > ANSI and 256-colour values resolve through a fixed palette, while RGB passes
 > through as direct truecolor, with the resolved colour carried per vertex. The
-> default palette and theme are not user-configurable. The renderer still uses
-> a case-insensitive 5x7 ASCII bitmap font, with all non-ASCII shown as `?`, no
-> visible cursor, no IME, and no accessibility surface. Startup launches
-> exactly one local session; additional palette rows do not launch or switch
-> PTYs yet. A bounded, explicitly partial list of positive literal aliases
+> default palette and theme are not user-configurable. The renderer still uses a
+> hand-built 5x7 bitmap font with bounded coverage — distinct ASCII case plus
+> the Latin-1 Supplement and Box Drawing blocks, a fixed replacement glyph for
+> every other code point, so CJK text and emoji do not render — with no
+> visible cursor, no IME, and no accessibility surface. The palette's session
+> commands spawn real local sessions that switch, park, and close through the
+> live view. A bounded, explicitly partial list of positive literal aliases
 > from the user's OpenSSH config is displayed in the sidebar (at most 24 rows),
 > and selecting one launches the system `/usr/bin/ssh` client for that alias in
 > the terminal's PTY (argv is exactly `ssh -- <alias>`; no credential is ever
@@ -28,8 +30,10 @@
 > whose canonical targets remain under the top-level config directory;
 > git worktrees of the launch repository are discovered and launchable (a
 > sidebar click starts a shell whose working directory is that worktree),
-> while project rows and agents remain modelled but unreachable. Keybindings are not
-> configurable. There are no published binaries, and a local build carries only
+> while project rows and agents remain modelled but unreachable. Palette
+> keybindings — the opener and the four command chords — are configurable
+> through `[keys]` in `config.toml`; the remaining shortcuts are compiled in.
+> There are no published binaries, and a local build carries only
 > macOS's automatic ad-hoc signature — no signing identity, no notarization. Read
 > **[docs/known-limitations.md](docs/known-limitations.md)** first — it is the
 > accurate predictor of what happens when you run the build. Everything below
@@ -64,8 +68,10 @@ pass-through takes priority over Noren shortcuts.
 Milestones 0–2 (discovery, requirements/design, terminal foundation) are
 complete on the evidence recorded in [ROADMAP.md](ROADMAP.md). Milestone 3
 (workspace) is **in progress**: the vertical slice — sidebar, palette, session
-lifecycle, persistence, Zellij pass-through — has landed, while configurable
-keybindings, SSH connection launching, and agent launching have not; the
+lifecycle, persistence, Zellij pass-through, worktree sessions — has landed,
+as have configurable keybindings (palette surface) and SSH connection
+launching through the fixed system client, while reachable project rows and
+agent launching have not; the
 reasoning is in
 [Milestone 3 status](ROADMAP.md#milestone-3-status). The SSH,
 agent-experience, theming/accessibility, quality, and preview milestones are
