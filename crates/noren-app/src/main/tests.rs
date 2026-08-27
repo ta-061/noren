@@ -3608,7 +3608,9 @@ impl AppTestHome {
         Self(path)
     }
 
-    /// A default app whose spawned sessions run in this isolated home.
+    /// A default app whose spawned sessions run in this isolated home —
+    /// local sessions and worktree sessions alike (a worktree child still
+    /// starts *in* its worktree; only its `HOME` is isolated).
     ///
     /// Borrows the guard so it stays alive (and the directory stays present)
     /// for the whole test: the child validates the directory at spawn time.
@@ -3648,9 +3650,11 @@ fn session_status(app: &NorenApp, id: SessionId) -> SessionStatus {
 
 /// Drain the live view until the shell has produced its first output.
 ///
-/// Real zsh sessions run in the inherited `$HOME`, whose startup files a user
-/// may have customized: input typed before they finish races them, so every
-/// test that drives a shell by typing first waits for its prompt.
+/// The shell sessions these tests drive run in an isolated `HOME` (see
+/// [`AppTestHome`]), so their prompt is immediate and deterministic; a
+/// developer's real `$HOME` with slow startup files could not meet this
+/// deadline. Input typed while zsh is still starting races its startup, so
+/// every test that drives a shell by typing first waits for its prompt.
 fn wait_for_shell_output(app: &mut NorenApp) {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(10);
@@ -3664,12 +3668,21 @@ fn wait_for_shell_output(app: &mut NorenApp) {
             return;
         }
         if Instant::now() >= deadline {
-            let terminal_text = app.terminal.as_ref().map(terminal_text).unwrap_or_default();
+            let rows = app
+                .terminal
+                .as_ref()
+                .map(|terminal| terminal.screen().display_row_count());
+            let text = app.terminal.as_ref().map(terminal_text).unwrap_or_default();
             panic!(
-                "the spawned shell never produced its prompt after {:?}\n\
-                 terminal said: {}",
+                "the spawned shell never produced its prompt\n\
+                 expected: the live terminal to render at least one display row \
+                 of shell output within 10s\n\
+                 received: display_row_count={rows:?} after {:?} \
+                 (terminal_attached={}, pty_attached={}), terminal said: {:?}",
                 start.elapsed(),
-                terminal_text,
+                app.terminal.is_some(),
+                app.pty.is_some(),
+                text,
             );
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -4713,11 +4726,15 @@ const MAX_WORKTREE_SIDEBAR_TEST_ROWS: usize = noren_app::git_worktree::MAX_WORKT
 /// that worktree — verified by reading the child's own `pwd` answer back
 /// through the terminal, never by trusting the code path that set the cwd.
 ///
+/// The child's `HOME` is isolated through the same [`AppTestHome`] seam as
+/// every other shell-driving test (production inherits `HOME` unchanged): a
+/// developer's `.zshrc` cannot stall the prompt past the deadline, while the
+/// working directory stays the worktree, so the `pwd` proof is unaffected.
+///
 /// Mutation check (A): breaking the launch so the child starts elsewhere
 /// (for example dropping the cwd from the launch policy) fails this test.
 #[cfg(target_os = "macos")]
 #[test]
-#[allow(unsafe_code)] // HOME swap is safe: tests run sequentially; child inherits before restore.
 fn selecting_a_worktree_row_starts_a_session_in_that_worktree() {
     let Some(fixture) = GitWorktreeFixture::new() else {
         report_worktree_skip("selecting_a_worktree_row_starts_a_session_in_that_worktree");
@@ -4725,23 +4742,12 @@ fn selecting_a_worktree_row_starts_a_session_in_that_worktree() {
     };
     let (worktree, _branch) = fixture.add_worktree("launch-wt");
     let canonical = std::fs::canonicalize(&worktree).expect("canonicalize the worktree path");
-    let mut app = NorenApp::default();
+    let home = AppTestHome::new();
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..NorenApp::default()
+    };
     app.load_git_worktrees_from(&fixture.root);
-
-    // `spawn_worktree_session` calls `PtySession::spawn_in_dir` which
-    // intentionally inherits HOME unchanged so the user's shell config
-    // applies in production.  In the test harness the inherited HOME is the
-    // developer's real home whose `.zshrc` can take arbitrarily long
-    // (oh-my-zsh, conda, nvm …) or block entirely, making the test time out
-    // before the shell reaches its prompt.  Temporarily point HOME at the
-    // worktree so zsh finds no startup files and starts instantly.  The cwd
-    // is still independently verified by the pwd check below.
-    let saved_home = std::env::var_os("HOME");
-    // SAFETY: tests in this binary run sequentially; the child has
-    // already inherited the env by the time we restore below.
-    unsafe {
-        std::env::set_var("HOME", &canonical);
-    }
 
     // Row 0 is the main worktree; find the linked worktree's row by path.
     let row = app
@@ -4754,15 +4760,6 @@ fn selecting_a_worktree_row_starts_a_session_in_that_worktree() {
         click_sidebar_row(&mut app, row),
         "the worktree row is consumed"
     );
-
-    // Restore HOME immediately — the child has already inherited it.
-    // SAFETY: same single-threaded reasoning as above.
-    unsafe {
-        match saved_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
-    }
 
     // The launch created a real Worktree-kind session that owns the live
     // surface and is observed Running.
@@ -4799,7 +4796,10 @@ fn selecting_a_worktree_row_starts_a_session_in_that_worktree() {
         }
         assert!(
             Instant::now() < deadline,
-            "the child's own pwd never reported the worktree directory; terminal said: {}",
+            "the child's own pwd never reported the worktree directory\n\
+             expected: the terminal text to contain the worktree path {}\n\
+             received: terminal said: {}",
+            canonical.display(),
             app.terminal.as_ref().map(terminal_text).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(10));

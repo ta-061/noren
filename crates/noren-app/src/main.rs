@@ -1332,6 +1332,30 @@ impl NorenApp {
         }
     }
 
+    /// Spawn the PTY for a worktree session, whose working directory is the
+    /// worktree itself.
+    ///
+    /// Production inherits `HOME` unchanged so the user's own shell
+    /// configuration applies inside the worktree checkout. Tests that drive
+    /// the shell by typing redirect the child's `HOME` to the isolated
+    /// empty home (see [`NorenApp::test_pty_home`]) for the same reason as
+    /// [`Self::spawn_pty_session`]: a developer's real `$HOME` may carry
+    /// startup files that take arbitrarily long or read the terminal, which
+    /// would make every shell-driving test depend on personal configuration.
+    /// The working directory is the worktree in both shapes, so the child's
+    /// actual cwd stays observable through its own `pwd` answer.
+    fn spawn_worktree_pty_session(
+        &self,
+        path: &std::path::Path,
+        size: PtySize,
+    ) -> Result<PtySession, noren_pty::PtyError> {
+        #[cfg(test)]
+        if let Some(home) = &self.test_pty_home {
+            return PtySession::spawn_in_dir_with_home(path, home, size);
+        }
+        PtySession::spawn_in_dir(path, size)
+    }
+
     /// Spawn a real PTY session whose working directory is the worktree at
     /// `path`, and give it the live view.
     ///
@@ -1355,7 +1379,7 @@ impl NorenApp {
             );
             return None;
         };
-        match PtySession::spawn_in_dir(path, pty_size) {
+        match self.spawn_worktree_pty_session(path, pty_size) {
             Ok(pty) => {
                 self.workspace.observe_session(id, SessionStatus::Running);
                 self.park_active_session();
