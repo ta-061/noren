@@ -62,6 +62,23 @@
 //! developer exports — notably `ZELLIJ_CONFIG_FILE`, which clap prefers
 //! over `ZELLIJ_CONFIG_DIR` — cannot escape the harness's control.
 //!
+//! Kill-path teardown (issue #157): the reaper above lives inside the test
+//! binary, so it is unreachable whenever the binary dies WITHOUT unwinding.
+//! Reproduced deliberately: SIGINT to a `cargo test` process group (a
+//! terminal Ctrl-C), SIGTERM, SIGKILL, and SIGHUP each leaked EVERY
+//! up-server (3/3 — the spawn tests run in parallel), while every unwind
+//! path (a panicking test, a failed assertion) reaped cleanly through the
+//! [`Drop`] guard. That is why review measured the leak as "intermittent"
+//! (`0,0,0,2,4,4`): the count leaked is however many sessions happened to
+//! be up when the signal landed (the wild state found while diagnosing:
+//! 28 leaked servers in pairs, every owning pid dead). Two mechanisms now
+//! cover the kill paths: a [`ServerWatchdog`] planted per session — a
+//! detached `sh` that reaps this run's server the moment the harness's
+//! file table closes, any death mode including SIGKILL — and a startup
+//! sweep ([`sweep_orphaned_harness_state`]) that reaps servers and
+//! directories left by runs whose owning pid is dead, so nothing
+//! accumulates across interrupted runs.
+//!
 //! The multi-parameter DECSET path is a proven regression site (fixed in
 //! PR #113), so the mouse-mode test pins it EXPLICITLY beside the live
 //! evidence: after asserting on the real attach stream, it drives
@@ -78,6 +95,7 @@ use std::io::{Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child as StdChild, ChildStdin, Command, Stdio};
+use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -191,6 +209,48 @@ const POPUP_MARKERS: [&str; 4] = [
 ];
 
 static DIR_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
+/// `/tmp` name prefix of one harness run's isolation base directory. The
+/// owner pid is embedded between the dashes (`zn-live-<pid>-<sequence>`) so
+/// [`sweep_orphaned_harness_state`] can tell a DEAD run's abandoned state
+/// from a live sibling run's active state.
+const ZN_LIVE_PREFIX: &str = "zn-live-";
+
+/// Parse a `/tmp` entry name into the pid of the harness binary that created
+/// it. `None` for anything that is not exactly `zn-live-<digits>-<digits>`:
+/// an unrecognized name is not ours to touch.
+fn orphan_dir_owner(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix(ZN_LIVE_PREFIX)?;
+    let (pid, sequence) = rest.split_once('-')?;
+    if pid.is_empty()
+        || sequence.is_empty()
+        || !pid
+            .bytes()
+            .chain(sequence.bytes())
+            .all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+/// Whether a pid is still in the process table, via `ps -p` (reports any
+/// process regardless of signalability — a `kill -0` probe conflates "no
+/// such process" with "operation not permitted" on foreign-owned pids, and
+/// mistaking a live sibling harness for a dead one would sweep its state
+/// mid-run). If the probe itself fails, assume ALIVE: the sweep must never
+/// act on doubt.
+fn process_is_alive(pid: u32) -> bool {
+    match Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "pid="])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(_) => true,
+    }
+}
 
 /// Parsed `zellij --version` output of an installed Zellij, or `None` when
 /// Zellij is absent (or unusable), which every live test treats as a skip.
@@ -308,6 +368,12 @@ impl LiveZellij {
     /// with [`POPUP_SUPPRESSION_CONFIG`] so session startup draws no popup
     /// over the pane area (issue #147).
     fn spawn(version: &str) -> Self {
+        // First, heal the past (issue #157): reap servers and directories
+        // abandoned by runs that died by signal, before adding this run's
+        // own state to /tmp. Once per process; see
+        // [`sweep_orphaned_harness_state`].
+        sweep_orphaned_harness_state();
+
         let dirs = ZellijDirs::new();
 
         // Plant the deathwatch BEFORE anything that could spawn the server,
@@ -743,6 +809,107 @@ impl LiveZellij {
             self.dirs.socket.display()
         ));
     }
+}
+
+/// Reap Zellij servers and isolation directories left by harness runs that
+/// died without unwinding (issue #157). SIGINT/SIGKILL/SIGTERM/SIGHUP skip
+/// every in-process teardown by definition; the [`ServerWatchdog`] closes
+/// the fresh case, but a run can still die with its watchdog (a
+/// group-SIGKILL reaches every process group the harness could ever plant),
+/// and HISTORICAL leaks — like the 28 orphaned servers found while
+/// diagnosing this issue — predate the watchdog entirely. This sweep is the
+/// self-healing backstop: run once per process at the first
+/// [`LiveZellij::spawn`], it treats every `/tmp/zn-live-<pid>-<sequence>`
+/// whose owner pid is DEAD as abandoned — no live process can still reap
+/// it — kills any `zellij --server <that dir>` still holding it, removes
+/// the directory, and reports what it did to the real stderr so the next
+/// person sees the leak instead of re-deriving it.
+///
+/// Safety of scope: concurrent harness runs are alive by construction and
+/// skipped (a pid reused by an unrelated process also reads as alive —
+/// conservative in the safe direction); the kill pattern embeds the dead
+/// run's unique socket-directory path, which no foreign process carries, so
+/// a developer's own Zellij session can never match it.
+fn sweep_orphaned_harness_state() {
+    static SWEEP_ONCE: Once = Once::new();
+    SWEEP_ONCE.call_once(|| {
+        let (servers, dirs, skipped) = sweep_orphaned_harness_state_now();
+        if servers > 0 || dirs > 0 {
+            write_raw_stderr(&format!(
+                "NOTICE [zellij_live]: startup sweep (issue #157) reaped {servers} leaked \
+                 harness Zellij server(s) and removed {dirs} abandoned /tmp/{ZN_LIVE_PREFIX}* \
+                 directories left by dead runs; {skipped} live run(s) were left alone. \
+                 Leaks happen when the test binary dies by signal; each pinned server is \
+                 swap-starvation budget for later live runs (issue #147)."
+            ));
+        }
+    });
+}
+
+/// One pass of [`sweep_orphaned_harness_state`], separated so the unit test
+/// can drive it with an injected liveness probe. Returns (servers reaped,
+/// directories removed, live-owner directories skipped).
+fn sweep_orphaned_harness_state_now() -> (usize, usize, usize) {
+    sweep_orphaned_harness_state_with(process_is_alive)
+}
+
+/// [`sweep_orphaned_harness_state_now`]'s engine with the owner-liveness
+/// probe injected: the production probe races with pid reuse when a test
+/// seeds a just-exited owner pid on a busy machine, so the scope test
+/// decides liveness itself instead of racing the process table.
+fn sweep_orphaned_harness_state_with(is_alive: fn(u32) -> bool) -> (usize, usize, usize) {
+    let Ok(entries) = fs::read_dir("/tmp") else {
+        return (0, 0, 0);
+    };
+    let (mut servers, mut dirs, mut skipped) = (0, 0, 0);
+    for entry in entries.flatten() {
+        let Some(name) = entry.file_name().into_string().ok() else {
+            continue;
+        };
+        let Some(owner) = orphan_dir_owner(&name) else {
+            continue;
+        };
+        if is_alive(owner) {
+            skipped += 1;
+            continue;
+        }
+        let base = entry.path();
+        let pattern = format!("zellij --server {}", base.join("s").display());
+        if let Ok(pgrep) = Command::new("pgrep").arg("-f").arg(&pattern).output() {
+            let pids = String::from_utf8_lossy(&pgrep.stdout);
+            let pids: Vec<&str> = pids.split_whitespace().collect();
+            if !pids.is_empty() {
+                servers += pids.len();
+                for pid in &pids {
+                    let _ = Command::new("kill").arg("-9").arg(pid).status();
+                }
+                // Give the kills a bounded window to land before the
+                // directory (and its evidence in the server table) is
+                // judged clean.
+                for _ in 0..SERVER_REAP_ATTEMPTS {
+                    let gone = Command::new("pgrep")
+                        .arg("-f")
+                        .arg(&pattern)
+                        .output()
+                        .map(|out| {
+                            String::from_utf8_lossy(&out.stdout)
+                                .split_whitespace()
+                                .count()
+                                == 0
+                        })
+                        .unwrap_or(true);
+                    if gone {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+        if fs::remove_dir_all(&base).is_ok() {
+            dirs += 1;
+        }
+    }
+    (servers, dirs, skipped)
 }
 
 fn read_pty(mut reader: Box<dyn Read + Send>, events: mpsc::Sender<Vec<u8>>) {
@@ -1217,4 +1384,75 @@ fn disarmed_watchdog_leaves_matching_processes_alive() {
     );
     let _ = target.kill();
     let _ = target.wait();
+}
+
+/// The startup sweep's scope pin (issue #157): a directory whose owning
+/// harness pid is dead is abandoned and must be removed; a directory whose
+/// owner is alive belongs to a concurrent run and must be left untouched.
+/// Both halves in one test, because the dangerous failure is not "swept too
+/// little" but "swept too much". Liveness is injected (dead = exactly the
+/// fixture's owner pid) so the test decides the outcome instead of racing
+/// the real process table, where a busy machine can reuse a just-exited pid
+/// mid-test (this flake was observed under a concurrently loaded workspace
+/// run).
+#[test]
+fn orphan_sweep_removes_only_dead_owner_directories() {
+    const DEAD_OWNER: u32 = 157_000_157; // no process: above macOS's pid space
+    let dead_dir = PathBuf::from("/tmp").join(format!("{ZN_LIVE_PREFIX}{DEAD_OWNER}-157"));
+    let live_dir =
+        PathBuf::from("/tmp").join(format!("{ZN_LIVE_PREFIX}{}-157", std::process::id()));
+    for dir in [&dead_dir, &live_dir] {
+        fs::create_dir_all(dir.join("s")).expect("seed a sweep fixture directory");
+    }
+
+    let (servers, dirs, skipped) = sweep_orphaned_harness_state_with(|pid| pid != DEAD_OWNER);
+
+    assert_eq!(
+        servers, 0,
+        "the fixture dirs carry no real server; nothing may be reaped for them"
+    );
+    assert!(
+        !dead_dir.exists(),
+        "a dead run's directory is abandoned and must be removed"
+    );
+    assert!(
+        live_dir.exists(),
+        "a live run's directory must never be swept (concurrent-run safety)"
+    );
+    assert_eq!(
+        dirs, 1,
+        "exactly the dead-owner fixture may be removed, machine-wide"
+    );
+    assert!(
+        skipped >= 1,
+        "the live-owner fixture must be among the skipped directories"
+    );
+    let _ = fs::remove_dir_all(&live_dir);
+}
+
+/// The production liveness probe: this process is definitionally alive.
+/// (The dead direction is exercised by the injected-probe test above; a
+/// direct "spawn-and-exit" probe races pid reuse on a busy machine.)
+#[test]
+fn liveness_probe_reports_this_process_alive() {
+    assert!(
+        process_is_alive(std::process::id()),
+        "the probe must see this very process as alive"
+    );
+}
+
+/// The sweep's name parser accepts exactly the harness's own directory
+/// names and nothing else — over-broad parsing is how a sweep turns into
+/// vandalism of unrelated `/tmp` state.
+#[test]
+fn orphan_owner_parsing_accepts_only_harness_directory_names() {
+    assert_eq!(orphan_dir_owner("zn-live-123-0"), Some(123));
+    assert_eq!(orphan_dir_owner("zn-live-99999-42"), Some(99999));
+    assert_eq!(orphan_dir_owner("zn-live-123"), None);
+    assert_eq!(orphan_dir_owner("zn-live--0"), None);
+    assert_eq!(orphan_dir_owner("zn-live-abc-0"), None);
+    assert_eq!(orphan_dir_owner("zn-live-123-x"), None);
+    assert_eq!(orphan_dir_owner("zn-live-123-0-extra"), None);
+    assert_eq!(orphan_dir_owner("zellij-501"), None);
+    assert_eq!(orphan_dir_owner("tmpzn-live-123-0"), None);
 }
