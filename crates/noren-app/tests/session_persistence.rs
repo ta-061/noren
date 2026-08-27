@@ -504,10 +504,11 @@ fn malformed_session_tables_error_cleanly() {
                 key: "kind".to_owned(),
             },
         ),
-        // Unknown kind string.
+        // Unknown kind string: the value is never echoed, only the key and
+        // the accepted set are named (issue #150).
         (
             "version = 1\n\n[[sessions]]\nkind = \"mystery\"\n",
-            SessionPersistenceError::UnknownKind("mystery".to_owned()),
+            SessionPersistenceError::UnknownKind,
         ),
         // Missing or wrong-typed payloads.
         (
@@ -634,6 +635,36 @@ fn hostile_key_names_are_clipped_in_errors() {
     assert!(
         echoed.chars().count() <= 121,
         "hostile key must be clipped: {echoed}"
+    );
+}
+
+/// A `kind` value is file content, not a key name: unlike a key it can hold
+/// arbitrary text (an SSH target pasted into the wrong field, issue #150),
+/// so neither the `Display` nor the derived `Debug` rendering may echo it.
+/// The error must stay actionable by naming the key and the accepted kinds.
+#[test]
+fn unknown_kind_values_are_not_echoed() {
+    const SENTINEL: &str = "VALUE-SENTINEL-ops@bastion.example";
+    let text =
+        format!("version = {SESSION_STATE_VERSION}\n\n[[sessions]]\nkind = \"{SENTINEL}\"\n");
+    let mut registry = SessionRegistry::new();
+    let error =
+        load_bytes(text.as_bytes(), &mut registry).expect_err("an unknown kind string must fail");
+    assert_eq!(error, SessionPersistenceError::UnknownKind);
+    assert!(registry.is_empty(), "a rejected document loads nothing");
+    let display = error.to_string();
+    assert!(
+        !display.contains(SENTINEL),
+        "Display must not echo the kind value: {display}"
+    );
+    let debug = format!("{error:?}");
+    assert!(
+        !debug.contains(SENTINEL),
+        "Debug must not echo the kind value: {debug}"
+    );
+    assert!(
+        display.contains("kind"),
+        "the error must name the offending key: {display}"
     );
 }
 
