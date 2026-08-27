@@ -1390,11 +1390,20 @@ mod tests {
     ) {
         let start = Instant::now();
         while Instant::now() < deadline {
-            match session.try_recv().expect("receive PTY event") {
-                Some(PtyEvent::Output(bytes)) => output.extend(bytes),
-                Some(PtyEvent::Eof | PtyEvent::Exited { .. }) => *lifecycle = true,
-                Some(PtyEvent::Error(error)) => panic!("unexpected typed PTY error: {error}"),
-                None => thread::sleep(Duration::from_millis(1)),
+            match session.try_recv() {
+                Ok(Some(PtyEvent::Output(bytes))) => output.extend(bytes),
+                Ok(Some(PtyEvent::Eof | PtyEvent::Exited { .. })) => *lifecycle = true,
+                Ok(Some(PtyEvent::Error(error))) => panic!("unexpected typed PTY error: {error}"),
+                Ok(None) => thread::sleep(Duration::from_millis(1)),
+                // A drained-and-disconnected channel after exit evidence is
+                // end-of-stream, not an error: both producer threads finish
+                // as a normal consequence of the child exiting, and the
+                // disconnect lands in the window before `shutdown` sets the
+                // session's finished flag. A disconnect with no exit
+                // evidence yet means the session ended without reporting
+                // its child's fate — a real defect that must fail loudly.
+                Err(PtyError::ChannelDisconnected) if *lifecycle => return,
+                Err(error) => panic!("PTY channel failed before any exit evidence: {error}"),
             }
             if done(output, *lifecycle) {
                 return;
