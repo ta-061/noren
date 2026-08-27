@@ -2422,25 +2422,26 @@ fn baseline_mixed_quadratic_measurement() {
 fn mixed_quadratic_config_is_rejected_promptly_at_default_limits() {
     // The 1 MiB mixed literal+wildcard file from the DoS report. The
     // resolution-work budget must reject it as complexity, not spend
-    // minutes resolving it: measured 18-22 ms, ceiling has two orders of
-    // headroom.
+    // minutes resolving it.  The guard asserts on the build-independent
+    // operation count (resolution_work.total()) rather than wall-clock
+    // time so the test is green in both debug and release (issue #154).
     let text = baseline_mixed_text(14_189);
-    let started = std::time::Instant::now();
     let result = SshConfig::parse(&text);
-    let elapsed = started.elapsed();
-    assert!(
-        matches!(
-            result,
-            Err(SshConfigError {
-                kind: SshConfigErrorKind::ResolutionComplexityExceeded,
-                ..
-            })
-        ),
-        "expected ResolutionComplexityExceeded, got {result:?}"
+    let error = match result {
+        Ok(_) => panic!("expected ResolutionComplexityExceeded, got Ok"),
+        Err(e) => e,
+    };
+    assert_eq!(
+        error.kind(),
+        &SshConfigErrorKind::ResolutionComplexityExceeded,
+        "expected ResolutionComplexityExceeded, got {error:?}"
     );
+    let work = error
+        .resolution_work()
+        .expect("ResolutionComplexityExceeded must carry the work total");
     assert!(
-        elapsed < std::time::Duration::from_secs(2),
-        "rejection took {elapsed:?}; the budget wall must fail fast"
+        work > MAX_RESOLUTION_WORK,
+        "resolution work {work} should exceed the default budget {MAX_RESOLUTION_WORK}"
     );
 }
 

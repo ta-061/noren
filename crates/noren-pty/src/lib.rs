@@ -1752,13 +1752,37 @@ mod tests {
         );
         thread::sleep(Duration::from_millis(100));
         session.request_close();
-        let started = Instant::now();
+        // Assert what the name claims — one bounded shutdown — on outcomes
+        // and counts rather than elapsed time (issue #159).  The session's
+        // own internal SHUTDOWN_DEADLINE is the hang-catcher: a supervisor
+        // that loops or never finishes surfaces as Err(SupervisorJoinTimeout)
+        // and a stuck reader as Err(ReaderJoinTimeout), so demanding the
+        // orderly outcome fails deterministically on either.  (The previous
+        // form accepted both errors and re-derived the same deadline from
+        // wall-clock time, which raced the internal one at the margin.)
         let result = session.shutdown();
-        assert!(started.elapsed() <= SHUTDOWN_DEADLINE);
-        assert!(matches!(
+        assert_eq!(
             result,
-            Ok(()) | Err(PtyError::ReaderJoinTimeout | PtyError::SupervisorJoinTimeout)
-        ));
+            Ok(()),
+            "shutdown must complete orderly within its own deadline"
+        );
+
+        // Bounded drain: shutdown() joins the supervisor before returning, so
+        // no producer remains and the event channel yields at most the
+        // OUTPUT_CHANNEL_CAPACITY chunks ever queued, then ends.
+        let mut drained = 0usize;
+        while let Some(_event) = session.try_recv().expect("drain PTY events") {
+            drained += 1;
+            assert!(
+                drained <= OUTPUT_CHANNEL_CAPACITY,
+                "drained {drained} events after shutdown; at most \
+                 {OUTPUT_CHANNEL_CAPACITY} can be queued"
+            );
+        }
+
+        // One shutdown suffices: the second call returns immediately via the
+        // finished flag instead of waiting a second deadline.
+        session.shutdown().expect("second shutdown is a no-op");
     }
 
     #[cfg(target_os = "macos")]
