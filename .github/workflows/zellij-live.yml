@@ -141,10 +141,16 @@ jobs:
       # Evidence guard (issue #153): with Zellij installed the suite skips
       # nothing, so a skip notice in the log means the environment lied
       # (e.g. PATH broke between steps) and a green run would prove nothing.
+      # The grep token is the suite's own `SKIP_NOTICE_PREFIX` constant,
+      # pinned to this line by `ci_skip_guard_greps_for_the_exact_notice_prefix`
+      # in zellij_live.rs: rewording the notice fails that test (locally and
+      # in every CI test job) instead of silently disarming this guard. `-F`
+      # matches the prefix as a fixed string, so no regex quoting can wedge
+      # itself between the two sides.
       - name: Guard against a silent skip reading as a pass
         run: |
           set -euo pipefail
-          if grep -q 'SKIP \[' /tmp/zellij_live.log; then
+          if grep -qF 'SKIP [' /tmp/zellij_live.log; then
             echo "::error::The live suite printed a skip notice: pass-through evidence was NOT gathered even though Zellij was installed."
             exit 1
           fi
