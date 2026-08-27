@@ -67,7 +67,7 @@ const SSH_ERROR_KINDS: usize = 13;
 /// Pinned variant count of [`WorktreeListError`].
 const WORKTREE_ERROR_VARIANTS: usize = 6;
 /// Pinned variant count of [`PtyError`].
-const PTY_ERROR_VARIANTS: usize = 16;
+const PTY_ERROR_VARIANTS: usize = 18;
 /// Pinned allowlist size across every file-derived enum. Raising this
 /// number is the reviewed decision to admit a new value echo.
 const CHORD_ALLOWLIST_SIZE: usize = 6;
@@ -211,6 +211,8 @@ fn classify_pty_error(error: &PtyError) -> ValueEcho {
         PtyError::SessionClosing => ValueEcho::Never,
         PtyError::ReaderJoinTimeout => ValueEcho::Never,
         PtyError::SupervisorJoinTimeout => ValueEcho::Never,
+        PtyError::CommandEmpty => ValueEcho::Never,
+        PtyError::CommandNotAbsolute => ValueEcho::Never,
         PtyError::Backend { .. } => ValueEcho::Never,
         PtyError::Io { .. } => ValueEcho::Never,
     }
@@ -413,6 +415,8 @@ fn pty_error_samples() -> Vec<(PtyError, ValueEcho)> {
         (PtyError::SessionClosing, ValueEcho::Never),
         (PtyError::ReaderJoinTimeout, ValueEcho::Never),
         (PtyError::SupervisorJoinTimeout, ValueEcho::Never),
+        (PtyError::CommandEmpty, ValueEcho::Never),
+        (PtyError::CommandNotAbsolute, ValueEcho::Never),
         (
             PtyError::Backend {
                 operation: noren_pty::PtyOperation::Open,

@@ -1,10 +1,19 @@
 //! Noren-owned process and PTY boundary for the macOS local-shell PoC.
 //!
 //! The public API deliberately exposes no `portable-pty` types. A session
-//! launches either the fixed `/bin/zsh` shell or the fixed system SSH client
-//! (`/usr/bin/ssh`) — in both cases without caller-controlled arguments or
-//! `-c`, moves blocking I/O off the UI thread, bounds every queue and payload,
-//! and owns child termination and reaping in one supervisor thread.
+//! launches the fixed `/bin/zsh` shell, the fixed system SSH client
+//! (`/usr/bin/ssh`), or a configured agent command validated by
+//! [`AgentLaunchPolicy`] — in every case without caller-controlled shell
+//! interpretation or `-c`, moves blocking I/O off the UI thread, bounds
+//! every queue and payload, and owns child termination and reaping in one
+//! supervisor thread.
+//!
+//! The agent launch path is an argv vector, never a shell: the configured
+//! program becomes `argv[0]`, each configured argument becomes exactly one
+//! argv word, and the program must be an absolute path so no `PATH` lookup
+//! can substitute a different binary. A value containing `;`, `$(...)`, or
+//! a backtick is literal data to the agent program, because no shell ever
+//! interprets it.
 //!
 //! The SSH launch path drives the system `ssh` binary only. Noren never
 //! reimplements the SSH protocol and never passes a credential, key, or
@@ -488,6 +497,103 @@ fn build_ssh_command(policy: &SshLaunchPolicy) -> CommandBuilder {
     command
 }
 
+/// Validated argv launch policy for a configured agent command.
+///
+/// This is the third launch shape (after the fixed zsh and ssh policies):
+/// the program comes from the user's own configuration instead of a
+/// compile-time constant, so the validation that the fixed policies got for
+/// free is explicit here:
+///
+/// - the command must be non-empty ([`PtyError::CommandEmpty`]) and
+///   absolute with a leading `/` ([`PtyError::CommandNotAbsolute`]); no
+///   `PATH` lookup is performed, so a writable `PATH` entry cannot
+///   substitute a different binary;
+/// - the launch is an **argv vector, never a shell invocation**: there is no
+///   `sh -c` and no `-c` anywhere in the build, so a configured value
+///   containing `;`, `$(...)`, or a backtick reaches the agent program as
+///   literal data. Shell metacharacters cannot inject because no shell ever
+///   interprets them.
+///
+/// The child runs in the inherited `HOME` (as cwd and `HOME`) like a local
+/// session, with the same fixed `TERM`/`TERM_PROGRAM` surgery and
+/// `COLUMNS`/`LINES` removal.
+///
+/// [`fmt::Debug`] is shape-only: a program path can embed a username or a
+/// private directory name, so neither the program nor any argument is
+/// printed (issue #146 discipline).
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentLaunchPolicy {
+    program: String,
+    args: Vec<String>,
+}
+
+impl AgentLaunchPolicy {
+    /// Validate `program` and `args` as a shell-free argv vector.
+    ///
+    /// `program` must be non-empty and absolute; `args` are taken verbatim
+    /// (each element is exactly one argv word; no quoting, splitting, or
+    /// expansion is ever applied).
+    pub fn new(program: &str, args: &[String]) -> Result<Self, PtyError> {
+        if program.is_empty() {
+            return Err(PtyError::CommandEmpty);
+        }
+        if !program.starts_with('/') {
+            return Err(PtyError::CommandNotAbsolute);
+        }
+        Ok(Self {
+            program: program.to_owned(),
+            args: args.to_vec(),
+        })
+    }
+
+    /// The validated program; `argv[0]` of the launch.
+    ///
+    /// This accessor exists to build the child argv, not for display: the
+    /// [`fmt::Debug`] implementation is redacted so a private path can never
+    /// reach a log through a debug print.
+    #[must_use]
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    /// The validated argv words after the program.
+    #[must_use]
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+}
+
+impl fmt::Debug for AgentLaunchPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentLaunchPolicy")
+            .field("argv", &(self.args.len() + 1))
+            .finish()
+    }
+}
+
+/// Build the agent command from a validated policy. Security invariants,
+/// pinned by tests:
+///
+/// - argv is exactly `[program, args...]` as supplied — no shell, no `-c`,
+///   no extra words — so shell metacharacters in any configured value are
+///   literal data to the agent program;
+/// - the working directory and `HOME` are the inherited home (the same
+///   treatment a local session gets), and the fixed `TERM`/`TERM_PROGRAM`
+///   overrides plus `COLUMNS`/`LINES` removal apply like every policy.
+fn build_agent_command(policy: &AgentLaunchPolicy, home: &ZshLaunchPolicy) -> CommandBuilder {
+    let mut command = CommandBuilder::new(policy.program());
+    command.cwd(&home.home);
+    command.env("HOME", &home.home);
+    for argument in policy.args() {
+        command.arg(argument);
+    }
+    command.env("TERM", TERM_VALUE);
+    command.env("TERM_PROGRAM", TERM_PROGRAM_VALUE);
+    command.env_remove("COLUMNS");
+    command.env_remove("LINES");
+    command
+}
+
 /// PTY operations named by payload-free errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PtyOperation {
@@ -522,6 +628,11 @@ pub enum PtyError {
     SessionClosing,
     ReaderJoinTimeout,
     SupervisorJoinTimeout,
+    /// An [`AgentLaunchPolicy`](crate::AgentLaunchPolicy) program was empty.
+    CommandEmpty,
+    /// An [`AgentLaunchPolicy`](crate::AgentLaunchPolicy) program was not an
+    /// absolute path; `PATH` lookup is deliberately not performed.
+    CommandNotAbsolute,
     Backend {
         operation: PtyOperation,
     },
@@ -560,6 +671,10 @@ impl fmt::Display for PtyError {
             Self::ReaderJoinTimeout => f.write_str("PTY reader did not stop before the deadline"),
             Self::SupervisorJoinTimeout => {
                 f.write_str("PTY supervisor did not stop before the deadline")
+            }
+            Self::CommandEmpty => f.write_str("agent command must not be empty"),
+            Self::CommandNotAbsolute => {
+                f.write_str("agent command must be an absolute path; PATH lookup is not performed")
             }
             Self::Backend { operation } => {
                 write!(f, "PTY backend operation {operation:?} failed")
@@ -643,6 +758,22 @@ impl PtySession {
     /// left to ssh's own agent and configuration resolution.
     pub fn spawn_ssh(policy: SshLaunchPolicy, size: PtySize) -> Result<Self, PtyError> {
         Self::spawn_session(build_ssh_command(&policy), size)
+    }
+
+    /// Spawn a configured agent command at the supplied initial non-zero
+    /// size, as a shell-free argv vector (see [`build_agent_command`]).
+    ///
+    /// argv is exactly `[program, args...]` from the validated policy — no
+    /// `sh -c`, so metacharacters in configured values are literal data. A
+    /// missing or non-executable program surfaces as the spawn error from
+    /// the PTY backend ([`PtyError::Backend`] with
+    /// [`PtyOperation::SpawnChild`]); the caller is expected to make that a
+    /// visible failure, never a silent no-op. The child runs in the
+    /// inherited `HOME` with the same environment surgery as a local
+    /// session.
+    pub fn spawn_agent(policy: AgentLaunchPolicy, size: PtySize) -> Result<Self, PtyError> {
+        let home = ZshLaunchPolicy::from_environment()?;
+        Self::spawn_session(build_agent_command(&policy, &home), size)
     }
 
     /// Spawn `/bin/zsh` with `home` as the child's `HOME` and working
@@ -1601,6 +1732,138 @@ mod tests {
         );
         session.shutdown().expect("bounded shutdown after ssh exit");
         session.shutdown().expect("shutdown remains idempotent");
+    }
+
+    #[test]
+    fn agent_launch_policy_validates_and_redacts_its_debug() {
+        assert_eq!(AgentLaunchPolicy::new("", &[]), Err(PtyError::CommandEmpty));
+        assert_eq!(
+            AgentLaunchPolicy::new("claude", &[]),
+            Err(PtyError::CommandNotAbsolute)
+        );
+
+        // The policy's own Debug prints shape only: a program path can embed
+        // a private directory, and an argument can carry anything.
+        const SECRET: &str = "NOREN-AGENT-hunter2";
+        let policy = AgentLaunchPolicy::new(
+            &format!("/opt/{SECRET}/agent"),
+            &[format!("--token={SECRET}"), format!("{SECRET};rm")],
+        )
+        .expect("absolute program with metacharacter args is valid data");
+        let rendered = format!("{policy:?}");
+        assert!(
+            !rendered.contains(SECRET),
+            "AgentLaunchPolicy Debug leaked argv text: {rendered}"
+        );
+        assert!(
+            rendered.contains("argv: 3"),
+            "the shape-only Debug names the argv length: {rendered}"
+        );
+        // Accessors expose the real values for argv construction.
+        assert_eq!(policy.program(), format!("/opt/{SECRET}/agent"));
+        assert_eq!(policy.args().len(), 2);
+    }
+
+    /// The agent command is the configured argv VERBATIM: no shell, no `-c`,
+    /// no word splitting or re-quoting. Metacharacters survive as literal
+    /// argv words, which is exactly why they cannot inject.
+    #[test]
+    fn agent_command_argv_is_exactly_the_configured_vector() {
+        let home = temp_directory();
+        let policy = validate_home(Some(home.clone().into_os_string())).expect("valid home");
+        let agent = AgentLaunchPolicy::new(
+            "/usr/local/bin/agent-cli",
+            &[
+                "--login".to_owned(),
+                "; rm -rf /".to_owned(),
+                "$(whoami)".to_owned(),
+                "`id`".to_owned(),
+            ],
+        )
+        .expect("validated policy");
+        let command = build_agent_command(&agent, &policy);
+        let argv: Vec<OsString> = command.get_argv().to_vec();
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("/usr/local/bin/agent-cli"),
+                OsString::from("--login"),
+                OsString::from("; rm -rf /"),
+                OsString::from("$(whoami)"),
+                OsString::from("`id`"),
+            ],
+            "argv must be the configured vector with no interpretation"
+        );
+        assert_eq!(argv.len(), 5, "no shell word was added or split");
+        // The child's environment is the local-session shape: cwd/HOME are
+        // the home, TERM is fixed, COLUMNS/LINES are removed.
+        assert_eq!(
+            command.get_cwd().map(OsString::as_os_str),
+            Some(home.as_os_str())
+        );
+        assert_eq!(command.get_env("HOME"), Some(home.as_os_str()));
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new(TERM_VALUE))
+        );
+        assert_eq!(command.get_env("COLUMNS"), None);
+        assert_eq!(command.get_env("LINES"), None);
+        fs::remove_dir(home).expect("remove test directory");
+    }
+
+    /// A real configured agent command actually runs: /bin/echo's own
+    /// output, read back through the PTY, is the evidence the child started
+    /// — never an inference from the code path. Its clean exit code 0 is
+    /// observed through the normal reaping path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn spawn_agent_runs_the_configured_command_to_a_verified_exit() {
+        let marker = format!("NOREN_AGENT_ECHO_{}", std::process::id());
+        let policy = AgentLaunchPolicy::new("/bin/echo", &[marker.clone()])
+            .expect("absolute /bin/echo with one literal argument");
+        let size = PtySize::from_raw(24, 80).expect("valid initial size");
+        let mut session =
+            PtySession::spawn_agent(policy, size).expect("spawn the configured agent command");
+
+        let mut output = Vec::new();
+        let mut lifecycle = false;
+        poll_events(
+            &session,
+            Instant::now() + Duration::from_secs(10),
+            &mut output,
+            &mut lifecycle,
+            |bytes, done| done && bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+        );
+        assert!(
+            output.windows(marker.len()).any(|w| w == marker.as_bytes()),
+            "the child's own output must flow through the PTY: {}",
+            String::from_utf8_lossy(&output)
+        );
+        session
+            .shutdown()
+            .expect("bounded shutdown after agent exit");
+        session.shutdown().expect("shutdown remains idempotent");
+    }
+
+    /// A command that does not exist is a typed spawn failure at the seam,
+    /// not a hang and not a silently created session.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn spawn_agent_with_a_missing_program_fails_typed() {
+        let missing = format!("/noren-definitely-missing-agent-{}", std::process::id());
+        let policy =
+            AgentLaunchPolicy::new(&missing, &[]).expect("absolute but nonexistent program");
+        let size = PtySize::from_raw(24, 80).expect("valid initial size");
+        let result = PtySession::spawn_agent(policy, size);
+        assert!(
+            matches!(
+                result,
+                Err(PtyError::Backend {
+                    operation: PtyOperation::SpawnChild
+                })
+            ),
+            "a missing program must fail the spawn, got {result:?}"
+        );
     }
 
     #[test]
