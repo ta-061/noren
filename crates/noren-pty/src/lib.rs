@@ -61,6 +61,10 @@ const TERM_PROGRAM_VALUE: &str = "Noren-PoC";
 const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
 const READER_JOIN_BUDGET: Duration = Duration::from_millis(1_750);
 const LIFECYCLE_SEND_BUDGET: Duration = Duration::from_millis(100);
+/// Maximum wait for the reader thread to report itself armed before the
+/// child is forked. The report is a channel send executed as the reader's
+/// first statement, so only total thread-startup failure can exceed it.
+const READER_ARMED_BUDGET: Duration = Duration::from_secs(5);
 
 /// Validated, non-zero terminal grid dimensions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1159,27 +1163,40 @@ fn setup_pty(
     let writer = pair.master.take_writer().map_err(|_| PtyError::Backend {
         operation: PtyOperation::TakeWriter,
     })?;
-    let mut child = pair
+
+    // The reader must be parked in `read` BEFORE the child is forked.
+    // macOS discards any unread slave-to-master output at the moment the
+    // last slave-side descriptor closes: if a short-lived child writes and
+    // exits before the reader's first `read` is pending, that output is
+    // flushed and only EOF is observed (established with a raw openpty
+    // probe: a first read starting after the child was reaped lost the
+    // marker in 200/200 rounds). The rendezvous below waits for the
+    // reader's armed report, so the child's writes always land in a
+    // pending read and the flush at child exit can no longer destroy
+    // undelivered output. A failure to arm is a typed spawn error; the
+    // master and writer drop here, which unblocks and ends the reader.
+    let (reader_done_tx, reader_done_rx) = mpsc::sync_channel(1);
+    let (armed_tx, armed_rx) = mpsc::sync_channel(1);
+    let reader_events = event_tx.clone();
+    let reader_thread = thread::Builder::new()
+        .name("noren-pty-reader".to_owned())
+        .spawn(move || reader_main(reader, reader_events, reader_done_tx, armed_tx, closing))
+        .map_err(|error| PtyError::io(PtyOperation::SpawnThread, &error))?;
+    armed_rx
+        .recv_timeout(READER_ARMED_BUDGET)
+        .map_err(|_| PtyError::Backend {
+            operation: PtyOperation::SpawnThread,
+        })?;
+
+    let child = pair
         .slave
         .spawn_command(command)
         .map_err(|_| PtyError::Backend {
             operation: PtyOperation::SpawnChild,
         })?;
+    // Not the last slave-side descriptor: the child holds its stdio, so
+    // this close cannot flush anything the parked reader has not read.
     drop(pair.slave);
-
-    let (reader_done_tx, reader_done_rx) = mpsc::sync_channel(1);
-    let reader_events = event_tx.clone();
-    let reader_thread = match thread::Builder::new()
-        .name("noren-pty-reader".to_owned())
-        .spawn(move || reader_main(reader, reader_events, reader_done_tx, closing))
-    {
-        Ok(thread) => thread,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(PtyError::io(PtyOperation::SpawnThread, &error));
-        }
-    };
 
     Ok((pair.master, writer, child, reader_thread, reader_done_rx))
 }
@@ -1198,8 +1215,13 @@ fn reader_main(
     mut reader: Box<dyn Read + Send>,
     event_tx: SyncSender<PtyEvent>,
     done_tx: SyncSender<()>,
+    armed_tx: SyncSender<()>,
     closing: Arc<AtomicBool>,
 ) {
+    // Armed report: the reader is scheduled and entering its first `read`.
+    // setup_pty waits for this before forking the child, so a pending read
+    // always exists by the time the child can write (see setup_pty).
+    let _ = armed_tx.send(());
     let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
     loop {
         match reader.read(&mut buffer) {
