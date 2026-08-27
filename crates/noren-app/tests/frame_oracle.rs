@@ -68,6 +68,7 @@ mod renderer_capture;
 
 use std::fs;
 use std::io::Write;
+use std::process::Command;
 
 use noren_app::{
     GridGeometry, MAX_RENDER_COLS, MAX_RENDER_ROWS, POC_CELL_HEIGHT as CELL_HEIGHT,
@@ -1091,5 +1092,74 @@ fn empty_state_message_is_drawn_in_the_sidebar() {
         cell_pattern(&frame, 0, 0),
         cell_pattern(&frame, 0, 1),
         "'N' and 'O' rendered the same pattern"
+    );
+}
+
+// ===========================================================================
+// Skip-visibility guards (issue #144): a skip that prints nothing, or a
+// device failure that skips, are both worse than a red test — they launder
+// absence of evidence as evidence. These two tests force each headless
+// failure mode through the REAL test binary (`NOREN_FRAME_ORACLE_ADAPTER`,
+// see renderer_capture.rs) and pin the observable behaviour from the outside:
+// adapter absence must skip with the notice, device failure must stay red
+// with no skip notice. Deleting `report_skip`, silently returning on
+// AdapterUnavailable, or folding DeviceUnavailable into the skip each fails
+// one of these two.
+// ===========================================================================
+
+/// Re-run one adapter-dependent oracle test in this very binary under a
+/// forced adapter mode, returning its exit status plus both captured streams:
+/// the harness prints its failure report (panic text included) to stdout,
+/// while the skip notice bypasses capture and lands on real stderr.
+fn rerun_forced(test: &str, mode: &str) -> (bool, String, String) {
+    let output = Command::new(std::env::current_exe().expect("locate the test binary"))
+        .arg("--exact")
+        .arg(test)
+        .env("NOREN_FRAME_ORACLE_ADAPTER", mode)
+        .output()
+        .unwrap_or_else(|error| panic!("re-run `{test}` with adapter mode `{mode}`: {error}"));
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn forced_adapter_absence_skips_visibly_instead_of_failing() {
+    let (success, _stdout, stderr) = rerun_forced("blank_screen_has_no_lit_pixels", "absent");
+    assert!(
+        success,
+        "adapter absence must skip, not fail; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("SKIP [blank_screen_has_no_lit_pixels]"),
+        "adapter-absent run printed no skip notice naming the test — a silent \
+         skip launders absence of evidence as evidence; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("rendered-frame evidence was NOT gathered")
+            && stderr.contains("This is a skip, not a pass"),
+        "the skip notice lost its evidence-not-gathered wording; stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn forced_device_failure_stays_red_and_prints_no_skip() {
+    let (success, stdout, stderr) = rerun_forced("blank_screen_has_no_lit_pixels", "device-fails");
+    assert!(
+        !success,
+        "an adapter that exists but cannot yield a device is a real failure and \
+         must stay red, not pass; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("adapter present but device request failed"),
+        "the device-failure panic never reached the harness report; stdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("SKIP [") && !stderr.contains("SKIP ["),
+        "a device failure must not be reported as a skip — that would conflate \
+         a broken render environment with absence of hardware; stdout:\n{stdout}\n\
+         stderr:\n{stderr}"
     );
 }
