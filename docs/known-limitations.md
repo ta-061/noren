@@ -186,9 +186,9 @@ Each item states what you would actually see if you ran the build.
   terminal. (The app crate has no `cfg(target_os)` gating, so it may well
   compile elsewhere; compiling is not the barrier, running is.)
   The PTY launches `/bin/zsh` with a fixed policy and no caller-controlled
-  arguments (`ZSH_PROGRAM` in `crates/noren-pty/src/lib.rs`). Linux support and SSH/remote
-  sessions are roadmap intent (Milestones 4 and 6), not current capability.
-- **Only local and worktree sessions are actually launched.** `SessionKind` models
+  arguments (`ZSH_PROGRAM` in `crates/noren-pty/src/lib.rs`). Linux support is roadmap intent
+  (Milestone 6), not current capability.
+- **Project and agent sessions are not launched.** `SessionKind` models
   `Local`, `Project`, `Worktree`, `Ssh`, and `Agent`, and `EntryKind` in
   `sidebar.rs` can describe project, worktree, SSH-connection, and agent rows —
   `Local`, `Worktree`, and `Ssh` have launch paths. The running binary reads bounded
