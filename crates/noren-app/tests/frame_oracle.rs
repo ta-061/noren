@@ -50,9 +50,24 @@
 //! - `non_ascii_glyph_is_not_the_question_mark` guards the fixed fallback
 //!   defect: unsupported Unicode such as `日` uses a visible replacement glyph,
 //!   while Latin-1 Supplement and Box Drawing have built-in coverage.
+//!
+//! ## Skip policy (issue #144)
+//!
+//! When this machine has no GPU adapter at all, each test returns early after
+//! printing `SKIP: [...]` to the REAL stderr (bypassing the harness's output
+//! capture) — an adapter-less machine stays green while the output states
+//! explicitly that rendered-frame evidence was NOT gathered. A skip is never
+//! reported as gathered evidence. An adapter that EXISTS but fails to yield a
+//! device or a frame is a real failure and stays red; only total adapter
+//! absence skips. `NOREN_FRAME_ORACLE_ADAPTER=absent|device-fails` (see
+//! `renderer_capture.rs`) forces either headless failure mode on
+//! adapter-equipped machines so the skip behaviour itself is testable.
 
 #[path = "../src/renderer_capture.rs"]
 mod renderer_capture;
+
+use std::fs;
+use std::io::Write;
 
 use noren_app::{
     GridGeometry, MAX_RENDER_COLS, MAX_RENDER_ROWS, POC_CELL_HEIGHT as CELL_HEIGHT,
@@ -245,16 +260,70 @@ fn assert_cells_agree(frame: &CapturedFrame, snapshot: &TerminalSnapshot) -> usi
 }
 
 // ===========================================================================
-// Gate 0: can wgpu initialise headlessly on this machine? If not, the oracle
-// reports `offscreen=blocked` with the exact failure rather than faking success.
+// Gate 0: can wgpu initialise headlessly on this machine? Total adapter
+// absence skips with the notice below (evidence NOT gathered); an adapter
+// that exists but cannot yield a device is a real failure and stays red.
 // ===========================================================================
+
+/// Print the skip notice shared by every oracle test when no GPU adapter
+/// exists — the same discipline `tests/zellij_live.rs` uses when Zellij is
+/// absent, not a second convention for the same idea.
+///
+/// The notice is written straight to the process's stderr file descriptor so
+/// it survives the test harness's output capture: an early-returning test
+/// otherwise reads as a silent pass under default `cargo test` output, and a
+/// skip must never be mistaken for gathered evidence.
+fn report_skip(test: &str) {
+    let notice = format!(
+        "SKIP [{test}]: no GPU adapter is available (wgpu request_adapter failed: \
+         AdapterUnavailable); rendered-frame evidence was NOT gathered. This is a \
+         skip, not a pass."
+    );
+    match fs::OpenOptions::new().write(true).open("/dev/stderr") {
+        Ok(mut file) => {
+            // One write, notice and newline together: 24 tests skip in
+            // parallel on an adapter-less machine, and two separate writes
+            // interleave into concatenated lines under the pipe buffer.
+            let _ = file.write_all(format!("{notice}\n").as_bytes());
+        }
+        Err(_) => eprintln!("{notice}"),
+    }
+}
+
+/// The offscreen renderer, or `None` after reporting a skip, when this machine
+/// has no GPU adapter at all.
+///
+/// The two headless failures are kept deliberately distinct:
+///
+/// - `AdapterUnavailable` — wgpu enumerated no adapter at all: the machine
+///   cannot render and nothing the renderer did is wrong, so the test SKIPS
+///   after printing the notice above. A skip, never a pass.
+/// - `DeviceUnavailable` — an adapter exists but the device request failed:
+///   a real failure of the render path's environment, which must stay red,
+///   so this panics instead of skipping.
+///
+/// Failures past a working device (shader compile, pipeline build, readback)
+/// already panic inside `capture`, so no frame-producing failure can be
+/// conflated with a skip either.
+fn renderer_or_skip(test: &str) -> Option<OffscreenRenderer> {
+    match OffscreenRenderer::new() {
+        Ok(renderer) => Some(renderer),
+        Err(CaptureError::AdapterUnavailable) => {
+            report_skip(test);
+            None
+        }
+        Err(CaptureError::DeviceUnavailable) => {
+            panic!("offscreen=blocked: adapter present but device request failed");
+        }
+    }
+}
 
 #[test]
 fn offscreen_wgpu_pipeline_initialises() {
     match OffscreenRenderer::new() {
         Ok(_) => { /* offscreen=ok */ }
         Err(CaptureError::AdapterUnavailable) => {
-            panic!("offscreen=blocked: no Metal adapter without a display surface");
+            report_skip("offscreen_wgpu_pipeline_initialises");
         }
         Err(CaptureError::DeviceUnavailable) => {
             panic!("offscreen=blocked: adapter present but device request failed");
@@ -268,7 +337,9 @@ fn offscreen_wgpu_pipeline_initialises() {
 
 #[test]
 fn blank_screen_has_no_lit_pixels() {
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) = renderer_or_skip("blank_screen_has_no_lit_pixels") else {
+        return;
+    };
     let snap = snapshot(3, 8, b"");
     let frame = render(&renderer, &snap);
 
@@ -284,7 +355,10 @@ fn blank_screen_has_no_lit_pixels() {
 
 #[test]
 fn an_ascii_cell_is_lit_and_its_neighbours_are_blank() {
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) = renderer_or_skip("an_ascii_cell_is_lit_and_its_neighbours_are_blank")
+    else {
+        return;
+    };
     let snap = snapshot(1, 4, b"A");
     let frame = render(&renderer, &snap);
 
@@ -326,7 +400,10 @@ fn an_ascii_cell_is_lit_and_its_neighbours_are_blank() {
 
 #[test]
 fn distinct_ascii_glyphs_have_distinct_lit_patterns() {
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) = renderer_or_skip("distinct_ascii_glyphs_have_distinct_lit_patterns")
+    else {
+        return;
+    };
     let snap = snapshot(1, 2, b"AB");
     let frame = render(&renderer, &snap);
 
@@ -339,7 +416,9 @@ fn distinct_ascii_glyphs_have_distinct_lit_patterns() {
 
 #[test]
 fn drawn_grid_dimensions_match_state_dimensions() {
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) = renderer_or_skip("drawn_grid_dimensions_match_state_dimensions") else {
+        return;
+    };
     let rows = 3_u16;
     let cols = 5_u16;
     // A deliberately ragged layout: row 0 fills the grid width, row 1 stops at
@@ -374,7 +453,10 @@ fn drawn_grid_dimensions_match_state_dimensions() {
 
 #[test]
 fn state_and_render_agree_across_the_fr005_fixtures() {
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) = renderer_or_skip("state_and_render_agree_across_the_fr005_fixtures")
+    else {
+        return;
+    };
 
     // Prompt: a shell-like "$ ".
     let prompt = snapshot(2, 8, b"$ ");
@@ -437,7 +519,9 @@ fn state_and_render_agree_across_the_fr005_fixtures() {
 
 #[test]
 fn glyphs_stay_inside_the_render_clamp_grid() {
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) = renderer_or_skip("glyphs_stay_inside_the_render_clamp_grid") else {
+        return;
+    };
 
     // A grid one past each clamp limit in both dimensions. Three CUP-placed
     // markers carry the only lit content:
@@ -506,7 +590,11 @@ fn cells_with_different_sgr_foregrounds_render_different_colours() {
     // The headline defect: before colour was wired, these two cells drew the
     // same green and this test could not exist. Both cells hold 'A', so the
     // glyph shape is identical and only the colour can differ.
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) =
+        renderer_or_skip("cells_with_different_sgr_foregrounds_render_different_colours")
+    else {
+        return;
+    };
     let snap = snapshot(1, 4, b"\x1b[31mA\x1b[32mA");
     let frame = render(&renderer, &snap);
 
@@ -536,7 +624,10 @@ fn cells_with_different_sgr_foregrounds_render_different_colours() {
 fn a_cell_with_no_sgr_colour_keeps_the_default_appearance() {
     // The compatibility half of issue #107: wiring colour must not change how
     // an unstyled prompt looks.
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) = renderer_or_skip("a_cell_with_no_sgr_colour_keeps_the_default_appearance")
+    else {
+        return;
+    };
     let snap = snapshot(1, 4, b"$ A");
     let frame = render(&renderer, &snap);
 
@@ -556,7 +647,11 @@ fn a_cell_with_no_sgr_colour_keeps_the_default_appearance() {
 
 #[test]
 fn truecolor_and_256_colour_both_resolve_to_their_expected_pixels() {
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) =
+        renderer_or_skip("truecolor_and_256_colour_both_resolve_to_their_expected_pixels")
+    else {
+        return;
+    };
 
     // Truecolor: SGR 38;2;R;G;B must produce exactly those channels. The
     // value is deliberately not a palette entry, so only a real truecolor
@@ -597,7 +692,10 @@ fn truecolor_and_256_colour_both_resolve_to_their_expected_pixels() {
 fn the_16_colour_and_256_colour_forms_of_one_colour_agree() {
     // `SGR 31` and `SGR 38;5;1` name the same colour. If they resolved through
     // different tables they could drift apart; both must reach one palette.
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) = renderer_or_skip("the_16_colour_and_256_colour_forms_of_one_colour_agree")
+    else {
+        return;
+    };
     let snap = snapshot(1, 4, b"\x1b[31mA\x1b[38;5;1mA");
     let frame = render(&renderer, &snap);
 
@@ -612,7 +710,11 @@ fn the_16_colour_and_256_colour_forms_of_one_colour_agree() {
 
 #[test]
 fn truecolor_background_paints_the_whole_cell_and_keeps_glyph_foreground() {
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) =
+        renderer_or_skip("truecolor_background_paints_the_whole_cell_and_keeps_glyph_foreground")
+    else {
+        return;
+    };
     let background = [12, 98, 201];
     let foreground = [241, 207, 33];
     let snap = snapshot(1, 1, b"\x1b[38;2;241;207;33;48;2;12;98;201mA");
@@ -658,7 +760,11 @@ fn truecolor_background_paints_the_whole_cell_and_keeps_glyph_foreground() {
 
 #[test]
 fn background_on_a_space_paints_even_without_glyph_strokes() {
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) =
+        renderer_or_skip("background_on_a_space_paints_even_without_glyph_strokes")
+    else {
+        return;
+    };
     let background = [73, 18, 146];
     let snap = snapshot(1, 1, b"\x1b[48;2;73;18;146m ");
     let frame = render(&renderer, &snap);
@@ -675,7 +781,10 @@ fn background_on_a_space_paints_even_without_glyph_strokes() {
 
 #[test]
 fn indexed_background_matches_its_truecolor_palette_entry() {
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) = renderer_or_skip("indexed_background_matches_its_truecolor_palette_entry")
+    else {
+        return;
+    };
     let truecolor = snapshot(1, 1, b"\x1b[48;2;255;0;0mA");
     let indexed = snapshot(1, 1, b"\x1b[48;5;196mA");
 
@@ -690,7 +799,11 @@ fn indexed_background_matches_its_truecolor_palette_entry() {
 
 #[test]
 fn no_background_keeps_the_existing_pixel_exact_appearance() {
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) =
+        renderer_or_skip("no_background_keeps_the_existing_pixel_exact_appearance")
+    else {
+        return;
+    };
     let plain = render(&renderer, &snapshot(1, 1, b"A"));
     let reset_background = render(&renderer, &snapshot(1, 1, b"\x1b[49mA"));
 
@@ -707,7 +820,9 @@ fn a_dark_coloured_cell_is_still_seen_as_lit() {
     // threshold, so a threshold-based oracle would call the cell blank and
     // agree with a renderer that dropped it. `is_background` now compares to
     // the clear colour, so the cell reads as lit and the colour is checked.
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) = renderer_or_skip("a_dark_coloured_cell_is_still_seen_as_lit") else {
+        return;
+    };
     let snap = snapshot(1, 4, b"\x1b[30mA");
     let frame = render(&renderer, &snap);
 
@@ -730,7 +845,11 @@ fn colour_follows_the_cell_across_wide_characters_and_rows() {
     // Colour must be addressed per cell in the renderer's coordinate model,
     // not per character of a flattened string: a wide lead's continuation
     // column must not shift the colour of the glyph that follows it.
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) =
+        renderer_or_skip("colour_follows_the_cell_across_wide_characters_and_rows")
+    else {
+        return;
+    };
     // 'a' default, then a red wide char (columns 1-2), then green 'b' at
     // display column 3.
     let snap = snapshot(2, 6, "a\x1b[31m日\x1b[32mb\r\n\x1b[34mc".as_bytes());
@@ -768,7 +887,9 @@ fn colour_follows_the_cell_across_wide_characters_and_rows() {
 fn lowercase_distinct_from_uppercase() {
     // Regression guard: the bitmap font used to fold case via
     // `to_ascii_uppercase`, making 'a' and 'A' produce identical pixels.
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) = renderer_or_skip("lowercase_distinct_from_uppercase") else {
+        return;
+    };
     let lower = snapshot(1, 2, b"a");
     let upper = snapshot(1, 2, b"A");
     let lower_frame = render(&renderer, &lower);
@@ -789,7 +910,9 @@ fn non_ascii_glyph_is_not_the_question_mark() {
     // Full CJK is intentionally outside this fixed bitmap font. Unsupported
     // Unicode uses a visible replacement glyph, which must not impersonate a
     // literal question mark typed by the terminal application.
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) = renderer_or_skip("non_ascii_glyph_is_not_the_question_mark") else {
+        return;
+    };
     let kanji = snapshot(1, 4, "日".as_bytes());
     let question = snapshot(1, 4, b"?");
     let kanji_frame = render(&renderer, &kanji);
@@ -813,7 +936,11 @@ fn utf8_cell_is_at_least_lit_so_the_pipeline_handles_wide_input() {
     // Unlike the glyph-correctness defect above, this only asserts the wide
     // input lights its lead cell at all — the pipeline must not silently drop
     // non-ASCII. (It draws '?' today, which still lights the cell.)
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) =
+        renderer_or_skip("utf8_cell_is_at_least_lit_so_the_pipeline_handles_wide_input")
+    else {
+        return;
+    };
     let snap = snapshot(1, 4, "café".as_bytes());
     let frame = render(&renderer, &snap);
     // c, a, f are ASCII and lit; the final cell holds the non-ASCII 'é' lead.
@@ -849,7 +976,9 @@ fn render_with_sidebar(
 
 #[test]
 fn sidebar_rows_appear_in_the_left_columns() {
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) = renderer_or_skip("sidebar_rows_appear_in_the_left_columns") else {
+        return;
+    };
     // One selected session row: '>' marker, then label and detail.
     let sidebar = vec!["> SESSION-1 LOCAL".to_string()];
     let snap = snapshot(1, 20, b"");
@@ -882,7 +1011,10 @@ fn sidebar_rows_appear_in_the_left_columns() {
 
 #[test]
 fn terminal_content_does_not_overlap_sidebar_columns() {
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) = renderer_or_skip("terminal_content_does_not_overlap_sidebar_columns")
+    else {
+        return;
+    };
     // No sidebar text — the sidebar region stays entirely blank.
     let sidebar: Vec<String> = vec![];
     // Terminal with 'A' at column 0.
@@ -907,7 +1039,10 @@ fn terminal_content_does_not_overlap_sidebar_columns() {
 
 #[test]
 fn sidebar_plus_terminal_columns_equal_window_columns() {
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) = renderer_or_skip("sidebar_plus_terminal_columns_equal_window_columns")
+    else {
+        return;
+    };
     let sidebar: Vec<String> = vec![];
     let term_cols = 10u16;
     // Fill every terminal column with 'A'.
@@ -935,7 +1070,9 @@ fn sidebar_plus_terminal_columns_equal_window_columns() {
 
 #[test]
 fn empty_state_message_is_drawn_in_the_sidebar() {
-    let renderer = OffscreenRenderer::new().expect("offscreen renderer");
+    let Some(renderer) = renderer_or_skip("empty_state_message_is_drawn_in_the_sidebar") else {
+        return;
+    };
     let sidebar = vec!["NO SESSIONS".to_string()];
     let snap = snapshot(1, 10, b"");
     let frame = render_with_sidebar(&renderer, &snap, &sidebar);
