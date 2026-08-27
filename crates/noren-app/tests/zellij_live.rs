@@ -491,8 +491,18 @@ impl LiveZellij {
 /// test: [`Drop`] also runs while a panic unwinds, and an unbounded child
 /// turns every failing live test into a minutes-long failure.
 fn run_zellij_bounded(command: &mut Command) -> Option<bool> {
+    run_command_bounded(command, TEARDOWN_BUDGET)
+}
+
+/// [`run_zellij_bounded`]'s engine with the budget as a parameter, so the
+/// unit test can prove the bound is enforced without sleeping anywhere near
+/// [`TEARDOWN_BUDGET`]: spawn, poll for exit, kill on overrun. Returns
+/// `Some(success)` when the child exited by any means before the budget
+/// expired; `None` when it was killed for overrunning (or never spawned) —
+/// an overrun is survived, never waited on.
+fn run_command_bounded(command: &mut Command, budget: Duration) -> Option<bool> {
     let mut child = command.spawn().ok()?;
-    let deadline = Instant::now() + TEARDOWN_BUDGET;
+    let deadline = Instant::now() + budget;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Some(status.success()),
@@ -936,4 +946,39 @@ fn version_line_parser_reads_zellij_output_shape() {
     assert_eq!(parse_version_line("zellij 0.41.2\r\n"), Some("0.41.2"));
     assert_eq!(parse_version_line("zellij\n"), None);
     assert_eq!(parse_version_line(""), None);
+}
+
+/// A teardown subprocess that ignores its budget is killed, not waited on
+/// (the issue #147 failure mode: a wedged `zellij delete-all-sessions`
+/// stretched failing runs to ~90 s). This pins the bound itself with a
+/// 300 ms budget so the assertion does not pay [`TEARDOWN_BUDGET`]'s cost.
+#[test]
+fn bounded_runner_kills_an_overrunning_subprocess() {
+    let mut command = Command::new("sleep");
+    command.arg("30");
+    let started = Instant::now();
+    let result = run_command_bounded(&mut command, Duration::from_millis(300));
+    assert!(
+        result.is_none(),
+        "a subprocess that overruns its teardown budget must be killed"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the bound must be enforced promptly, not eventually: {:?} elapsed",
+        started.elapsed()
+    );
+}
+
+/// The complementary half of the bound: a subprocess that exits inside its
+/// budget is reaped and its success flag reported, so the bound can never
+/// degrade into "kill everything, report nothing".
+#[test]
+fn bounded_runner_reports_a_fast_subprocess() {
+    let mut command = Command::new("true");
+    let result = run_command_bounded(&mut command, TEARDOWN_BUDGET);
+    assert_eq!(
+        result,
+        Some(true),
+        "a promptly exiting successful subprocess must be reported as such"
+    );
 }
