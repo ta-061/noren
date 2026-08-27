@@ -1901,37 +1901,24 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    #[allow(unsafe_code)] // HOME swap is safe: tests run sequentially; child inherits before restore.
     fn spawn_in_dir_runs_the_child_in_that_directory() {
         let worktree = temp_directory_with("worktree-cwd");
 
-        // `build_dir_zsh_command` intentionally inherits HOME unchanged so
-        // the user's shell config applies in production.  In the test
-        // harness, the inherited HOME is the developer's real home whose
-        // .zshrc can take arbitrarily long (oh-my-zsh, conda, nvm …) or
-        // block entirely, making the test time out before the shell reaches
-        // its prompt.  Temporarily point HOME at the empty worktree so
-        // zsh finds no startup files and starts instantly.  The cwd is
+        // The production entry `spawn_in_dir` inherits HOME unchanged so the
+        // user's shell config applies, and a developer's real `$HOME` may
+        // carry startup files (oh-my-zsh, conda, nvm, …) that take longer
+        // than the deadline or read the terminal. This live check drives the
+        // `spawn_in_dir_with_home` seam — the same `DirLaunchPolicy`, the
+        // same fixed builder, and the same session machinery, with HOME
+        // pinned to the empty fixture directory — so the shell finds no
+        // startup files and answers immediately. Unlike an env swap, the
+        // seam never mutates process-global environment, which races the
+        // parallel tests that read HOME (this exact race was observed:
+        // `ssh_command_argv_...` failed while HOME was swapped). The cwd is
         // still independently verified by the pwd check below.
-        let saved_home = std::env::var_os("HOME");
-        // SAFETY: tests in this binary run sequentially; the child has
-        // already inherited the env by the time we restore below.
-        unsafe {
-            std::env::set_var("HOME", &worktree);
-        }
-
         let size = PtySize::from_raw(24, 80).expect("valid initial size");
-        let mut session =
-            PtySession::spawn_in_dir(&worktree, size).expect("spawn zsh in the worktree");
-
-        // Restore HOME immediately — the child has already inherited it.
-        // SAFETY: same single-threaded reasoning as above.
-        unsafe {
-            match saved_home {
-                Some(home) => std::env::set_var("HOME", home),
-                None => std::env::remove_var("HOME"),
-            }
-        }
+        let mut session = PtySession::spawn_in_dir_with_home(&worktree, &worktree, size)
+            .expect("spawn zsh in the worktree");
 
         session.send_input(b"pwd\nexit\n").expect("ask for the cwd");
 
