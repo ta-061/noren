@@ -141,6 +141,42 @@ today can select `high-contrast` (measured minimum 7.84:1). The measured
 minima are pinned by tests (`crates/noren-app/tests/theme.rs`), so any
 palette change — fix or regression — is a visible failure.
 
+### `[[agents]]`
+
+Configured AI-agent entries: each `[[agents]]` table names one agent with a
+display `name` and the `command` to launch when its sidebar row is selected.
+An optional `args` array supplies argv words after the program. Entries
+appear in file order, after the worktree and SSH rows, capped at 24 rows
+(the omitted count is reported on the status row, exactly like the SSH host
+and worktree caps).
+
+| Key | Type | Required | Accepted range | Meaning |
+| --- | --- | --- | --- | --- |
+| `name` | string | yes | 1..=1024 bytes | Display name on the sidebar row. |
+| `command` | string | yes | 1..=1024 bytes, absolute path | Program launched in a PTY when the row is selected. |
+| `args` | array of strings | no | each element at most 1024 bytes | argv words after the program. |
+
+The launch is **argv, never a shell**: `command` becomes `argv[0]` and each
+`args` element becomes exactly one argv word, so a value containing `;`,
+`$(...)`, or a backtick is literal data to the agent program — no `sh -c`
+ever interprets it. The command must be an absolute path with a leading `/`;
+`PATH` lookup is deliberately not performed, so a writable `PATH` entry
+cannot substitute a different binary (the same reasoning that fixes the SSH
+client at `/usr/bin/ssh`).
+
+A command that is missing or not executable is a visible failure when the
+row is selected — the configured row reports the launch failure, the
+created session row shows `failed`, and the status row carries a fixed
+failure line — never a hang and never a silent no-op.
+
+Rejections follow the same hard-error discipline as the rest of the schema:
+an entry missing `name` or `command`, a wrong-typed field, a non-array
+`args`, a non-string `args` element, a relative `command`, an empty or
+oversized field, or an unknown key inside an entry is an error naming the
+offending key. The `agents` table must be spelled as an array of tables
+(`[[agents]]`); `agents = [...]` with inline tables is rejected. Error
+messages never echo the field values.
+
 ### Rejected keys, by design
 
 - **`[terminal]` / `scrollback_lines`.** Scrollback retention is enforced
@@ -165,6 +201,15 @@ session_create = "ctrl+shift+t"
 
 [theme]
 name = "light"
+
+[[agents]]
+name = "claude"
+command = "/usr/local/bin/claude"
+args = ["--login"]
+
+[[agents]]
+name = "aider"
+command = "/opt/homebrew/bin/aider"
 ```
 
 ## Error behavior
@@ -184,9 +229,12 @@ name = "light"
 
 ## What configuration deliberately cannot do
 
-- **No shell selection.** The threat model (TM-01) fixes the spawn at
+- **No shell selection.** The threat model (TM-01) fixes the shell spawn at
   `/bin/zsh` with structured argv and accepts no configured additions, so
-  there is no shell key and none may be added.
+  there is no shell key and none may be added. The `[[agents]]` `command` is
+  a different, explicit surface: a program the user asks Noren to launch,
+  executed as a shell-free argv vector with an absolute path (see the
+  `[[agents]]` section above).
 - **No credentials.** No key names a credential, key, or sensitive path; the
   schema exposes no path keys at all.
 - **No raised ceilings.** `MAX_SCROLLBACK_LINES` and `MAX_SCREEN_CELLS` stay
