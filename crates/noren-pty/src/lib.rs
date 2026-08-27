@@ -253,6 +253,22 @@ fn build_dir_zsh_command(policy: &DirLaunchPolicy) -> CommandBuilder {
     command
 }
 
+/// Build the fixed zsh command for a directory-scoped launch whose child
+/// `HOME` is an explicitly supplied, validated home.
+///
+/// Identical to [`build_dir_zsh_command`] except `HOME` is set explicitly:
+/// the test-harness sibling of the inherited-`HOME` production shape, so a
+/// higher-level suite can point the child at an isolated empty home while
+/// the working directory stays the policy's validated directory.
+fn build_dir_zsh_command_with_home(
+    policy: &DirLaunchPolicy,
+    home: &ZshLaunchPolicy,
+) -> CommandBuilder {
+    let mut command = build_dir_zsh_command(policy);
+    command.env("HOME", &home.home);
+    command
+}
+
 /// An unexpanded OpenSSH percent token found in a destination.
 ///
 /// OpenSSH expands these inside configuration keywords (never in the
@@ -658,6 +674,34 @@ impl PtySession {
     pub fn spawn_in_dir(dir: &Path, size: PtySize) -> Result<Self, PtyError> {
         let policy = DirLaunchPolicy::new(dir)?;
         Self::spawn_session(build_dir_zsh_command(&policy), size)
+    }
+
+    /// Spawn `/bin/zsh` with `dir` as the child's working directory and
+    /// `home` as the child's `HOME`.
+    ///
+    /// Directory-scoped sibling of [`PtySession::spawn_in_home`]: production
+    /// worktree launches use [`PtySession::spawn_in_dir`], which inherits
+    /// `HOME` unchanged so the user's own shell configuration applies.
+    /// Higher-level test suites that drive the child by typing use this seam
+    /// to point `HOME` at an isolated empty directory — a developer's real
+    /// `$HOME` may carry startup files that take arbitrarily long or read the
+    /// terminal, which would make every shell-driving test depend on
+    /// personal configuration — while the working directory remains the
+    /// validated directory, so the child's actual cwd stays observable
+    /// through its own `pwd` answer. Both paths are validated exactly like
+    /// their standalone policies, and the fixed program, `TERM`, and
+    /// environment surgery are identical to [`PtySession::spawn_in_dir`].
+    pub fn spawn_in_dir_with_home(
+        dir: &Path,
+        home: &Path,
+        size: PtySize,
+    ) -> Result<Self, PtyError> {
+        let dir_policy = DirLaunchPolicy::new(dir)?;
+        let home_policy = validate_home(Some(home.as_os_str().to_owned()))?;
+        Self::spawn_session(
+            build_dir_zsh_command_with_home(&dir_policy, &home_policy),
+            size,
+        )
     }
 
     /// Spawn using an already validated fixed-zsh policy.
@@ -1803,6 +1847,42 @@ mod tests {
         assert_eq!(command.get_env("COLUMNS"), None);
         assert_eq!(command.get_env("LINES"), None);
         fs::remove_dir(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn dir_with_home_builder_pins_cwd_and_the_seam_home() {
+        // The seam's directory and home are distinct directories, so an
+        // assertion against the wrong one cannot pass by coincidence.
+        let directory = temp_directory_with("seam-dir");
+        let home = temp_directory_with("seam-home");
+        let dir_policy = DirLaunchPolicy::new(&directory).expect("valid directory");
+        let home_policy =
+            validate_home(Some(home.clone().into_os_string())).expect("valid seam home");
+        let command = build_dir_zsh_command_with_home(&dir_policy, &home_policy);
+
+        assert_eq!(command.get_argv(), &[OsString::from(ZSH_PROGRAM)]);
+        assert_eq!(
+            command.get_cwd().map(OsString::as_os_str),
+            Some(directory.as_os_str()),
+            "the seam keeps the working directory on the policy directory"
+        );
+        assert_eq!(
+            command.get_env("HOME"),
+            Some(home.as_os_str()),
+            "the seam sets HOME to the isolated home, never the inherited one"
+        );
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new(TERM_VALUE))
+        );
+        assert_eq!(
+            command.get_env("TERM_PROGRAM"),
+            Some(std::ffi::OsStr::new(TERM_PROGRAM_VALUE))
+        );
+        assert_eq!(command.get_env("COLUMNS"), None);
+        assert_eq!(command.get_env("LINES"), None);
+        fs::remove_dir(&directory).expect("remove test directory");
+        fs::remove_dir(&home).expect("remove test home");
     }
 
     #[test]
