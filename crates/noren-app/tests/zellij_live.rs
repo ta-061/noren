@@ -33,6 +33,22 @@
 //! `CSI ? 1002;1006 h` is therefore NOT live-Zellij wire shape for this
 //! version.
 //!
+//! Popup control (issue #147): a fresh session's pane area is NOT popup-free
+//! by default. With an untouched default configuration, Zellij's session
+//! startup adds ONE floating `about`-plugin popup over the pane area:
+//! first-run setup wizard (absent here — the harness seeds `config.kdl`),
+//! else release notes (drawn every run whose cache has not recorded them for
+//! the installed version — the harness isolates `HOME`, so its cache is
+//! always fresh and the release-notes popup, which carries the sponsor
+//! notice, appears on EVERY harness run), else a random startup tip. The
+//! popups are suppressible by top-level configuration — `show_release_notes
+//! false` and `show_startup_tips false` (options parsed from `config.kdl` by
+//! the installed 0.44.3, exactly the pinned `ZELLIJ_FIXTURE_TAG`) — so the
+//! harness pins both in the config it seeds instead of inheriting whatever
+//! popup state the developer's machine would draw. The pin is enforced by
+//! `live_zellij_session_starts_without_popups_over_the_pane_area`, which
+//! fails if the suppression is removed and a popup is drawn.
+//!
 //! The multi-parameter DECSET path is a proven regression site (fixed in
 //! PR #113), so the mouse-mode test pins it EXPLICITLY beside the live
 //! evidence: after asserting on the real attach stream, it drives
@@ -70,7 +86,35 @@ const ROWS: u16 = 40;
 const COLS: u16 = 120;
 const ATTACH_BUDGET: Duration = Duration::from_secs(20);
 const INTERACTION_BUDGET: Duration = Duration::from_secs(8);
+/// How long the popup-absence pin keeps draining after the tab bar renders,
+/// giving an async-loading popup pane time to draw before absence is
+/// asserted. This is a settle window for detecting a popup that SHOULD be
+/// there under a mutation — never a fixed sleep that a dismissal waits on.
+const POPUP_SETTLE_BUDGET: Duration = Duration::from_secs(2);
 const CONFIG_FILE_NAME: &str = "config.kdl";
+
+/// Session-start popup suppression appended to the seeded configuration
+/// (issue #147). Both are top-level `config.kdl` options of the installed
+/// Zellij 0.44.3 (the pinned `ZELLIJ_FIXTURE_TAG`): `show_release_notes`
+/// skips the once-per-version release-notes popup — which carries the
+/// sponsor notice — before its cache check, and `show_startup_tips` skips
+/// the random startup-tip popup. With both false, session startup adds no
+/// `about`-plugin floating pane at all, so the pane area shows only pane
+/// output on every machine regardless of cache state. A Zellij that renames
+/// these options rejects the seeded config and the session never renders
+/// its tab bar, which fails every live spawn loudly instead of silently
+/// regressing to popup-covered screens.
+const POPUP_SUPPRESSION_CONFIG: &str = "show_release_notes false\nshow_startup_tips false\n";
+
+/// Marker strings that only a session-start popup draws over the pane area
+/// (titles and the two help/sponsor lines the 0.44.3 popups render). None of
+/// these can appear in a suppressed session's screen.
+const POPUP_MARKERS: [&str; 4] = [
+    "Release Notes",
+    "Zellij Tip #",
+    "Please support the Zellij developer",
+    "Help: <↓↑> - Navigate, <ESC> - Dismiss",
+];
 
 static DIR_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -175,7 +219,9 @@ impl LiveZellij {
     /// Spawn an attached Zellij with an isolated, deterministic state: the
     /// default configuration is dumped from the installed binary into the
     /// isolated config dir first, so no first-run configuration dialog and no
-    /// user configuration interferes with the session.
+    /// user configuration interferes with the session. The dump is seeded
+    /// with [`POPUP_SUPPRESSION_CONFIG`] so session startup draws no popup
+    /// over the pane area (issue #147).
     fn spawn(version: &str) -> Self {
         let dirs = ZellijDirs::new();
 
@@ -190,7 +236,9 @@ impl LiveZellij {
             "zellij setup --dump-config failed: {}",
             String::from_utf8_lossy(&dump.stderr)
         );
-        fs::write(dirs.config.join(CONFIG_FILE_NAME), &dump.stdout)
+        let mut seeded_config = dump.stdout;
+        seeded_config.extend_from_slice(POPUP_SUPPRESSION_CONFIG.as_bytes());
+        fs::write(dirs.config.join(CONFIG_FILE_NAME), &seeded_config)
             .expect("seed isolated config with the default configuration");
 
         let launch_policy =
@@ -612,6 +660,57 @@ fn live_zellij_tab_and_pane_chords_are_forwarded_and_handled_by_zellij() {
             "hello-noren"
         )),
         "live zellij {version}: forwarded text did not reach the pane's shell; screen:\n{}",
+        session.terminal.snapshot().display_lines().join("\n")
+    );
+}
+
+/// Issue #147 regression pin, co-located with the live evidence it guards:
+/// the harness's seeded configuration must suppress every session-start
+/// popup (release notes with the sponsor notice, random startup tips), so
+/// the pane area shows only pane output and the screen assertions of the
+/// tab/pane test depend on the code under test, not on which popup the
+/// installed Zellij happens to draw. Removing the suppression from the
+/// seeded config makes the release-notes popup appear on every fresh
+/// harness run (the harness isolates `HOME`, so the seen-release-notes
+/// cache is always empty) and this test FAILS — the suppression is
+/// load-bearing, not decorative. The extra drain window after the tab bar
+/// exists because the popup is a WASM plugin pane that loads slightly after
+/// the first frame; absence is only meaningful once the session is fully
+/// attached.
+#[test]
+fn live_zellij_session_starts_without_popups_over_the_pane_area() {
+    let Some(version) = installed_zellij_version() else {
+        report_skip("live_zellij_session_starts_without_popups_over_the_pane_area");
+        return;
+    };
+    let mut session = LiveZellij::spawn(&version);
+    assert!(
+        session.pump_until(ATTACH_BUDGET, |terminal, _| snapshot_has(
+            terminal, "Tab #1"
+        )),
+        "live zellij {version}: the session never rendered its tab bar; screen:\n{}",
+        session.terminal.snapshot().display_lines().join("\n")
+    );
+    // Drain a full settle window so a popup pane loading after the first
+    // frame cannot slip past the check below.
+    session.pump_until(POPUP_SETTLE_BUDGET, |_, _| false);
+
+    let drawn: Vec<&str> = POPUP_MARKERS
+        .iter()
+        .copied()
+        .filter(|marker| snapshot_has(&session.terminal, marker))
+        .collect();
+    println!(
+        "live zellij {version}: attach screen checked against {} popup markers, \
+         {} drawn",
+        POPUP_MARKERS.len(),
+        drawn.len()
+    );
+    assert!(
+        drawn.is_empty(),
+        "live zellij {version}: a session-start popup drew {drawn:?} over the pane \
+         area — the harness's seeded popup suppression (issue #147) is not in \
+         effect; screen:\n{}",
         session.terminal.snapshot().display_lines().join("\n")
     );
 }
