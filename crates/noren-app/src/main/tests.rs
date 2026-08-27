@@ -3652,19 +3652,25 @@ fn session_status(app: &NorenApp, id: SessionId) -> SessionStatus {
 /// may have customized: input typed before they finish races them, so every
 /// test that drives a shell by typing first waits for its prompt.
 fn wait_for_shell_output(app: &mut NorenApp) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(10);
     loop {
         app.drain_pty();
         let ready = app
             .terminal
             .as_ref()
             .is_some_and(|terminal| terminal.screen().display_row_count() > 0);
-        assert!(
-            Instant::now() < deadline || ready,
-            "the spawned shell never produced its prompt"
-        );
         if ready {
             return;
+        }
+        if Instant::now() >= deadline {
+            let terminal_text = app.terminal.as_ref().map(terminal_text).unwrap_or_default();
+            panic!(
+                "the spawned shell never produced its prompt after {:?}\n\
+                 terminal said: {}",
+                start.elapsed(),
+                terminal_text,
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -4711,6 +4717,7 @@ const MAX_WORKTREE_SIDEBAR_TEST_ROWS: usize = noren_app::git_worktree::MAX_WORKT
 /// (for example dropping the cwd from the launch policy) fails this test.
 #[cfg(target_os = "macos")]
 #[test]
+#[allow(unsafe_code)] // HOME swap is safe: tests run sequentially; child inherits before restore.
 fn selecting_a_worktree_row_starts_a_session_in_that_worktree() {
     let Some(fixture) = GitWorktreeFixture::new() else {
         report_worktree_skip("selecting_a_worktree_row_starts_a_session_in_that_worktree");
@@ -4720,6 +4727,21 @@ fn selecting_a_worktree_row_starts_a_session_in_that_worktree() {
     let canonical = std::fs::canonicalize(&worktree).expect("canonicalize the worktree path");
     let mut app = NorenApp::default();
     app.load_git_worktrees_from(&fixture.root);
+
+    // `spawn_worktree_session` calls `PtySession::spawn_in_dir` which
+    // intentionally inherits HOME unchanged so the user's shell config
+    // applies in production.  In the test harness the inherited HOME is the
+    // developer's real home whose `.zshrc` can take arbitrarily long
+    // (oh-my-zsh, conda, nvm …) or block entirely, making the test time out
+    // before the shell reaches its prompt.  Temporarily point HOME at the
+    // worktree so zsh finds no startup files and starts instantly.  The cwd
+    // is still independently verified by the pwd check below.
+    let saved_home = std::env::var_os("HOME");
+    // SAFETY: tests in this binary run sequentially; the child has
+    // already inherited the env by the time we restore below.
+    unsafe {
+        std::env::set_var("HOME", &canonical);
+    }
 
     // Row 0 is the main worktree; find the linked worktree's row by path.
     let row = app
@@ -4732,6 +4754,15 @@ fn selecting_a_worktree_row_starts_a_session_in_that_worktree() {
         click_sidebar_row(&mut app, row),
         "the worktree row is consumed"
     );
+
+    // Restore HOME immediately — the child has already inherited it.
+    // SAFETY: same single-threaded reasoning as above.
+    unsafe {
+        match saved_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
 
     // The launch created a real Worktree-kind session that owns the live
     // surface and is observed Running.
