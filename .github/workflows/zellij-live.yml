@@ -35,8 +35,14 @@ on:
 permissions:
   contents: read
 
+# `github.event_name` in the group keeps the nightly schedule and pushes to
+# main apart: both carry `github.ref` == refs/heads/main, so a ref-only group
+# let a nightly run cancel a push run mid-flight (or vice versa), discarding
+# one run's gathered evidence for no benefit. Same-event runs of the same ref
+# still cancel each other — a superseded push, or an over-long nightly by the
+# next one — which is the desired behaviour.
 concurrency:
-  group: zellij-live-${{ github.workflow }}-${{ github.ref }}
+  group: zellij-live-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -49,6 +55,16 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # The suite is one `cargo test` target, but it compiles the whole
+      # dependency tree from scratch on every PR, push, and nightly run
+      # (~5 CI minutes each; issue #153 review). rust-cache shares the
+      # compiled dependencies across runs — the same economics the artifact
+      # cache below applies to the Zellij download — and its key derives
+      # from the lockfile and toolchain, so a dependency bump misses by
+      # design and a stale cache can never satisfy a new lockfile. Pinned
+      # by SHA like every action here; dependabot bumps it weekly.
+      - name: Cache the Rust build
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
       # The corpus fixture and the live binary must not be able to drift
       # apart silently, so the download is DERIVED from `ZELLIJ_FIXTURE_TAG`
       # in `crates/noren-app/src/passthrough.rs` rather than re-hard-coded
