@@ -4672,3 +4672,215 @@ fn many_worktrees_are_capped_and_the_omitted_count_is_reported() {
 
 /// Bound constant for the live cap test; must equal the shipped cap.
 const MAX_WORKTREE_SIDEBAR_TEST_ROWS: usize = noren_app::git_worktree::MAX_WORKTREE_SIDEBAR_ROWS;
+
+/// Selecting a worktree row must start a session whose working directory IS
+/// that worktree — verified by reading the child's own `pwd` answer back
+/// through the terminal, never by trusting the code path that set the cwd.
+///
+/// Mutation check (A): breaking the launch so the child starts elsewhere
+/// (for example dropping the cwd from the launch policy) fails this test.
+#[cfg(target_os = "macos")]
+#[test]
+fn selecting_a_worktree_row_starts_a_session_in_that_worktree() {
+    let Some(fixture) = GitWorktreeFixture::new() else {
+        report_worktree_skip("selecting_a_worktree_row_starts_a_session_in_that_worktree");
+        return;
+    };
+    let (worktree, _branch) = fixture.add_worktree("launch-wt");
+    let canonical = std::fs::canonicalize(&worktree).expect("canonicalize the worktree path");
+    let mut app = NorenApp::default();
+    app.load_git_worktrees_from(&fixture.root);
+
+    // Row 0 is the main worktree; find the linked worktree's row by path.
+    let row = app
+        .workspace
+        .worktrees
+        .iter()
+        .position(|worktree| worktree.path() == canonical)
+        .expect("the linked worktree is discovered");
+    assert!(
+        click_sidebar_row(&mut app, row),
+        "the worktree row is consumed"
+    );
+
+    // The launch created a real Worktree-kind session that owns the live
+    // surface and is observed Running.
+    let ids = registry_ids(&app);
+    assert_eq!(ids.len(), 1, "one registry session from the worktree row");
+    let id = ids[0];
+    assert_eq!(
+        app.workspace.registry().get(id).map(|d| d.kind().clone()),
+        Some(SessionKind::Worktree {
+            path: canonical.clone()
+        }),
+        "the session's launch shape carries the worktree path"
+    );
+    assert_eq!(session_status(&app, id), SessionStatus::Running);
+    assert_eq!(app.active_session, Some(id));
+    assert!(app.pty.is_some(), "the worktree session owns a real PTY");
+
+    // Read the child's ACTUAL working directory back: wait for the shell,
+    // ask it, and search the terminal text for its own answer. The path the
+    // session claims and the directory the child reports must agree. The
+    // grid wraps long lines across rows, so the comparison strips the row
+    // separators a wrap inserts — a wrapped path must still match whole.
+    wait_for_shell_output(&mut app);
+    app.send_input(b"pwd\n");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.drain_pty();
+        let answered = app.terminal.as_ref().is_some_and(|terminal| {
+            let unwrapped = terminal_text(terminal).replace(['\r', '\n'], "");
+            unwrapped.contains(canonical.display().to_string().as_str())
+        });
+        if answered {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child's own pwd never reported the worktree directory; terminal said: {}",
+            app.terminal.as_ref().map(terminal_text).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Quitting with a worktree session and a local session persists BOTH
+/// through the real sessions.toml path, and the next launch restores them —
+/// the worktree kind round-trips with its path, and local-session
+/// persistence is unharmed. This is also the direct guard that the
+/// worktree launch path did not reintroduce the historic quit-path erase:
+/// teardown must save exactly the sessions it had.
+#[test]
+fn quitting_persists_worktree_sessions_beside_local_sessions() {
+    let Some(fixture) = GitWorktreeFixture::new() else {
+        report_worktree_skip("quitting_persists_worktree_sessions_beside_local_sessions");
+        return;
+    };
+    let (worktree, _branch) = fixture.add_worktree("persist-wt");
+    let canonical = std::fs::canonicalize(&worktree).expect("canonicalize the worktree path");
+    let path = temp_state_path();
+    let home = AppTestHome::new();
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..app_with_state_path(&path)
+    };
+    app.load_git_worktrees_from(&fixture.root);
+
+    // One local session (palette) and one worktree session (row click).
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let row = app
+        .workspace
+        .worktrees
+        .iter()
+        .position(|worktree| worktree.path() == canonical)
+        .expect("the worktree is discovered before the click");
+    // Row 0 is the local session; the worktree rows are offset by it.
+    assert!(
+        click_sidebar_row(&mut app, 1 + row),
+        "the worktree row launches"
+    );
+    let ids = registry_ids(&app);
+    assert_eq!(ids.len(), 2);
+    assert_eq!(session_status(&app, ids[0]), SessionStatus::Running);
+    assert_eq!(session_status(&app, ids[1]), SessionStatus::Running);
+
+    app.teardown();
+
+    let text = std::fs::read_to_string(&path).expect("state saved on quit");
+    assert_eq!(
+        text.matches("kind = \"local\"").count(),
+        1,
+        "the local session still persists: {text}"
+    );
+    assert_eq!(
+        text.matches("kind = \"worktree\"").count(),
+        1,
+        "the worktree session persists with its kind: {text}"
+    );
+    assert!(
+        text.contains("path = "),
+        "the worktree entry carries its path for restoration: {text}"
+    );
+
+    // The next launch restores both rows as Restored with intact kinds —
+    // the worktree path survives the round-trip byte for byte.
+    let relaunched = sidebar_after_relaunch(&path);
+    assert_eq!(relaunched.registry().len(), 2);
+    let kinds: Vec<SessionKind> = relaunched
+        .registry()
+        .sessions()
+        .iter()
+        .map(|descriptor| descriptor.kind().clone())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            SessionKind::Local,
+            SessionKind::Worktree {
+                path: canonical.clone()
+            },
+        ]
+    );
+    for descriptor in relaunched.registry().sessions() {
+        assert_eq!(
+            descriptor.status(),
+            &SessionStatus::Restored,
+            "a relaunched row must be Restored, never a phantom Running"
+        );
+    }
+    cleanup_state_file(&path);
+}
+
+/// A worktree path can embed a username or a private directory name. Every
+/// debug and status surface the discovery/launch flow can reach must stay
+/// free of it. The persisted sessions.toml file deliberately DOES carry the
+/// path — it is the user's own private state and exactly what restoration
+/// needs, the same class as a project root; the redaction discipline
+/// governs Debug and error output, not the state file (SSH destinations, by
+/// contrast, may embed credentials and so never enter the registry at all).
+#[test]
+fn worktree_paths_never_reach_debug_or_status_surfaces() {
+    let secret = format!("NOREN-WT-hunter2-{}", std::process::id());
+    let Some(fixture) = GitWorktreeFixture::new() else {
+        report_worktree_skip("worktree_paths_never_reach_debug_or_status_surfaces");
+        return;
+    };
+    let (worktree, _branch) = fixture.add_worktree(&secret);
+    let canonical = std::fs::canonicalize(&worktree).expect("canonicalize the worktree path");
+    let mut app = NorenApp::default();
+    app.load_git_worktrees_from(&fixture.root);
+    assert!(
+        canonical.display().to_string().contains(&secret),
+        "fixture self-check: the secret is really in the path"
+    );
+
+    // The workspace (sidebar rows, worktree facts) never prints it.
+    assert!(
+        !format!("{:?}", app.workspace).contains(&secret),
+        "workspace debug leaked the worktree path"
+    );
+    // Status surfaces carry fixed text only.
+    if let Some(notice) = app.worktree_diagnostic.as_deref() {
+        assert!(!notice.contains(&secret), "notice leaked: {notice}");
+    }
+
+    // A registry session of this shape (the state a launch or a restore
+    // leaves behind) never prints it through the descriptor either.
+    let id = app
+        .workspace
+        .create_session(SessionKind::Worktree { path: canonical });
+    let rendered = format!("{:?}", app.workspace.registry().get(id));
+    assert!(
+        !rendered.contains(&secret),
+        "descriptor debug leaked the worktree path: {rendered}"
+    );
+    assert!(
+        rendered.contains("Worktree"),
+        "not vacuous — the descriptor still names its shape: {rendered}"
+    );
+    assert!(
+        !format!("{:?}", app.workspace).contains(&secret),
+        "workspace debug leaked after the session was created"
+    );
+}
