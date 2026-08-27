@@ -520,13 +520,10 @@ fn a_descriptor_has_a_generated_title_for_every_kind() {
 // ── Reserved session kinds ──────────────────────────────────────────────
 
 #[test]
-fn reserved_kinds_can_be_bookkept_but_are_not_launchable() {
+fn project_ssh_agent_kinds_can_be_bookkept_but_are_not_launchable() {
     let mut registry = SessionRegistry::new();
     let project = registry.create(SessionKind::Project {
         root: PathBuf::from("/p"),
-    });
-    let worktree = registry.create(SessionKind::Worktree {
-        path: PathBuf::from("/w"),
     });
     let ssh = registry.create(SessionKind::Ssh {
         target: "host".to_owned(),
@@ -538,7 +535,6 @@ fn reserved_kinds_can_be_bookkept_but_are_not_launchable() {
     // The registry accepts reserved shapes as entries (bookkeeping only); it
     // never launches anything, so this stays pure data.
     assert!(!registry.get(project).unwrap().kind().is_launchable());
-    assert!(!registry.get(worktree).unwrap().kind().is_launchable());
     assert!(!registry.get(ssh).unwrap().kind().is_launchable());
     assert!(!registry.get(agent).unwrap().kind().is_launchable());
     let local = registry.create(SessionKind::Local);
@@ -549,5 +545,18 @@ fn reserved_kinds_can_be_bookkept_but_are_not_launchable() {
     assert_eq!(registry.selected(), Some(ssh));
     registry.close(ssh).unwrap();
     assert_eq!(registry.selected(), None);
-    assert_eq!(registry.len(), 4);
+    assert_eq!(registry.len(), 3);
+}
+
+#[test]
+fn the_worktree_kind_is_launchable() {
+    // The worktree kind gained a real launch path: a local PTY whose working
+    // directory is the worktree checkout. The registry still only bookkeeps
+    // (it never spawns); this pins that the launch gate classifies the kind
+    // as launchable so a mutation reverting it fails here.
+    let mut registry = SessionRegistry::new();
+    let worktree = registry.create(SessionKind::Worktree {
+        path: PathBuf::from("/w"),
+    });
+    assert!(registry.get(worktree).unwrap().kind().is_launchable());
 }

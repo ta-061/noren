@@ -188,10 +188,10 @@ Each item states what you would actually see if you ran the build.
   The PTY launches `/bin/zsh` with a fixed policy and no caller-controlled
   arguments (`ZSH_PROGRAM` in `crates/noren-pty/src/lib.rs`). Linux support and SSH/remote
   sessions are roadmap intent (Milestones 4 and 6), not current capability.
-- **Only local sessions are actually launched.** `SessionKind` models
+- **Only local and worktree sessions are actually launched.** `SessionKind` models
   `Local`, `Project`, `Worktree`, `Ssh`, and `Agent`, and `EntryKind` in
   `sidebar.rs` can describe project, worktree, SSH-connection, and agent rows —
-  `Local` and `Ssh` have launch paths. The running binary reads bounded
+  `Local`, `Worktree`, and `Ssh` have launch paths. The running binary reads bounded
   OpenSSH configuration facts and displays configured targets as
   `SidebarEntry::SshConnection` rows. Clicking one validates the alias as an
   `SshDestination` (raw `%h`/`%p`/`%r` tokens are refused with a typed error
@@ -203,13 +203,23 @@ Each item states what you would actually see if you ran the build.
   alias never enters the persisted registry, so `sessions.toml` cannot carry
   it. Authentication, agent, and config resolution (including the user's own
   `ProxyCommand`) remain entirely ssh's own, executed by the system binary.
-  Project and worktree kinds remain modelled, while agent entries remain
+  At startup Noren also runs `git worktree list --porcelain` in its launch
+  directory and shows the discovered worktrees as `SidebarEntry::Worktree`
+  rows (at most 24; a larger list reports the omitted count). Clicking a
+  present row starts a real `SessionKind::Worktree` session: a `/bin/zsh`
+  PTY whose child's working directory IS that worktree (verified by reading
+  the child's own `pwd` back through the terminal). A registered worktree
+  whose directory was deleted from disk is listed with a `(missing)` marker
+  and refused on selection — no panic, no child. Worktree sessions persist
+  and restore through `sessions.toml` exactly like local ones.
+  Project and agent kinds remain modelled, while agent entries remain
   reserved fixtures and no agent is launched. In practice: startup owns exactly
   one local `zsh`, the palette's "New Session" spawns another real local `zsh`,
   and every local row can take the live view; a restored row cannot (its shell
   died with the previous launch). Selecting an SSH host row now launches the
-  system `ssh` client in the terminal's PTY (see the SSH section); a git
-  worktree or an agent still cannot be opened from the workspace. Milestones 4
+  system `ssh` client in the terminal's PTY (see the SSH section); selecting a
+  worktree row starts a shell in that worktree. A project row or an agent
+  still cannot be opened from the workspace. Milestones 4
   and 5 own the remaining work.
 - **The SSH list is not OpenSSH-equivalent discovery.** A readable config can
   legitimately name destinations that do not appear: wildcard or negated

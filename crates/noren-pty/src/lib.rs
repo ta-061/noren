@@ -140,6 +140,59 @@ impl fmt::Debug for ZshLaunchPolicy {
     }
 }
 
+/// Fixed zsh-in-a-directory launch policy: like [`ZshLaunchPolicy`] but the
+/// child's working directory is an arbitrary validated directory while
+/// `HOME` is inherited unchanged from this process.
+///
+/// This is the launch shape a git-worktree session uses: the shell starts
+/// *in* the worktree checkout (so `pwd`, build tools, and the prompt report
+/// it) while the user's own shell configuration still applies. The directory
+/// is intentionally private and its `Debug` representation is redacted: a
+/// worktree path can embed a username or a private directory name.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DirLaunchPolicy {
+    dir: PathBuf,
+}
+
+impl DirLaunchPolicy {
+    /// Validate `dir` as the child's working directory.
+    ///
+    /// Refuses a relative path ([`PtyError::CwdNotAbsolute`]) and a path
+    /// that is not an existing directory ([`PtyError::CwdNotDirectory`]) —
+    /// the latter is exactly the registered-but-deleted worktree case, so a
+    /// stale worktree is refused with a typed error instead of a child that
+    /// fails to spawn for an unstated reason.
+    pub fn new(dir: &Path) -> Result<Self, PtyError> {
+        if !dir.is_absolute() {
+            return Err(PtyError::CwdNotAbsolute);
+        }
+        if !dir.is_dir() {
+            return Err(PtyError::CwdNotDirectory);
+        }
+        Ok(Self {
+            dir: dir.to_owned(),
+        })
+    }
+
+    /// The validated working directory.
+    ///
+    /// This accessor exists to build diagnostics-free equality checks, not
+    /// for display: [`fmt::Debug`] is redacted so a worktree path that
+    /// embeds a username can never reach a log through a debug print.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+}
+
+impl fmt::Debug for DirLaunchPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DirLaunchPolicy")
+            .field("dir", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Validate an optional `HOME` without mutating process-global environment.
 fn validate_home(home: Option<OsString>) -> Result<ZshLaunchPolicy, PtyError> {
     let home = PathBuf::from(home.ok_or(PtyError::MissingHome)?);
@@ -179,6 +232,40 @@ fn build_zsh_command(policy: &ZshLaunchPolicy) -> CommandBuilder {
     command.env("TERM_PROGRAM", TERM_PROGRAM_VALUE);
     command.env_remove("COLUMNS");
     command.env_remove("LINES");
+    command
+}
+
+/// Build the fixed zsh command for a directory-scoped launch. Security and
+/// environment invariants, pinned by tests:
+///
+/// - argv is exactly `[ZSH_PROGRAM]` — no caller-controlled arguments, so no
+///   `-c` command can ever appear in argv (`ps`-visible).
+/// - the child's working directory is the policy's validated directory and
+///   `HOME` is inherited unchanged: the user's own shell configuration still
+///   applies, exactly like [`build_zsh_command`] when `HOME` and cwd agree.
+fn build_dir_zsh_command(policy: &DirLaunchPolicy) -> CommandBuilder {
+    let mut command = CommandBuilder::new(ZSH_PROGRAM);
+    command.cwd(&policy.dir);
+    command.env("TERM", TERM_VALUE);
+    command.env("TERM_PROGRAM", TERM_PROGRAM_VALUE);
+    command.env_remove("COLUMNS");
+    command.env_remove("LINES");
+    command
+}
+
+/// Build the fixed zsh command for a directory-scoped launch whose child
+/// `HOME` is an explicitly supplied, validated home.
+///
+/// Identical to [`build_dir_zsh_command`] except `HOME` is set explicitly:
+/// the test-harness sibling of the inherited-`HOME` production shape, so a
+/// higher-level suite can point the child at an isolated empty home while
+/// the working directory stays the policy's validated directory.
+fn build_dir_zsh_command_with_home(
+    policy: &DirLaunchPolicy,
+    home: &ZshLaunchPolicy,
+) -> CommandBuilder {
+    let mut command = build_dir_zsh_command(policy);
+    command.env("HOME", &home.home);
     command
 }
 
@@ -424,6 +511,8 @@ pub enum PtyError {
     MissingHome,
     HomeNotAbsolute,
     HomeNotDirectory,
+    CwdNotAbsolute,
+    CwdNotDirectory,
     InvalidSize,
     InputTooLarge,
     ReplyTooLarge,
@@ -457,6 +546,10 @@ impl fmt::Display for PtyError {
             Self::MissingHome => f.write_str("HOME is required"),
             Self::HomeNotAbsolute => f.write_str("HOME must be absolute"),
             Self::HomeNotDirectory => f.write_str("HOME must name an existing directory"),
+            Self::CwdNotAbsolute => f.write_str("working directory must be absolute"),
+            Self::CwdNotDirectory => {
+                f.write_str("working directory must name an existing directory")
+            }
             Self::InvalidSize => f.write_str("terminal size must be non-zero"),
             Self::InputTooLarge => f.write_str("PTY input message exceeds its byte limit"),
             Self::ReplyTooLarge => f.write_str("terminal reply exceeds its message byte limit"),
@@ -565,6 +658,50 @@ impl PtySession {
     pub fn spawn_in_home(home: &Path, size: PtySize) -> Result<Self, PtyError> {
         let policy = validate_home(Some(home.as_os_str().to_owned()))?;
         Self::spawn_with_policy(policy, size)
+    }
+
+    /// Spawn `/bin/zsh` with `dir` as the child's working directory, leaving
+    /// `HOME` inherited.
+    ///
+    /// The same fixed launch policy as [`PtySession::spawn`] — identical
+    /// program, `TERM`, and environment surgery — except the working
+    /// directory is the supplied directory (validated absolute and existing
+    /// by [`DirLaunchPolicy::new`], which refuses a registered-but-deleted
+    /// worktree with a typed error) and `HOME` is inherited unchanged so the
+    /// user's own shell configuration applies. This is the launch shape a
+    /// git-worktree session uses: the shell starts inside the worktree
+    /// checkout.
+    pub fn spawn_in_dir(dir: &Path, size: PtySize) -> Result<Self, PtyError> {
+        let policy = DirLaunchPolicy::new(dir)?;
+        Self::spawn_session(build_dir_zsh_command(&policy), size)
+    }
+
+    /// Spawn `/bin/zsh` with `dir` as the child's working directory and
+    /// `home` as the child's `HOME`.
+    ///
+    /// Directory-scoped sibling of [`PtySession::spawn_in_home`]: production
+    /// worktree launches use [`PtySession::spawn_in_dir`], which inherits
+    /// `HOME` unchanged so the user's own shell configuration applies.
+    /// Higher-level test suites that drive the child by typing use this seam
+    /// to point `HOME` at an isolated empty directory — a developer's real
+    /// `$HOME` may carry startup files that take arbitrarily long or read the
+    /// terminal, which would make every shell-driving test depend on
+    /// personal configuration — while the working directory remains the
+    /// validated directory, so the child's actual cwd stays observable
+    /// through its own `pwd` answer. Both paths are validated exactly like
+    /// their standalone policies, and the fixed program, `TERM`, and
+    /// environment surgery are identical to [`PtySession::spawn_in_dir`].
+    pub fn spawn_in_dir_with_home(
+        dir: &Path,
+        home: &Path,
+        size: PtySize,
+    ) -> Result<Self, PtyError> {
+        let dir_policy = DirLaunchPolicy::new(dir)?;
+        let home_policy = validate_home(Some(home.as_os_str().to_owned()))?;
+        Self::spawn_session(
+            build_dir_zsh_command_with_home(&dir_policy, &home_policy),
+            size,
+        )
     }
 
     /// Spawn using an already validated fixed-zsh policy.
@@ -1039,6 +1176,18 @@ mod tests {
         path
     }
 
+    /// A uniquely named directory whose name embeds `fragment`, for redaction
+    /// checks: any debug surface that prints the path prints the fragment.
+    fn temp_directory_with(fragment: &str) -> PathBuf {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "noren-pty-test-{}-{sequence}-{fragment}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("create test directory");
+        path
+    }
+
     #[cfg(target_os = "macos")]
     struct TestHome(PathBuf);
 
@@ -1074,6 +1223,19 @@ mod tests {
         lifecycle: &mut bool,
         done: impl Fn(&[u8], bool) -> bool,
     ) {
+        poll_events_with_desc(session, deadline, output, lifecycle, "", done)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn poll_events_with_desc(
+        session: &PtySession,
+        deadline: Instant,
+        output: &mut Vec<u8>,
+        lifecycle: &mut bool,
+        desc: &str,
+        done: impl Fn(&[u8], bool) -> bool,
+    ) {
+        let start = Instant::now();
         while Instant::now() < deadline {
             match session.try_recv().expect("receive PTY event") {
                 Some(PtyEvent::Output(bytes)) => output.extend(bytes),
@@ -1085,7 +1247,18 @@ mod tests {
                 return;
             }
         }
-        panic!("PTY event polling deadline expired");
+        let elapsed = start.elapsed();
+        let stripped = strip_ansi(output);
+        panic!(
+            "PTY event polling deadline expired after {elapsed:?}\n\
+             {desc}expected condition not met\n\
+             raw output ({} bytes): {:?}\n\
+             stripped output: {:?}\n\
+             lifecycle={lifecycle}",
+            output.len(),
+            String::from_utf8_lossy(output),
+            String::from_utf8_lossy(&stripped),
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1094,6 +1267,28 @@ mod tests {
             .windows(needle.len())
             .filter(|window| *window == needle)
             .count()
+    }
+
+    /// Strip ANSI escape sequences from raw PTY output for human-readable
+    /// diagnostics.
+    #[cfg(target_os = "macos")]
+    fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        out
     }
 
     /// Mutation M4 (restoring `#[derive(Debug)]`) must expose the numeric byte
@@ -1623,5 +1818,154 @@ mod tests {
         // occurrence proves the isolated shell answered.
         assert!(occurrences(&output, b"SPAWN_IN_HOME_OK") >= 1);
         session.shutdown().expect("reap isolated-home zsh");
+    }
+
+    #[test]
+    fn dir_policy_validation_refuses_relative_and_missing_directories() {
+        // A relative path is refused before the filesystem is touched.
+        assert_eq!(
+            DirLaunchPolicy::new(Path::new("relative/worktree")),
+            Err(PtyError::CwdNotAbsolute)
+        );
+        // The registered-but-deleted worktree case: a typed refusal, never a
+        // child that fails to spawn for an unstated reason (and never a
+        // panic).
+        let missing = std::env::temp_dir().join("noren-pty-missing-worktree-dir");
+        assert_eq!(
+            DirLaunchPolicy::new(&missing),
+            Err(PtyError::CwdNotDirectory)
+        );
+
+        let directory = temp_directory();
+        let policy = DirLaunchPolicy::new(&directory).expect("valid directory");
+        assert_eq!(policy.dir(), directory.as_path());
+        fs::remove_dir(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn dir_policy_builder_pins_cwd_and_leaves_home_inherited() {
+        let directory = temp_directory();
+        let policy = DirLaunchPolicy::new(&directory).expect("valid directory");
+        let command = build_dir_zsh_command(&policy);
+        assert_eq!(command.get_argv(), &[OsString::from(ZSH_PROGRAM)]);
+        assert_eq!(
+            command.get_cwd().map(OsString::as_os_str),
+            Some(directory.as_os_str()),
+            "the child's working directory is the policy directory"
+        );
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new(TERM_VALUE))
+        );
+        assert_eq!(
+            command.get_env("TERM_PROGRAM"),
+            Some(std::ffi::OsStr::new(TERM_PROGRAM_VALUE))
+        );
+        // HOME is inherited unchanged: a directory-scoped session is still
+        // the user's shell, with the user's own configuration.
+        assert_eq!(
+            command.get_env("HOME"),
+            std::env::var_os("HOME").as_deref(),
+            "the directory launch must inherit HOME unchanged"
+        );
+        assert_eq!(command.get_env("COLUMNS"), None);
+        assert_eq!(command.get_env("LINES"), None);
+        fs::remove_dir(&directory).expect("remove test directory");
+    }
+
+    #[test]
+    fn dir_with_home_builder_pins_cwd_and_the_seam_home() {
+        // The seam's directory and home are distinct directories, so an
+        // assertion against the wrong one cannot pass by coincidence.
+        let directory = temp_directory_with("seam-dir");
+        let home = temp_directory_with("seam-home");
+        let dir_policy = DirLaunchPolicy::new(&directory).expect("valid directory");
+        let home_policy =
+            validate_home(Some(home.clone().into_os_string())).expect("valid seam home");
+        let command = build_dir_zsh_command_with_home(&dir_policy, &home_policy);
+
+        assert_eq!(command.get_argv(), &[OsString::from(ZSH_PROGRAM)]);
+        assert_eq!(
+            command.get_cwd().map(OsString::as_os_str),
+            Some(directory.as_os_str()),
+            "the seam keeps the working directory on the policy directory"
+        );
+        assert_eq!(
+            command.get_env("HOME"),
+            Some(home.as_os_str()),
+            "the seam sets HOME to the isolated home, never the inherited one"
+        );
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new(TERM_VALUE))
+        );
+        assert_eq!(
+            command.get_env("TERM_PROGRAM"),
+            Some(std::ffi::OsStr::new(TERM_PROGRAM_VALUE))
+        );
+        assert_eq!(command.get_env("COLUMNS"), None);
+        assert_eq!(command.get_env("LINES"), None);
+        fs::remove_dir(&directory).expect("remove test directory");
+        fs::remove_dir(&home).expect("remove test home");
+    }
+
+    #[test]
+    fn dir_policy_debug_never_carries_the_directory() {
+        const SECRET: &str = "noren-debug-secret-wt-4c31";
+        let directory = temp_directory_with(SECRET);
+        let policy = DirLaunchPolicy::new(&directory).expect("valid directory");
+        let inspected = format!("{policy:?}");
+        assert!(
+            !inspected.contains(SECRET),
+            "debug must be redacted: {inspected}"
+        );
+        assert!(inspected.contains("<redacted>"));
+        fs::remove_dir(&directory).expect("remove test directory");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn spawn_in_dir_runs_the_child_in_that_directory() {
+        let worktree = temp_directory_with("worktree-cwd");
+
+        // The production entry `spawn_in_dir` inherits HOME unchanged so the
+        // user's shell config applies, and a developer's real `$HOME` may
+        // carry startup files (oh-my-zsh, conda, nvm, …) that take longer
+        // than the deadline or read the terminal. This live check drives the
+        // `spawn_in_dir_with_home` seam — the same `DirLaunchPolicy`, the
+        // same fixed builder, and the same session machinery, with HOME
+        // pinned to the empty fixture directory — so the shell finds no
+        // startup files and answers immediately. Unlike an env swap, the
+        // seam never mutates process-global environment, which races the
+        // parallel tests that read HOME (this exact race was observed:
+        // `ssh_command_argv_...` failed while HOME was swapped). The cwd is
+        // still independently verified by the pwd check below.
+        let size = PtySize::from_raw(24, 80).expect("valid initial size");
+        let mut session = PtySession::spawn_in_dir_with_home(&worktree, &worktree, size)
+            .expect("spawn zsh in the worktree");
+
+        session.send_input(b"pwd\nexit\n").expect("ask for the cwd");
+
+        // macOS resolves /var to /private/var, and the shell reports the
+        // canonical form; compare against the canonicalized fixture path.
+        let canonical = fs::canonicalize(&worktree).expect("canonicalize the fixture path");
+        let canonical_bytes = canonical.as_os_str().as_encoded_bytes().to_vec();
+        let mut output = Vec::new();
+        let mut lifecycle = false;
+        let desc = format!("worktree={worktree:?} canonical={canonical:?}");
+        poll_events_with_desc(
+            &session,
+            Instant::now() + Duration::from_secs(10),
+            &mut output,
+            &mut lifecycle,
+            &desc,
+            |bytes, _| occurrences(bytes, &canonical_bytes) >= 1,
+        );
+        assert!(
+            occurrences(&output, &canonical_bytes) >= 1,
+            "the child's own pwd must report the worktree directory"
+        );
+        session.shutdown().expect("reap worktree zsh");
+        fs::remove_dir_all(&worktree).expect("remove worktree fixture");
     }
 }

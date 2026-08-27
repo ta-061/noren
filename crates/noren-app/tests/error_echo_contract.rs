@@ -32,11 +32,13 @@
 //! which cannot hold file-derived text without an explicit leak.
 
 use noren_app::config::{AppConfig, ChordParseError, ConfigError};
+use noren_app::git_worktree::WorktreeListError;
 use noren_app::palette::Palette;
 use noren_app::passthrough::ChordError;
 use noren_app::session::SessionRegistry;
 use noren_app::session_persistence::{SESSION_STATE_VERSION, SessionPersistenceError, load_bytes};
 use noren_app::ssh_config::{SshConfig, SshConfigErrorKind};
+use noren_pty::PtyError;
 use std::io::ErrorKind;
 
 /// How a variant may treat file **values**. Key names, positions, and
@@ -59,6 +61,10 @@ const SESSION_ERROR_VARIANTS: usize = 14;
 const CHORD_PARSE_ERROR_VARIANTS: usize = 7;
 /// Pinned variant count of [`SshConfigErrorKind`].
 const SSH_ERROR_KINDS: usize = 13;
+/// Pinned variant count of [`WorktreeListError`].
+const WORKTREE_ERROR_VARIANTS: usize = 6;
+/// Pinned variant count of [`PtyError`].
+const PTY_ERROR_VARIANTS: usize = 16;
 /// Pinned allowlist size across every file-derived enum. Raising this
 /// number is the reviewed decision to admit a new value echo.
 const CHORD_ALLOWLIST_SIZE: usize = 6;
@@ -149,6 +155,44 @@ fn classify_ssh_kind(kind: &SshConfigErrorKind) -> ValueEcho {
         SshConfigErrorKind::StructuralComplexityExceeded => ValueEcho::Never,
         SshConfigErrorKind::HostCountExceeded => ValueEcho::Never,
         SshConfigErrorKind::UnterminatedArgument => ValueEcho::Never,
+    }
+}
+
+/// Classify every [`WorktreeListError`] variant. All are unit variants
+/// with fixed, content-free Display strings — worktree discovery never
+/// carries paths, branch names, or git output in its error messages.
+fn classify_worktree_error(error: &WorktreeListError) -> ValueEcho {
+    match error {
+        WorktreeListError::GitUnavailable => ValueEcho::Never,
+        WorktreeListError::NotARepository => ValueEcho::Never,
+        WorktreeListError::LaunchDirectoryUnavailable => ValueEcho::Never,
+        WorktreeListError::NotUtf8 => ValueEcho::Never,
+        WorktreeListError::TooLarge => ValueEcho::Never,
+        WorktreeListError::Malformed => ValueEcho::Never,
+    }
+}
+
+/// Classify every [`PtyError`] variant. All carry only operation names and
+/// `io::ErrorKind` discriminants — never terminal content, paths, or
+/// environment values.
+fn classify_pty_error(error: &PtyError) -> ValueEcho {
+    match error {
+        PtyError::MissingHome => ValueEcho::Never,
+        PtyError::HomeNotAbsolute => ValueEcho::Never,
+        PtyError::HomeNotDirectory => ValueEcho::Never,
+        PtyError::CwdNotAbsolute => ValueEcho::Never,
+        PtyError::CwdNotDirectory => ValueEcho::Never,
+        PtyError::InvalidSize => ValueEcho::Never,
+        PtyError::InputTooLarge => ValueEcho::Never,
+        PtyError::ReplyTooLarge => ValueEcho::Never,
+        PtyError::ReplyRateExceeded => ValueEcho::Never,
+        PtyError::CommandQueueFull => ValueEcho::Never,
+        PtyError::ChannelDisconnected => ValueEcho::Never,
+        PtyError::SessionClosing => ValueEcho::Never,
+        PtyError::ReaderJoinTimeout => ValueEcho::Never,
+        PtyError::SupervisorJoinTimeout => ValueEcho::Never,
+        PtyError::Backend { .. } => ValueEcho::Never,
+        PtyError::Io { .. } => ValueEcho::Never,
     }
 }
 
@@ -285,6 +329,52 @@ fn ssh_kind_samples() -> Vec<(SshConfigErrorKind, ValueEcho)> {
     ]
 }
 
+fn worktree_error_samples() -> Vec<(WorktreeListError, ValueEcho)> {
+    vec![
+        (WorktreeListError::GitUnavailable, ValueEcho::Never),
+        (WorktreeListError::NotARepository, ValueEcho::Never),
+        (
+            WorktreeListError::LaunchDirectoryUnavailable,
+            ValueEcho::Never,
+        ),
+        (WorktreeListError::NotUtf8, ValueEcho::Never),
+        (WorktreeListError::TooLarge, ValueEcho::Never),
+        (WorktreeListError::Malformed, ValueEcho::Never),
+    ]
+}
+
+fn pty_error_samples() -> Vec<(PtyError, ValueEcho)> {
+    vec![
+        (PtyError::MissingHome, ValueEcho::Never),
+        (PtyError::HomeNotAbsolute, ValueEcho::Never),
+        (PtyError::HomeNotDirectory, ValueEcho::Never),
+        (PtyError::CwdNotAbsolute, ValueEcho::Never),
+        (PtyError::CwdNotDirectory, ValueEcho::Never),
+        (PtyError::InvalidSize, ValueEcho::Never),
+        (PtyError::InputTooLarge, ValueEcho::Never),
+        (PtyError::ReplyTooLarge, ValueEcho::Never),
+        (PtyError::ReplyRateExceeded, ValueEcho::Never),
+        (PtyError::CommandQueueFull, ValueEcho::Never),
+        (PtyError::ChannelDisconnected, ValueEcho::Never),
+        (PtyError::SessionClosing, ValueEcho::Never),
+        (PtyError::ReaderJoinTimeout, ValueEcho::Never),
+        (PtyError::SupervisorJoinTimeout, ValueEcho::Never),
+        (
+            PtyError::Backend {
+                operation: noren_pty::PtyOperation::Open,
+            },
+            ValueEcho::Never,
+        ),
+        (
+            PtyError::Io {
+                operation: noren_pty::PtyOperation::Read,
+                kind: ErrorKind::BrokenPipe,
+            },
+            ValueEcho::Never,
+        ),
+    ]
+}
+
 /// The classifiers must cover every variant, the sample tables must match
 /// the pinned variant counts, and the allowlist must be exactly the pinned
 /// size. Together with the exhaustive matches this is the tripwire: a new
@@ -316,6 +406,18 @@ fn every_file_derived_variant_is_classified_and_the_allowlist_is_pinned() {
         SSH_ERROR_KINDS,
         "an SshConfigErrorKind variant changed; classify it and update the pin"
     );
+    let worktree = worktree_error_samples();
+    assert_eq!(
+        worktree.len(),
+        WORKTREE_ERROR_VARIANTS,
+        "a WorktreeListError variant changed; classify it and update the pin"
+    );
+    let pty = pty_error_samples();
+    assert_eq!(
+        pty.len(),
+        PTY_ERROR_VARIANTS,
+        "a PtyError variant changed; classify it and update the pin"
+    );
 
     for (sample, expected) in &config {
         assert_eq!(&classify_config(sample), expected, "{sample:?}");
@@ -328,6 +430,12 @@ fn every_file_derived_variant_is_classified_and_the_allowlist_is_pinned() {
     }
     for (sample, expected) in &ssh {
         assert_eq!(&classify_ssh_kind(sample), expected, "{sample:?}");
+    }
+    for (sample, expected) in &worktree {
+        assert_eq!(&classify_worktree_error(sample), expected, "{sample:?}");
+    }
+    for (sample, expected) in &pty {
+        assert_eq!(&classify_pty_error(sample), expected, "{sample:?}");
     }
 
     // Police the classification against the actual rendering, on both
@@ -368,6 +476,12 @@ fn every_file_derived_variant_is_classified_and_the_allowlist_is_pinned() {
         // them with `{:?}`, so Debug is the rendering surface here.
         assert_rendering(format!("{sample:?}"), format!("{sample:?}"), *class);
     }
+    for (sample, class) in &worktree {
+        assert_rendering(sample.to_string(), format!("{sample:?}"), *class);
+    }
+    for (sample, class) in &pty {
+        assert_rendering(sample.to_string(), format!("{sample:?}"), *class);
+    }
 
     let allowlist = config
         .iter()
@@ -375,6 +489,8 @@ fn every_file_derived_variant_is_classified_and_the_allowlist_is_pinned() {
         .chain(session.iter().map(|(_, class)| *class))
         .chain(chords.iter().map(|(_, class)| *class))
         .chain(ssh.iter().map(|(_, class)| *class))
+        .chain(worktree.iter().map(|(_, class)| *class))
+        .chain(pty.iter().map(|(_, class)| *class))
         .filter(|class| *class == ValueEcho::ChordText)
         .count();
     assert_eq!(
