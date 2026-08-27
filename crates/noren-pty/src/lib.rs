@@ -1179,6 +1179,19 @@ mod tests {
         lifecycle: &mut bool,
         done: impl Fn(&[u8], bool) -> bool,
     ) {
+        poll_events_with_desc(session, deadline, output, lifecycle, "", done)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn poll_events_with_desc(
+        session: &PtySession,
+        deadline: Instant,
+        output: &mut Vec<u8>,
+        lifecycle: &mut bool,
+        desc: &str,
+        done: impl Fn(&[u8], bool) -> bool,
+    ) {
+        let start = Instant::now();
         while Instant::now() < deadline {
             match session.try_recv().expect("receive PTY event") {
                 Some(PtyEvent::Output(bytes)) => output.extend(bytes),
@@ -1190,7 +1203,18 @@ mod tests {
                 return;
             }
         }
-        panic!("PTY event polling deadline expired");
+        let elapsed = start.elapsed();
+        let stripped = strip_ansi(output);
+        panic!(
+            "PTY event polling deadline expired after {elapsed:?}\n\
+             {desc}expected condition not met\n\
+             raw output ({} bytes): {:?}\n\
+             stripped output: {:?}\n\
+             lifecycle={lifecycle}",
+            output.len(),
+            String::from_utf8_lossy(output),
+            String::from_utf8_lossy(&stripped),
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -1199,6 +1223,28 @@ mod tests {
             .windows(needle.len())
             .filter(|window| *window == needle)
             .count()
+    }
+
+    /// Strip ANSI escape sequences from raw PTY output for human-readable
+    /// diagnostics.
+    #[cfg(target_os = "macos")]
+    fn strip_ansi(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+        out
     }
 
     /// Mutation M4 (restoring `#[derive(Debug)]`) must expose the numeric byte
@@ -1775,14 +1821,38 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    #[allow(unsafe_code)] // HOME swap is safe: tests run sequentially; child inherits before restore.
     fn spawn_in_dir_runs_the_child_in_that_directory() {
-        // The live cwd check: drive a real zsh and read its own `pwd` answer
-        // back through the PTY. This observes the child's actual working
-        // directory rather than trusting the command builder.
         let worktree = temp_directory_with("worktree-cwd");
+
+        // `build_dir_zsh_command` intentionally inherits HOME unchanged so
+        // the user's shell config applies in production.  In the test
+        // harness, the inherited HOME is the developer's real home whose
+        // .zshrc can take arbitrarily long (oh-my-zsh, conda, nvm …) or
+        // block entirely, making the test time out before the shell reaches
+        // its prompt.  Temporarily point HOME at the empty worktree so
+        // zsh finds no startup files and starts instantly.  The cwd is
+        // still independently verified by the pwd check below.
+        let saved_home = std::env::var_os("HOME");
+        // SAFETY: tests in this binary run sequentially; the child has
+        // already inherited the env by the time we restore below.
+        unsafe {
+            std::env::set_var("HOME", &worktree);
+        }
+
         let size = PtySize::from_raw(24, 80).expect("valid initial size");
         let mut session =
             PtySession::spawn_in_dir(&worktree, size).expect("spawn zsh in the worktree");
+
+        // Restore HOME immediately — the child has already inherited it.
+        // SAFETY: same single-threaded reasoning as above.
+        unsafe {
+            match saved_home {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
         session.send_input(b"pwd\nexit\n").expect("ask for the cwd");
 
         // macOS resolves /var to /private/var, and the shell reports the
@@ -1791,11 +1861,13 @@ mod tests {
         let canonical_bytes = canonical.as_os_str().as_encoded_bytes().to_vec();
         let mut output = Vec::new();
         let mut lifecycle = false;
-        poll_events(
+        let desc = format!("worktree={worktree:?} canonical={canonical:?}");
+        poll_events_with_desc(
             &session,
             Instant::now() + Duration::from_secs(10),
             &mut output,
             &mut lifecycle,
+            &desc,
             |bytes, _| occurrences(bytes, &canonical_bytes) >= 1,
         );
         assert!(
