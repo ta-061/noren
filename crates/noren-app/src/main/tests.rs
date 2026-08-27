@@ -4884,3 +4884,262 @@ fn worktree_paths_never_reach_debug_or_status_surfaces() {
         "workspace debug leaked after the session was created"
     );
 }
+
+// ── Mixed sidebars: every row kind present at once ────────────────────
+//
+// Independent review (issue #156 follow-up): the click path resolves each
+// row kind by subtracting the row counts of the kinds above it
+// (`local_sidebar_session`, `worktree_sidebar_row`, `select_ssh_sidebar_row`),
+// and every existing test exercised one row kind in isolation — an index
+// arithmetic error (the `MouseGrid::new(rows, cols)` class) passed the whole
+// suite. A mixed sidebar is not an edge case: it is the DEFAULT state of
+// this repository's own development environment.
+
+/// Real directories for synthetic worktree facts. Discovery parsing is pure,
+/// but a worktree row click launches a session rooted at the row's
+/// directory, so the directories must exist for the launch to identify the
+/// clicked row by its path.
+fn mixed_worktree_directories(count: usize) -> Vec<PathBuf> {
+    (0..count)
+        .map(|index| {
+            let sequence = WT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "noren-app-mixed-wt-{}-{sequence}-{index}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("create mixed-sidebar worktree directory");
+            path
+        })
+        .collect()
+}
+
+/// `git worktree list --porcelain` text for the given directories, one
+/// branched record each, in listing order.
+fn synthetic_porcelain(paths: &[PathBuf]) -> String {
+    let mut text = String::new();
+    for (index, path) in paths.iter().enumerate() {
+        text.push_str(&format!(
+            "worktree {}\nbranch refs/heads/mix-{index:02}\n\n",
+            path.display()
+        ));
+    }
+    text
+}
+
+/// The paths of every registry session launched from a worktree row, in
+/// registry order — the observable identity of WHICH worktree row a click
+/// selected.
+fn worktree_session_paths(app: &NorenApp) -> Vec<PathBuf> {
+    app.workspace
+        .registry()
+        .sessions()
+        .iter()
+        .filter_map(|descriptor| match descriptor.kind() {
+            SessionKind::Worktree { path } => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Row order is FIXED — sessions first, then discovered worktree facts, then
+/// configured SSH hosts — and the click-path offset arithmetic silently
+/// depends on it, so the rendered order is pinned here with all three kinds
+/// present at once, including each kind's internal order (registry order,
+/// git listing order, config order). Agent-kind sessions render as ordinary
+/// session rows; the reserved `EntryKind::Agent` is never emitted by the
+/// sidebar rebuild, which the kind sequence pins as well.
+#[test]
+fn sidebar_rows_render_sessions_then_worktrees_then_ssh_hosts() {
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(b"Host zulu\nHost alpha\n");
+    let records = git_worktree::parse_worktree_porcelain(
+        "worktree /srv/mix-main\nbranch refs/heads/mix-main\n\
+         \nworktree /srv/mix-a\nbranch refs/heads/mix-a\n\
+         \nworktree /srv/mix-b\ndetached\n",
+    )
+    .expect("synthetic porcelain parses");
+
+    let mut app = NorenApp::default();
+    app.workspace
+        .load_worktrees(WorktreeDiscovery::from_records(records));
+    app.load_ssh_hosts_from(fixture.path());
+    let _agent = app.workspace.create_session(SessionKind::Agent {
+        name: "reserved".to_owned(),
+    });
+    let _local = app.workspace.create_session(SessionKind::Local);
+    app.workspace.rebuild_sidebar();
+
+    let rows = app.workspace.sidebar().rows();
+    let kinds: Vec<EntryKind> = rows.iter().map(|row| row.kind()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            EntryKind::Session,
+            EntryKind::Session,
+            EntryKind::Worktree,
+            EntryKind::Worktree,
+            EntryKind::Worktree,
+            EntryKind::SshConnection,
+            EntryKind::SshConnection,
+        ],
+        "the fixed order is sessions, then worktrees, then SSH hosts"
+    );
+    // Worktree rows keep git's listing order (main first).
+    assert_eq!(
+        rows[2..5]
+            .iter()
+            .map(|row| row.label().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["mix-main", "mix-a", "mix-b"]
+    );
+    // SSH rows keep the config's declaration order.
+    assert_eq!(
+        rows[5..7]
+            .iter()
+            .map(|row| row.label().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["SSH-OFF zulu", "SSH-OFF alpha"]
+    );
+}
+
+/// Clicking each row kind in a mixed sidebar must select the row the user
+/// actually clicked — the default sidebar shape of this repository, which
+/// holds sessions, worktrees, and SSH hosts at once. The boundaries are
+/// asserted explicitly: the last worktree row, the first SSH row, the last
+/// SSH row, and the row immediately after the last SSH row (a dead click
+/// that must select nothing, not wrap).
+///
+/// Mutation checks:
+/// - dropping `+ worktree_rows` from `select_ssh_sidebar_row` makes the
+///   first-SSH-row click resolve to a DIFFERENT host (the host list here is
+///   longer than the worktree list, so the misresolved index lands on a
+///   real host, not a dead click);
+/// - dropping the session-row offset from `worktree_sidebar_row` resolves a
+///   worktree click to another worktree's row;
+/// - dropping the session bound from `local_sidebar_session` makes
+///   non-session rows claim a session id.
+#[cfg(target_os = "macos")]
+#[test]
+fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
+    // Five SSH hosts — more than the three worktrees — so a misresolved SSH
+    // index lands on a real, different host instead of dead-clicking.
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(b"Host alpha\nHost bravo\nHost charlie\nHost delta\nHost echo\n");
+    let worktree_paths = mixed_worktree_directories(3);
+    let records = git_worktree::parse_worktree_porcelain(&synthetic_porcelain(&worktree_paths))
+        .expect("synthetic porcelain parses");
+
+    // The deterministic seam keeps SSH row clicks from spawning any process;
+    // worktree row clicks really launch (that is their observable identity).
+    let mut app = app_with_deterministic_ssh_seam();
+    app.workspace
+        .load_worktrees(WorktreeDiscovery::from_records(records));
+    app.load_ssh_hosts_from(fixture.path());
+    let sessions = [
+        app.workspace.create_session(SessionKind::Local),
+        app.workspace.create_session(SessionKind::Project {
+            root: PathBuf::from("/srv/noren"),
+        }),
+    ];
+
+    // Layout: rows 0-1 sessions, rows 2-4 worktrees, rows 5-9 SSH hosts.
+    assert_eq!(
+        app.workspace.sidebar().rows().len(),
+        10,
+        "two session rows, three worktree rows, five SSH rows"
+    );
+
+    // Session rows select their own session, first and last alike.
+    assert!(click_sidebar_row(&mut app, 0), "the first session row");
+    assert_eq!(app.workspace.registry().selected(), Some(sessions[0]));
+    assert!(click_sidebar_row(&mut app, 1), "the last session row");
+    assert_eq!(app.workspace.registry().selected(), Some(sessions[1]));
+
+    // First SSH row (row 5): selects the FIRST host, and never moves the
+    // registry selection.
+    assert!(click_sidebar_row(&mut app, 5), "the first SSH row");
+    assert_eq!(app.workspace.selected_ssh_target(), Some("alpha"));
+    assert_eq!(
+        app.workspace.registry().selected(),
+        Some(sessions[1]),
+        "an SSH row click never selects a registry session"
+    );
+    // Last SSH row (row 9): selects the LAST host.
+    assert!(click_sidebar_row(&mut app, 9), "the last SSH row");
+    assert_eq!(app.workspace.selected_ssh_target(), Some("echo"));
+
+    // Row 10 — immediately after the last SSH row — selects nothing: not a
+    // session, not a host, no wrap-around, and no state changes at all.
+    let registry_len = app.workspace.registry().len();
+    assert!(
+        !click_sidebar_row(&mut app, 10),
+        "the row after the last SSH row is a dead click"
+    );
+    assert_eq!(
+        app.workspace.selected_ssh_target(),
+        Some("echo"),
+        "a dead click must not change the pending SSH choice"
+    );
+    assert_eq!(
+        app.workspace.registry().selected(),
+        Some(sessions[1]),
+        "a dead click must not move the registry selection"
+    );
+    assert_eq!(
+        app.workspace.registry().len(),
+        registry_len,
+        "a dead click must not create a session"
+    );
+
+    // Last worktree row (row 4): launches a session rooted at the THIRD
+    // worktree — the row the user clicked, not the one an offset error
+    // would resolve to.
+    assert!(click_sidebar_row(&mut app, 4), "the last worktree row");
+    assert_eq!(
+        worktree_session_paths(&app),
+        vec![worktree_paths[2].clone()],
+        "the click launches the worktree the user pointed at"
+    );
+
+    // Each launch adds a session row, shifting the rows below: with three
+    // sessions the worktree block occupies rows 3-5. First worktree row.
+    assert!(click_sidebar_row(&mut app, 3), "the first worktree row");
+    assert_eq!(
+        worktree_session_paths(&app),
+        vec![worktree_paths[2].clone(), worktree_paths[0].clone()]
+    );
+
+    // With four sessions the worktree block occupies rows 4-6; the middle
+    // worktree is row 5.
+    assert!(click_sidebar_row(&mut app, 5), "a middle worktree row");
+    assert_eq!(
+        worktree_session_paths(&app),
+        vec![
+            worktree_paths[2].clone(),
+            worktree_paths[0].clone(),
+            worktree_paths[1].clone()
+        ]
+    );
+
+    // After the launches the accumulated counts changed (five sessions), so
+    // the SSH boundary is re-asserted at its new offset: first SSH row 8.
+    assert_eq!(
+        app.workspace.sidebar().rows().len(),
+        13,
+        "five session rows, three worktree rows, five SSH rows"
+    );
+    assert!(click_sidebar_row(&mut app, 8), "the first SSH row again");
+    assert_eq!(
+        app.workspace.selected_ssh_target(),
+        Some("alpha"),
+        "the SSH offset must track the grown session block"
+    );
+    assert!(
+        !click_sidebar_row(&mut app, 13),
+        "the row after the last SSH row stays dead after the shifts"
+    );
+
+    for path in &worktree_paths {
+        let _ = std::fs::remove_dir(path);
+    }
+}
