@@ -108,6 +108,21 @@ const SSH_STATUS_REFUSED: &str = "Noren ssh connect refused";
 const WORKTREE_STATUS_MISSING: &str = "Noren worktree directory missing";
 /// Status-row text when a worktree session's zsh child could not be spawned.
 const WORKTREE_STATUS_LAUNCH_FAILED: &str = "Noren worktree launch failed";
+/// Keep configured-agent memory and identity work bounded independently of
+/// the frame height, exactly like the SSH host bound. Agent rows share the
+/// sidebar's scroll window over this bounded list.
+const MAX_AGENT_SIDEBAR_ROWS: usize = 24;
+/// ASCII-only agent row state that is always inside the first 16 columns.
+/// Eight characters, like the SSH prefixes, so the label arithmetic is the
+/// shared [`sidebar_state_label`] helper.
+const AGENT_SIDEBAR_PREFIX_IDLE: &str = "AGT-OFF ";
+const AGENT_SIDEBAR_PREFIX_FAILED: &str = "AGT-ERR ";
+const AGENT_SIDEBAR_DETAIL_IDLE: &str = "not running";
+const AGENT_SIDEBAR_DETAIL_FAILED: &str = "launch failed";
+/// Status-row text when an agent row's configured command could not be
+/// spawned (missing or non-executable program). Fixed text: the command is
+/// configuration content and never appears on the status row.
+const AGENT_STATUS_LAUNCH_FAILED: &str = "Noren agent launch failed";
 
 /// Observed state of the one live SSH launch. This is application-local
 /// runtime state, deliberately outside the session registry: the registry
@@ -206,12 +221,19 @@ fn ssh_sidebar_label(target: &str) -> String {
     ssh_state_label(SshConnectionPhase::Closed, target)
 }
 
-/// Build the bounded sidebar label for an SSH target in `phase`.
-///
-/// The prefix encodes the connection state; the target text is bounded
-/// exactly like the offline label.
-fn ssh_state_label(phase: SshConnectionPhase, target: &str) -> String {
-    let inspected: Vec<char> = target
+/// Build a bounded sidebar label: an eight-character ASCII state `prefix`
+/// followed by as much of `text` as fits in the shared target budget. The
+/// renderer counts Unicode scalar values, so the helper does the same and
+/// looks at one scalar beyond the untruncated budget solely to decide
+/// whether the ASCII truncation marker is needed. Shared by the SSH and
+/// agent row kinds so their bounding rules cannot drift apart.
+fn sidebar_state_label(prefix: &str, text: &str) -> String {
+    debug_assert_eq!(
+        prefix.chars().count(),
+        SSH_SIDEBAR_LABEL_PREFIX_CHARS,
+        "sidebar state prefixes are fixed eight-character ASCII strings"
+    );
+    let inspected: Vec<char> = text
         .chars()
         .take(SSH_SIDEBAR_TARGET_CHARS.saturating_add(1))
         .collect();
@@ -222,12 +244,43 @@ fn ssh_state_label(phase: SshConnectionPhase, target: &str) -> String {
         inspected.len()
     };
     let mut label = String::with_capacity(SSH_SIDEBAR_LABEL_CHARS.saturating_mul(4));
-    label.push_str(phase.sidebar_prefix());
+    label.push_str(prefix);
     label.extend(inspected.into_iter().take(visible_target_chars));
     if truncated {
         label.push_str(SSH_SIDEBAR_TRUNCATION_MARKER);
     }
     label
+}
+
+/// Build the bounded sidebar label for an SSH target in `phase`.
+///
+/// The prefix encodes the connection state; the target text is bounded
+/// exactly like the offline label.
+fn ssh_state_label(phase: SshConnectionPhase, target: &str) -> String {
+    sidebar_state_label(phase.sidebar_prefix(), target)
+}
+
+/// Build the bounded sidebar label for a configured agent row. `failed`
+/// selects the fixed state prefix; the agent's display name is bounded
+/// exactly like an SSH target.
+fn agent_sidebar_label(failed: bool, name: &str) -> String {
+    sidebar_state_label(
+        if failed {
+            AGENT_SIDEBAR_PREFIX_FAILED
+        } else {
+            AGENT_SIDEBAR_PREFIX_IDLE
+        },
+        name,
+    )
+}
+
+/// The fixed detail text for a configured agent row.
+fn agent_sidebar_detail(failed: bool) -> &'static str {
+    if failed {
+        AGENT_SIDEBAR_DETAIL_FAILED
+    } else {
+        AGENT_SIDEBAR_DETAIL_IDLE
+    }
 }
 
 fn ssh_status_source_label(label: &str) -> String {
@@ -279,6 +332,37 @@ impl fmt::Debug for ConfiguredSshHost {
         f.debug_struct("ConfiguredSshHost")
             .field("kind", &kind)
             .field("source_label_chars", &self.source_label.chars().count())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One configured agent held by the workspace: the display name shown on its
+/// sidebar row plus the argv vector launched when the row is selected.
+///
+/// Sidebar fact until a row is selected, exactly like the configured SSH
+/// hosts and discovered worktrees. The command was validated at
+/// configuration load (absolute, bounded, shell-free argv); copying it here
+/// preserves it verbatim, and it is never inserted into the live registry or
+/// persisted — only the [`SessionKind::Agent`] name reaches `sessions.toml`.
+#[derive(Clone, PartialEq, Eq)]
+struct ConfiguredAgent {
+    /// Display name from configuration; also the `SessionKind::Agent` name
+    /// of a launched session, which is what persists.
+    name: String,
+    /// Absolute program path; `argv[0]` of the launch. Never displayed.
+    command: String,
+    /// argv words after the program, verbatim from configuration.
+    args: Vec<String>,
+}
+
+/// Shape-only [`Debug`] (issue #146): the name and command are
+/// user-authored configuration text, and a command can embed a private
+/// path, so neither is printed — only the argv element count.
+impl fmt::Debug for ConfiguredAgent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfiguredAgent")
+            .field("name_chars", &self.name.chars().count())
+            .field("argv", &(self.args.len() + 1))
             .finish_non_exhaustive()
     }
 }
@@ -362,6 +446,18 @@ struct WorkspaceState {
     ssh_hosts_omitted: usize,
     selected_ssh_target: Option<String>,
     selected_ssh_source_label: Option<String>,
+    /// Configured agents (`[[agents]]`), bounded by [`MAX_AGENT_SIDEBAR_ROWS`].
+    /// Sidebar facts until a row is selected: no registry entry or child
+    /// exists for one. The command never enters the registry, so it is never
+    /// persisted to `sessions.toml` — only a launched session's
+    /// [`SessionKind::Agent`] name is.
+    agents: Vec<ConfiguredAgent>,
+    /// How many configured agents the bounded sidebar policy omitted.
+    agents_omitted: usize,
+    /// Names of configured agents whose most recent launch FAILED. Best-effort
+    /// row marker bounded by the configured agent count; the session rows the
+    /// registry owns remain the authority for a launch's observed status.
+    agent_launch_failures: std::collections::HashSet<String>,
     /// The one live SSH launch's target and phase, mirrored here only so
     /// [`Self::rebuild_sidebar`] can mark the matching configured row. The
     /// target never enters the registry, so it is never persisted.
@@ -393,6 +489,9 @@ impl fmt::Debug for WorkspaceState {
             .field("worktrees_omitted", &self.worktrees_omitted)
             .field("ssh_hosts", &self.ssh_hosts.len())
             .field("ssh_hosts_omitted", &self.ssh_hosts_omitted)
+            .field("agents", &self.agents.len())
+            .field("agents_omitted", &self.agents_omitted)
+            .field("agent_launch_failures", &self.agent_launch_failures.len())
             .field("selected_ssh_target", &self.selected_ssh_target.is_some())
             .field(
                 "selected_ssh_source_label",
@@ -435,6 +534,9 @@ impl WorkspaceState {
             ssh_hosts_omitted: 0,
             selected_ssh_target: None,
             selected_ssh_source_label: None,
+            agents: Vec::new(),
+            agents_omitted: 0,
+            agent_launch_failures: std::collections::HashSet::new(),
             ssh_connection: None,
             palette: Palette::noren(
                 WorkspaceAction::CreateSession,
@@ -627,6 +729,47 @@ impl WorkspaceState {
         true
     }
 
+    /// Replace the configured agent facts without creating sessions. Rows
+    /// are bounded by [`MAX_AGENT_SIDEBAR_ROWS`] and the omitted count is
+    /// retained for the status notice, exactly like the worktree and SSH
+    /// host bounds. Returns the number omitted.
+    fn load_agents(&mut self, agents: &[noren_app::config::AgentConfig]) -> usize {
+        self.agents = agents
+            .iter()
+            .take(MAX_AGENT_SIDEBAR_ROWS)
+            .map(|agent| ConfiguredAgent {
+                name: agent.name().to_owned(),
+                command: agent.command().to_owned(),
+                args: agent.args().to_vec(),
+            })
+            .collect();
+        self.agents_omitted = agents.len().saturating_sub(self.agents.len());
+        self.agent_launch_failures.clear();
+        self.rebuild_sidebar();
+        self.agents_omitted
+    }
+
+    /// The configured agent fact at a stable sidebar position, if that
+    /// position is an agent row. Session rows precede worktree rows, SSH
+    /// host rows follow them, and agent rows follow the SSH hosts; the
+    /// subtraction chain mirrors the order the sidebar renders.
+    fn agent_sidebar_row(&self, row_index: usize) -> Option<&ConfiguredAgent> {
+        let index = row_index
+            .checked_sub(self.registry.len() + self.worktrees.len() + self.ssh_hosts.len())?;
+        self.agents.get(index)
+    }
+
+    /// Mark a configured agent's most recent launch as failed, so its row
+    /// carries the visible `AG-ERR` state.
+    fn record_agent_launch_failure(&mut self, name: &str) {
+        self.agent_launch_failures.insert(name.to_owned());
+    }
+
+    /// Clear a configured agent's failure marker after a successful launch.
+    fn clear_agent_launch_failure(&mut self, name: &str) {
+        self.agent_launch_failures.remove(name);
+    }
+
     /// Record the phase of the one live SSH launch and refresh the sidebar.
     ///
     /// The target is compared against the configured host rows to mark the
@@ -673,7 +816,7 @@ impl WorkspaceState {
     ///
     /// Called after every mutation so the view never lags the model. Row
     /// order is stable: session rows first, then discovered worktree facts,
-    /// then configured SSH host facts.
+    /// then configured SSH host facts, then configured agent facts.
     fn rebuild_sidebar(&mut self) {
         let entries: Vec<SidebarEntry> = self
             .registry
@@ -714,6 +857,13 @@ impl WorkspaceState {
                 host: detail.to_owned(),
                 selected,
             })
+        }));
+        entries.extend(self.agents.iter().map(|agent| {
+            let failed = self.agent_launch_failures.contains(&agent.name);
+            SidebarEntry::Agent {
+                label: agent_sidebar_label(failed, &agent.name),
+                status: agent_sidebar_detail(failed).to_owned(),
+            }
         }));
         self.sidebar = SidebarView::build(&entries, self.registry.selected());
     }
@@ -802,6 +952,9 @@ struct NorenApp {
     ssh_selection_status: Option<String>,
     /// Bounded, content-free worktree-discovery notice (cap or failure).
     worktree_diagnostic: Option<String>,
+    /// Bounded, content-free configured-agents notice (cap only; agent
+    /// launch failures surface as runtime statuses instead).
+    agent_diagnostic: Option<String>,
     /// When EOF was observed on a live ssh child whose reaped exit event has
     /// not arrived yet; drives the immediate-disconnect classification.
     ssh_eof_since: Option<Instant>,
@@ -864,16 +1017,17 @@ struct NorenApp {
 ///
 /// Runtime statuses take precedence while `show_status` is set. A pending SSH
 /// selection then exposes its bounded provenance; a worktree-discovery notice
-/// (cap or failure) follows; otherwise a readable config keeps the
-/// partial-discovery notice (or a parse failure keeps its content-free
-/// diagnostic). The runtime source is also the idle fallback, making the row a
-/// permanent part of the application grid rather than dynamically hiding a PTY
-/// row when a notice appears.
+/// (cap or failure) follows; an agents-cap notice follows that; otherwise a
+/// readable config keeps the partial-discovery notice (or a parse failure
+/// keeps its content-free diagnostic). The runtime source is also the idle
+/// fallback, making the row a permanent part of the application grid rather
+/// than dynamically hiding a PTY row when a notice appears.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StatusRowSource {
     Runtime,
     SshSelection,
     WorktreeDiagnostic,
+    AgentDiagnostic,
     SshDiagnostic,
 }
 
@@ -883,6 +1037,7 @@ impl StatusRowSource {
         runtime: &'a str,
         ssh_selection_status: Option<&'a str>,
         worktree_diagnostic: Option<&'a str>,
+        agent_diagnostic: Option<&'a str>,
         ssh_diagnostic: Option<&'a str>,
     ) -> &'a str {
         match self {
@@ -892,6 +1047,9 @@ impl StatusRowSource {
             }
             Self::WorktreeDiagnostic => {
                 worktree_diagnostic.expect("worktree diagnostic source requires diagnostic text")
+            }
+            Self::AgentDiagnostic => {
+                agent_diagnostic.expect("agent diagnostic source requires diagnostic text")
             }
             Self::SshDiagnostic => {
                 ssh_diagnostic.expect("SSH diagnostic source requires diagnostic text")
@@ -913,6 +1071,16 @@ impl NorenApp {
         let geometry =
             GridGeometry::with_cells(config.font().cell_width(), config.font().cell_height())
                 .unwrap_or_else(GridGeometry::poc);
+        // Configured agents are sidebar facts from the same validated file:
+        // the names come from configuration (already bounded), the sidebar
+        // bound applies on top, and the omitted count reaches the status row.
+        let mut workspace = WorkspaceState::new();
+        let agents_omitted = workspace.load_agents(config.agents());
+        let agent_diagnostic = (agents_omitted > 0).then(|| {
+            format!(
+                "Noren agents: showing first {MAX_AGENT_SIDEBAR_ROWS}; {agents_omitted} omitted"
+            )
+        });
         Self {
             window: None,
             renderer: None,
@@ -929,6 +1097,7 @@ impl NorenApp {
             ssh_diagnostic: None,
             ssh_selection_status: None,
             worktree_diagnostic: None,
+            agent_diagnostic,
             ssh_eof_since: None,
             ssh_spawn_enabled: true,
             #[cfg(test)]
@@ -939,7 +1108,7 @@ impl NorenApp {
             drag_mode: SelectionMode::Char,
             cursor_position: None,
             held_mouse_button: None,
-            workspace: WorkspaceState::new(),
+            workspace,
             sidebar_scroll_offset: 0,
             active_session: None,
             exited_surface_session: None,
@@ -963,6 +1132,8 @@ impl NorenApp {
             StatusRowSource::SshSelection
         } else if self.worktree_diagnostic.is_some() {
             StatusRowSource::WorktreeDiagnostic
+        } else if self.agent_diagnostic.is_some() {
+            StatusRowSource::AgentDiagnostic
         } else if self.ssh_diagnostic.is_some() {
             StatusRowSource::SshDiagnostic
         } else {
@@ -1426,6 +1597,81 @@ impl NorenApp {
                     },
                 );
                 self.status = WORKTREE_STATUS_LAUNCH_FAILED;
+                self.show_status = true;
+                self.redraw_needed = true;
+                None
+            }
+        }
+    }
+
+    /// Spawn a real PTY session running a configured agent's command, and
+    /// give it the live view.
+    ///
+    /// This is the agent-row runtime: the new sidebar row is a
+    /// `SessionKind::Agent` registry session backed by a PTY whose child is
+    /// the configured argv vector — a shell-free launch (see
+    /// [`noren_pty::AgentLaunchPolicy`]), so configuration text can never
+    /// become shell syntax. The registry observes `Running` when the spawn
+    /// succeeds and `Failed` when it does not (a missing or non-executable
+    /// command lands here as a visible failure: the configured row shows the
+    /// `AG-ERR` state, the session row shows `failed`, and the status row
+    /// carries the fixed failure line — never a hang, never a silent
+    /// no-op). A successful launch takes the live view and parks the
+    /// previous session, the same convention as every other launch; a
+    /// failed launch leaves the current live session untouched.
+    fn spawn_agent_session(&mut self, agent: &ConfiguredAgent) -> Option<SessionId> {
+        let id = self.workspace.create_session(SessionKind::Agent {
+            name: agent.name.clone(),
+        });
+        let Some((terminal, pty_size)) = self.session_surfaces() else {
+            self.workspace.observe_session(
+                id,
+                SessionStatus::Failed {
+                    reason: "terminal surface unavailable".to_owned(),
+                },
+            );
+            self.workspace.record_agent_launch_failure(&agent.name);
+            self.workspace.rebuild_sidebar();
+            self.redraw_needed = true;
+            return None;
+        };
+        // Configuration validated the command at load; the policy validation
+        // is defense in depth and folds into the same visible failure path
+        // rather than panicking on a value this process did not re-validate.
+        let launch = noren_pty::AgentLaunchPolicy::new(&agent.command, &agent.args)
+            .and_then(|policy| noren_pty::PtySession::spawn_agent(policy, pty_size));
+        match launch {
+            Ok(pty) => {
+                self.workspace.observe_session(id, SessionStatus::Running);
+                self.workspace.clear_agent_launch_failure(&agent.name);
+                self.park_active_session();
+                self.pty = Some(pty);
+                self.terminal = Some(terminal);
+                self.active_session = Some(id);
+                self.pty_child = PtyChildStatus::Running;
+                self.selection = None;
+                self.drag_origin = None;
+                self.exited_surface_session = None;
+                self.workspace
+                    .select_session(id)
+                    .expect("freshly spawned session is live");
+                self.ssh_selection_status = None;
+                self.redraw_needed = true;
+                Some(id)
+            }
+            Err(_) => {
+                self.workspace.observe_session(
+                    id,
+                    SessionStatus::Failed {
+                        reason: "PTY spawn failed".to_owned(),
+                    },
+                );
+                // observe_session already rebuilt once; recording the row
+                // marker after it needs a second rebuild or the configured
+                // row keeps its idle label.
+                self.workspace.record_agent_launch_failure(&agent.name);
+                self.workspace.rebuild_sidebar();
+                self.status = AGENT_STATUS_LAUNCH_FAILED;
                 self.show_status = true;
                 self.redraw_needed = true;
                 None
@@ -2191,6 +2437,15 @@ impl NorenApp {
             self.redraw_needed = true;
             return true;
         }
+        if let Some(agent) = self.workspace.agent_sidebar_row(row_index) {
+            // A configured agent row launches its validated argv in a PTY;
+            // the outcome (a running session or a visible launch failure) is
+            // first-class, exactly like a worktree row.
+            let agent = agent.clone();
+            self.spawn_agent_session(&agent);
+            self.redraw_needed = true;
+            return true;
+        }
         false
     }
 
@@ -2766,6 +3021,7 @@ impl NorenApp {
                 self.status,
                 self.ssh_selection_status.as_deref(),
                 self.worktree_diagnostic.as_deref(),
+                self.agent_diagnostic.as_deref(),
                 self.ssh_diagnostic.as_deref(),
             )
         });

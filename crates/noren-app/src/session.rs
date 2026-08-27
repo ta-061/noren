@@ -64,11 +64,12 @@ impl fmt::Display for SessionId {
 
 /// The launch shape of a session.
 ///
-/// Conforms to D-M3-001: five variants. [`Local`] and [`Worktree`] have
-/// implemented launch paths (a worktree session is a local PTY whose working
-/// directory is the worktree checkout); [`Project`], [`Ssh`], and [`Agent`]
-/// are carried as data so the enum is stable for exhaustive matching — no
-/// code in this module launches any of them.
+/// Conforms to D-M3-001: five variants. [`Local`], [`Worktree`], and
+/// [`Agent`] have implemented launch paths (a worktree session is a local
+/// PTY whose working directory is the worktree checkout; an agent session is
+/// a PTY running a configured, shell-free argv vector); [`Project`] and
+/// [`Ssh`] are carried as data so the enum is stable for exhaustive
+/// matching.
 ///
 /// D-M3-001 records the concrete payloads used here: `root`/`path` for the
 /// local-rooted kinds and `target`/`name` for the remote/agent kinds.
@@ -105,9 +106,11 @@ pub enum SessionKind {
         /// SSH target (`user@host` or `host`).
         target: String,
     },
-    /// An AI-agent-backed session. Reserved: not launched by this model.
+    /// An agent-backed session: a configured command launched in a PTY. The
+    /// payload is the display name from configuration; the argv itself lives
+    /// in the configuration the workspace loaded, never in this model.
     Agent {
-        /// Identifier or name of the backing agent.
+        /// Display name of the backing agent.
         name: String,
     },
 }
@@ -130,13 +133,18 @@ impl fmt::Debug for SessionKind {
 impl SessionKind {
     /// Whether this kind has an implemented launch path.
     ///
-    /// [`Local`](SessionKind::Local) and [`Worktree`](SessionKind::Worktree)
-    /// do today — a worktree session launches the fixed zsh policy in the
-    /// worktree directory. The spawn layer gates on this rather than
-    /// guessing; the other kinds are carried as reserved data.
+    /// [`Local`](SessionKind::Local), [`Worktree`](SessionKind::Worktree),
+    /// and [`Agent`](SessionKind::Agent) do today — a worktree session
+    /// launches the fixed zsh policy in the worktree directory, and an agent
+    /// session launches a configured, shell-free argv vector in a PTY. The
+    /// spawn layer gates on this rather than guessing; the other kinds are
+    /// carried as reserved data.
     #[must_use]
     pub const fn is_launchable(&self) -> bool {
-        matches!(self, Self::Local | Self::Worktree { .. })
+        matches!(
+            self,
+            Self::Local | Self::Worktree { .. } | Self::Agent { .. }
+        )
     }
 }
 
@@ -520,15 +528,22 @@ mod tests {
     }
 
     #[test]
-    fn local_and_worktree_kinds_are_launchable() {
+    fn local_worktree_and_agent_kinds_are_launchable() {
         // The worktree kind gained a real launch path (a local PTY whose
-        // working directory is the worktree checkout); the other kinds stay
-        // reserved data. A mutation reverting Worktree to non-launchable
-        // fails this test.
+        // working directory is the worktree checkout) and the agent kind a
+        // configured shell-free argv launch; the other kinds stay reserved
+        // data. A mutation reverting either to non-launchable fails this
+        // test.
         assert!(SessionKind::Local.is_launchable());
         assert!(
             SessionKind::Worktree {
                 path: PathBuf::from("/w")
+            }
+            .is_launchable()
+        );
+        assert!(
+            SessionKind::Agent {
+                name: "a".to_owned()
             }
             .is_launchable()
         );
@@ -541,12 +556,6 @@ mod tests {
         assert!(
             !SessionKind::Ssh {
                 target: "h".to_owned()
-            }
-            .is_launchable()
-        );
-        assert!(
-            !SessionKind::Agent {
-                name: "a".to_owned()
             }
             .is_launchable()
         );

@@ -1979,6 +1979,7 @@ fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_
             app.status,
             app.ssh_selection_status.as_deref(),
             app.worktree_diagnostic.as_deref(),
+            app.agent_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
         diagnostic
@@ -2011,6 +2012,7 @@ fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_
         app.status,
         app.ssh_selection_status.as_deref(),
         app.worktree_diagnostic.as_deref(),
+        app.agent_diagnostic.as_deref(),
         app.ssh_diagnostic.as_deref(),
     );
     let vertices = renderer::glyph_vertices_for(
@@ -2096,6 +2098,7 @@ fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_
             app.status,
             app.ssh_selection_status.as_deref(),
             app.worktree_diagnostic.as_deref(),
+            app.agent_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
         "Noren PTY operation failed",
@@ -2165,6 +2168,7 @@ fn selecting_an_ssh_row_keeps_a_pending_choice_and_never_a_registry_connection()
             app.status,
             app.ssh_selection_status.as_deref(),
             app.worktree_diagnostic.as_deref(),
+            app.agent_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
         "SSH partial source #0 config; launch failed"
@@ -3237,9 +3241,15 @@ fn single_instance_save_has_no_persistence_false_alarm() {
 /// click path runs its full validation and phase reporting without
 /// launching any process.
 fn app_with_deterministic_ssh_seam() -> NorenApp {
+    app_with_deterministic_ssh_seam_and_config(AppConfig::default())
+}
+
+/// The same deterministic ssh seam, carrying a real configuration so a test
+/// can exercise the configured surfaces (`[[agents]]` rows included).
+fn app_with_deterministic_ssh_seam_and_config(config: AppConfig) -> NorenApp {
     NorenApp {
         ssh_spawn_enabled: false,
-        ..NorenApp::default()
+        ..NorenApp::new(config)
     }
 }
 
@@ -5036,14 +5046,14 @@ fn worktree_session_paths(app: &NorenApp) -> Vec<PathBuf> {
 }
 
 /// Row order is FIXED — sessions first, then discovered worktree facts, then
-/// configured SSH hosts — and the click-path offset arithmetic silently
-/// depends on it, so the rendered order is pinned here with all three kinds
-/// present at once, including each kind's internal order (registry order,
-/// git listing order, config order). Agent-kind sessions render as ordinary
-/// session rows; the reserved `EntryKind::Agent` is never emitted by the
-/// sidebar rebuild, which the kind sequence pins as well.
+/// configured SSH hosts, then configured agents — and the click-path offset
+/// arithmetic silently depends on it, so the rendered order is pinned here
+/// with all four kinds present at once, including each kind's internal order
+/// (registry order, git listing order, config order). Agent-kind sessions
+/// render as ordinary session rows; a configured agent row (`EntryKind::Agent`)
+/// appears only for `[[agents]]` configuration entries.
 #[test]
-fn sidebar_rows_render_sessions_then_worktrees_then_ssh_hosts() {
+fn sidebar_rows_render_sessions_then_worktrees_then_ssh_hosts_then_agents() {
     let fixture = SshConfigFixture::new();
     fixture.write_new(b"Host zulu\nHost alpha\n");
     let records = git_worktree::parse_worktree_porcelain(
@@ -5052,8 +5062,13 @@ fn sidebar_rows_render_sessions_then_worktrees_then_ssh_hosts() {
          \nworktree /srv/mix-b\ndetached\n",
     )
     .expect("synthetic porcelain parses");
+    let config = AppConfig::parse(
+        "[[agents]]\nname = \"m-one\"\ncommand = \"/bin/true\"\n\
+         [[agents]]\nname = \"m-two\"\ncommand = \"/bin/true\"\n",
+    )
+    .expect("valid agents configuration");
 
-    let mut app = NorenApp::default();
+    let mut app = NorenApp::new(config);
     app.workspace
         .load_worktrees(WorktreeDiscovery::from_records(records));
     app.load_ssh_hosts_from(fixture.path());
@@ -5075,8 +5090,10 @@ fn sidebar_rows_render_sessions_then_worktrees_then_ssh_hosts() {
             EntryKind::Worktree,
             EntryKind::SshConnection,
             EntryKind::SshConnection,
+            EntryKind::Agent,
+            EntryKind::Agent,
         ],
-        "the fixed order is sessions, then worktrees, then SSH hosts"
+        "the fixed order is sessions, worktrees, SSH hosts, then agents"
     );
     // Worktree rows keep git's listing order (main first).
     assert_eq!(
@@ -5094,20 +5111,38 @@ fn sidebar_rows_render_sessions_then_worktrees_then_ssh_hosts() {
             .collect::<Vec<_>>(),
         vec!["SSH-OFF zulu", "SSH-OFF alpha"]
     );
+    // Agent rows keep the configuration's declaration order (short names:
+    // the label target budget is six characters, like an SSH target's).
+    assert_eq!(
+        rows[7..9]
+            .iter()
+            .map(|row| row.label().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["AGT-OFF m-one", "AGT-OFF m-two"]
+    );
+    assert_eq!(rows[7].detail(), Some("not running"));
+    assert!(
+        app.agent_diagnostic.is_none(),
+        "an in-cap agent list adds no notice"
+    );
 }
 
 /// Clicking each row kind in a mixed sidebar must select the row the user
 /// actually clicked — the default sidebar shape of this repository, which
-/// holds sessions, worktrees, and SSH hosts at once. The boundaries are
-/// asserted explicitly: the last worktree row, the first SSH row, the last
-/// SSH row, and the row immediately after the last SSH row (a dead click
-/// that must select nothing, not wrap).
+/// holds sessions, worktrees, SSH hosts, and configured agents at once. The
+/// boundaries are asserted explicitly: the last worktree row, the first SSH
+/// row, the last SSH row, the first and last agent rows, and the row
+/// immediately after the last agent row (a dead click that must select
+/// nothing, not wrap).
 ///
 /// Mutation checks:
 /// - dropping `+ worktree_rows` from `select_ssh_sidebar_row` makes the
 ///   first-SSH-row click resolve to a DIFFERENT host (the host list here is
 ///   longer than the worktree list, so the misresolved index lands on a
 ///   real host, not a dead click);
+/// - dropping `+ self.ssh_hosts.len()` from `agent_sidebar_row` (the agent
+///   block's offset arithmetic) makes the first-agent-row click a dead
+///   click or an SSH connect instead of an agent launch;
 /// - dropping the session-row offset from `worktree_sidebar_row` resolves a
 ///   worktree click to another worktree's row;
 /// - dropping the session bound from `local_sidebar_session` makes
@@ -5122,10 +5157,18 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
     let worktree_paths = mixed_worktree_directories(3);
     let records = git_worktree::parse_worktree_porcelain(&synthetic_porcelain(&worktree_paths))
         .expect("synthetic porcelain parses");
+    // Two configured agents whose launches are real, cheap, and immediate.
+    let config = AppConfig::parse(&format!(
+        "[[agents]]\nname = \"mix-agent-one\"\ncommand = \"/bin/echo\"\nargs = [\"{}\"]\n\
+         [[agents]]\nname = \"mix-agent-two\"\ncommand = \"/bin/echo\"\nargs = [\"{}\"]\n",
+        "MIX-AGENT-ONE", "MIX-AGENT-TWO"
+    ))
+    .expect("valid agents configuration");
 
     // The deterministic seam keeps SSH row clicks from spawning any process;
-    // worktree row clicks really launch (that is their observable identity).
-    let mut app = app_with_deterministic_ssh_seam();
+    // worktree and agent row clicks really launch (that is their observable
+    // identity).
+    let mut app = app_with_deterministic_ssh_seam_and_config(config);
     app.workspace
         .load_worktrees(WorktreeDiscovery::from_records(records));
     app.load_ssh_hosts_from(fixture.path());
@@ -5136,11 +5179,12 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
         }),
     ];
 
-    // Layout: rows 0-1 sessions, rows 2-4 worktrees, rows 5-9 SSH hosts.
+    // Layout: rows 0-1 sessions, rows 2-4 worktrees, rows 5-9 SSH hosts,
+    // rows 10-11 configured agents.
     assert_eq!(
         app.workspace.sidebar().rows().len(),
-        10,
-        "two session rows, three worktree rows, five SSH rows"
+        12,
+        "two session rows, three worktree rows, five SSH rows, two agent rows"
     );
 
     // Session rows select their own session, first and last alike.
@@ -5162,21 +5206,44 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
     assert!(click_sidebar_row(&mut app, 9), "the last SSH row");
     assert_eq!(app.workspace.selected_ssh_target(), Some("echo"));
 
-    // Row 10 — immediately after the last SSH row — selects nothing: not a
-    // session, not a host, no wrap-around, and no state changes at all.
-    let registry_len = app.workspace.registry().len();
-    assert!(
-        !click_sidebar_row(&mut app, 10),
-        "the row after the last SSH row is a dead click"
-    );
+    // First agent row (row 10): launches the FIRST configured agent — the
+    // created session's Agent name is the observable identity of WHICH row
+    // the click resolved to.
+    assert!(click_sidebar_row(&mut app, 10), "the first agent row");
     assert_eq!(
-        app.workspace.selected_ssh_target(),
-        Some("echo"),
-        "a dead click must not change the pending SSH choice"
+        agent_session_names(&app),
+        vec!["mix-agent-one".to_owned()],
+        "the click launches the agent the user pointed at"
+    );
+
+    // Each launch adds a session row, shifting the rows below: with three
+    // sessions the agent block occupies rows 11-12. Last agent row.
+    assert!(click_sidebar_row(&mut app, 12), "the last agent row");
+    assert_eq!(
+        agent_session_names(&app),
+        vec!["mix-agent-one".to_owned(), "mix-agent-two".to_owned()],
+        "the last agent row launches the second agent, not the first again"
+    );
+    assert!(
+        agent_session_names(&app)[0] != agent_session_names(&app)[1],
+        "the two agent clicks resolved to two DIFFERENT agents"
+    );
+
+    // Row 14 — immediately after the last agent row (with four sessions the
+    // layout is sessions 0-3, worktrees 4-6, SSH 7-11, agents 12-13) —
+    // selects nothing: not a session, not a host, not an agent, no
+    // wrap-around, and no state changes at all. (The agent launches already
+    // cleared the pending SSH choice by selecting their own sessions, so
+    // the invariant here is that a dead click changes NOTHING.)
+    let registry_len = app.workspace.registry().len();
+    let selected = app.workspace.registry().selected();
+    assert!(
+        !click_sidebar_row(&mut app, 14),
+        "the row after the last agent row is a dead click"
     );
     assert_eq!(
         app.workspace.registry().selected(),
-        Some(sessions[1]),
+        selected,
         "a dead click must not move the registry selection"
     );
     assert_eq!(
@@ -5185,27 +5252,27 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
         "a dead click must not create a session"
     );
 
-    // Last worktree row (row 4): launches a session rooted at the THIRD
-    // worktree — the row the user clicked, not the one an offset error
-    // would resolve to.
-    assert!(click_sidebar_row(&mut app, 4), "the last worktree row");
+    // Last worktree row (row 6 with four sessions): launches a session
+    // rooted at the THIRD worktree — the row the user clicked, not the one
+    // an offset error would resolve to.
+    assert!(click_sidebar_row(&mut app, 6), "the last worktree row");
     assert_eq!(
         worktree_session_paths(&app),
         vec![worktree_paths[2].clone()],
         "the click launches the worktree the user pointed at"
     );
 
-    // Each launch adds a session row, shifting the rows below: with three
-    // sessions the worktree block occupies rows 3-5. First worktree row.
-    assert!(click_sidebar_row(&mut app, 3), "the first worktree row");
+    // With five sessions the worktree block occupies rows 5-7. First
+    // worktree row.
+    assert!(click_sidebar_row(&mut app, 5), "the first worktree row");
     assert_eq!(
         worktree_session_paths(&app),
         vec![worktree_paths[2].clone(), worktree_paths[0].clone()]
     );
 
-    // With four sessions the worktree block occupies rows 4-6; the middle
-    // worktree is row 5.
-    assert!(click_sidebar_row(&mut app, 5), "a middle worktree row");
+    // With six sessions the worktree block occupies rows 6-8; the middle
+    // worktree is row 7.
+    assert!(click_sidebar_row(&mut app, 7), "a middle worktree row");
     assert_eq!(
         worktree_session_paths(&app),
         vec![
@@ -5215,25 +5282,434 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
         ]
     );
 
-    // After the launches the accumulated counts changed (five sessions), so
-    // the SSH boundary is re-asserted at its new offset: first SSH row 8.
+    // After the launches the accumulated counts changed (seven sessions),
+    // so the SSH and agent boundaries are re-asserted at their new offsets:
+    // sessions 0-6, worktrees 7-9, SSH 10-14, agents 15-16.
     assert_eq!(
         app.workspace.sidebar().rows().len(),
-        13,
-        "five session rows, three worktree rows, five SSH rows"
+        17,
+        "seven session rows, three worktree rows, five SSH rows, two agent rows"
     );
-    assert!(click_sidebar_row(&mut app, 8), "the first SSH row again");
+    assert!(click_sidebar_row(&mut app, 10), "the first SSH row again");
     assert_eq!(
         app.workspace.selected_ssh_target(),
         Some("alpha"),
         "the SSH offset must track the grown session block"
     );
     assert!(
-        !click_sidebar_row(&mut app, 13),
-        "the row after the last SSH row stays dead after the shifts"
+        !click_sidebar_row(&mut app, 17),
+        "the row after the last agent row stays dead after the shifts"
     );
 
     for path in &worktree_paths {
         let _ = std::fs::remove_dir(path);
     }
+}
+
+/// The names of every registry session launched from an agent row, in
+/// registry order — the observable identity of WHICH agent row a click
+/// selected.
+fn agent_session_names(app: &NorenApp) -> Vec<String> {
+    app.workspace
+        .registry()
+        .sessions()
+        .iter()
+        .filter_map(|descriptor| match descriptor.kind() {
+            SessionKind::Agent { name } => Some(name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+// ── Configured agents: rows, launches, failures, persistence ────────────
+//
+// The `[[agents]]` configuration slice (M5): configured agents are sidebar
+// facts until a row is selected; selecting launches the configured command
+// as a shell-free argv vector in a PTY (see `noren_pty::AgentLaunchPolicy`),
+// exactly like a local or SSH session; a missing or non-executable command
+// is a visible failure on the row, never a hang and never a silent no-op.
+
+/// Config text for `count` uniquely named agents running the same program
+/// with one distinguishing argument. Names stay inside the six-character
+/// label target budget so cap assertions read exact labels.
+fn many_agents_config(count: usize, command: &str) -> AppConfig {
+    let mut text = String::new();
+    for index in 0..count {
+        text.push_str(&format!(
+            "[[agents]]\nname = \"ag-{index:02}\"\ncommand = \"{command}\"\nargs = [\"a-{index:02}\"]\n"
+        ));
+    }
+    AppConfig::parse(&text).expect("synthetic agents configuration parses")
+}
+
+/// Configured agents appear as `EntryKind::Agent` rows in configuration
+/// order, with bounded labels: a name longer than the target budget is
+/// truncated with the shared ASCII marker, never overflowing the sidebar
+/// column.
+#[test]
+fn configured_agents_appear_as_sidebar_rows_with_bounded_labels() {
+    let config = AppConfig::parse(
+        "[[agents]]\nname = \"claude\"\ncommand = \"/bin/true\"\n\
+         [[agents]]\nname = \"a-very-long-agent-name-that-exceeds-the-budget\"\n\
+         command = \"/bin/true\"\n",
+    )
+    .expect("valid configuration");
+    let app = NorenApp::new(config);
+
+    let rows = app.workspace.sidebar().rows();
+    let kinds: Vec<EntryKind> = rows.iter().map(|row| row.kind()).collect();
+    assert_eq!(kinds, vec![EntryKind::Agent, EntryKind::Agent]);
+    assert_eq!(rows[0].label(), "AGT-OFF claude");
+    assert_eq!(rows[0].detail(), Some("not running"));
+    // The label budget mirrors the SSH target budget (six characters after
+    // the state prefix): three kept characters plus the shared ASCII
+    // truncation marker — never the full overlong name.
+    assert_eq!(
+        rows[1].label(),
+        "AGT-OFF a-v...",
+        "an overlong name is truncated with the shared marker: {}",
+        rows[1].label()
+    );
+    assert!(app.workspace.agents_omitted == 0);
+}
+
+/// More configured agents than the sidebar cap keep the first rows in
+/// configuration order and report the cap and the omitted count on the
+/// status row, exactly like the bounded SSH host and worktree lists.
+#[test]
+fn many_configured_agents_are_capped_and_the_omitted_count_is_reported() {
+    let config = many_agents_config(MAX_AGENT_SIDEBAR_ROWS + 2, "/bin/true");
+    let mut app = NorenApp::new(config);
+
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(
+        rows.len(),
+        MAX_AGENT_SIDEBAR_ROWS,
+        "the sidebar keeps exactly the capped row count"
+    );
+    assert_eq!(rows[0].label(), "AGT-OFF ag-00");
+    assert_eq!(
+        rows[MAX_AGENT_SIDEBAR_ROWS - 1].label(),
+        format!("AGT-OFF ag-{:02}", MAX_AGENT_SIDEBAR_ROWS - 1),
+        "the retained block is the FIRST {} in configuration order",
+        MAX_AGENT_SIDEBAR_ROWS
+    );
+    assert_eq!(
+        app.workspace.agents_omitted, 2,
+        "beyond-cap agents are counted, not silently dropped"
+    );
+    let notice = app
+        .agent_diagnostic
+        .as_deref()
+        .expect("the cap is reported on the status row");
+    assert!(
+        notice.contains("showing first 24") && notice.contains("2 omitted"),
+        "the notice names the cap and the omitted count: {notice}"
+    );
+    // The notice owns the status row whenever no runtime status shows.
+    app.show_status = false;
+    assert_eq!(app.status_row(), StatusRowSource::AgentDiagnostic);
+    assert_eq!(
+        app.status_row().text(
+            app.status,
+            app.ssh_selection_status.as_deref(),
+            app.worktree_diagnostic.as_deref(),
+            app.agent_diagnostic.as_deref(),
+            app.ssh_diagnostic.as_deref(),
+        ),
+        notice
+    );
+}
+
+/// Selecting an agent row must START the configured command — verified by
+/// reading the child's own output back through the terminal and its reaped
+/// exit code, never by trusting the code path that spawned it.
+///
+/// Mutation checks: making the click add a model row without spawning (no
+/// PTY, no `Running` observation), or pointing argv at the wrong agent,
+/// fails the assertions below.
+#[cfg(target_os = "macos")]
+#[test]
+fn selecting_an_agent_row_launches_the_configured_command_in_a_pty() {
+    let marker = format!("NOREN-AGENT-OUTPUT-{}", std::process::id());
+    let config = AppConfig::parse(&format!(
+        "[[agents]]\nname = \"echo-agent\"\ncommand = \"/bin/echo\"\nargs = [\"{marker}\"]\n"
+    ))
+    .expect("valid configuration");
+    let mut app = NorenApp::new(config);
+    assert!(click_sidebar_row(&mut app, 0), "the agent row is consumed");
+
+    // The launch created a real Agent-kind session that owns the live
+    // surface and is observed Running.
+    let ids = registry_ids(&app);
+    assert_eq!(ids.len(), 1, "one registry session from the agent row");
+    let id = ids[0];
+    assert_eq!(
+        app.workspace.registry().get(id).map(|d| d.kind().clone()),
+        Some(SessionKind::Agent {
+            name: "echo-agent".to_owned()
+        }),
+        "the session's launch shape carries the configured agent name"
+    );
+    assert_eq!(session_status(&app, id), SessionStatus::Running);
+    assert_eq!(app.active_session, Some(id));
+    assert!(app.pty.is_some(), "the agent session owns a real PTY");
+
+    // Read the child's ACTUAL output back: the marker /bin/echo printed is
+    // the evidence the configured command ran.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.drain_pty();
+        let answered = app
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal_text(terminal).contains(&marker));
+        if answered {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the agent child never produced its marker output\n\
+             expected: terminal text containing {marker}\n\
+             received: terminal said: {}",
+            app.terminal.as_ref().map(terminal_text).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // And the child's own clean exit is observed through the reaping path:
+    // the session row honestly reports `Exited`, never a stuck `Running`.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.drain_pty();
+        if session_status(&app, id) == (SessionStatus::Exited { code: Some(0) }) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the /bin/echo child was never reaped as exit 0; status: {:?}",
+            session_status(&app, id)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A configured command that does not exist is a clear, visible failure on
+/// the row — the configured row shows `AGT-ERR`, the created session row
+/// shows `failed`, and the fixed status line owns the status row — never a
+/// hang and never a silent no-op.
+///
+/// Mutation check (B): making a missing command report success (observe
+/// `Running`, skip the status line, or skip the row marker) fails every
+/// assertion past the click.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_agent_row_with_a_missing_command_is_a_visible_failure_never_a_hang() {
+    let config = AppConfig::parse(&format!(
+        "[[agents]]\nname = \"ghost\"\ncommand = \"/noren-missing-agent-{}\"\n",
+        std::process::id()
+    ))
+    .expect("valid configuration");
+    let mut app = NorenApp::new(config);
+
+    // The click returns promptly (a hang fails the test runner's deadline);
+    // nothing was spawned.
+    assert!(
+        click_sidebar_row(&mut app, 0),
+        "the agent row is consumed even when the launch fails"
+    );
+
+    // The failure is first-class on every surface a user can see.
+    assert_eq!(app.status, "Noren agent launch failed");
+    assert!(app.show_status, "the launch failure must be visible");
+    let rows = app.workspace.sidebar().rows();
+    // Session rows precede the configured agent rows: the failed launch
+    // inserted its session row at position 0.
+    assert_eq!(rows[1].label(), "AGT-ERR ghost");
+    assert_eq!(rows[1].detail(), Some("launch failed"));
+    // The created session row reports `failed`, never a phantom `Running`.
+    let ids = registry_ids(&app);
+    assert_eq!(
+        ids.len(),
+        1,
+        "the failed launch still creates its session row"
+    );
+    assert_eq!(
+        session_status(&app, ids[0]),
+        SessionStatus::Failed {
+            reason: "PTY spawn failed".to_owned()
+        }
+    );
+    assert_eq!(rows[0].kind(), EntryKind::Session);
+    assert_eq!(rows[0].detail(), Some("agent · failed"));
+    assert!(
+        app.pty.is_none(),
+        "a failed launch must leave no PTY behind"
+    );
+}
+
+/// A failed agent launch must not tear down a running local session (the
+/// SSH slice found this class of bug by independent review).
+#[cfg(target_os = "macos")]
+#[test]
+fn an_agent_launch_failure_never_retires_the_running_local_session() {
+    let home = AppTestHome::new();
+    let config = AppConfig::parse(&format!(
+        "[[agents]]\nname = \"ghost\"\ncommand = \"/noren-missing-agent-{}\"\n",
+        std::process::id()
+    ))
+    .expect("valid configuration");
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..NorenApp::new(config)
+    };
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let live = registry_ids(&app)[0];
+    assert!(app.pty.is_some(), "a live local session is running");
+
+    // Row 0 is the live local session; the agent row sits at row 1.
+    assert!(click_sidebar_row(&mut app, 1), "the agent row is consumed");
+
+    assert_eq!(
+        app.status, "Noren agent launch failed",
+        "the failure is surfaced first-class"
+    );
+    assert!(
+        app.pty.is_some(),
+        "a failed agent launch must not tear down the running local shell"
+    );
+    assert_eq!(
+        app.active_session,
+        Some(live),
+        "the local session keeps the live view"
+    );
+    assert_eq!(
+        session_status(&app, live),
+        SessionStatus::Running,
+        "the local session is not observed Exiting behind a failed launch"
+    );
+}
+
+/// Quitting with an agent session and a local session persists BOTH through
+/// the real sessions.toml path, and the next launch restores them — the
+/// agent kind round-trips with its name, local-session persistence is
+/// unharmed, and the configured COMMAND never reaches the state file (only
+/// the session's display name persists, the same class as a worktree path).
+#[cfg(target_os = "macos")]
+#[test]
+fn quitting_persists_agent_sessions_beside_local_sessions() {
+    let path = temp_state_path();
+    let home = AppTestHome::new();
+    let config = AppConfig::parse(
+        "[[agents]]\nname = \"persist-agent\"\ncommand = \"/bin/echo\"\nargs = [\"NOREN-PERSIST\"]\n",
+    )
+    .expect("valid configuration");
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..app_with_deterministic_ssh_seam_and_config(config)
+    };
+    app.workspace.state_path = Some(path.clone());
+
+    // One local session (palette) and one agent session (row click).
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    assert!(click_sidebar_row(&mut app, 1), "the agent row launches");
+    let ids = registry_ids(&app);
+    assert_eq!(ids.len(), 2);
+    assert_eq!(session_status(&app, ids[0]), SessionStatus::Running);
+    assert_eq!(session_status(&app, ids[1]), SessionStatus::Running);
+
+    app.teardown();
+
+    let text = std::fs::read_to_string(&path).expect("state saved on quit");
+    assert_eq!(
+        text.matches("kind = \"local\"").count(),
+        1,
+        "the local session still persists: {text}"
+    );
+    assert_eq!(
+        text.matches("kind = \"agent\"").count(),
+        1,
+        "the agent session persists with its kind: {text}"
+    );
+    assert!(
+        text.contains("name = \"persist-agent\""),
+        "the agent entry carries its display name for restoration: {text}"
+    );
+    assert!(
+        !text.contains("/bin/echo") && !text.contains("NOREN-PERSIST"),
+        "the configured command and args never reach sessions.toml: {text}"
+    );
+
+    // The next launch restores both rows as Restored with intact kinds.
+    let relaunched = sidebar_after_relaunch(&path);
+    assert_eq!(relaunched.registry().len(), 2);
+    let kinds: Vec<SessionKind> = relaunched
+        .registry()
+        .sessions()
+        .iter()
+        .map(|descriptor| descriptor.kind().clone())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            SessionKind::Local,
+            SessionKind::Agent {
+                name: "persist-agent".to_owned()
+            },
+        ]
+    );
+    for descriptor in relaunched.registry().sessions() {
+        assert_eq!(
+            descriptor.status(),
+            &SessionStatus::Restored,
+            "a relaunched row must be Restored, never a phantom Running"
+        );
+    }
+    cleanup_state_file(&path);
+}
+
+/// A configured agent's command can embed a private path. Every debug and
+/// status surface the launch flow can reach must stay free of it. The
+/// persisted sessions.toml deliberately carries the agent NAME (the user's
+/// own state, exactly what restoration needs — the same class as a worktree
+/// path) but never the command or its args.
+#[cfg(target_os = "macos")]
+#[test]
+fn agent_commands_never_reach_debug_status_or_state_surfaces() {
+    const NAME_SENTINEL: &str = "NOREN-AGENT-NAME-hunter2";
+    const COMMAND_SENTINEL: &str = "/noren/NOREN-AGENT-CMD-hunter2-missing";
+    let config = AppConfig::parse(&format!(
+        "[[agents]]\nname = \"{NAME_SENTINEL}\"\ncommand = \"{COMMAND_SENTINEL}\"\nargs = [\"{COMMAND_SENTINEL}\"]\n"
+    ))
+    .expect("valid configuration");
+    let path = temp_state_path();
+    let mut app = NorenApp::new(config);
+    app.workspace.state_path = Some(path.clone());
+
+    // The workspace (configured agents, sidebar view, registry) never
+    // prints the command — not before the click...
+    assert!(
+        !format!("{:?}", app.workspace).contains(COMMAND_SENTINEL),
+        "workspace debug leaked the agent command"
+    );
+    // ...and not after a failed launch (whose failure surfaces are fixed
+    // text).
+    assert!(click_sidebar_row(&mut app, 0), "the agent row is consumed");
+    assert_eq!(app.status, "Noren agent launch failed");
+    assert!(
+        !format!("{:?}", app.workspace).contains(COMMAND_SENTINEL),
+        "workspace debug leaked the agent command after the failure"
+    );
+    app.teardown();
+
+    let text = std::fs::read_to_string(&path).expect("state saved on quit");
+    assert!(
+        !text.contains(COMMAND_SENTINEL),
+        "the configured command must never reach sessions.toml: {text}"
+    );
+    assert!(
+        text.contains(NAME_SENTINEL),
+        "the agent NAME is the persisted identity, like a worktree path: {text}"
+    );
+    cleanup_state_file(&path);
 }

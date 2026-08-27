@@ -116,7 +116,7 @@ Measured against it, item by item:
 | --- | --- | --- |
 | Sidebar drawn | Done | `SIDEBAR_COLS` reserved in `renderer.rs`; `glyph_vertices` applies the column offset; `sidebar_text_lines` formats rows |
 | — projects, git worktrees | Worktrees launchable; projects modelled | Startup runs `git worktree list --porcelain` in the launch directory (`git_worktree.rs`) and shows at most 24 discovered worktrees as `EntryKind::Worktree` rows (beyond the cap the omitted count is reported); a registered-but-deleted worktree is listed with a `(missing)` marker and refused on selection; selecting a present row creates a `SessionKind::Worktree` session backed by a real `/bin/zsh` PTY whose child's working directory IS the worktree (verified by reading the child's own `pwd` back through the terminal), persisting and restoring through `sessions.toml` like a local session. `EntryKind::Project`/`SessionKind::Project` remain modelled-only with no runtime constructor |
-| — SSH connections, agents | Connections run for discovered aliases; discovery explicitly partial; agents fixture only | At most 24 positive literal OpenSSH aliases become `SessionKind::Ssh` and `SidebarEntry::SshConnection` rows; the status identifies partial discovery, and clicking one launches the fixed system `/usr/bin/ssh` client in the terminal's single PTY (argv is exactly `ssh -- <alias>`; no credential is ever argv-visible), with launch, connect, and disconnect failures as visible per-row and status-row states (PR #138). Wildcard/dynamic destinations are not a complete host inventory; agent entries remain reserved |
+| — SSH connections, agents | Connections run for discovered aliases; discovery explicitly partial; agents launchable from configuration | At most 24 positive literal OpenSSH aliases become `SessionKind::Ssh` and `SidebarEntry::SshConnection` rows; the status identifies partial discovery, and clicking one launches the fixed system `/usr/bin/ssh` client in the terminal's single PTY (argv is exactly `ssh -- <alias>`; no credential is ever argv-visible), with launch, connect, and disconnect failures as visible per-row and status-row states (PR #138). Wildcard/dynamic destinations are not a complete host inventory. `[[agents]]` entries in `config.toml` become at most 24 `EntryKind::Agent` rows (beyond the cap the omitted count is reported); selecting one creates a `SessionKind::Agent` session backed by a real PTY running the configured command as a shell-free argv vector (absolute path, no `PATH` lookup; a missing or non-executable command is a visible per-row and status-row failure), persisting and restoring through `sessions.toml` like every other session kind |
 | — terminal sessions | Runtime for local sessions | Every palette `session_create` spawns a real `SessionKind::Local` PTY (`spawn_local_session`); sidebar clicks and the palette's `session_select` switch the live view between live sessions (`switch_live_session`, parked surfaces keep draining and resizing), and `session_close` reaps the closed child and repairs the view. Rows restored from disk come back `Restored` with no live surface and cannot take the live view |
 | Single-session view | Done | The active terminal is drawn beside the sidebar, narrowed to the remaining columns; switching swaps the active surface whole, and rows without a live surface cannot claim its selection or input owner |
 | Session lifecycle | Done | `SessionStatus` advances `Starting -> Running -> Exited/Failed` via `SessionRegistry::observe`, wired in `main.rs` for spawned, parked, closed, and restored sessions alike |
@@ -125,22 +125,24 @@ Measured against it, item by item:
 | Configurable keybindings | Done for the palette surface | `[keys]` in `config.toml` (`KeymapConfig` in `config.rs`) rebinds the palette opener and the four palette command chords with the previous values as defaults; `palette_policy`/`handle_palette_key` in `main.rs` honor them, unparseable chords and unknown actions are typed errors, and the opener is validated against the pinned Zellij corpus and the exit leader. The exit leader, palette navigation keys, diagnostics chord, and clipboard shortcuts remain fixed |
 | Zellij pass-through | Done against a pinned corpus and a live installed Zellij | The shipped policy (`palette_policy` in `main.rs`) claims exactly two Super-modified chords — `Super+Escape` (exit leader) and `Super+p` (palette opener) — that the pinned Zellij `v0.44.3` default corpus (`ZELLIJ_FIXTURE_TAG`) never binds, and `tests/zellij_live.rs` drives an INSTALLED Zellij in a real PTY through the same parser, gate, and key encoder: attach enables mouse tracking in `TerminalState`, gated `Ctrl+t`/`n`/`Ctrl+p` reach Zellij and render tab #2 and pane #2, typed text reaches the pane's shell, and the installed version's default keybinds bind nothing in the Super/Cmd/Meta space. The harness skips (visibly, on the real stderr) when no `zellij` is on `PATH`. Empirical wire-shape note: Zellij 0.44.3 sends `1002`/`1006` as separate single-parameter DECSETs across its whole lifecycle and does not forward a pane program's multi-parameter DECSET to the host terminal, so the multi-parameter form `CSI ? 1002;1006 h` (the PR #113 regression site) is pinned as a co-located regression guard beside the live assertions, with the live multi-parameter count printed as drift telemetry. Beyond the skip, the suite today runs only where a developer runs it — no gating machine executes it (issue #153) |
 
-Two named scope items remain unsatisfied: **projects are not reachable** and
-**agents do not run**. No runtime path constructs an `EntryKind::Project` row
-or a `SessionKind::Project` session — the model, `parse_session` for a
-hand-written `sessions.toml`, and the tests are the only constructors — and
-`SidebarEntry::Agent` is likewise never emitted by the running binary, so no
-agent is ever launched. Positive
-literal aliases appear in a bounded sidebar list and a click launches a real
-system-ssh connection (PR #138), but wildcard or dynamic destinations are
-not presented as a complete host inventory. Configurable keybindings are
-satisfied for the palette surface only; the exit leader, palette navigation,
-diagnostics chord, and clipboard shortcuts remain compiled in. Since
-"Only evidence-backed work is marked complete" and the scope line names the
-two unsatisfied items, Milestone 3 stays **In progress**. The agent session
-kind also depends on Milestone 5; whether it and the project row are retired
-from Milestone 3's scope or carried is an open scoping decision, not something
-to settle by relabelling the status.
+Two named scope items remain unsatisfied: **projects are not reachable**
+and **host discovery is explicitly partial**. No runtime path constructs an
+`EntryKind::Project` row or a `SessionKind::Project` session — the model,
+`parse_session` for a hand-written `sessions.toml`, and the tests are the
+only constructors. Positive literal aliases appear in a bounded sidebar
+list and a click launches a real system-ssh connection (PR #138), but
+wildcard or dynamic destinations are not presented as a complete host
+inventory. Agent entries are no longer fixtures: `[[agents]]`
+configuration rows launch a configured, shell-free argv command in a real
+PTY (the first Milestone 5 slice); the remaining agent-experience scope
+(verified adapters, trustworthy state, notifications, jump-to-source) is
+Milestone 5 work. Configurable keybindings are satisfied for the palette
+surface only; the exit leader, palette navigation, diagnostics chord, and
+clipboard shortcuts remain compiled in. Since "Only evidence-backed work
+is marked complete" and the scope line names the unsatisfied items,
+Milestone 3 stays **In progress**; whether the project row is retired from
+Milestone 3's scope or carried is an open scoping decision, not something to
+settle by relabelling the status.
 
 Open engineering issues a reader of this section should know about: the
 behavior-preserving split of the oversized binary and SSH-parser modules
@@ -174,9 +176,10 @@ the Noren terminal." The reasoning and the decision are recorded in
   system `ssh` client in the terminal's PTY. Git
   worktrees of the launch repository ARE reachable now (discovered from
   `git worktree list --porcelain`, shown as bounded rows, and launched as
-  worktree-scoped sessions), while project rows remain unreachable and
-  agents remain fixture-only; keybindings ARE configurable through the
-  `[keys]` section since this milestone (see
+  worktree-scoped sessions), configured agents are launchable through the
+  `[[agents]]` section (a shell-free argv PTY launch with visible failure
+  states), while project rows remain unreachable; keybindings ARE
+  configurable through the `[keys]` section since this milestone (see
   [Milestone 3 status](#milestone-3-status)).
 - **Colour rendering exists, but themes are fixed.** `renderer.rs` resolves
   each cell's SGR foreground and any explicit background through its compiled-in

@@ -28,8 +28,9 @@ use std::fmt;
 ///
 /// This view-level taxonomy is deliberately wider than [`SessionKind`]:
 /// projects and worktrees are workspace anchors rather than launch shapes, a
-/// configured SSH target may appear without a running session, and agent
-/// entries remain reserved fixtures.
+/// configured SSH target may appear without a running session, and a
+/// configured agent entry names a launchable command without being a live
+/// session itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EntryKind {
     /// A project anchored at a directory.
@@ -38,7 +39,8 @@ pub enum EntryKind {
     Worktree,
     /// A configured SSH target. It is not a live connection or PTY.
     SshConnection,
-    /// A reserved agent. Fixture only: no agent is launched.
+    /// A configured agent entry. It names a launchable command; the entry
+    /// itself is not a live session, PTY, or running agent.
     Agent,
     /// A live terminal session described by a `SessionDescriptor`.
     Session,
@@ -136,10 +138,12 @@ pub enum SidebarEntry {
         /// connection, process, or viewport.
         selected: bool,
     },
-    /// A reserved agent entry.
+    /// A configured agent entry.
     Agent {
         /// Display name of the agent.
         label: String,
+        /// Fixed state text, such as `not running` or `launch failed`.
+        status: String,
     },
     /// A live terminal session, described by the shared contract descriptor.
     Session(SessionDescriptor),
@@ -329,10 +333,10 @@ impl SidebarView {
                         selected: is_selected,
                     }
                 }
-                SidebarEntry::Agent { label } => SidebarRow {
+                SidebarEntry::Agent { label, status } => SidebarRow {
                     kind: EntryKind::Agent,
                     label: label.clone(),
-                    detail: None,
+                    detail: Some(status.clone()),
                     selected: false,
                 },
                 SidebarEntry::Session(descriptor) => {
@@ -485,6 +489,7 @@ pub mod fixtures {
             },
             SidebarEntry::Agent {
                 label: "claude-code".to_string(),
+                status: "not running".to_string(),
             },
         ];
         entries.extend(registry.sessions().into_iter().map(SidebarEntry::Session));
