@@ -690,8 +690,13 @@ impl ResolutionWork {
 }
 
 fn ensure_resolution_work(work: ResolutionWork, limit: u128) -> Result<(), SshConfigError> {
-    if work.total() > limit {
-        return Err(error(0, SshConfigErrorKind::ResolutionComplexityExceeded));
+    let total = work.total();
+    if total > limit {
+        return Err(SshConfigError {
+            line: 0,
+            kind: SshConfigErrorKind::ResolutionComplexityExceeded,
+            resolution_work: Some(total),
+        });
     }
     Ok(())
 }
@@ -722,6 +727,11 @@ fn apply_settings(host: &mut SshHost, block: &Block) {
 pub struct SshConfigError {
     line: usize,
     kind: SshConfigErrorKind,
+    /// The aggregate resolution-work total when the error is
+    /// [`ResolutionComplexityExceeded`]; `None` for all other kinds.
+    /// Tests assert on this build-independent operation count instead of
+    /// wall-clock time (issue #154).
+    resolution_work: Option<u128>,
 }
 
 impl SshConfigError {
@@ -736,6 +746,15 @@ impl SshConfigError {
     #[must_use]
     pub const fn kind(&self) -> &SshConfigErrorKind {
         &self.kind
+    }
+
+    /// The aggregate resolution-work total that caused
+    /// [`ResolutionComplexityExceeded`].  `None` for every other kind.
+    /// The budget wall enforces this count, not elapsed time; exposing it
+    /// lets tests assert on the build-independent operation count.
+    #[must_use]
+    pub const fn resolution_work(&self) -> Option<u128> {
+        self.resolution_work
     }
 }
 
@@ -1340,7 +1359,11 @@ fn charge_token_item(used: &mut usize, limit: usize, line: usize) -> Result<(), 
 }
 
 fn error(line: usize, kind: SshConfigErrorKind) -> SshConfigError {
-    SshConfigError { line, kind }
+    SshConfigError {
+        line,
+        kind,
+        resolution_work: None,
+    }
 }
 
 fn parse_port(value: &str, line: usize) -> Result<u16, SshConfigError> {
