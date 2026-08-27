@@ -49,6 +49,19 @@
 //! `live_zellij_session_starts_without_popups_over_the_pane_area`, which
 //! fails if the suppression is removed and a popup is drawn.
 //!
+//! Hermetic teardown (issue #147 follow-up): `zellij delete-all-sessions
+//! --yes` returns success WITHOUT reaping the server process it talks to —
+//! every harness run used to leak one idle server (~100 MB RSS each)
+//! forever, and accumulated leaks starved later runs' pane spawns into
+//! failing the tab/pane test (the machine, not the code, decided the
+//! verdict; diagnosed in detail on [`LiveZellij::reap_session_server`]).
+//! Teardown is therefore bounded ([`TEARDOWN_BUDGET`]) and reaps this run's
+//! server by its unique socket-directory command line. Likewise, every
+//! spawned Zellij gets the inherited `ZELLIJ_*` environment scrubbed
+//! ([`SCRUBBED_ZELLIJ_ENV`]) before the isolation variables are set, so
+//! developer exports — notably `ZELLIJ_CONFIG_FILE`, which clap prefers
+//! over `ZELLIJ_CONFIG_DIR` — cannot escape the harness's control.
+//!
 //! The multi-parameter DECSET path is a proven regression site (fixed in
 //! PR #113), so the mouse-mode test pins it EXPLICITLY beside the live
 //! evidence: after asserting on the real attach stream, it drives
@@ -91,7 +104,67 @@ const INTERACTION_BUDGET: Duration = Duration::from_secs(8);
 /// asserted. This is a settle window for detecting a popup that SHOULD be
 /// there under a mutation — never a fixed sleep that a dismissal waits on.
 const POPUP_SETTLE_BUDGET: Duration = Duration::from_secs(2);
+/// How long a teardown `zellij` CLI subprocess may run before the harness
+/// kills it. `zellij delete-all-sessions --yes` has no timeout of its own;
+/// pointed at a starved or wedged server its connect/retry loop can block
+/// for tens of seconds, which is exactly the machine state teardown runs in
+/// after a failing test (issue #147: failing runs previously took ~90 s just
+/// to unwind). The bound keeps worst-case teardown linear and small.
+const TEARDOWN_BUDGET: Duration = Duration::from_secs(5);
+/// Attempts (each a pgrep + SIGKILL round) to reap this run's leaked Zellij
+/// server before giving up and printing a visible notice. The server is
+/// normally gone after the first SIGKILL; the retries only cover the window
+/// where it is mid-exit when pgrep still lists it.
+const SERVER_REAP_ATTEMPTS: usize = 5;
 const CONFIG_FILE_NAME: &str = "config.kdl";
+
+/// Every `ZELLIJ_*` environment variable the installed Zellij binary is
+/// known to read (verified against the 0.44.3 binary's own strings). The
+/// harness scrubs all of them from every Zellij subprocess it spawns and
+/// then sets the three isolation variables explicitly, so a developer's
+/// exported Zellij state cannot escape the harness's control:
+///
+/// - `ZELLIJ_CONFIG_FILE` is clap's `-c/--config` environment form and takes
+///   precedence over `--config-dir`/`ZELLIJ_CONFIG_DIR` (independent review
+///   of the popup fix, issue #147): with it set, the attached session would
+///   read the developer's config file instead of the harness-seeded one and
+///   the popup-suppression pin would test the wrong configuration.
+/// - `ZELLIJ_SESSION_NAME` is the clap default for `--session`; scrubbed so
+///   the session name is exactly what the harness passes, never inherited.
+/// - `ZELLIJ_AUTO_ATTACH`/`ZELLIJ_AUTO_EXIT` change client behaviour inside
+///   sessions; `ZELLIJ_PANE_ID` marks a process as a pane child. None may
+///   leak into a harness-spawned client.
+/// - `ZELLIJ_CONFIG_DIR`/`ZELLIJ_DATA_DIR`/`ZELLIJ_SOCKET_DIR` are the
+///   isolation variables themselves: scrub-then-set makes the explicit value
+///   authoritative even if the environment already exports one.
+const SCRUBBED_ZELLIJ_ENV: [&str; 8] = [
+    "ZELLIJ_CONFIG_FILE",
+    "ZELLIJ_CONFIG_DIR",
+    "ZELLIJ_DATA_DIR",
+    "ZELLIJ_SOCKET_DIR",
+    "ZELLIJ_SESSION_NAME",
+    "ZELLIJ_AUTO_ATTACH",
+    "ZELLIJ_AUTO_EXIT",
+    "ZELLIJ_PANE_ID",
+];
+
+/// Scrub the inherited Zellij environment of a std `Command` (see
+/// [`SCRUBBED_ZELLIJ_ENV`]); the caller sets the isolation variables
+/// afterwards.
+fn scrub_zellij_env(command: &mut Command) {
+    for key in SCRUBBED_ZELLIJ_ENV {
+        command.env_remove(key);
+    }
+}
+
+/// Scrub the inherited Zellij environment of a portable-pty
+/// `CommandBuilder` (see [`SCRUBBED_ZELLIJ_ENV`]); the caller sets the
+/// isolation variables afterwards.
+fn scrub_zellij_env_pty(command: &mut CommandBuilder) {
+    for key in SCRUBBED_ZELLIJ_ENV {
+        command.env_remove(key);
+    }
+}
 
 /// Session-start popup suppression appended to the seeded configuration
 /// (issue #147). Both are top-level `config.kdl` options of the installed
@@ -148,6 +221,12 @@ fn report_skip(test: &str) {
         "SKIP [{test}]: zellij is not installed (or `zellij --version` failed); \
          live pass-through evidence was NOT gathered. This is a skip, not a pass."
     );
+    write_raw_stderr(&notice);
+}
+
+/// Write a notice to the real stderr file descriptor, bypassing the test
+/// harness's output capture (see [`report_skip`]).
+fn write_raw_stderr(notice: &str) {
     match fs::OpenOptions::new().write(true).open("/dev/stderr") {
         Ok(mut file) => {
             let _ = file.write_all(notice.as_bytes());
@@ -227,6 +306,7 @@ impl LiveZellij {
 
         let mut dump = Command::new("zellij");
         dump.args(["setup", "--dump-config"]);
+        scrub_zellij_env(&mut dump);
         for (key, value) in dirs.env_pairs() {
             dump.env(key, value);
         }
@@ -274,6 +354,7 @@ impl LiveZellij {
         command.env("TERM_PROGRAM", metadata.term_program);
         command.env_remove("COLUMNS");
         command.env_remove("LINES");
+        scrub_zellij_env_pty(&mut command);
         for (key, value) in dirs.env_pairs() {
             command.env(key, value);
         }
@@ -404,16 +485,94 @@ impl LiveZellij {
     }
 }
 
+/// Run one teardown `zellij` CLI to completion under [`TEARDOWN_BUDGET`],
+/// killing it if it overruns. Returns whether it exited (by any means) and
+/// its success flag when it did. Teardown subprocesses must never hang the
+/// test: [`Drop`] also runs while a panic unwinds, and an unbounded child
+/// turns every failing live test into a minutes-long failure.
+fn run_zellij_bounded(command: &mut Command) -> Option<bool> {
+    let mut child = command.spawn().ok()?;
+    let deadline = Instant::now() + TEARDOWN_BUDGET;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.success()),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 impl Drop for LiveZellij {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
         let mut cleanup = Command::new("zellij");
         cleanup.args(["delete-all-sessions", "--yes"]);
+        scrub_zellij_env(&mut cleanup);
         for (key, value) in self.dirs.env_pairs() {
             cleanup.env(key, value);
         }
-        let _ = cleanup.output();
+        let _ = run_zellij_bounded(&mut cleanup);
+        self.reap_session_server();
+    }
+}
+
+impl LiveZellij {
+    /// Kill the Zellij server this run spawned, by finding the process whose
+    /// command line carries this run's isolated socket directory
+    /// (`zellij --server <socket dir>/contract_version_1/<session>`).
+    ///
+    /// Why reaping is load-bearing (issue #147): `zellij delete-all-sessions
+    /// --yes` reports success while the server process itself stays alive —
+    /// verified by leaving a live test's server running ~2 minutes past a
+    /// successful teardown, and by the ~140 idle leaked servers (each
+    /// pinning ~100 MB RSS) found while diagnosing this issue. Because every
+    /// run — passing or failing — used to leak one server per spawned
+    /// session, repeated runs (verification loops, review runs, suites)
+    /// pushed a 16 GB machine into double-digit GB of swap; fork/exec of a
+    /// new pane's shell then took 30–60 s in D-state, Zellij's soft 1 s
+    /// action-completion deadline (`ACTION_COMPLETION_TIMEOUT`, route.rs —
+    /// a diagnostic, the action still completes) and this harness's 8 s
+    /// assertion budget blew, and `live_zellij_tab_and_pane_chords…` failed
+    /// at "forwarded n did not create Zellij pane 2" despite healthy code.
+    /// The harness owns the processes it spawns, so it reaps them itself.
+    ///
+    /// Scoped to this run's socket directory, so concurrent harness runs
+    /// (different directories) are never affected. `pgrep`/`kill` are the
+    /// portable crutches for "find process by command line" without unsafe
+    /// `libc` calls (the workspace denies hand-written `unsafe`); if either
+    /// is missing, teardown degrades to the delete-all-sessions path above
+    /// and a visible notice is printed — never a panic: this runs during
+    /// unwind.
+    fn reap_session_server(&self) {
+        let pattern = format!("zellij --server {}", self.dirs.socket.display());
+        for _ in 0..SERVER_REAP_ATTEMPTS {
+            let Ok(pgrep) = Command::new("pgrep").arg("-f").arg(&pattern).output() else {
+                return;
+            };
+            let pids = String::from_utf8_lossy(&pgrep.stdout);
+            let pids: Vec<&str> = pids.split_whitespace().collect();
+            if pids.is_empty() {
+                return;
+            }
+            for pid in &pids {
+                let _ = Command::new("kill").arg("-9").arg(pid).status();
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        write_raw_stderr(&format!(
+            "NOTICE [zellij_live]: a Zellij server for socket dir {} is still alive after \
+             teardown; it pins ~100 MB RSS and, if left to accumulate across runs, starves \
+             later live runs (issue #147). Kill it manually: pkill -9 -f '{pattern}'",
+            self.dirs.socket.display()
+        ));
     }
 }
 
@@ -724,6 +883,7 @@ fn live_zellij_default_keybinds_bind_no_super_chord() {
     let dirs = ZellijDirs::new();
     let mut dump = Command::new("zellij");
     dump.args(["setup", "--dump-config"]);
+    scrub_zellij_env(&mut dump);
     for (key, value) in dirs.env_pairs() {
         dump.env(key, value);
     }
