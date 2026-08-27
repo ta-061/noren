@@ -70,7 +70,7 @@ use std::fs;
 use std::io::Write;
 use std::process::Command;
 
-use noren_app::theme::{DARK, Theme};
+use noren_app::theme::{DARK, HIGH_CONTRAST, LIGHT, Theme};
 use noren_app::{
     GridGeometry, MAX_RENDER_COLS, MAX_RENDER_ROWS, POC_CELL_HEIGHT as CELL_HEIGHT,
     POC_CELL_WIDTH as CELL_WIDTH,
@@ -944,6 +944,189 @@ fn theme_absent_config_renders_byte_identically_to_the_explicit_dark_theme() {
     assert!(
         is_clear(via_dark.pixel(8, 1)),
         "the dark default's clear colour moved"
+    );
+}
+
+/// The single lit colour inside a cell, measured over a themed ground.
+///
+/// The shared [`cell_color`] skips pixels matching the *dark* clear colour,
+/// which under a light theme would skip nothing (or everything). This
+/// variant takes the theme's own background as the ground predicate, so a
+/// themed frame's glyph colour can be read the same way.
+fn cell_color_over(frame: &CapturedFrame, ground: [u8; 3], row: u32, col: u32) -> [u8; 3] {
+    let mut colors: Vec<[u8; 3]> = Vec::new();
+    for y in 0..CELL_HEIGHT {
+        for x in 0..CELL_WIDTH {
+            let pixel = frame.pixel(col * CELL_WIDTH + x, row * CELL_HEIGHT + y);
+            let rgb = [pixel[0], pixel[1], pixel[2]];
+            if colors_match(rgb, ground) {
+                continue;
+            }
+            if !colors.iter().any(|seen| colors_match(*seen, rgb)) {
+                colors.push(rgb);
+            }
+        }
+    }
+    assert_eq!(
+        colors.len(),
+        1,
+        "cell ({row},{col}) should hold exactly one colour over the ground, \
+         found {colors:?}"
+    );
+    colors[0]
+}
+
+/// The theme-reachability headline: a cell drawn with a given SGR colour must
+/// produce **different pixels** under `light` than under `dark`, and each must
+/// match its own theme's palette. The chain driven here is the real one —
+/// `AppConfig::parse` of actual `[theme]` TOML → the theme's palette → the
+/// shipped vertex/pipeline/clear path — so a theme that parses but never
+/// reaches drawing cannot pass this test (the mutation that ignores the
+/// setting fails here).
+#[test]
+fn a_configured_theme_changes_what_the_renderer_draws() {
+    let Some(renderer) = renderer_or_skip("a_configured_theme_changes_what_the_renderer_draws")
+    else {
+        return;
+    };
+    // red 'b', green 'c', unstyled 'a', red-background 'd' (default fg), and
+    // two empty columns whose pixels show the theme's clear colour.
+    let snap = snapshot(1, 6, b"\x1b[31mb\x1b[32mc\x1b[0ma\x1b[41md");
+
+    let theme_for = |text: &str| {
+        noren_app::config::AppConfig::parse(text)
+            .unwrap_or_else(|error| panic!("{text:?} must parse: {error}"))
+            .theme()
+            .palette()
+    };
+    let dark = theme_for("[theme]\nname = \"dark\"\n");
+    let light = theme_for("[theme]\nname = \"light\"\n");
+    assert_eq!(dark, DARK);
+    assert_eq!(light, LIGHT);
+
+    let dark_frame = render_with_theme(&renderer, &dark, &snap);
+    let light_frame = render_with_theme(&renderer, &light, &snap);
+    assert_ne!(
+        dark_frame.rgba, light_frame.rgba,
+        "the two themes must produce different pixels for the same snapshot"
+    );
+
+    // SGR 31: dark draws xterm red, light draws its darkened red; different.
+    let dark_red = cell_color_over(&dark_frame, dark.background_u8(), 0, 0);
+    let light_red = cell_color_over(&light_frame, light.background_u8(), 0, 0);
+    assert!(
+        colors_match(dark_red, DARK.ansi()[1]),
+        "dark SGR 31 drew {dark_red:?}, expected {:?}",
+        DARK.ansi()[1]
+    );
+    assert!(
+        colors_match(light_red, LIGHT.ansi()[1]),
+        "light SGR 31 drew {light_red:?}, expected {:?}",
+        LIGHT.ansi()[1]
+    );
+    assert!(
+        !colors_match(dark_red, light_red),
+        "SGR 31 must draw different pixels under the two themes"
+    );
+
+    // SGR 32 likewise.
+    let dark_green = cell_color_over(&dark_frame, dark.background_u8(), 0, 1);
+    let light_green = cell_color_over(&light_frame, light.background_u8(), 0, 1);
+    assert!(colors_match(dark_green, DARK.ansi()[2]));
+    assert!(colors_match(light_green, LIGHT.ansi()[2]));
+    assert!(!colors_match(dark_green, light_green));
+
+    // Unstyled text: the theme's default foreground, different per theme.
+    let dark_plain = cell_color_over(&dark_frame, dark.background_u8(), 0, 2);
+    let light_plain = cell_color_over(&light_frame, light.background_u8(), 0, 2);
+    assert!(colors_match(dark_plain, DARK.foreground_u8()));
+    assert!(colors_match(light_plain, LIGHT.foreground_u8()));
+    assert!(
+        !colors_match(dark_plain, light_plain),
+        "unstyled text must change with the theme"
+    );
+
+    // An explicit SGR 41 background paints its theme's palette entry: the
+    // cell corner is glyph-free, so it is pure background.
+    let dark_bg = [
+        dark_frame.pixel(3 * CELL_WIDTH, 0)[0],
+        dark_frame.pixel(3 * CELL_WIDTH, 0)[1],
+        dark_frame.pixel(3 * CELL_WIDTH, 0)[2],
+    ];
+    let light_bg = [
+        light_frame.pixel(3 * CELL_WIDTH, 0)[0],
+        light_frame.pixel(3 * CELL_WIDTH, 0)[1],
+        light_frame.pixel(3 * CELL_WIDTH, 0)[2],
+    ];
+    assert!(
+        colors_match(dark_bg, DARK.ansi()[1]),
+        "dark SGR 41 corner drew {dark_bg:?}, expected {:?}",
+        DARK.ansi()[1]
+    );
+    assert!(
+        colors_match(light_bg, LIGHT.ansi()[1]),
+        "light SGR 41 corner drew {light_bg:?}, expected {:?}",
+        LIGHT.ansi()[1]
+    );
+
+    // The untouched ground is each theme's clear colour (empty column 4).
+    let dark_clear = dark_frame.pixel(4 * CELL_WIDTH, 0);
+    let light_clear = light_frame.pixel(4 * CELL_WIDTH, 0);
+    assert!(is_clear(dark_clear), "dark clear colour moved");
+    assert!(
+        colors_match(
+            [light_clear[0], light_clear[1], light_clear[2]],
+            LIGHT.background_u8()
+        ),
+        "light clear pixel {light_clear:?} is not the light background {:?}",
+        LIGHT.background_u8()
+    );
+}
+
+/// High-contrast draws its own pastel palette on pure black — the theme whose
+/// measured minimum (7.84:1) clears WCAG AAA — and its pixels differ from
+/// both other themes'.
+#[test]
+fn high_contrast_theme_draws_its_own_verified_palette() {
+    let Some(renderer) = renderer_or_skip("high_contrast_theme_draws_its_own_verified_palette")
+    else {
+        return;
+    };
+    let snap = snapshot(1, 6, b"\x1b[31mb\x1b[32mc\x1b[0ma\x1b[41md");
+
+    let hc = noren_app::config::AppConfig::parse("[theme]\nname = \"high-contrast\"\n")
+        .expect("high-contrast is a valid theme name")
+        .theme()
+        .palette();
+    assert_eq!(hc, HIGH_CONTRAST);
+
+    let hc_frame = render_with_theme(&renderer, &hc, &snap);
+    let dark_frame = render_with_theme(&renderer, &DARK, &snap);
+    let light_frame = render_with_theme(&renderer, &LIGHT, &snap);
+    assert_ne!(hc_frame.rgba, dark_frame.rgba);
+    assert_ne!(hc_frame.rgba, light_frame.rgba);
+
+    // SGR 31 is the pastel red; unstyled text is pure white on pure black.
+    assert!(
+        colors_match(
+            cell_color_over(&hc_frame, hc.background_u8(), 0, 0),
+            HIGH_CONTRAST.ansi()[1]
+        ),
+        "high-contrast SGR 31 must draw {:?}",
+        HIGH_CONTRAST.ansi()[1]
+    );
+    assert!(
+        colors_match(
+            cell_color_over(&hc_frame, hc.background_u8(), 0, 2),
+            HIGH_CONTRAST.foreground_u8()
+        ),
+        "high-contrast unstyled text must be pure white"
+    );
+    let clear = hc_frame.pixel(4 * CELL_WIDTH, 0);
+    assert_eq!(
+        [clear[0], clear[1], clear[2]],
+        [0, 0, 0],
+        "high-contrast clear must be pure black"
     );
 }
 

@@ -122,17 +122,28 @@ Each item states what you would actually see if you ran the build.
   word "cursor" does not appear anywhere in `renderer.rs`. In practice: you type, characters appear,
   and nothing shows you where the insertion point is. This is the first thing
   most people notice.
-- **Colours render, but the palette and theme are fixed.** `glyph_vertices`
-  reads each terminal cell's attributes: `resolve_foreground` and
-  `resolve_background` route ANSI and 256-colour values through
-  `DEFAULT_PALETTE`, while direct RGB truecolor passes through unchanged
-  (`crates/noren-app/src/renderer.rs`). Explicit backgrounds emit a full-cell
-  rectangle before the glyph. Each vertex now carries a `Float32x2` position
-  and `Float32x3` resolved colour on a 20-byte stride, and `fs_main` returns
-  that per-vertex colour. The defaults and xterm-style palette are compiled in;
-  `config.rs` exposes no palette or theme setting. In practice, SGR foreground
-  and explicit background colours appear, but users cannot select or customise
-  a light, dark, high-contrast, or colour-vision-friendly theme.
+- **Colours render through a selectable theme, but the default palette fails
+  WCAG AA on five slots.** `[theme] name` in `config.toml` selects one of
+  three built-in palettes — `dark` (the default, byte-identical to the
+  pre-theme colours), `light`, and `high-contrast` — and `glyph_vertices_for`
+  in `crates/noren-app/src/renderer.rs` resolves every SGR colour, the
+  default foreground, and the clear colour through it
+  (`resolve_foreground`/`resolve_background` route ANSI and 256-colour
+  values through the theme's table; truecolor passes through). **The known
+  contrast finding:** the default `dark` palette fails the WCAG AA normal-text
+  floor (4.5:1) for five of its sixteen ANSI slots on its own background —
+  black at 1.06:1, blue at 2.10:1, red at 3.38:1, bright blue at 4.16:1, and
+  magenta at 4.21:1 — measured and pinned by
+  `default_dark_palette_minimum_is_pinned_below_the_aa_floor` in
+  `crates/noren-app/tests/theme.rs`. The values stay frozen because the
+  no-`[theme]` default must render byte-identically to the pre-theme
+  renderer (pinned by the frame oracle); fixing them is a separate
+  deliberate decision. `light` (measured minimum 5.07:1) and `high-contrast`
+  (7.84:1, above WCAG AAA) pass every slot. In practice: programs that emit
+  SGR red, blue, bright blue, magenta, or black text on the default dark
+  background draw below the AA floor until the dark palette is revisited;
+  selecting `high-contrast` avoids it. Themes are built-in only — there is
+  no custom-palette or colour-vision-friendly configuration.
 - **The bitmap font is coverage-bounded, and seven glyph pairs are visually
   identical.** Glyphs are a hand-built 5x7 bitmap in `glyph_rows`
   (`crates/noren-app/src/renderer.rs`): printable ASCII keeps distinct
@@ -318,8 +329,10 @@ key event into a live window and observes the result. The oracle guards
 structural shape, grid mapping, and resolved pixel colour, but not glyph
 identity or overall perceptual correctness, so the manual check above remains a
 smoke test of the window→grid→PTY chain rather than a perceptual proof of what
-appears on screen. The palette/theme has no user-configurable surface to test;
-IME and accessibility remain absent from both testing and the build.
+appears on screen. Theme selection is configurable and its drawing path is
+oracle-tested, but the built-in palettes are fixed tables — no custom theme
+surface exists to test; IME and accessibility remain absent from both
+testing and the build.
 
 ## What is deliberately delegated
 
@@ -352,6 +365,8 @@ shows no first-launch warning about any of this; verify any build yourself
 rather than trusting a copy from elsewhere. Nothing here should be
 read as "nearly done": the honest summary is that the foundation is tested, a
 first workspace slice is now real and visible, and what stands between this and
-a usable daily terminal is not workspace plumbing but the display itself —
-a user-configurable theme, a real font, and a cursor. SGR colour is now drawn,
-but its fixed defaults are not yet a usable theming system.
+a usable daily terminal is not workspace plumbing but the display itself — a
+theme whose default palette clears WCAG AA on every slot, a real font, and a
+cursor. SGR colour is drawn through selectable light/dark/high-contrast
+themes with verified contrast, but the built-in palettes are not yet a
+custom theming system.
