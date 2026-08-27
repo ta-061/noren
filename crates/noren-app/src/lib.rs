@@ -11,6 +11,7 @@
 mod clipboard;
 pub mod config;
 pub mod diagnostics;
+pub mod git_worktree;
 mod input;
 pub mod mouse;
 pub mod palette;
