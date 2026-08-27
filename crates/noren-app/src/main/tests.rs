@@ -1940,6 +1940,7 @@ fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_
         source.text(
             app.status,
             app.ssh_selection_status.as_deref(),
+            app.worktree_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
         diagnostic
@@ -1971,6 +1972,7 @@ fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_
     let status = source.text(
         app.status,
         app.ssh_selection_status.as_deref(),
+        app.worktree_diagnostic.as_deref(),
         app.ssh_diagnostic.as_deref(),
     );
     let vertices = renderer::glyph_vertices(
@@ -2057,6 +2059,7 @@ fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_
         source.text(
             app.status,
             app.ssh_selection_status.as_deref(),
+            app.worktree_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
         "Noren PTY operation failed",
@@ -2125,6 +2128,7 @@ fn selecting_an_ssh_row_keeps_a_pending_choice_and_never_a_registry_connection()
         source.text(
             app.status,
             app.ssh_selection_status.as_deref(),
+            app.worktree_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
         "SSH partial source #0 config; launch failed"
@@ -3604,7 +3608,9 @@ impl AppTestHome {
         Self(path)
     }
 
-    /// A default app whose spawned sessions run in this isolated home.
+    /// A default app whose spawned sessions run in this isolated home —
+    /// local sessions and worktree sessions alike (a worktree child still
+    /// starts *in* its worktree; only its `HOME` is isolated).
     ///
     /// Borrows the guard so it stays alive (and the directory stays present)
     /// for the whole test: the child validates the directory at spawn time.
@@ -3644,23 +3650,40 @@ fn session_status(app: &NorenApp, id: SessionId) -> SessionStatus {
 
 /// Drain the live view until the shell has produced its first output.
 ///
-/// Real zsh sessions run in the inherited `$HOME`, whose startup files a user
-/// may have customized: input typed before they finish races them, so every
-/// test that drives a shell by typing first waits for its prompt.
+/// The shell sessions these tests drive run in an isolated `HOME` (see
+/// [`AppTestHome`]), so their prompt is immediate and deterministic; a
+/// developer's real `$HOME` with slow startup files could not meet this
+/// deadline. Input typed while zsh is still starting races its startup, so
+/// every test that drives a shell by typing first waits for its prompt.
 fn wait_for_shell_output(app: &mut NorenApp) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(10);
     loop {
         app.drain_pty();
         let ready = app
             .terminal
             .as_ref()
             .is_some_and(|terminal| terminal.screen().display_row_count() > 0);
-        assert!(
-            Instant::now() < deadline || ready,
-            "the spawned shell never produced its prompt"
-        );
         if ready {
             return;
+        }
+        if Instant::now() >= deadline {
+            let rows = app
+                .terminal
+                .as_ref()
+                .map(|terminal| terminal.screen().display_row_count());
+            let text = app.terminal.as_ref().map(terminal_text).unwrap_or_default();
+            panic!(
+                "the spawned shell never produced its prompt\n\
+                 expected: the live terminal to render at least one display row \
+                 of shell output within 10s\n\
+                 received: display_row_count={rows:?} after {:?} \
+                 (terminal_attached={}, pty_attached={}), terminal said: {:?}",
+                start.elapsed(),
+                app.terminal.is_some(),
+                app.pty.is_some(),
+                text,
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -4297,4 +4320,887 @@ fn a_restored_row_never_takes_the_live_view_from_the_running_session() {
         "the live shell survives closing the restored row"
     );
     cleanup_state_file(&path);
+}
+
+// ── Git worktree discovery and worktree sessions ────────────────────────
+//
+// The live fixtures drive the real `git` binary (never a scraped fixture of
+// its output): every worktree case the ROADMAP names — not a repository, a
+// single worktree, a registered-but-deleted directory, a detached HEAD, and
+// paths with spaces or non-ASCII — is created with real git plumbing and
+// discovered through the production `git worktree list --porcelain` child.
+// Skip policy follows the live Zellij harness: when git is not usable the
+// live tests print a visible skip notice on stderr and return early — a
+// skip is never mistaken for gathered evidence.
+
+static WT_SEQUENCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether the real `git` binary is usable on this machine.
+fn git_usable() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Print the visible skip notice shared by every live git test.
+fn report_worktree_skip(test: &str) {
+    let notice = format!(
+        "SKIP [{test}]: git is not installed (or `git --version` failed); \
+         live worktree evidence was NOT gathered. This is a skip, not a pass."
+    );
+    use std::io::Write;
+    match std::fs::OpenOptions::new().write(true).open("/dev/stderr") {
+        Ok(mut file) => {
+            let _ = file.write_all(notice.as_bytes());
+            let _ = file.write_all(b"\n");
+        }
+        Err(_) => eprintln!("{notice}"),
+    }
+}
+
+/// A private git repository fixture driven through the real `git` binary.
+///
+/// `root` is the main worktree; linked worktrees are created on demand as
+/// siblings under the fixture's private base directory. The initial commit
+/// is made on a fixed branch name so no assertion depends on the machine's
+/// `init.defaultBranch`. Identity is supplied with per-command `-c` config
+/// so the developer's global git configuration is never read or required.
+struct GitWorktreeFixture {
+    /// Private base directory holding the main worktree and its links.
+    base: PathBuf,
+    /// The main worktree, also the repository root.
+    root: PathBuf,
+    /// Per-fixture branch counter so linked-branch names are deterministic
+    /// (`wt-1`, `wt-2`, ...) regardless of process-wide test ordering.
+    branch_sequence: std::cell::Cell<usize>,
+}
+
+impl GitWorktreeFixture {
+    /// The main worktree on branch `noren-trunk` with one empty commit, or
+    /// `None` when git is unusable (the caller reports the skip).
+    fn new() -> Option<Self> {
+        if !git_usable() {
+            return None;
+        }
+        let sequence = WT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!(
+            "noren-app-wt-fixture-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&base).expect("create private worktree fixture base");
+        let root = base.join("main");
+        let root_text = root.display().to_string();
+        Self::git(None, &["init", &root_text]).expect("git init the fixture repository");
+        // Fixed branch name + per-command identity: independent of the
+        // machine's init.defaultBranch and global git config.
+        Self::git(Some(&root), &["checkout", "-b", "noren-trunk"])
+            .expect("create the fixed fixture branch");
+        Self::git(
+            Some(&root),
+            &[
+                "-c",
+                "user.name=Noren",
+                "-c",
+                "user.email=noren@example",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+            ],
+        )
+        .expect("create the initial fixture commit");
+
+        Some(Self {
+            base,
+            root,
+            branch_sequence: std::cell::Cell::new(0),
+        })
+    }
+
+    /// Run one real `git` command, optionally inside `dir`.
+    fn git(dir: Option<&std::path::Path>, args: &[&str]) -> std::io::Result<()> {
+        let mut command = std::process::Command::new("git");
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
+        command.args(args);
+        let output = command.output()?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("git fixture command failed"))
+        }
+    }
+
+    /// Add a linked worktree and return its path and branch name. The
+    /// branch is named from the fixture's sequence (git refnames cannot
+    /// carry spaces); the PATH deliberately may contain spaces and
+    /// non-ASCII because git must round-trip them.
+    fn add_worktree(&self, name: &str) -> (PathBuf, String) {
+        let path = self.base.join(name);
+        let branch = format!(
+            "wt-{}",
+            self.branch_sequence.replace(self.branch_sequence.get() + 1) + 1
+        );
+        let path_text = path.display().to_string();
+        Self::git(
+            Some(&self.root),
+            &["worktree", "add", "-b", &branch, &path_text],
+        )
+        .unwrap_or_else(|error| panic!("add worktree fixture {name}: {error}"));
+        (path, branch)
+    }
+
+    /// Add a linked worktree with a detached HEAD and return its path.
+    fn add_detached_worktree(&self, name: &str) -> PathBuf {
+        let path = self.base.join(name);
+        let path_text = path.display().to_string();
+        Self::git(
+            Some(&self.root),
+            &["worktree", "add", "--detach", &path_text],
+        )
+        .unwrap_or_else(|error| panic!("add detached worktree fixture {name}: {error}"));
+        path
+    }
+
+    /// The worktree at `path` stays REGISTERED while its directory is
+    /// deleted from disk — the common stale case until `git worktree prune`.
+    /// Equivalent to the user's `rm -rf` of a scratch checkout: the whole
+    /// directory (including the `.git` link file) goes, the registration in
+    /// the main repository's metadata stays.
+    fn delete_worktree_directory(&self, path: &std::path::Path) {
+        std::fs::remove_dir_all(path).expect("delete the worktree directory only");
+    }
+}
+
+impl Drop for GitWorktreeFixture {
+    fn drop(&mut self) {
+        // The linked worktrees are siblings under the base, so one removal
+        // takes the whole fixture; failures are ignored because a stale
+        // worktree directory can already be gone.
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
+
+/// A temp directory that is NOT a git repository (no git child needed).
+fn non_repository_directory() -> PathBuf {
+    let sequence = WT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "noren-app-not-a-repo-{}-{sequence}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&path).expect("create plain fixture directory");
+    path
+}
+
+/// Discovered worktree rows appear as `EntryKind::Worktree` sidebar rows a
+/// user SEES on launch: the main worktree first with its branch, then the
+/// linked worktrees, branched or detached, with spaces and non-ASCII in
+/// paths intact. A detached HEAD shows the fixed placeholder, never a panic.
+#[test]
+fn discovered_worktrees_appear_as_sidebar_rows() {
+    let Some(fixture) = GitWorktreeFixture::new() else {
+        report_worktree_skip("discovered_worktrees_appear_as_sidebar_rows");
+        return;
+    };
+    let (plain_path, plain_branch) = fixture.add_worktree("plain");
+    let (_spaced_path, spaced_branch) = fixture.add_worktree("spaced 名前 wt");
+    let detached_path = fixture.add_detached_worktree("detached-only");
+
+    let mut app = NorenApp::default();
+    app.load_git_worktrees_from(&fixture.root);
+
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(rows.len(), 4, "the main worktree plus three linked ones");
+    // The main worktree is always listed first; the order of the linked
+    // worktrees is git's readdir order, so they are found by path, not
+    // position. Git prints resolved paths (/private/var on macOS), so the
+    // fixture paths are canonicalized before comparing. Worktree facts and
+    // sidebar rows are index-aligned (the registry is empty).
+    assert_eq!(rows[0].kind(), EntryKind::Worktree);
+    assert_eq!(rows[0].label(), "main");
+    assert_eq!(rows[0].detail(), Some("noren-trunk"));
+    let row_of = |path: &std::path::Path| -> usize {
+        let canonical = std::fs::canonicalize(path).expect("canonicalize fixture path");
+        app.workspace
+            .worktrees
+            .iter()
+            .position(|worktree| worktree.path() == canonical)
+            .unwrap_or_else(|| panic!("no discovered worktree for {canonical:?}"))
+    };
+    assert_eq!(
+        rows[row_of(&plain_path)].detail(),
+        Some(plain_branch.as_str())
+    );
+    assert_eq!(
+        rows[row_of(&detached_path)].detail(),
+        Some("(detached)"),
+        "a detached HEAD reports the fixed placeholder"
+    );
+    let spaced_index = app
+        .workspace
+        .worktrees
+        .iter()
+        .position(|worktree| worktree.name_display() == "spaced 名前 wt")
+        .expect("a path with spaces and non-ASCII round-trips into discovery");
+    assert_eq!(rows[spaced_index].label(), "spaced 名前 wt");
+    assert_eq!(rows[spaced_index].detail(), Some(spaced_branch.as_str()));
+    assert!(
+        app.worktree_diagnostic.is_none(),
+        "an in-cap discovery adds no notice"
+    );
+}
+
+/// A launch directory outside any git repository is the common case: no
+/// rows, no diagnostic, no panic — like a missing SSH config.
+#[test]
+fn a_launch_directory_outside_a_repository_is_silent() {
+    let dir = non_repository_directory();
+    let mut app = NorenApp::default();
+    app.load_git_worktrees_from(&dir);
+    assert_eq!(app.workspace.sidebar().rows().len(), 0);
+    assert!(app.workspace.worktrees.is_empty());
+    assert!(
+        app.worktree_diagnostic.is_none(),
+        "not-a-repository is silent, exactly like a missing SSH config"
+    );
+    let _ = std::fs::remove_dir(&dir);
+}
+
+/// A nonexistent launch directory must report `LaunchDirectoryUnavailable`,
+/// not `GitUnavailable`: git may be installed, the directory is not. The
+/// `discover_worktrees` function checks `is_dir()` before spawning git, so
+/// a path that does not exist reaches `LaunchDirectoryUnavailable` through
+/// the normal error path.
+#[test]
+fn a_nonexistent_launch_directory_reports_launch_directory_unavailable() {
+    let nonexistent = std::env::temp_dir().join(format!(
+        "noren-nonexistent-dir-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+
+    let mut app = NorenApp::default();
+    app.load_git_worktrees_from(&nonexistent);
+    let diagnostic = app
+        .worktree_diagnostic
+        .as_deref()
+        .expect("a nonexistent dir must produce a diagnostic");
+    assert!(
+        diagnostic.contains("launch directory"),
+        "the diagnostic must mention the directory, not git: {diagnostic}"
+    );
+    assert!(
+        !diagnostic.contains("git is unavailable"),
+        "a nonexistent dir must not be reported as git unavailable: {diagnostic}"
+    );
+}
+#[test]
+fn a_single_worktree_repository_lists_one_row() {
+    let Some(fixture) = GitWorktreeFixture::new() else {
+        report_worktree_skip("a_single_worktree_repository_lists_one_row");
+        return;
+    };
+    let mut app = NorenApp::default();
+    app.load_git_worktrees_from(&fixture.root);
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind(), EntryKind::Worktree);
+    assert_eq!(rows[0].detail(), Some("noren-trunk"));
+}
+
+/// The stale case the ROADMAP names: a worktree whose directory was deleted
+/// from disk but is still registered. Discovery must list it (marked
+/// missing), the sidebar must show the marker, and selecting the row must
+/// refuse the launch before any session or child exists — no panic, no
+/// hang, an honest visible status.
+///
+/// Mutation check (B): making discovery panic on a missing directory (for
+/// example an `.expect` on the directory's presence) fails this test.
+#[test]
+fn a_registered_but_deleted_worktree_is_marked_and_refused() {
+    let Some(fixture) = GitWorktreeFixture::new() else {
+        report_worktree_skip("a_registered_but_deleted_worktree_is_marked_and_refused");
+        return;
+    };
+    let (stale, stale_branch) = fixture.add_worktree("gone-wt");
+    // Resolve before deleting: the canonical path is what git prints (and
+    // what discovery retains), but a deleted directory can no longer be
+    // canonicalized through the filesystem.
+    let stale_canonical =
+        std::fs::canonicalize(&stale).expect("canonicalize the stale worktree path");
+    fixture.delete_worktree_directory(&stale);
+    let _live = fixture.add_worktree("present-wt");
+
+    let mut app = NorenApp::default();
+    // Discovery over a real registration whose directory is gone must not
+    // panic (a panic here fails the test) and must not hang (the runner is
+    // one bounded git listing).
+    app.load_git_worktrees_from(&fixture.root);
+
+    let worktrees = &app.workspace.worktrees;
+    assert_eq!(
+        worktrees.len(),
+        3,
+        "main, the stale link, and the live link"
+    );
+    let stale_index = worktrees
+        .iter()
+        .position(|worktree| worktree.path() == stale_canonical)
+        .expect("the stale registration is still listed");
+    let stale_row = &worktrees[stale_index];
+    assert!(!stale_row.directory_present());
+    assert_eq!(
+        stale_row.branch_display(),
+        format!("{stale_branch} (missing)")
+    );
+    assert!(
+        worktrees
+            .iter()
+            .any(|worktree| worktree.directory_present()),
+        "the live link is still present"
+    );
+
+    // The sidebar row the user sees carries the missing marker.
+    let missing_detail = format!("{stale_branch} (missing)");
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(rows[stale_index].detail(), Some(missing_detail.as_str()));
+
+    // Selecting it refuses the launch: no session, no PTY, a visible status.
+    assert!(click_sidebar_row(&mut app, stale_index));
+    assert_eq!(app.status, "Noren worktree directory missing");
+    assert!(app.show_status, "the refusal must own the status row");
+    assert!(app.workspace.registry().sessions().is_empty());
+    assert!(app.pty.is_none(), "a stale worktree must not spawn a child");
+}
+
+/// A repository with more worktrees than the sidebar cap keeps the first
+/// rows in git listing order and reports the cap and the omitted count,
+/// exactly like the bounded SSH host list.
+#[test]
+fn many_worktrees_are_capped_and_the_omitted_count_is_reported() {
+    let Some(fixture) = GitWorktreeFixture::new() else {
+        report_worktree_skip("many_worktrees_are_capped_and_the_omitted_count_is_reported");
+        return;
+    };
+    // main + (cap + 2) linked worktrees = cap + 3 total; 3 are omitted.
+    for index in 0..(MAX_WORKTREE_SIDEBAR_TEST_ROWS + 2) {
+        fixture.add_worktree(&format!("capped-{index:02}"));
+    }
+    let mut app = NorenApp::default();
+    app.load_git_worktrees_from(&fixture.root);
+
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(
+        rows.len(),
+        MAX_WORKTREE_SIDEBAR_TEST_ROWS,
+        "the sidebar keeps exactly the capped row count"
+    );
+    assert_eq!(
+        rows[0].label(),
+        "main",
+        "the main worktree is always retained"
+    );
+    assert_eq!(
+        app.workspace.worktrees_omitted, 3,
+        "beyond-cap worktrees are counted, not silently dropped"
+    );
+    let notice = app
+        .worktree_diagnostic
+        .as_deref()
+        .expect("the cap is reported on the status row");
+    assert!(
+        notice.contains("showing first 24") && notice.contains("3 omitted"),
+        "the notice names the cap and the omitted count: {notice}"
+    );
+}
+
+/// Bound constant for the live cap test; must equal the shipped cap.
+const MAX_WORKTREE_SIDEBAR_TEST_ROWS: usize = noren_app::git_worktree::MAX_WORKTREE_SIDEBAR_ROWS;
+
+/// Selecting a worktree row must start a session whose working directory IS
+/// that worktree — verified by reading the child's own `pwd` answer back
+/// through the terminal, never by trusting the code path that set the cwd.
+///
+/// The child's `HOME` is isolated through the same [`AppTestHome`] seam as
+/// every other shell-driving test (production inherits `HOME` unchanged): a
+/// developer's `.zshrc` cannot stall the prompt past the deadline, while the
+/// working directory stays the worktree, so the `pwd` proof is unaffected.
+///
+/// Mutation check (A): breaking the launch so the child starts elsewhere
+/// (for example dropping the cwd from the launch policy) fails this test.
+#[cfg(target_os = "macos")]
+#[test]
+fn selecting_a_worktree_row_starts_a_session_in_that_worktree() {
+    let Some(fixture) = GitWorktreeFixture::new() else {
+        report_worktree_skip("selecting_a_worktree_row_starts_a_session_in_that_worktree");
+        return;
+    };
+    let (worktree, _branch) = fixture.add_worktree("launch-wt");
+    let canonical = std::fs::canonicalize(&worktree).expect("canonicalize the worktree path");
+    let home = AppTestHome::new();
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..NorenApp::default()
+    };
+    app.load_git_worktrees_from(&fixture.root);
+
+    // Row 0 is the main worktree; find the linked worktree's row by path.
+    let row = app
+        .workspace
+        .worktrees
+        .iter()
+        .position(|worktree| worktree.path() == canonical)
+        .expect("the linked worktree is discovered");
+    assert!(
+        click_sidebar_row(&mut app, row),
+        "the worktree row is consumed"
+    );
+
+    // The launch created a real Worktree-kind session that owns the live
+    // surface and is observed Running.
+    let ids = registry_ids(&app);
+    assert_eq!(ids.len(), 1, "one registry session from the worktree row");
+    let id = ids[0];
+    assert_eq!(
+        app.workspace.registry().get(id).map(|d| d.kind().clone()),
+        Some(SessionKind::Worktree {
+            path: canonical.clone()
+        }),
+        "the session's launch shape carries the worktree path"
+    );
+    assert_eq!(session_status(&app, id), SessionStatus::Running);
+    assert_eq!(app.active_session, Some(id));
+    assert!(app.pty.is_some(), "the worktree session owns a real PTY");
+
+    // Read the child's ACTUAL working directory back: wait for the shell,
+    // ask it, and search the terminal text for its own answer. The path the
+    // session claims and the directory the child reports must agree. The
+    // grid wraps long lines across rows, so the comparison strips the row
+    // separators a wrap inserts — a wrapped path must still match whole.
+    wait_for_shell_output(&mut app);
+    app.send_input(b"pwd\n");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.drain_pty();
+        let answered = app.terminal.as_ref().is_some_and(|terminal| {
+            let unwrapped = terminal_text(terminal).replace(['\r', '\n'], "");
+            unwrapped.contains(canonical.display().to_string().as_str())
+        });
+        if answered {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child's own pwd never reported the worktree directory\n\
+             expected: the terminal text to contain the worktree path {}\n\
+             received: terminal said: {}",
+            canonical.display(),
+            app.terminal.as_ref().map(terminal_text).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Quitting with a worktree session and a local session persists BOTH
+/// through the real sessions.toml path, and the next launch restores them —
+/// the worktree kind round-trips with its path, and local-session
+/// persistence is unharmed. This is also the direct guard that the
+/// worktree launch path did not reintroduce the historic quit-path erase:
+/// teardown must save exactly the sessions it had.
+#[test]
+fn quitting_persists_worktree_sessions_beside_local_sessions() {
+    let Some(fixture) = GitWorktreeFixture::new() else {
+        report_worktree_skip("quitting_persists_worktree_sessions_beside_local_sessions");
+        return;
+    };
+    let (worktree, _branch) = fixture.add_worktree("persist-wt");
+    let canonical = std::fs::canonicalize(&worktree).expect("canonicalize the worktree path");
+    let path = temp_state_path();
+    let home = AppTestHome::new();
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..app_with_state_path(&path)
+    };
+    app.load_git_worktrees_from(&fixture.root);
+
+    // One local session (palette) and one worktree session (row click).
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    let row = app
+        .workspace
+        .worktrees
+        .iter()
+        .position(|worktree| worktree.path() == canonical)
+        .expect("the worktree is discovered before the click");
+    // Row 0 is the local session; the worktree rows are offset by it.
+    assert!(
+        click_sidebar_row(&mut app, 1 + row),
+        "the worktree row launches"
+    );
+    let ids = registry_ids(&app);
+    assert_eq!(ids.len(), 2);
+    assert_eq!(session_status(&app, ids[0]), SessionStatus::Running);
+    assert_eq!(session_status(&app, ids[1]), SessionStatus::Running);
+
+    app.teardown();
+
+    let text = std::fs::read_to_string(&path).expect("state saved on quit");
+    assert_eq!(
+        text.matches("kind = \"local\"").count(),
+        1,
+        "the local session still persists: {text}"
+    );
+    assert_eq!(
+        text.matches("kind = \"worktree\"").count(),
+        1,
+        "the worktree session persists with its kind: {text}"
+    );
+    assert!(
+        text.contains("path = "),
+        "the worktree entry carries its path for restoration: {text}"
+    );
+
+    // The next launch restores both rows as Restored with intact kinds —
+    // the worktree path survives the round-trip byte for byte.
+    let relaunched = sidebar_after_relaunch(&path);
+    assert_eq!(relaunched.registry().len(), 2);
+    let kinds: Vec<SessionKind> = relaunched
+        .registry()
+        .sessions()
+        .iter()
+        .map(|descriptor| descriptor.kind().clone())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            SessionKind::Local,
+            SessionKind::Worktree {
+                path: canonical.clone()
+            },
+        ]
+    );
+    for descriptor in relaunched.registry().sessions() {
+        assert_eq!(
+            descriptor.status(),
+            &SessionStatus::Restored,
+            "a relaunched row must be Restored, never a phantom Running"
+        );
+    }
+    cleanup_state_file(&path);
+}
+
+/// A worktree path can embed a username or a private directory name. Every
+/// debug and status surface the discovery/launch flow can reach must stay
+/// free of it. The persisted sessions.toml file deliberately DOES carry the
+/// path — it is the user's own private state and exactly what restoration
+/// needs, the same class as a project root; the redaction discipline
+/// governs Debug and error output, not the state file (SSH destinations, by
+/// contrast, may embed credentials and so never enter the registry at all).
+#[test]
+fn worktree_paths_never_reach_debug_or_status_surfaces() {
+    let secret = format!("NOREN-WT-hunter2-{}", std::process::id());
+    let Some(fixture) = GitWorktreeFixture::new() else {
+        report_worktree_skip("worktree_paths_never_reach_debug_or_status_surfaces");
+        return;
+    };
+    let (worktree, _branch) = fixture.add_worktree(&secret);
+    let canonical = std::fs::canonicalize(&worktree).expect("canonicalize the worktree path");
+    let mut app = NorenApp::default();
+    app.load_git_worktrees_from(&fixture.root);
+    assert!(
+        canonical.display().to_string().contains(&secret),
+        "fixture self-check: the secret is really in the path"
+    );
+
+    // The workspace (sidebar rows, worktree facts) never prints it.
+    assert!(
+        !format!("{:?}", app.workspace).contains(&secret),
+        "workspace debug leaked the worktree path"
+    );
+    // Status surfaces carry fixed text only.
+    if let Some(notice) = app.worktree_diagnostic.as_deref() {
+        assert!(!notice.contains(&secret), "notice leaked: {notice}");
+    }
+
+    // A registry session of this shape (the state a launch or a restore
+    // leaves behind) never prints it through the descriptor either.
+    let id = app
+        .workspace
+        .create_session(SessionKind::Worktree { path: canonical });
+    let rendered = format!("{:?}", app.workspace.registry().get(id));
+    assert!(
+        !rendered.contains(&secret),
+        "descriptor debug leaked the worktree path: {rendered}"
+    );
+    assert!(
+        rendered.contains("Worktree"),
+        "not vacuous — the descriptor still names its shape: {rendered}"
+    );
+    assert!(
+        !format!("{:?}", app.workspace).contains(&secret),
+        "workspace debug leaked after the session was created"
+    );
+}
+
+// ── Mixed sidebars: every row kind present at once ────────────────────
+//
+// Independent review (issue #156 follow-up): the click path resolves each
+// row kind by subtracting the row counts of the kinds above it
+// (`local_sidebar_session`, `worktree_sidebar_row`, `select_ssh_sidebar_row`),
+// and every existing test exercised one row kind in isolation — an index
+// arithmetic error (the `MouseGrid::new(rows, cols)` class) passed the whole
+// suite. A mixed sidebar is not an edge case: it is the DEFAULT state of
+// this repository's own development environment.
+
+/// Real directories for synthetic worktree facts. Discovery parsing is pure,
+/// but a worktree row click launches a session rooted at the row's
+/// directory, so the directories must exist for the launch to identify the
+/// clicked row by its path.
+fn mixed_worktree_directories(count: usize) -> Vec<PathBuf> {
+    (0..count)
+        .map(|index| {
+            let sequence = WT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "noren-app-mixed-wt-{}-{sequence}-{index}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("create mixed-sidebar worktree directory");
+            path
+        })
+        .collect()
+}
+
+/// `git worktree list --porcelain` text for the given directories, one
+/// branched record each, in listing order.
+fn synthetic_porcelain(paths: &[PathBuf]) -> String {
+    let mut text = String::new();
+    for (index, path) in paths.iter().enumerate() {
+        text.push_str(&format!(
+            "worktree {}\nbranch refs/heads/mix-{index:02}\n\n",
+            path.display()
+        ));
+    }
+    text
+}
+
+/// The paths of every registry session launched from a worktree row, in
+/// registry order — the observable identity of WHICH worktree row a click
+/// selected.
+fn worktree_session_paths(app: &NorenApp) -> Vec<PathBuf> {
+    app.workspace
+        .registry()
+        .sessions()
+        .iter()
+        .filter_map(|descriptor| match descriptor.kind() {
+            SessionKind::Worktree { path } => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Row order is FIXED — sessions first, then discovered worktree facts, then
+/// configured SSH hosts — and the click-path offset arithmetic silently
+/// depends on it, so the rendered order is pinned here with all three kinds
+/// present at once, including each kind's internal order (registry order,
+/// git listing order, config order). Agent-kind sessions render as ordinary
+/// session rows; the reserved `EntryKind::Agent` is never emitted by the
+/// sidebar rebuild, which the kind sequence pins as well.
+#[test]
+fn sidebar_rows_render_sessions_then_worktrees_then_ssh_hosts() {
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(b"Host zulu\nHost alpha\n");
+    let records = git_worktree::parse_worktree_porcelain(
+        "worktree /srv/mix-main\nbranch refs/heads/mix-main\n\
+         \nworktree /srv/mix-a\nbranch refs/heads/mix-a\n\
+         \nworktree /srv/mix-b\ndetached\n",
+    )
+    .expect("synthetic porcelain parses");
+
+    let mut app = NorenApp::default();
+    app.workspace
+        .load_worktrees(WorktreeDiscovery::from_records(records));
+    app.load_ssh_hosts_from(fixture.path());
+    let _agent = app.workspace.create_session(SessionKind::Agent {
+        name: "reserved".to_owned(),
+    });
+    let _local = app.workspace.create_session(SessionKind::Local);
+    app.workspace.rebuild_sidebar();
+
+    let rows = app.workspace.sidebar().rows();
+    let kinds: Vec<EntryKind> = rows.iter().map(|row| row.kind()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            EntryKind::Session,
+            EntryKind::Session,
+            EntryKind::Worktree,
+            EntryKind::Worktree,
+            EntryKind::Worktree,
+            EntryKind::SshConnection,
+            EntryKind::SshConnection,
+        ],
+        "the fixed order is sessions, then worktrees, then SSH hosts"
+    );
+    // Worktree rows keep git's listing order (main first).
+    assert_eq!(
+        rows[2..5]
+            .iter()
+            .map(|row| row.label().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["mix-main", "mix-a", "mix-b"]
+    );
+    // SSH rows keep the config's declaration order.
+    assert_eq!(
+        rows[5..7]
+            .iter()
+            .map(|row| row.label().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["SSH-OFF zulu", "SSH-OFF alpha"]
+    );
+}
+
+/// Clicking each row kind in a mixed sidebar must select the row the user
+/// actually clicked — the default sidebar shape of this repository, which
+/// holds sessions, worktrees, and SSH hosts at once. The boundaries are
+/// asserted explicitly: the last worktree row, the first SSH row, the last
+/// SSH row, and the row immediately after the last SSH row (a dead click
+/// that must select nothing, not wrap).
+///
+/// Mutation checks:
+/// - dropping `+ worktree_rows` from `select_ssh_sidebar_row` makes the
+///   first-SSH-row click resolve to a DIFFERENT host (the host list here is
+///   longer than the worktree list, so the misresolved index lands on a
+///   real host, not a dead click);
+/// - dropping the session-row offset from `worktree_sidebar_row` resolves a
+///   worktree click to another worktree's row;
+/// - dropping the session bound from `local_sidebar_session` makes
+///   non-session rows claim a session id.
+#[cfg(target_os = "macos")]
+#[test]
+fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
+    // Five SSH hosts — more than the three worktrees — so a misresolved SSH
+    // index lands on a real, different host instead of dead-clicking.
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(b"Host alpha\nHost bravo\nHost charlie\nHost delta\nHost echo\n");
+    let worktree_paths = mixed_worktree_directories(3);
+    let records = git_worktree::parse_worktree_porcelain(&synthetic_porcelain(&worktree_paths))
+        .expect("synthetic porcelain parses");
+
+    // The deterministic seam keeps SSH row clicks from spawning any process;
+    // worktree row clicks really launch (that is their observable identity).
+    let mut app = app_with_deterministic_ssh_seam();
+    app.workspace
+        .load_worktrees(WorktreeDiscovery::from_records(records));
+    app.load_ssh_hosts_from(fixture.path());
+    let sessions = [
+        app.workspace.create_session(SessionKind::Local),
+        app.workspace.create_session(SessionKind::Project {
+            root: PathBuf::from("/srv/noren"),
+        }),
+    ];
+
+    // Layout: rows 0-1 sessions, rows 2-4 worktrees, rows 5-9 SSH hosts.
+    assert_eq!(
+        app.workspace.sidebar().rows().len(),
+        10,
+        "two session rows, three worktree rows, five SSH rows"
+    );
+
+    // Session rows select their own session, first and last alike.
+    assert!(click_sidebar_row(&mut app, 0), "the first session row");
+    assert_eq!(app.workspace.registry().selected(), Some(sessions[0]));
+    assert!(click_sidebar_row(&mut app, 1), "the last session row");
+    assert_eq!(app.workspace.registry().selected(), Some(sessions[1]));
+
+    // First SSH row (row 5): selects the FIRST host, and never moves the
+    // registry selection.
+    assert!(click_sidebar_row(&mut app, 5), "the first SSH row");
+    assert_eq!(app.workspace.selected_ssh_target(), Some("alpha"));
+    assert_eq!(
+        app.workspace.registry().selected(),
+        Some(sessions[1]),
+        "an SSH row click never selects a registry session"
+    );
+    // Last SSH row (row 9): selects the LAST host.
+    assert!(click_sidebar_row(&mut app, 9), "the last SSH row");
+    assert_eq!(app.workspace.selected_ssh_target(), Some("echo"));
+
+    // Row 10 — immediately after the last SSH row — selects nothing: not a
+    // session, not a host, no wrap-around, and no state changes at all.
+    let registry_len = app.workspace.registry().len();
+    assert!(
+        !click_sidebar_row(&mut app, 10),
+        "the row after the last SSH row is a dead click"
+    );
+    assert_eq!(
+        app.workspace.selected_ssh_target(),
+        Some("echo"),
+        "a dead click must not change the pending SSH choice"
+    );
+    assert_eq!(
+        app.workspace.registry().selected(),
+        Some(sessions[1]),
+        "a dead click must not move the registry selection"
+    );
+    assert_eq!(
+        app.workspace.registry().len(),
+        registry_len,
+        "a dead click must not create a session"
+    );
+
+    // Last worktree row (row 4): launches a session rooted at the THIRD
+    // worktree — the row the user clicked, not the one an offset error
+    // would resolve to.
+    assert!(click_sidebar_row(&mut app, 4), "the last worktree row");
+    assert_eq!(
+        worktree_session_paths(&app),
+        vec![worktree_paths[2].clone()],
+        "the click launches the worktree the user pointed at"
+    );
+
+    // Each launch adds a session row, shifting the rows below: with three
+    // sessions the worktree block occupies rows 3-5. First worktree row.
+    assert!(click_sidebar_row(&mut app, 3), "the first worktree row");
+    assert_eq!(
+        worktree_session_paths(&app),
+        vec![worktree_paths[2].clone(), worktree_paths[0].clone()]
+    );
+
+    // With four sessions the worktree block occupies rows 4-6; the middle
+    // worktree is row 5.
+    assert!(click_sidebar_row(&mut app, 5), "a middle worktree row");
+    assert_eq!(
+        worktree_session_paths(&app),
+        vec![
+            worktree_paths[2].clone(),
+            worktree_paths[0].clone(),
+            worktree_paths[1].clone()
+        ]
+    );
+
+    // After the launches the accumulated counts changed (five sessions), so
+    // the SSH boundary is re-asserted at its new offset: first SSH row 8.
+    assert_eq!(
+        app.workspace.sidebar().rows().len(),
+        13,
+        "five session rows, three worktree rows, five SSH rows"
+    );
+    assert!(click_sidebar_row(&mut app, 8), "the first SSH row again");
+    assert_eq!(
+        app.workspace.selected_ssh_target(),
+        Some("alpha"),
+        "the SSH offset must track the grown session block"
+    );
+    assert!(
+        !click_sidebar_row(&mut app, 13),
+        "the row after the last SSH row stays dead after the shifts"
+    );
+
+    for path in &worktree_paths {
+        let _ = std::fs::remove_dir(path);
+    }
 }

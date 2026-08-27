@@ -111,8 +111,8 @@ Measured against it, item by item:
 | Scope item | State | Evidence |
 | --- | --- | --- |
 | Sidebar drawn | Done | `SIDEBAR_COLS` reserved in `renderer.rs`; `glyph_vertices` applies the column offset; `sidebar_text_lines` formats rows |
-| — projects, git worktrees | Modelled, not launchable | `EntryKind::Project`/`Worktree`, `SessionKind::Project`/`Worktree` exist; no runtime path creates them, though `parse_session` will reconstruct one from a hand-written `sessions.toml` `kind` field — nothing in the product writes such an entry |
-| — SSH connections, agents | Partial configured-target list, not connected; agents fixture only | At most 24 positive literal OpenSSH aliases become `SessionKind::Ssh` and `SidebarEntry::SshConnection` rows; the status identifies partial discovery, and clicking shows bounded root-relative source provenance while opening no SSH connection or PTY; agent entries remain reserved |
+| — projects, git worktrees | Worktrees launchable; projects modelled | Startup runs `git worktree list --porcelain` in the launch directory (`git_worktree.rs`) and shows at most 24 discovered worktrees as `EntryKind::Worktree` rows (beyond the cap the omitted count is reported); a registered-but-deleted worktree is listed with a `(missing)` marker and refused on selection; selecting a present row creates a `SessionKind::Worktree` session backed by a real `/bin/zsh` PTY whose child's working directory IS the worktree (verified by reading the child's own `pwd` back through the terminal), persisting and restoring through `sessions.toml` like a local session. `EntryKind::Project`/`SessionKind::Project` remain modelled-only with no runtime constructor |
+| — SSH connections, agents | Connections run for discovered aliases; discovery explicitly partial; agents fixture only | At most 24 positive literal OpenSSH aliases become `SessionKind::Ssh` and `SidebarEntry::SshConnection` rows; the status identifies partial discovery, and clicking one launches the fixed system `/usr/bin/ssh` client in the terminal's single PTY (argv is exactly `ssh -- <alias>`; no credential is ever argv-visible), with launch, connect, and disconnect failures as visible per-row and status-row states (PR #138). Wildcard/dynamic destinations are not a complete host inventory; agent entries remain reserved |
 | — terminal sessions | Runtime for local sessions | Every palette `session_create` spawns a real `SessionKind::Local` PTY (`spawn_local_session`); sidebar clicks and the palette's `session_select` switch the live view between live sessions (`switch_live_session`, parked surfaces keep draining and resizing), and `session_close` reaps the closed child and repairs the view. Rows restored from disk come back `Restored` with no live surface and cannot take the live view |
 | Single-session view | Done | The active terminal is drawn beside the sidebar, narrowed to the remaining columns; switching swaps the active surface whole, and rows without a live surface cannot claim its selection or input owner |
 | Session lifecycle | Done | `SessionStatus` advances `Starting -> Running -> Exited/Failed` via `SessionRegistry::observe`, wired in `main.rs` for spawned, parked, closed, and restored sessions alike |
@@ -121,14 +121,14 @@ Measured against it, item by item:
 | Configurable keybindings | Done for the palette surface | `[keys]` in `config.toml` (`KeymapConfig` in `config.rs`) rebinds the palette opener and the four palette command chords with the previous values as defaults; `palette_policy`/`handle_palette_key` in `main.rs` honor them, unparseable chords and unknown actions are typed errors, and the opener is validated against the pinned Zellij corpus and the exit leader. The exit leader, palette navigation keys, diagnostics chord, and clipboard shortcuts remain fixed |
 | Zellij pass-through | Done against a pinned corpus and a live installed Zellij | The shipped policy (`palette_policy` in `main.rs`) claims exactly two Super-modified chords — `Super+Escape` (exit leader) and `Super+p` (palette opener) — that the pinned Zellij `v0.44.3` default corpus (`ZELLIJ_FIXTURE_TAG`) never binds, and `tests/zellij_live.rs` drives an INSTALLED Zellij in a real PTY through the same parser, gate, and key encoder: attach enables mouse tracking in `TerminalState`, gated `Ctrl+t`/`n`/`Ctrl+p` reach Zellij and render tab #2 and pane #2, typed text reaches the pane's shell, and the installed version's default keybinds bind nothing in the Super/Cmd/Meta space. The harness skips (visibly, on the real stderr) when no `zellij` is on `PATH`. Empirical wire-shape note: Zellij 0.44.3 sends `1002`/`1006` as separate single-parameter DECSETs across its whole lifecycle and does not forward a pane program's multi-parameter DECSET to the host terminal, so the multi-parameter form `CSI ? 1002;1006 h` (the PR #113 regression site) is pinned as a co-located regression guard beside the live assertions, with the live multi-parameter count printed as drift telemetry |
 
-One named scope item remains unsatisfied: **SSH connections and agents do
-not run**. Positive literal aliases now appear in a bounded sidebar list and
-a click records a source-attributed pending target, but opens no SSH
-connection or PTY; wildcard or dynamic destinations are not presented as a
-complete host inventory, and agent entries remain fixtures and launch no
+One named scope item remains unsatisfied: **agents do not run**. Positive
+literal aliases appear in a bounded sidebar list and a click launches a real
+system-ssh connection (PR #138), but wildcard or dynamic destinations are
+not presented as a complete host inventory, and agent entries remain
+fixtures and launch no
 agent. Since "Only evidence-backed work is marked complete" and the scope
-line names it, Milestone 3 stays **In progress**. The SSH and agent session
-kinds also depend on Milestones 4 and 5; whether they are retired from
+line names it, Milestone 3 stays **In progress**. The agent session
+kind also depends on Milestone 5; whether it is retired from
 Milestone 3's scope or carried is an open scoping decision, not something to
 settle by relabelling the status.
 
@@ -139,20 +139,21 @@ concluded that the current tree cannot honestly be released as "0.1.0-preview of
 the Noren terminal." The reasoning and the decision are recorded in
 [D-M8-001](docs/coordination/decisions/D-M8-001-preview-scope.md). In short:
 
-- **The workspace is a slice, not a product.** The Milestone 3 modules now
-  reach the binary: the sidebar is drawn, the palette opens on `Super+p`,
-  local sessions spawn real PTYs that switch, park, and close through the
-  live view, mouse reports reach the active PTY, and sidebar state persists
-  across a restart. What is still missing is breadth —
-  bounded OpenSSH configuration now produces an explicitly partial list of at
-  most 24 positive literal aliases as `SessionKind::Ssh` values and
-  `SidebarEntry::SshConnection` rows. The UI labels the discovery scope and
-  shows bounded root-relative source provenance on selection, but selecting one
-  only records a pending target and opens no connection or PTY. Only
-  `SessionKind::Local` reaches a
-  launch path; git worktrees remain unreachable, and agents remain
-  fixture-only; keybindings ARE configurable through the `[keys]` section
-  since this milestone (see [Milestone 3 status](#milestone-3-status)).
+  - **The workspace is a slice, not a product.** The Milestone 3 modules now
+    reach the binary: the sidebar is drawn, the palette opens on `Super+p`,
+    local sessions spawn real PTYs that switch, park, and close through the
+    live view, mouse reports reach the active PTY, and sidebar state persists
+    across a restart. What is still missing is breadth —
+    bounded OpenSSH configuration now produces an explicitly partial list of at
+    most 24 positive literal aliases as `SessionKind::Ssh` values and
+    `SidebarEntry::SshConnection` rows, and selecting one launches the fixed
+    system `ssh` client in the terminal's PTY. Git
+    worktrees of the launch repository ARE reachable now (discovered from
+    `git worktree list --porcelain`, shown as bounded rows, and launched as
+    worktree-scoped sessions), while project rows remain unreachable and
+    agents remain
+    fixture-only; keybindings ARE configurable through the `[keys]` section
+    since this milestone (see [Milestone 3 status](#milestone-3-status)).
 - **Colour rendering exists, but themes are fixed.** `renderer.rs` resolves
   each cell's SGR foreground and any explicit background through its compiled-in
   ANSI/256-colour palette or as direct RGB truecolor. The vertex layout carries

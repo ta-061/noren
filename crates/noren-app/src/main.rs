@@ -29,6 +29,7 @@ use noren_app::{
     config::{AppConfig, KeymapConfig},
     diagnostics::{self, PtyChildStatus},
     encode_paste,
+    git_worktree::{self, DiscoveredWorktree, WorktreeDiscovery, WorktreeListError},
     mouse::{MouseEncoder, MouseGrid, MouseModes, PointerEvent, PointerModifiers},
     palette::{CommandId, Palette},
     passthrough::{
@@ -101,6 +102,11 @@ const SSH_STATUS_CONNECT_FAILED: &str = "Noren ssh connection failed";
 const SSH_STATUS_DISCONNECTED: &str = "Noren ssh connection lost";
 const SSH_STATUS_LAUNCH_FAILED: &str = "Noren ssh launch failed";
 const SSH_STATUS_REFUSED: &str = "Noren ssh connect refused";
+/// Status-row text when a worktree row whose directory no longer exists is
+/// selected: the launch is refused before any session or child exists.
+const WORKTREE_STATUS_MISSING: &str = "Noren worktree directory missing";
+/// Status-row text when a worktree session's zsh child could not be spawned.
+const WORKTREE_STATUS_LAUNCH_FAILED: &str = "Noren worktree launch failed";
 
 /// Observed state of the one live SSH launch. This is application-local
 /// runtime state, deliberately outside the session registry: the registry
@@ -342,6 +348,13 @@ fn session_state_path() -> Option<PathBuf> {
 struct WorkspaceState {
     registry: SessionRegistry,
     sidebar: SidebarView,
+    /// Worktrees discovered in the launch repository at startup: sidebar
+    /// facts only until a row is selected, exactly like the configured SSH
+    /// hosts. Selecting a row creates a `SessionKind::Worktree` session,
+    /// which is the shape that persists.
+    worktrees: Vec<DiscoveredWorktree>,
+    /// How many discovered worktrees the bounded sidebar policy omitted.
+    worktrees_omitted: usize,
     /// Configured SSH targets represented by the shared session vocabulary.
     /// They are sidebar facts only: no registry entry or connection exists.
     ssh_hosts: Vec<ConfiguredSshHost>,
@@ -375,6 +388,8 @@ impl fmt::Debug for WorkspaceState {
             .field("registry", &self.registry.len())
             .field("registry_selection", &self.registry.selected())
             .field("sidebar", &self.sidebar)
+            .field("worktrees", &self.worktrees.len())
+            .field("worktrees_omitted", &self.worktrees_omitted)
             .field("ssh_hosts", &self.ssh_hosts.len())
             .field("ssh_hosts_omitted", &self.ssh_hosts_omitted)
             .field("selected_ssh_target", &self.selected_ssh_target.is_some())
@@ -413,6 +428,8 @@ impl WorkspaceState {
         Self {
             registry: SessionRegistry::new(),
             sidebar: SidebarView::build(&[], None),
+            worktrees: Vec::new(),
+            worktrees_omitted: 0,
             ssh_hosts: Vec::new(),
             ssh_hosts_omitted: 0,
             selected_ssh_target: None,
@@ -542,6 +559,23 @@ impl WorkspaceState {
         Ok(())
     }
 
+    /// Replace the discovered worktree facts without creating sessions.
+    /// Rows are bounded by [`git_worktree::MAX_WORKTREE_SIDEBAR_ROWS`] and
+    /// the omitted count is retained for the status notice.
+    fn load_worktrees(&mut self, discovery: WorktreeDiscovery) {
+        self.worktrees_omitted = discovery.omitted();
+        self.worktrees = discovery.rows().to_vec();
+        self.rebuild_sidebar();
+    }
+
+    /// The worktree fact at a stable sidebar position, if that position is
+    /// a worktree row. Session rows precede worktree rows; SSH host rows
+    /// follow them.
+    fn worktree_sidebar_row(&self, row_index: usize) -> Option<&DiscoveredWorktree> {
+        let index = row_index.checked_sub(self.registry.len())?;
+        self.worktrees.get(index)
+    }
+
     /// Replace the configured SSH host facts without creating sessions.
     /// Returns the number omitted by the bounded sidebar policy.
     fn load_ssh_config(&mut self, config: &SshConfig) -> usize {
@@ -569,7 +603,8 @@ impl WorkspaceState {
     /// Select an SSH row as a pending UI choice, never as a live session.
     fn select_ssh_sidebar_row(&mut self, row_index: usize) -> bool {
         let session_rows = self.registry.len();
-        let host_index = row_index.checked_sub(session_rows);
+        let worktree_rows = self.worktrees.len();
+        let host_index = row_index.checked_sub(session_rows + worktree_rows);
         let Some(Some(ConfiguredSshHost {
             kind: SessionKind::Ssh { target },
             source_label,
@@ -627,7 +662,9 @@ impl WorkspaceState {
 
     /// Rebuild the sidebar from the registry's current sessions and selection.
     ///
-    /// Called after every mutation so the view never lags the model.
+    /// Called after every mutation so the view never lags the model. Row
+    /// order is stable: session rows first, then discovered worktree facts,
+    /// then configured SSH host facts.
     fn rebuild_sidebar(&mut self) {
         let entries: Vec<SidebarEntry> = self
             .registry
@@ -636,6 +673,14 @@ impl WorkspaceState {
             .map(SidebarEntry::Session)
             .collect();
         let mut entries = entries;
+        entries.extend(
+            self.worktrees
+                .iter()
+                .map(|worktree| SidebarEntry::Worktree {
+                    name: worktree.name_display(),
+                    branch: worktree.branch_display(),
+                }),
+        );
         let mut pending_marked = false;
         entries.extend(self.ssh_hosts.iter().filter_map(|host| {
             let SessionKind::Ssh { target } = &host.kind else {
@@ -737,6 +782,8 @@ struct NorenApp {
     diagnostics_line: String,
     ssh_diagnostic: Option<String>,
     ssh_selection_status: Option<String>,
+    /// Bounded, content-free worktree-discovery notice (cap or failure).
+    worktree_diagnostic: Option<String>,
     /// When EOF was observed on a live ssh child whose reaped exit event has
     /// not arrived yet; drives the immediate-disconnect classification.
     ssh_eof_since: Option<Instant>,
@@ -793,8 +840,9 @@ struct NorenApp {
 /// Which application-owned line, if any, occupies the renderer's status row.
 ///
 /// Runtime statuses take precedence while `show_status` is set. A pending SSH
-/// selection then exposes its bounded provenance; otherwise a readable config
-/// keeps the partial-discovery notice (or a parse failure keeps its content-free
+/// selection then exposes its bounded provenance; a worktree-discovery notice
+/// (cap or failure) follows; otherwise a readable config keeps the
+/// partial-discovery notice (or a parse failure keeps its content-free
 /// diagnostic). The runtime source is also the idle fallback, making the row a
 /// permanent part of the application grid rather than dynamically hiding a PTY
 /// row when a notice appears.
@@ -802,6 +850,7 @@ struct NorenApp {
 enum StatusRowSource {
     Runtime,
     SshSelection,
+    WorktreeDiagnostic,
     SshDiagnostic,
 }
 
@@ -810,12 +859,16 @@ impl StatusRowSource {
         self,
         runtime: &'a str,
         ssh_selection_status: Option<&'a str>,
+        worktree_diagnostic: Option<&'a str>,
         ssh_diagnostic: Option<&'a str>,
     ) -> &'a str {
         match self {
             Self::Runtime => runtime,
             Self::SshSelection => {
                 ssh_selection_status.expect("SSH selection source requires a provenance status")
+            }
+            Self::WorktreeDiagnostic => {
+                worktree_diagnostic.expect("worktree diagnostic source requires diagnostic text")
             }
             Self::SshDiagnostic => {
                 ssh_diagnostic.expect("SSH diagnostic source requires diagnostic text")
@@ -852,6 +905,7 @@ impl NorenApp {
             diagnostics_line: String::new(),
             ssh_diagnostic: None,
             ssh_selection_status: None,
+            worktree_diagnostic: None,
             ssh_eof_since: None,
             ssh_spawn_enabled: true,
             #[cfg(test)]
@@ -883,6 +937,8 @@ impl NorenApp {
             StatusRowSource::Runtime
         } else if self.ssh_selection_status.is_some() {
             StatusRowSource::SshSelection
+        } else if self.worktree_diagnostic.is_some() {
+            StatusRowSource::WorktreeDiagnostic
         } else if self.ssh_diagnostic.is_some() {
             StatusRowSource::SshDiagnostic
         } else {
@@ -931,6 +987,60 @@ impl NorenApp {
             Ok(config) => self.apply_ssh_config(&config),
             Err(error) => self.report_ssh_diagnostic(error.to_string()),
         }
+    }
+
+    /// Discover the git worktrees of the repository Noren was launched in.
+    ///
+    /// A launch directory outside any git repository is the common case and
+    /// is silent (like a missing SSH config): no rows, no notice. A missing
+    /// or non-directory launch path is reported as `LaunchDirectoryUnavailable`
+    /// (not `GitUnavailable`): git may be installed, the directory is not.
+    /// Every other failure — git unavailable, unreadable or malformed
+    /// output — is a bounded, content-free status line that never stops
+    /// startup. A repository with more worktrees than the sidebar cap
+    /// reports the cap and the omitted count.
+    fn load_git_worktrees(&mut self) {
+        let launch_dir = std::env::current_dir()
+            .map_err(|_| WorktreeListError::LaunchDirectoryUnavailable)
+            .and_then(|dir| git_worktree::discover_worktrees(&dir));
+        self.apply_worktree_discovery(launch_dir);
+    }
+
+    /// Deterministic explicit-directory seam used by tests.
+    #[cfg(test)]
+    fn load_git_worktrees_from(&mut self, launch_dir: &std::path::Path) {
+        let discovery = git_worktree::discover_worktrees(launch_dir);
+        self.apply_worktree_discovery(discovery);
+    }
+
+    fn apply_worktree_discovery(
+        &mut self,
+        discovery: Result<WorktreeDiscovery, WorktreeListError>,
+    ) {
+        match discovery {
+            Ok(discovered) => {
+                let omitted = discovered.omitted();
+                self.workspace.load_worktrees(discovered);
+                self.worktree_diagnostic = (omitted > 0).then(|| {
+                    format!(
+                        "Noren worktrees: showing first {}; {omitted} omitted",
+                        git_worktree::MAX_WORKTREE_SIDEBAR_ROWS
+                    )
+                });
+            }
+            Err(WorktreeListError::NotARepository) => {
+                self.workspace.load_worktrees(WorktreeDiscovery::empty());
+                self.worktree_diagnostic = None;
+            }
+            Err(error) => {
+                // The error Display is a fixed, content-free string.
+                self.workspace.load_worktrees(WorktreeDiscovery::empty());
+                let line = format!("Noren worktrees: {error}");
+                eprintln!("{line}");
+                self.worktree_diagnostic = Some(line);
+            }
+        }
+        self.redraw_needed = true;
     }
 
     /// Deterministic explicit-path seam used by tests and future reload UI.
@@ -1217,6 +1327,86 @@ impl NorenApp {
                         reason: "PTY spawn failed".to_owned(),
                     },
                 );
+                None
+            }
+        }
+    }
+
+    /// Spawn the PTY for a worktree session, whose working directory is the
+    /// worktree itself.
+    ///
+    /// Production inherits `HOME` unchanged so the user's own shell
+    /// configuration applies inside the worktree checkout. Tests that drive
+    /// the shell by typing redirect the child's `HOME` to the isolated
+    /// empty home (see [`NorenApp::test_pty_home`]) for the same reason as
+    /// [`Self::spawn_pty_session`]: a developer's real `$HOME` may carry
+    /// startup files that take arbitrarily long or read the terminal, which
+    /// would make every shell-driving test depend on personal configuration.
+    /// The working directory is the worktree in both shapes, so the child's
+    /// actual cwd stays observable through its own `pwd` answer.
+    fn spawn_worktree_pty_session(
+        &self,
+        path: &std::path::Path,
+        size: PtySize,
+    ) -> Result<PtySession, noren_pty::PtyError> {
+        #[cfg(test)]
+        if let Some(home) = &self.test_pty_home {
+            return PtySession::spawn_in_dir_with_home(path, home, size);
+        }
+        PtySession::spawn_in_dir(path, size)
+    }
+
+    /// Spawn a real PTY session whose working directory is the worktree at
+    /// `path`, and give it the live view.
+    ///
+    /// This is the worktree-row runtime: the new sidebar row is a
+    /// `SessionKind::Worktree` registry session backed by an actual `/bin/zsh`
+    /// PTY whose child starts *in* the worktree checkout (HOME inherited, so
+    /// the user's shell configuration still applies). The registry observes
+    /// `Running` when the spawn succeeds and `Failed` when it does not. The
+    /// new session takes the live view and the previous one is parked, not
+    /// killed — the same convention as [`Self::spawn_local_session`].
+    fn spawn_worktree_session(&mut self, path: &std::path::Path) -> Option<SessionId> {
+        let id = self.workspace.create_session(SessionKind::Worktree {
+            path: path.to_owned(),
+        });
+        let Some((terminal, pty_size)) = self.session_surfaces() else {
+            self.workspace.observe_session(
+                id,
+                SessionStatus::Failed {
+                    reason: "terminal surface unavailable".to_owned(),
+                },
+            );
+            return None;
+        };
+        match self.spawn_worktree_pty_session(path, pty_size) {
+            Ok(pty) => {
+                self.workspace.observe_session(id, SessionStatus::Running);
+                self.park_active_session();
+                self.pty = Some(pty);
+                self.terminal = Some(terminal);
+                self.active_session = Some(id);
+                self.pty_child = PtyChildStatus::Running;
+                self.selection = None;
+                self.drag_origin = None;
+                self.exited_surface_session = None;
+                self.workspace
+                    .select_session(id)
+                    .expect("freshly spawned session is live");
+                self.ssh_selection_status = None;
+                self.redraw_needed = true;
+                Some(id)
+            }
+            Err(_) => {
+                self.workspace.observe_session(
+                    id,
+                    SessionStatus::Failed {
+                        reason: "PTY spawn failed".to_owned(),
+                    },
+                );
+                self.status = WORKTREE_STATUS_LAUNCH_FAILED;
+                self.show_status = true;
+                self.redraw_needed = true;
                 None
             }
         }
@@ -1938,6 +2128,21 @@ impl NorenApp {
             }
             return true;
         }
+        if let Some(worktree) = self.workspace.worktree_sidebar_row(row_index) {
+            // A present worktree row launches a real session rooted at the
+            // worktree directory; a registered-but-deleted one is refused
+            // before any session or child exists. Both are first-class,
+            // visible outcomes.
+            let path = worktree.path().to_owned();
+            if worktree.directory_present() {
+                self.spawn_worktree_session(&path);
+            } else {
+                self.status = WORKTREE_STATUS_MISSING;
+                self.show_status = true;
+            }
+            self.redraw_needed = true;
+            return true;
+        }
         if self.workspace.select_ssh_sidebar_row(row_index) {
             let target = self.workspace.selected_ssh_target().map(str::to_owned);
             let source = self
@@ -2536,6 +2741,7 @@ impl NorenApp {
             source.text(
                 self.status,
                 self.ssh_selection_status.as_deref(),
+                self.worktree_diagnostic.as_deref(),
                 self.ssh_diagnostic.as_deref(),
             )
         });
@@ -2789,6 +2995,7 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = NorenApp::new(config);
     app.load_sidebar_state(session_state_path());
+    app.load_git_worktrees();
     app.load_ssh_hosts();
     if event_loop.run_app(&mut app).is_err() {
         eprintln!("Noren event loop failed");

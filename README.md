@@ -26,7 +26,9 @@
 > only; a future connection path must resolve or reject them first. `Include`
 > handling is intentionally stricter than OpenSSH: Noren follows only files
 > whose canonical targets remain under the top-level config directory;
-> git worktrees and agents remain modelled but unreachable. Keybindings are not
+> git worktrees of the launch repository are discovered and launchable (a
+> sidebar click starts a shell whose working directory is that worktree),
+> while project rows and agents remain modelled but unreachable. Keybindings are not
 > configurable. There are no published binaries, and a local build carries only
 > macOS's automatic ad-hoc signature — no signing identity, no notarization. Read
 > **[docs/known-limitations.md](docs/known-limitations.md)** first — it is the
