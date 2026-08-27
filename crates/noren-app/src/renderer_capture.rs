@@ -98,6 +98,51 @@ impl CapturedFrame {
     }
 }
 
+/// Environment variable selecting how [`OffscreenRenderer::new`] experiences
+/// adapter availability, so the oracle's adapter-absence behaviour can be
+/// exercised (and asserted) on machines that have a working adapter.
+///
+/// Values:
+///
+/// - unset or `real` — the real machine state (`Backends::METAL`);
+/// - `absent` — the backend set is emptied, so wgpu genuinely enumerates no
+///   adapter and `new()` fails with the exact `AdapterUnavailable` an
+///   adapter-less machine produces (the real wgpu path, not a fake branch);
+/// - `device-fails` — `new()` returns `DeviceUnavailable` directly, standing
+///   in for an adapter that exists but cannot produce a device.
+///
+/// Neither forced value can substitute a working device or fake a frame: they
+/// only *remove* success paths, so they cannot make a broken renderer pass.
+const ORACLE_ADAPTER_ENV: &str = "NOREN_FRAME_ORACLE_ADAPTER";
+
+/// How [`OffscreenRenderer::new`] should experience adapter availability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OracleAdapterMode {
+    /// The machine's real adapters.
+    Real,
+    /// No adapter at all: wgpu enumerates over an empty backend set.
+    Absent,
+    /// An adapter exists, but no device can be requested from it.
+    DeviceFails,
+}
+
+/// The [`OracleAdapterMode`] the environment asks for (see [`ORACLE_ADAPTER_ENV`]).
+fn oracle_adapter_mode() -> OracleAdapterMode {
+    match std::env::var(ORACLE_ADAPTER_ENV).as_deref() {
+        Ok("absent") => OracleAdapterMode::Absent,
+        Ok("device-fails") => OracleAdapterMode::DeviceFails,
+        _ => OracleAdapterMode::Real,
+    }
+}
+
+/// The backend set the oracle may request adapters from for the current mode.
+fn oracle_backends() -> wgpu::Backends {
+    match oracle_adapter_mode() {
+        OracleAdapterMode::Absent => wgpu::Backends::empty(),
+        OracleAdapterMode::Real | OracleAdapterMode::DeviceFails => wgpu::Backends::METAL,
+    }
+}
+
 /// Owns the offscreen device/queue and the glyph pipeline (built once).
 ///
 /// Construction is the single point where headless wgpu initialisation can fail;
@@ -115,9 +160,18 @@ impl OffscreenRenderer {
     /// `SHADER`. Uses `Backends::METAL` and the same adapter options as the
     /// shipped renderer, but with `compatible_surface: None` so it needs no
     /// display.
+    ///
+    /// [`ORACLE_ADAPTER_ENV`] can force either headless failure mode so the
+    /// oracle's skip policy is verifiable on machines that HAVE an adapter.
     pub(crate) fn new() -> Result<Self, CaptureError> {
+        if oracle_adapter_mode() == OracleAdapterMode::DeviceFails {
+            // wgpu has no knob for making `request_device` fail on a working
+            // adapter, so this mode stands in for "an adapter exists but no
+            // device can be had from it" directly.
+            return Err(CaptureError::DeviceUnavailable);
+        }
         let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-        instance_descriptor.backends = wgpu::Backends::METAL;
+        instance_descriptor.backends = oracle_backends();
         let instance = wgpu::Instance::new(instance_descriptor);
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::LowPower,
