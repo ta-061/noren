@@ -70,14 +70,13 @@ use std::fs;
 use std::io::Write;
 use std::process::Command;
 
+use noren_app::theme::{DARK, Theme};
 use noren_app::{
     GridGeometry, MAX_RENDER_COLS, MAX_RENDER_ROWS, POC_CELL_HEIGHT as CELL_HEIGHT,
     POC_CELL_WIDTH as CELL_WIDTH,
 };
 use noren_terminal::{TerminalSnapshot, TerminalState};
-use renderer_capture::renderer_source::{
-    CLEAR_COLOR, DEFAULT_ANSI_PALETTE, DEFAULT_FOREGROUND, DEFAULT_PALETTE, SIDEBAR_COLS,
-};
+use renderer_capture::renderer_source::{CLEAR_COLOR, SIDEBAR_COLS, Target};
 use renderer_capture::{CaptureError, CapturedFrame, OffscreenRenderer};
 
 /// The PoC default cell metrics, used by every frame-oracle capture call so
@@ -94,10 +93,28 @@ fn snapshot(rows: u16, cols: u16, bytes: &[u8]) -> TerminalSnapshot {
 }
 
 /// Render a snapshot at exactly its grid size in PoC pixels.
+///
+/// Every pre-theme test renders through the default (`dark`) theme, exactly
+/// what the binary drew before `[theme]` existed; theme-specific behaviour
+/// has its own helpers and tests below.
 fn render(renderer: &OffscreenRenderer, snapshot: &TerminalSnapshot) -> CapturedFrame {
+    render_with_theme(renderer, &Theme::default(), snapshot)
+}
+
+/// Render a snapshot under an explicit theme at exactly its grid size.
+fn render_with_theme(
+    renderer: &OffscreenRenderer,
+    theme: &Theme,
+    snapshot: &TerminalSnapshot,
+) -> CapturedFrame {
     let width = u32::from(snapshot.cols()) * CELL_WIDTH;
     let height = u32::from(snapshot.rows()) * CELL_HEIGHT;
-    renderer.capture(Some(snapshot), None, None, width, height, poc_metrics())
+    renderer.capture(
+        Target::new(theme, width, height, poc_metrics()),
+        Some(snapshot),
+        None,
+        None,
+    )
 }
 
 /// The clear colour as captured bytes, derived from the renderer's own
@@ -208,10 +225,11 @@ fn cell_color(frame: &CapturedFrame, row: u32, col: u32) -> [u8; 3] {
 }
 
 /// The default foreground as captured bytes, derived from the renderer's own
-/// [`DEFAULT_FOREGROUND`] so the "unstyled cells are unchanged" assertion
+/// [`DARK.foreground()`] so the "unstyled cells are unchanged" assertion
 /// tracks the renderer rather than a literal copied here.
 fn default_foreground_rgb() -> [u8; 3] {
-    DEFAULT_FOREGROUND.map(|channel| (channel * 255.0).round() as u8)
+    DARK.foreground()
+        .map(|channel| (channel * 255.0).round() as u8)
 }
 
 /// State-driven blankness: a cell is blank when the row is absent, the column
@@ -610,14 +628,14 @@ fn cells_with_different_sgr_foregrounds_render_different_colours() {
     );
     // And each is the colour the palette says it is.
     assert!(
-        colors_match(red_cell, DEFAULT_ANSI_PALETTE[1]),
+        colors_match(red_cell, DARK.ansi()[1]),
         "SGR 31 should draw palette red {:?}, drew {red_cell:?}",
-        DEFAULT_ANSI_PALETTE[1]
+        DARK.ansi()[1]
     );
     assert!(
-        colors_match(green_cell, DEFAULT_ANSI_PALETTE[2]),
+        colors_match(green_cell, DARK.ansi()[2]),
         "SGR 32 should draw palette green {:?}, drew {green_cell:?}",
-        DEFAULT_ANSI_PALETTE[2]
+        DARK.ansi()[2]
     );
 }
 
@@ -671,20 +689,20 @@ fn truecolor_and_256_colour_both_resolve_to_their_expected_pixels() {
     let indexed_frame = render(&renderer, &indexed);
     let drawn_indexed = cell_color(&indexed_frame, 0, 0);
     assert!(
-        colors_match(drawn_indexed, DEFAULT_PALETTE[196]),
+        colors_match(drawn_indexed, DARK.indexed_palette()[196]),
         "256-colour index 196 drew {drawn_indexed:?}, expected {:?}",
-        DEFAULT_PALETTE[196]
+        DARK.indexed_palette()[196]
     );
-    assert_eq!(DEFAULT_PALETTE[196], [255, 0, 0]);
+    assert_eq!(DARK.indexed_palette()[196], [255, 0, 0]);
 
     // A grayscale-ramp index resolves too, and differs from both above.
     let gray = snapshot(1, 4, b"\x1b[38;5;244mA");
     let gray_frame = render(&renderer, &gray);
     let drawn_gray = cell_color(&gray_frame, 0, 0);
     assert!(
-        colors_match(drawn_gray, DEFAULT_PALETTE[244]),
+        colors_match(drawn_gray, DARK.indexed_palette()[244]),
         "256-colour index 244 drew {drawn_gray:?}, expected {:?}",
-        DEFAULT_PALETTE[244]
+        DARK.indexed_palette()[244]
     );
     assert!(!colors_match(drawn_gray, drawn_indexed));
 }
@@ -795,7 +813,7 @@ fn indexed_background_matches_its_truecolor_palette_entry() {
         truecolor_frame.rgba, indexed_frame.rgba,
         "truecolor red and indexed palette entry 196 must render identically"
     );
-    assert_eq!(DEFAULT_PALETTE[196], [255, 0, 0]);
+    assert_eq!(DARK.indexed_palette()[196], [255, 0, 0]);
 }
 
 #[test]
@@ -833,9 +851,9 @@ fn a_dark_coloured_cell_is_still_seen_as_lit() {
     );
     let drawn = cell_color(&frame, 0, 0);
     assert!(
-        colors_match(drawn, DEFAULT_ANSI_PALETTE[0]),
+        colors_match(drawn, DARK.ansi()[0]),
         "SGR 30 should draw palette black {:?}, drew {drawn:?}",
-        DEFAULT_ANSI_PALETTE[0]
+        DARK.ansi()[0]
     );
     // The old gate would have mistaken this for background; the new one must not.
     assert!(drawn.iter().all(|channel| *channel < 48));
@@ -861,7 +879,7 @@ fn colour_follows_the_cell_across_wide_characters_and_rows() {
         "the unstyled 'a' must keep the default foreground"
     );
     assert!(
-        colors_match(cell_color(&frame, 0, 1), DEFAULT_ANSI_PALETTE[1]),
+        colors_match(cell_color(&frame, 0, 1), DARK.ansi()[1]),
         "the wide lead at column 1 must be red"
     );
     assert!(
@@ -869,13 +887,63 @@ fn colour_follows_the_cell_across_wide_characters_and_rows() {
         "the wide continuation column must stay unlit"
     );
     assert!(
-        colors_match(cell_color(&frame, 0, 3), DEFAULT_ANSI_PALETTE[2]),
+        colors_match(cell_color(&frame, 0, 3), DARK.ansi()[2]),
         "'b' at display column 3 must be green — colour tracked the cell \
          across the continuation column"
     );
     assert!(
-        colors_match(cell_color(&frame, 1, 0), DEFAULT_ANSI_PALETTE[4]),
+        colors_match(cell_color(&frame, 1, 0), DARK.ansi()[4]),
         "'c' on row 1 must be blue"
+    );
+}
+
+// ===========================================================================
+// Themes (Milestone 6 foundation): a `[theme]` selection must change what is
+// drawn, and the absence of a selection must change nothing. The pipeline is
+// the real one — same shader, same vertex generation, same clear path — with
+// only the theme differing between captures.
+// ===========================================================================
+
+/// The defaults-preservation contract, at the pixel level: with no `[theme]`
+/// section the configuration resolves dark, and a frame captured through that
+/// resolution is byte-identical to one captured through the explicit dark
+/// theme. Together with the pre-theme tests above (which still pin the
+/// historical default foreground `[204, 235, 209]`, the dark clear colour,
+/// and the dark palette entries against their literals), this proves the
+/// default rendering did not move when themes landed.
+#[test]
+fn theme_absent_config_renders_byte_identically_to_the_explicit_dark_theme() {
+    let Some(renderer) =
+        renderer_or_skip("theme_absent_config_renders_byte_identically_to_the_explicit_dark_theme")
+    else {
+        return;
+    };
+    let snap = snapshot(2, 6, "a\x1b[31m日\x1b[32mb\r\n\x1b[34mc".as_bytes());
+
+    // The real configuration path: no [theme] section resolves the default.
+    let unthemed = noren_app::config::AppConfig::parse("# no theme section\n")
+        .expect("a theme-less file parses")
+        .theme()
+        .palette();
+    assert_eq!(unthemed, Theme::default());
+
+    let via_config = render_with_theme(&renderer, &unthemed, &snap);
+    let via_dark = render_with_theme(&renderer, &Theme::default(), &snap);
+    assert_eq!(
+        via_config.rgba, via_dark.rgba,
+        "a missing [theme] section must render exactly the dark theme's bytes"
+    );
+
+    // And those bytes carry the pre-theme appearance: the unstyled 'a' is the
+    // historical default foreground and the untouched background is the
+    // historical clear colour (y = 1 sits above the glyph's top inset).
+    assert!(
+        colors_match(cell_color(&via_dark, 0, 0), [204, 235, 209]),
+        "the dark default's unstyled foreground moved"
+    );
+    assert!(
+        is_clear(via_dark.pixel(8, 1)),
+        "the dark default's clear colour moved"
     );
 }
 
@@ -966,12 +1034,10 @@ fn render_with_sidebar(
     let width = total_cols * CELL_WIDTH;
     let height = u32::from(snap.rows()) * CELL_HEIGHT;
     renderer.capture(
+        Target::new(&Theme::default(), width, height, poc_metrics()),
         Some(snap),
         Some(sidebar),
         None,
-        width,
-        height,
-        poc_metrics(),
     )
 }
 

@@ -370,6 +370,44 @@ fn configured_cell_sizes_drive_the_app_geometry() {
     assert_eq!((grid.rows(), grid.cols()), (15, 45));
 }
 
+/// The `[theme]` selection reaches the app's renderer input: `NorenApp`
+/// carries exactly the palette the configuration named, and a missing
+/// `[theme]` section carries the dark default. This is the app-level half of
+/// the theme's reachability chain (configuration → app → renderer → pixels);
+/// the frame oracle proves the drawing half offscreen.
+#[test]
+fn configured_theme_reaches_the_app_renderer_input() {
+    for (text, expected) in [
+        ("", noren_app::theme::ThemeName::Dark),
+        (
+            "[theme]\nname = \"dark\"\n",
+            noren_app::theme::ThemeName::Dark,
+        ),
+        (
+            "[theme]\nname = \"light\"\n",
+            noren_app::theme::ThemeName::Light,
+        ),
+        (
+            "[theme]\nname = \"high-contrast\"\n",
+            noren_app::theme::ThemeName::HighContrast,
+        ),
+    ] {
+        let config = AppConfig::parse(text).expect("valid configuration");
+        assert_eq!(
+            config.theme().name(),
+            expected,
+            "config must parse {text:?} to {expected}"
+        );
+        let app = NorenApp::new(config);
+        assert_eq!(
+            app.theme,
+            expected.palette(),
+            "NorenApp must carry the palette named by {text:?}"
+        );
+    }
+    assert_eq!(NorenApp::default().theme, noren_app::theme::DARK);
+}
+
 #[test]
 fn workspace_starts_empty_with_no_sidebar_rows() {
     let state = WorkspaceState::new();
@@ -1975,13 +2013,11 @@ fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_
         app.worktree_diagnostic.as_deref(),
         app.ssh_diagnostic.as_deref(),
     );
-    let vertices = renderer::glyph_vertices(
+    let vertices = renderer::glyph_vertices_for(
+        renderer::Target::new(&app.theme, frame_width, frame_height, metrics),
         Some(&snapshot),
         Some(&[]),
         Some(status),
-        frame_width,
-        frame_height,
-        metrics,
     );
     assert!(
         !vertices.is_empty(),

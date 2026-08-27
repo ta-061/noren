@@ -45,6 +45,7 @@ use noren_app::{
     },
     sidebar::{SidebarEntry, SidebarView},
     ssh_config::{HostDiscoveryKind, SshConfig},
+    theme::Theme,
 };
 use noren_pty::{
     PtyEvent, PtySession, PtySize, SshDestination, SshDestinationError, SshLaunchPolicy,
@@ -835,6 +836,11 @@ struct NorenApp {
     /// commands. The single source of truth for every workspace chord the
     /// binary honors; no hard-coded chord remains on the key paths.
     keys: KeymapConfig,
+    /// The configured colour theme, handed to the renderer at creation so
+    /// every palette-derived draw colour — default foreground, ANSI
+    /// resolution, clear colour — follows the `[theme]` selection. The
+    /// default (`dark`) is exactly the pre-theme palette.
+    theme: Theme,
 }
 
 /// Which application-owned line, if any, occupies the renderer's status row.
@@ -928,6 +934,7 @@ impl NorenApp {
             passthrough_gate: PassthroughGate::new(),
             passthrough_policy: palette_policy(config.keys()),
             keys: config.keys(),
+            theme: config.theme().palette(),
         }
     }
 
@@ -1682,7 +1689,11 @@ impl NorenApp {
                 None
             }
         };
-        self.renderer = match Renderer::new(Arc::clone(&window), self.geometry.cell_metrics()) {
+        self.renderer = match Renderer::new(
+            Arc::clone(&window),
+            self.geometry.cell_metrics(),
+            self.theme,
+        ) {
             Ok(renderer) => Some(renderer),
             Err(_) => {
                 self.status = "Noren renderer start failed";

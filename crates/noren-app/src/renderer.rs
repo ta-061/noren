@@ -2,14 +2,19 @@
 //!
 //! Per-cell foreground colour recorded by the terminal state reaches drawing
 //! here: [`resolve_foreground`] runs a cell's `Color` selection through the
-//! default palette (or passes `Rgb` through directly) and the result rides on
-//! every vertex the cell's glyph emits, which the fragment shader returns.
-//! A cell with no SGR colour resolves to [`DEFAULT_FOREGROUND`] — the exact
-//! shade the shader previously returned as a constant — so unstyled output is
-//! unchanged.
+//! selected theme's palette (or passes `Rgb` through directly) and the result
+//! rides on every vertex the cell's glyph emits, which the fragment shader
+//! returns. A cell with no SGR colour resolves to the theme's default
+//! foreground — for the default `dark` theme, the exact shade the shader
+//! previously returned as a constant — so unstyled output is unchanged.
 //!
 //! Explicit SGR backgrounds emit one filled cell rectangle immediately before
 //! that cell's glyph, so the glyph remains legible over the background.
+//!
+//! The theme is selected through the `[theme]` configuration section and
+//! owned by the [`Renderer`]; every colour decision below — palette
+//! resolution, default foreground, clear colour — reads from it, so a theme
+//! that exists in configuration changes what is drawn.
 
 use std::borrow::Cow;
 use std::future::Future;
@@ -21,6 +26,7 @@ use wgpu::CurrentSurfaceTexture;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
+use noren_app::theme::Theme;
 use noren_app::{CellMetrics, MAX_RENDER_COLS, MAX_RENDER_ROWS};
 use noren_terminal::{CellAttributes, Color, TerminalSnapshot};
 const GLYPH_SCALE: u32 = 2;
@@ -186,80 +192,13 @@ pub(crate) const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 2] = [
 /// Default terminal foreground — the concrete colour behind a `Color::Default`
 /// foreground selection, the sidebar, and the status line.
 ///
-/// These are exactly the floats the fragment shader previously returned as a
-/// constant for every pixel. Keeping the value here rather than re-deriving it
-/// from an 8-bit triple is deliberate: rounding `0.80` through `u8` and back
-/// would shift the default shade slightly, and an unstyled prompt must look
-/// identical to how it looked before colour existed (issue #107).
-pub(crate) const DEFAULT_FOREGROUND: [f32; 3] = [0.80, 0.92, 0.82];
-
-/// Default terminal background as shader colour. Explicit backgrounds resolve
-/// through [`resolve_color`]; `Color::Default` emits no rectangle and leaves
-/// the render target's clear colour untouched.
-pub(crate) const DEFAULT_BACKGROUND: [f32; 3] = [0.035, 0.045, 0.04];
-
-/// The sixteen ANSI colours of the default theme as `(red, green, blue)` in
-/// palette-index order: standard colours `0..=7`, bright colours `8..=15`.
+/// The dark theme's value is exactly the floats the fragment shader
+/// previously returned as a constant for every pixel; see
+/// [`noren_app::theme::DARK`] (re-exported here as [`DARK`]) for the value
+/// and its history. Rounding `0.80` through `u8` and back would shift the
+/// default shade slightly, and an unstyled prompt must look identical to how
+/// it looked before colour existed (issue #107).
 ///
-/// This table is the single theme seam. The values are the xterm defaults; a
-/// future configurable theme replaces this table and every palette-derived
-/// draw colour follows without touching the resolution logic.
-pub(crate) const DEFAULT_ANSI_PALETTE: [[u8; 3]; 16] = [
-    [0, 0, 0],
-    [205, 0, 0],
-    [0, 205, 0],
-    [205, 205, 0],
-    [0, 0, 238],
-    [205, 0, 205],
-    [0, 205, 205],
-    [229, 229, 229],
-    [127, 127, 127],
-    [255, 0, 0],
-    [0, 255, 0],
-    [255, 255, 0],
-    [92, 92, 255],
-    [255, 0, 255],
-    [0, 255, 255],
-    [255, 255, 255],
-];
-
-/// One channel of the xterm 6×6×6 colour cube: level zero is zero, and the
-/// remaining five levels are `55 + 40 * level`.
-const fn cube_channel(level: u8) -> u8 {
-    if level == 0 { 0 } else { level * 40 + 55 }
-}
-
-/// Derive the full xterm 256-colour palette once, at compile time.
-const fn build_default_palette() -> [[u8; 3]; 256] {
-    let mut palette = [[0_u8; 3]; 256];
-    let mut index = 0_usize;
-    while index < 256 {
-        palette[index] = if index < 16 {
-            DEFAULT_ANSI_PALETTE[index]
-        } else if index < 232 {
-            let cube = (index - 16) as u32;
-            [
-                cube_channel((cube / 36) as u8),
-                cube_channel(((cube / 6) % 6) as u8),
-                cube_channel((cube % 6) as u8),
-            ]
-        } else {
-            let gray = (8 + (index - 232) * 10) as u8;
-            [gray, gray, gray]
-        };
-        index += 1;
-    }
-    palette
-}
-
-/// The xterm 256-colour default palette: entries `0..=15` from
-/// [`DEFAULT_ANSI_PALETTE`], `16..=231` the 6×6×6 colour cube, and
-/// `232..=255` the 24-step grayscale ramp.
-///
-/// The 16 ANSI colours and the 256-colour indexes resolve through this one
-/// table, so `SGR 31` and `SGR 38;5;1` cannot disagree about what red is.
-pub(crate) const DEFAULT_PALETTE: [[u8; 3]; 256] = build_default_palette();
-
 /// Convert an 8-bit-per-channel colour to the shader's `0.0..=1.0` floats.
 const fn channels_to_floats([red, green, blue]: [u8; 3]) -> [f32; 3] {
     [
@@ -269,37 +208,41 @@ const fn channels_to_floats([red, green, blue]: [u8; 3]) -> [f32; 3] {
     ]
 }
 
-/// Resolve one renderer-independent colour selection to a concrete draw colour.
+/// Resolve one renderer-independent colour selection to a concrete draw colour
+/// **through the selected theme**.
 ///
 /// [`Color::Default`] yields `default` (the caller supplies the contextual
 /// default for the slot), [`Color::Ansi`] and [`Color::Indexed`] both resolve
-/// through [`DEFAULT_PALETTE`] — one path, so the 16-colour and 256-colour
-/// forms of the same colour agree — and [`Color::Rgb`] passes through as
-/// direct 24-bit truecolor.
+/// through the theme's 256-colour table — one path, so the 16-colour and
+/// 256-colour forms of the same colour agree — and [`Color::Rgb`] passes
+/// through as direct 24-bit truecolor.
 #[must_use]
-pub(crate) fn resolve_color(color: Color, default: [f32; 3]) -> [f32; 3] {
+pub(crate) fn resolve_color(theme: &Theme, color: Color, default: [f32; 3]) -> [f32; 3] {
     match color {
         Color::Default => default,
-        Color::Ansi(ansi) => channels_to_floats(DEFAULT_PALETTE[ansi.palette_index() as usize]),
-        Color::Indexed(index) => channels_to_floats(DEFAULT_PALETTE[index as usize]),
+        Color::Ansi(ansi) => {
+            channels_to_floats(theme.indexed_palette()[ansi.palette_index() as usize])
+        }
+        Color::Indexed(index) => channels_to_floats(theme.indexed_palette()[index as usize]),
         Color::Rgb(red, green, blue) => channels_to_floats([red, green, blue]),
     }
 }
 
-/// The colour a cell's glyph is drawn in.
+/// The colour a cell's glyph is drawn in, under the selected theme.
 #[must_use]
-pub(crate) fn resolve_foreground(attributes: &CellAttributes) -> [f32; 3] {
-    resolve_color(attributes.foreground(), DEFAULT_FOREGROUND)
+pub(crate) fn resolve_foreground(theme: &Theme, attributes: &CellAttributes) -> [f32; 3] {
+    resolve_color(theme, attributes.foreground(), theme.foreground())
 }
 
-/// Resolve an explicit cell background through the same palette/truecolor path
-/// as foreground. `None` is intentional: an unstyled cell must remain exactly
-/// the clear colour, with no rectangle changing its rasterisation.
+/// Resolve an explicit cell background through the same theme palette /
+/// truecolor path as foreground. `None` is intentional: an unstyled cell must
+/// remain exactly the clear colour, with no rectangle changing its
+/// rasterisation.
 #[must_use]
-pub(crate) fn resolve_background(attributes: &CellAttributes) -> Option<[f32; 3]> {
+pub(crate) fn resolve_background(theme: &Theme, attributes: &CellAttributes) -> Option<[f32; 3]> {
     match attributes.background() {
         Color::Default => None,
-        background => Some(resolve_color(background, DEFAULT_BACKGROUND)),
+        background => Some(resolve_color(theme, background, theme.background())),
     }
 }
 
@@ -315,6 +258,25 @@ pub(crate) const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     b: 0.04,
     a: 1.0,
 };
+
+/// The clear colour a theme's background becomes at the render-pass load op.
+///
+/// The dark theme clears with the exact historical [`CLEAR_COLOR`] constants
+/// (f64 literals, not f32-widened values) so the no-`[theme]` default keeps
+/// its pre-theme clear bit-for-bit; other themes clear to their own
+/// background.
+pub(crate) fn theme_clear_color(theme: &Theme) -> wgpu::Color {
+    if *theme == noren_app::theme::DARK {
+        return CLEAR_COLOR;
+    }
+    let [red, green, blue] = theme.background();
+    wgpu::Color {
+        r: red as f64,
+        g: green as f64,
+        b: blue as f64,
+        a: 1.0,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RendererError {
@@ -342,10 +304,15 @@ pub(crate) struct Renderer {
     vertex_capacity: u64,
     device_lost: Arc<AtomicBool>,
     metrics: CellMetrics,
+    theme: Theme,
 }
 
 impl Renderer {
-    pub(crate) fn new(window: Arc<Window>, metrics: CellMetrics) -> Result<Self, RendererError> {
+    pub(crate) fn new(
+        window: Arc<Window>,
+        metrics: CellMetrics,
+        theme: Theme,
+    ) -> Result<Self, RendererError> {
         let size = window.inner_size();
         let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         instance_descriptor.backends = wgpu::Backends::METAL;
@@ -435,6 +402,7 @@ impl Renderer {
             vertex_capacity,
             device_lost,
             metrics,
+            theme,
         })
     }
 
@@ -457,14 +425,13 @@ impl Renderer {
             return RenderOutcome::DeviceLost;
         }
 
-        let vertices = glyph_vertices(
-            terminal,
-            sidebar,
-            status,
+        let target = Target::new(
+            &self.theme,
             self.config.width,
             self.config.height,
             self.metrics,
         );
+        let vertices = glyph_vertices_for(target, terminal, sidebar, status);
         let bytes = vertex_bytes(&vertices);
         let required = u64::try_from(bytes.len()).unwrap_or(u64::MAX).max(8);
         if required > self.vertex_capacity {
@@ -508,7 +475,7 @@ impl Renderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(CLEAR_COLOR),
+                        load: wgpu::LoadOp::Clear(theme_clear_color(&self.theme)),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -560,24 +527,17 @@ fn block_on<F: Future>(future: F) -> F::Output {
 /// for the sidebar text and the terminal is drawn starting at column
 /// `SIDEBAR_COLS`. When `sidebar` is `None`, the terminal occupies the full
 /// width starting at column 0 (preserving the pre-sidebar behaviour the frame
-/// oracle's existing tests rely on).
-pub(crate) fn glyph_vertices(
+/// oracle's existing tests rely on). Every colour decision — palette
+/// resolution, the sidebar/status default foreground, the clear colour the
+/// caller loads — reads from the target's theme, which is how a configured
+/// theme changes what is drawn.
+pub(crate) fn glyph_vertices_for(
+    target: Target,
     terminal: Option<&TerminalSnapshot>,
     sidebar: Option<&[String]>,
     status: Option<&str>,
-    width: u32,
-    height: u32,
-    metrics: CellMetrics,
 ) -> Vec<Vertex> {
-    glyph_vertices_with_budget(
-        terminal,
-        sidebar,
-        status,
-        width,
-        height,
-        metrics,
-        MAX_VERTICES,
-    )
+    glyph_vertices_with_budget(target, terminal, sidebar, status, MAX_VERTICES)
 }
 
 /// Internal seam for exercising the production vertex-budget backstop without
@@ -585,14 +545,14 @@ pub(crate) fn glyph_vertices(
 /// [`MAX_VERTICES`]; tests use a smaller budget but traverse this same emission
 /// code and the same post-primitive guards.
 fn glyph_vertices_with_budget(
+    target: Target,
     terminal: Option<&TerminalSnapshot>,
     sidebar: Option<&[String]>,
     status: Option<&str>,
-    width: u32,
-    height: u32,
-    metrics: CellMetrics,
     vertex_budget: usize,
 ) -> Vec<Vertex> {
+    let (width, height, metrics, theme) =
+        (target.width, target.height, target.metrics, target.theme);
     if width == 0 || height == 0 {
         return Vec::new();
     }
@@ -631,16 +591,12 @@ fn glyph_vertices_with_budget(
     let layout = FrameRowLayout::new(height, metrics, rows.len(), status.is_some())
         .expect("non-zero frame height has a row layout");
     let mut vertices = Vec::new();
-    let target = Target {
-        width,
-        height,
-        metrics,
-    };
 
     // The sidebar is chrome, not terminal content: it carries no cell
-    // attributes, so it draws in the default foreground. Unlike terminal and
-    // status rows, sidebar rows are interactive chrome and are only drawn when
-    // the whole cell is visible; sidebar hit testing uses this same count.
+    // attributes, so it draws in the theme's default foreground. Unlike
+    // terminal and status rows, sidebar rows are interactive chrome and are
+    // only drawn when the whole cell is visible; sidebar hit testing uses
+    // this same count.
     if let Some(lines) = sidebar {
         for (row, line) in lines
             .iter()
@@ -651,7 +607,7 @@ fn glyph_vertices_with_budget(
                 push_glyph(
                     &mut vertices,
                     character,
-                    DEFAULT_FOREGROUND,
+                    theme.foreground(),
                     col,
                     row,
                     target,
@@ -673,7 +629,7 @@ fn glyph_vertices_with_budget(
                     .get(line_index)
                     .expect("terminal layout only names display rows");
                 for (col, cell) in cells.iter().take(terminal_cols).enumerate() {
-                    if let Some(color) = resolve_background(cell.attributes()) {
+                    if let Some(color) = resolve_background(&theme, cell.attributes()) {
                         push_rect(
                             &mut vertices,
                             u32::try_from(col_offset + col).unwrap_or(u32::MAX) * cell_width,
@@ -693,7 +649,7 @@ fn glyph_vertices_with_budget(
                     if cell.is_continuation() {
                         continue;
                     }
-                    let color = resolve_foreground(cell.attributes());
+                    let color = resolve_foreground(&theme, cell.attributes());
                     for character in cell.text().chars() {
                         push_glyph(
                             &mut vertices,
@@ -720,7 +676,7 @@ fn glyph_vertices_with_budget(
                     push_glyph(
                         &mut vertices,
                         character,
-                        DEFAULT_FOREGROUND,
+                        theme.foreground(),
                         col_offset + col,
                         row,
                         target,
@@ -735,17 +691,32 @@ fn glyph_vertices_with_budget(
     vertices
 }
 
-/// The draw surface a frame is laid out against: pixel dimensions plus the
-/// cell size the grid is drawn at.
+/// The draw surface a frame is laid out against: the selected theme plus the
+/// pixel dimensions and cell size the grid is drawn at.
 ///
-/// These three travel together through every emit call and are constant for a
+/// These four travel together through every emit call and are constant for a
 /// frame, so passing them as one value keeps the glyph/rect helpers to a
-/// readable arity now that each also carries a colour.
+/// readable arity; bundling the theme here is also what keeps the public
+/// vertex and capture seams under the argument-count lint without scattering
+/// the theme through every signature.
 #[derive(Clone, Copy, Debug)]
-struct Target {
-    width: u32,
-    height: u32,
-    metrics: CellMetrics,
+pub(crate) struct Target {
+    pub(crate) theme: Theme,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) metrics: CellMetrics,
+}
+
+impl Target {
+    /// Assemble one frame's draw surface.
+    pub(crate) fn new(theme: &Theme, width: u32, height: u32, metrics: CellMetrics) -> Self {
+        Self {
+            theme: *theme,
+            width,
+            height,
+            metrics,
+        }
+    }
 }
 
 /// Emit the 5×7 bitmap glyph for `character` at grid cell `(col, row)`.
@@ -1312,7 +1283,26 @@ fn glyph_rows(character: char) -> [u8; 7] {
 mod tests {
     use super::*;
     use noren_app::GridGeometry;
+    use noren_app::theme::DARK;
     use noren_terminal::TerminalState;
+
+    /// Default-theme vertex emission for test call sites: the shape the
+    /// pre-theme tests used, now entering through the [`Target`] seam.
+    fn frame_vertices(
+        terminal: Option<&TerminalSnapshot>,
+        sidebar: Option<&[String]>,
+        status: Option<&str>,
+        width: u32,
+        height: u32,
+        metrics: CellMetrics,
+    ) -> Vec<Vertex> {
+        glyph_vertices_for(
+            Target::new(&Theme::default(), width, height, metrics),
+            terminal,
+            sidebar,
+            status,
+        )
+    }
 
     fn snapshot(rows: u16, cols: u16, bytes: &[u8]) -> TerminalSnapshot {
         let mut terminal = TerminalState::new(rows, cols).expect("valid test terminal");
@@ -1323,6 +1313,19 @@ mod tests {
     /// The PoC default cell metrics for tests that exercise the default path.
     fn poc_metrics() -> CellMetrics {
         GridGeometry::poc().cell_metrics()
+    }
+
+    /// The dark theme's clear colour is the exact historical constant — f64
+    /// literals, not f32-widened values — so the no-`[theme]` default keeps
+    /// its pre-theme clear bit-for-bit (`theme_clear_color` special-cases
+    /// dark for exactly this reason).
+    #[test]
+    fn dark_theme_clear_colour_is_the_historical_constant() {
+        let dark = theme_clear_color(&Theme::default());
+        assert_eq!(
+            (dark.r, dark.g, dark.b, dark.a),
+            (CLEAR_COLOR.r, CLEAR_COLOR.g, CLEAR_COLOR.b, CLEAR_COLOR.a)
+        );
     }
 
     // NOTE: the renderer's row/column clamp coverage used to live here as
@@ -1372,21 +1375,17 @@ mod tests {
         let sidebar_width = u32::try_from(SIDEBAR_COLS).unwrap_or(u32::MAX) * metrics.width();
         assert_truncated(
             "sidebar glyph",
-            glyph_vertices(
+            glyph_vertices_for(
+                Target::new(&Theme::default(), sidebar_width, height, metrics),
                 None,
                 Some(sidebar.as_slice()),
                 None,
-                sidebar_width,
-                height,
-                metrics,
             ),
             glyph_vertices_with_budget(
+                Target::new(&Theme::default(), sidebar_width, height, metrics),
                 None,
                 Some(sidebar.as_slice()),
                 None,
-                sidebar_width,
-                height,
-                metrics,
                 glyph_budget,
             ),
             glyph_budget,
@@ -1395,21 +1394,17 @@ mod tests {
         let background_terminal = snapshot(1, 1, b"\x1b[48;2;12;98;201mA");
         assert_truncated(
             "terminal background rectangle",
-            glyph_vertices(
+            glyph_vertices_for(
+                Target::new(&Theme::default(), metrics.width(), height, metrics),
                 Some(&background_terminal),
                 None,
                 None,
-                metrics.width(),
-                height,
-                metrics,
             ),
             glyph_vertices_with_budget(
+                Target::new(&Theme::default(), metrics.width(), height, metrics),
                 Some(&background_terminal),
                 None,
                 None,
-                metrics.width(),
-                height,
-                metrics,
                 VERTICES_PER_RECT,
             ),
             VERTICES_PER_RECT,
@@ -1428,21 +1423,17 @@ mod tests {
         );
         assert_truncated(
             "terminal cell glyph",
-            glyph_vertices(
+            glyph_vertices_for(
+                Target::new(&Theme::default(), metrics.width(), height, metrics),
                 Some(&terminal_glyphs),
                 None,
                 None,
-                metrics.width(),
-                height,
-                metrics,
             ),
             glyph_vertices_with_budget(
+                Target::new(&Theme::default(), metrics.width(), height, metrics),
                 Some(&terminal_glyphs),
                 None,
                 None,
-                metrics.width(),
-                height,
-                metrics,
                 glyph_budget,
             ),
             glyph_budget,
@@ -1451,14 +1442,17 @@ mod tests {
         let status_width = 2 * metrics.width();
         assert_truncated(
             "status glyph",
-            glyph_vertices(None, None, Some("AA"), status_width, height, metrics),
-            glyph_vertices_with_budget(
+            glyph_vertices_for(
+                Target::new(&Theme::default(), status_width, height, metrics),
                 None,
                 None,
                 Some("AA"),
-                status_width,
-                height,
-                metrics,
+            ),
+            glyph_vertices_with_budget(
+                Target::new(&Theme::default(), status_width, height, metrics),
+                None,
+                None,
+                Some("AA"),
                 glyph_budget,
             ),
             glyph_budget,
@@ -1548,7 +1542,7 @@ mod tests {
         let width = (SIDEBAR_COLS as u32) * metrics.width();
         let lines = vec!["A".to_owned(), "B".to_owned()];
         let draw =
-            |height| glyph_vertices(None, Some(lines.as_slice()), None, width, height, metrics);
+            |height| frame_vertices(None, Some(lines.as_slice()), None, width, height, metrics);
         let first_row_vertices = glyph_rows('A')
             .iter()
             .map(|row| row.count_ones() as usize)
@@ -1576,8 +1570,8 @@ mod tests {
     fn empty_and_zero_sized_inputs_have_no_vertices() {
         let empty = snapshot(1, 1, b"");
         let text = snapshot(1, 8, b"text");
-        assert!(glyph_vertices(Some(&empty), None, None, 900, 600, poc_metrics()).is_empty());
-        assert!(glyph_vertices(Some(&text), None, None, 0, 600, poc_metrics()).is_empty());
+        assert!(frame_vertices(Some(&empty), None, None, 900, 600, poc_metrics()).is_empty());
+        assert!(frame_vertices(Some(&text), None, None, 0, 600, poc_metrics()).is_empty());
     }
 
     /// The 16-colour and 256-colour forms of the same colour must resolve
@@ -1589,26 +1583,30 @@ mod tests {
         // `SGR 31` (ANSI red) and `SGR 38;5;1` (indexed 1) name the same
         // colour and must produce identical draw colours.
         assert_eq!(
-            resolve_color(Color::Ansi(AnsiColor::Red), DEFAULT_FOREGROUND),
-            resolve_color(Color::Indexed(1), DEFAULT_FOREGROUND),
+            resolve_color(
+                &Theme::default(),
+                Color::Ansi(AnsiColor::Red),
+                DARK.foreground()
+            ),
+            resolve_color(&Theme::default(), Color::Indexed(1), DARK.foreground()),
         );
         // Truecolor passes through as exact 24-bit channels.
         assert_eq!(
-            resolve_color(Color::Rgb(255, 0, 0), DEFAULT_FOREGROUND),
+            resolve_color(&Theme::default(), Color::Rgb(255, 0, 0), DARK.foreground()),
             [1.0, 0.0, 0.0]
         );
         // Default takes the contextual default the caller supplied.
         assert_eq!(
-            resolve_color(Color::Default, DEFAULT_FOREGROUND),
-            DEFAULT_FOREGROUND
+            resolve_color(&Theme::default(), Color::Default, DARK.foreground()),
+            DARK.foreground()
         );
         // Spot-check the xterm cube and grayscale derivations: index 196 is
         // cube (5,0,0) = pure red, and 232 is the darkest gray step.
-        assert_eq!(DEFAULT_PALETTE[196], [255, 0, 0]);
-        assert_eq!(DEFAULT_PALETTE[232], [8, 8, 8]);
-        assert_eq!(DEFAULT_PALETTE[255], [238, 238, 238]);
+        assert_eq!(DARK.indexed_palette()[196], [255, 0, 0]);
+        assert_eq!(DARK.indexed_palette()[232], [8, 8, 8]);
+        assert_eq!(DARK.indexed_palette()[255], [238, 238, 238]);
         // Distinct palette entries must stay distinct.
-        assert_ne!(DEFAULT_PALETTE[1], DEFAULT_PALETTE[4]);
+        assert_ne!(DARK.indexed_palette()[1], DARK.indexed_palette()[4]);
     }
 
     /// A cell's resolved colour must reach the vertices its glyph emits —
@@ -1617,8 +1615,8 @@ mod tests {
     fn sgr_foreground_reaches_the_vertex_colour() {
         // Red 'A' then default-coloured 'B'.
         let terminal = snapshot(1, 4, b"\x1b[31mA\x1b[0mB");
-        let vertices = glyph_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
-        let red = channels_to_floats(DEFAULT_ANSI_PALETTE[1]);
+        let vertices = frame_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
+        let red = channels_to_floats(DARK.ansi()[1]);
         assert!(
             vertices.iter().any(|vertex| vertex.color == red),
             "the SGR-31 cell must emit vertices in palette red"
@@ -1626,7 +1624,7 @@ mod tests {
         assert!(
             vertices
                 .iter()
-                .any(|vertex| vertex.color == DEFAULT_FOREGROUND),
+                .any(|vertex| vertex.color == DARK.foreground()),
             "the unstyled cell must emit vertices in the default foreground"
         );
     }
@@ -1634,7 +1632,7 @@ mod tests {
     #[test]
     fn explicit_background_emits_a_full_rect_before_the_glyph() {
         let terminal = snapshot(1, 1, b"\x1b[38;2;241;207;33;48;2;12;98;201mA");
-        let vertices = glyph_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
+        let vertices = frame_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
         let background = channels_to_floats([12, 98, 201]);
         let foreground = channels_to_floats([241, 207, 33]);
 
@@ -1667,7 +1665,7 @@ mod tests {
     #[test]
     fn default_background_emits_no_extra_vertices() {
         let terminal = snapshot(1, 1, b"A");
-        let vertices = glyph_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
+        let vertices = frame_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
         let glyph_pixels = glyph_rows('A')
             .iter()
             .map(|row| row.count_ones() as usize)
@@ -1689,7 +1687,7 @@ mod tests {
         );
         let width = u32::from(MAX_RENDER_COLS + 1) * 10;
         let height = u32::from(MAX_RENDER_ROWS + 1) * 20;
-        let vertices = glyph_vertices(Some(&terminal), None, None, width, height, poc_metrics());
+        let vertices = frame_vertices(Some(&terminal), None, None, width, height, poc_metrics());
 
         let contains = |row: usize, col: usize| {
             let left = col as f32 * 10.0 / width as f32 * 2.0 - 1.0;
@@ -1851,7 +1849,7 @@ mod tests {
         let height = metrics.height();
         let vertices_for = |text: &str| {
             let terminal = snapshot(1, 1, text.as_bytes());
-            glyph_vertices(Some(&terminal), None, None, width, height, metrics)
+            frame_vertices(Some(&terminal), None, None, width, height, metrics)
         };
 
         let horizontal = vertices_for("─");
@@ -1875,7 +1873,7 @@ mod tests {
     #[test]
     fn vertex_encoding_matches_the_declared_buffer_layout() {
         let terminal = snapshot(1, 2, b"A");
-        let vertices = glyph_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
+        let vertices = frame_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
         assert!(!vertices.is_empty(), "'A' emitted no vertices");
         assert_eq!(
             vertex_bytes(&vertices).len(),
@@ -1895,7 +1893,7 @@ mod tests {
     #[test]
     fn unstyled_cells_draw_in_the_previous_constant_foreground() {
         let terminal = snapshot(1, 4, b"AB");
-        let vertices = glyph_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
+        let vertices = frame_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
         assert!(!vertices.is_empty(), "unstyled text emitted no vertices");
         assert!(
             vertices
@@ -1903,7 +1901,7 @@ mod tests {
                 .all(|vertex| vertex.color == [0.80, 0.92, 0.82]),
             "unstyled cells must draw in the historical constant 0.80/0.92/0.82"
         );
-        assert_eq!(DEFAULT_FOREGROUND, [0.80, 0.92, 0.82]);
+        assert_eq!(DARK.foreground(), [0.80, 0.92, 0.82]);
     }
 
     const CELL_WIDTH: u32 = noren_app::POC_CELL_WIDTH;
@@ -1926,7 +1924,7 @@ mod tests {
     #[test]
     fn wide_characters_place_following_glyphs_at_display_columns() {
         let terminal = snapshot(1, 6, "a日b".as_bytes());
-        let vertices = glyph_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
+        let vertices = frame_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
 
         // a occupies column 0, 日 columns 1-2, so b must start at display
         // column 3 and nothing may draw at column 2's lead edge.
@@ -1944,8 +1942,8 @@ mod tests {
         let aligned = snapshot(1, 6, "a\u{fffd} b".as_bytes());
         let m = poc_metrics();
         assert_eq!(
-            glyph_vertices(Some(&wide), None, None, 900, 600, m),
-            glyph_vertices(Some(&aligned), None, None, 900, 600, m),
+            frame_vertices(Some(&wide), None, None, 900, 600, m),
+            frame_vertices(Some(&aligned), None, None, 900, 600, m),
             "the wide lead draws in column 1, its continuation column stays empty, and b lands in column 3"
         );
     }
@@ -1953,7 +1951,7 @@ mod tests {
     #[test]
     fn ascii_glyphs_keep_their_character_columns() {
         let terminal = snapshot(1, 4, b"BD");
-        let vertices = glyph_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
+        let vertices = frame_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
         assert!(has_rect_top_left(&vertices, ndc_left(0)));
         assert!(has_rect_top_left(&vertices, ndc_left(1)));
         assert!(!has_rect_top_left(&vertices, ndc_left(2)));
@@ -1974,11 +1972,11 @@ mod tests {
     #[test]
     fn non_default_cell_metrics_change_what_the_renderer_draws() {
         let terminal = snapshot(1, 4, b"BBBB");
-        let small = glyph_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
+        let small = frame_vertices(Some(&terminal), None, None, 900, 600, poc_metrics());
         let big = GridGeometry::with_cells(20, 40)
             .expect("valid metrics")
             .cell_metrics();
-        let big_verts = glyph_vertices(Some(&terminal), None, None, 900, 600, big);
+        let big_verts = frame_vertices(Some(&terminal), None, None, 900, 600, big);
 
         assert_ne!(
             small, big_verts,
