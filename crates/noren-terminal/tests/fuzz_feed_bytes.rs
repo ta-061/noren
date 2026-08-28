@@ -20,13 +20,52 @@
 //! the "ignore garbage" path; structured near-valid input is where parsers
 //! break.
 //!
-//! The oracle is `assert_invariants` copied VERBATIM from
-//! `tests/adversarial.rs` (each integration test file is its own crate, so
-//! it is copied, not imported — same provenance rule the soak states). It
-//! asserts: dimensions non-zero, cells within `MAX_SCREEN_CELLS`, grid cell
-//! count consistent with the dimensions, cursor row/column in bounds, and
-//! scroll region ordered (top <= bottom) and within the screen. A panic
-//! anywhere in `feed_bytes` is the other failure mode and fails the case.
+//! The ORACLE has three layers, and its guarantees are only as strong as
+//! the union of them:
+//!
+//! 1. Shape (verbatim): `assert_invariants` copied VERBATIM from
+//!    `tests/adversarial.rs` (each integration test file is its own crate,
+//!    so it is copied, not imported — same provenance rule the soak
+//!    states). It asserts: dimensions non-zero, cells within
+//!    `MAX_SCREEN_CELLS`, grid cell count consistent with the dimensions,
+//!    cursor row/column in bounds, and scroll region ordered (top <=
+//!    bottom) and within the screen. A panic anywhere in `feed_bytes` is
+//!    the other failure mode and fails the case.
+//! 2. Structural content, any input (fuzz-local): [`assert_state_oracles`]
+//!    additionally asserts after every feed/resize that scrollback stays
+//!    within `MAX_SCROLLBACK_LINES`, the cursor never rests on the
+//!    continuation half of a wide character, and every wide-character
+//!    lead/continuation pair in the grid is intact.
+//! 3. Decoded/pen/buffer content (fuzz-local): [`run_content_probes`]
+//!    appends deterministic probes to EVERY generated case (and to the
+//!    corpus sweep's originals plus a one-in-eight mutation lattice). Each
+//!    probe forces its own preconditions (`ESC \` grounds the parser, CUP
+//!    1;1 positions and clears pending autowrap, SGR 0 clears the pen), so
+//!    its expected outcome holds for ANY preceding input: a printed
+//!    character is retrievable verbatim from the cell it landed in (all
+//!    UTF-8 byte classes plus a combining mark), a compound SGR lands
+//!    exactly in the pen and in cells written under it, `SGR 0` (and the
+//!    empty `SGR`) returns the pen to the exact default, an overflowing
+//!    SGR leaves the pen untouched, SCS final bytes neither print nor move
+//!    the cursor, tabs stay inside the row without leaving autowrap
+//!    pending, and mode-1049 alternate-screen switching moves writes
+//!    between buffers without touching the primary's content.
+//!
+//! What this oracle still does NOT check (known-unasserted; do not quote
+//! the clean-run numbers as covering these): scrollback CONTENT (only the
+//! cap is asserted — retention, order, and row-width preservation are the
+//! scrollback host tests' job); erase/scroll/insert/delete CONTENT effects
+//! (shape only — semantics live in the erase_operation/scroll_regions host
+//! tests); exact tab-stop arithmetic (only bounds: row kept, column in
+//! bounds, wrap cleared — the 8-column stop math and its interaction with
+//! wide characters is unasserted here); the wide-character squeeze/wrap
+//! policy at the right screen edge (probes only print where the full width
+//! fits); alternate-screen modes 47/1047/1048 (this parser maps only 1049,
+//! so only 1049 is probed); charset translation (none is implemented —
+//! only final-byte non-leak is asserted); the combining-marks-per-cell cap
+//! (one-mark attachment is asserted, the cap policy is not); and pen
+//! persistence across a 1049 switch (terminal-global by design, covered by
+//! the sgr host tests).
 //!
 //! Reproducibility: every case is derived deterministically from
 //! (`root seed`, case index) — see [`case_rng`]. On failure the panic
@@ -48,12 +87,14 @@
 //!   in the module docs of the test below).
 //!
 //! Iteration bounds (documented, deterministic): the generated-streams test
-//! runs `DEFAULT_CASES` = 2500 cases of at most 8 sequences each; the
-//! corpus mutation sweep is systematic (every truncation, byte flip,
-//! substitution, and insertion site of every corpus entry) and needs no
-//! randomness. Both together stay well under the 10-second test budget on
-//! tiny grids (measured: the whole file runs in ~0.2 s on macOS arm64
-//! debug, so `cargo test --workspace` gains ~0.2 s).
+//! runs `DEFAULT_CASES` = 2500 cases of at most 8 sequences each — each now
+//! also carrying the full content-probe suite; the corpus mutation sweep is
+//! systematic (every truncation, byte flip, substitution, and insertion
+//! site of every corpus entry) and needs no randomness. Both together stay
+//! under the 10-second test budget on tiny grids (measured: the whole file
+//! runs in ~0.9 s on this macOS arm64 debug machine under load; ~0.2 s of
+//! that is the probe suites), so `cargo test --workspace` gains under a
+//! second.
 //!
 //! Campaign evidence (2026-08-28, macOS arm64 debug, `FUZZ_SECONDS=60`
 //! under three root seeds — `0xF00F_BEEF_5EED_0A11`, `0x1`, and
@@ -66,7 +107,9 @@
 use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
 
-use noren_terminal::{MAX_SCREEN_CELLS, TerminalState};
+use noren_terminal::{
+    Cell, CellAttributes, Color, MAX_SCREEN_CELLS, MAX_SCROLLBACK_LINES, TerminalState,
+};
 
 // ===== Invariant oracle (verbatim from tests/adversarial.rs) =====
 
@@ -94,6 +137,283 @@ fn assert_invariants(state: &TerminalState, context: &str) {
     let region = state.scroll_region();
     assert!(region.top() <= region.bottom(), "{context}: region ordered");
     assert!(region.bottom() < rows, "{context}: region within screen");
+}
+
+// ===== Extended any-input oracles (fuzz-local; NOT part of the verbatim
+// adversarial copy above) =====
+//
+// The shape-only oracle above cannot see a decoder or SGR regression: a
+// parser that drops every CJK glyph or turns `SGR 0` into a no-op keeps all
+// structural invariants green. The two checks in this section close that
+// gap from both directions:
+//
+// 1. [`assert_state_oracles`] — structural-content invariants that must
+//    hold after ANY input: scrollback stays within its cap, the cursor
+//    never rests on the continuation half of a wide character, and every
+//    wide-character pair in the grid is intact (each width-2 lead is
+//    directly followed by its continuation cell; each continuation
+//    directly follows a width-2 lead). The pair scan is a public-API
+//    mirror of the crate-private `ScreenBuffer::wide_cells_intact`.
+//
+// 2. [`run_content_probes`] — deterministic content probes appended to
+//    EVERY case (generated and corpus-sweep alike). Each probe first
+//    forces the parser into a known state (`ESC \` grounds the state
+//    machine from any parser state; `CUP 1;1` clears pending autowrap and
+//    positions absolutely; `SGR 0` clears the pen), so its expected
+//    outcome is independent of whatever hostile bytes preceded it. That
+//    is what makes the probes valid for ANY generated input rather than
+//    hand-picked cases.
+
+/// Content-level invariants that must hold after any sequence of public
+/// calls, checked after every feed and resize alongside the verbatim shape
+/// oracle.
+fn assert_state_oracles(state: &TerminalState, context: &str) {
+    assert!(
+        state.scrollback_len() <= MAX_SCROLLBACK_LINES,
+        "{context}: scrollback within cap"
+    );
+    let cursor = state.cursor();
+    assert!(
+        !state
+            .screen()
+            .cell(cursor.row(), cursor.column())
+            .is_some_and(Cell::is_continuation),
+        "{context}: cursor off continuation cell"
+    );
+    let (_, cols) = state.size();
+    for row_cells in state.screen().cells().chunks(usize::from(cols)) {
+        let mut index = 0;
+        while index < row_cells.len() {
+            if row_cells[index].is_continuation() {
+                assert!(
+                    index > 0 && row_cells[index - 1].width() == 2,
+                    "{context}: continuation cell follows a wide lead"
+                );
+                index += 1;
+            } else if row_cells[index].width() == 2 {
+                assert!(
+                    index + 1 < row_cells.len() && row_cells[index + 1].is_continuation(),
+                    "{context}: wide lead has its continuation cell"
+                );
+                index += 2;
+            } else {
+                index += 1;
+            }
+        }
+    }
+}
+
+/// One print round-trip probe: force the cursor to the grid origin and
+/// print `bytes`; the cell that the character landed in must return exactly
+/// `expect` as its text.
+fn print_round_trip(
+    state: &mut TerminalState,
+    bytes: &[u8],
+    expect: &str,
+    label: &str,
+    context: &str,
+) {
+    // `CUP 1;1` is absolute (origin mode is not implemented), clamps inside
+    // the grid, and clears pending autowrap, so the print lands at (0, 0)
+    // regardless of the preceding stream. Width-2 characters additionally
+    // need a second column to land in place rather than wrap.
+    state.feed_bytes(b"\x1b[1;1H");
+    state.feed_bytes(bytes);
+    assert_eq!(
+        state.screen().cell(0, 0).expect("probe cell").text(),
+        expect,
+        "{context}: {label} round-trip identity"
+    );
+}
+
+/// Deterministic content probes run at the end of every case. Every probe
+/// re-establishes its own preconditions, so each expectation holds for ANY
+/// preceding input; a failure here names the probe in the panic message and
+/// the case replay (`FUZZ_ROOT_SEED`/`FUZZ_CASE_INDEX`) reproduces it.
+fn run_content_probes(state: &mut TerminalState, context: &str) {
+    let (_, cols) = state.size();
+
+    // Ground the state machine: from every parser state (escape, escape-
+    // intermediate, CSI, control string, string-escape) the two bytes
+    // `ESC \` end in Ground, and leaving Ground drops any pending partial
+    // UTF-8 sequence, so the probes below always parse from a clean start.
+    state.feed_bytes(b"\x1b\\");
+
+    // Pen reset identity: whatever the fuzz stream left set, `SGR 0` and
+    // the empty `SGR` form must return the pen to the exact default.
+    state.feed_bytes(b"\x1b[0m");
+    assert_eq!(
+        *state.attributes(),
+        CellAttributes::DEFAULT,
+        "{context}: SGR 0 resets the pen"
+    );
+    state.feed_bytes(b"\x1b[m");
+    assert_eq!(
+        *state.attributes(),
+        CellAttributes::DEFAULT,
+        "{context}: empty SGR resets the pen"
+    );
+
+    // Print round-trip identity across the UTF-8 byte classes: ASCII, a
+    // 2-byte Latin-1 character, a 3-byte CJK character, a 4-byte emoji,
+    // and a combining mark attaching to a base character. A decoder that
+    // drops or mangles any continuation byte fails its class immediately.
+    print_round_trip(state, b"N", "N", "ASCII", context);
+    print_round_trip(state, "é".as_bytes(), "é", "2-byte", context);
+    if cols >= 2 {
+        state.feed_bytes(b"\x1b[1;1H");
+        state.feed_bytes("日".as_bytes());
+        assert_eq!(
+            state.screen().cell(0, 0).expect("probe cell").text(),
+            "日",
+            "{context}: 3-byte round-trip identity"
+        );
+        assert!(
+            state
+                .screen()
+                .cell(0, 1)
+                .expect("continuation")
+                .is_continuation(),
+            "{context}: CJK width-2 continuation cell"
+        );
+        state.feed_bytes(b"\x1b[1;1H");
+        state.feed_bytes("😀".as_bytes());
+        assert_eq!(
+            state.screen().cell(0, 0).expect("probe cell").text(),
+            "😀",
+            "{context}: 4-byte round-trip identity"
+        );
+        assert!(
+            state
+                .screen()
+                .cell(0, 1)
+                .expect("continuation")
+                .is_continuation(),
+            "{context}: emoji width-2 continuation cell"
+        );
+    }
+    // A zero-width combining mark attaches to the preceding cell's text
+    // without occupying a column.
+    state.feed_bytes(b"\x1b[1;1He");
+    state.feed_bytes("\u{0301}".as_bytes());
+    assert_eq!(
+        state.screen().cell(0, 0).expect("probe cell").text(),
+        "e\u{0301}",
+        "{context}: combining mark attaches"
+    );
+
+    // Pen set identity: a compound SGR (style flags plus indexed and
+    // direct-color extended forms) must land in the pen exactly, and a
+    // cell written under it must capture exactly that.
+    let expected = CellAttributes::DEFAULT
+        .with_bold(true)
+        .with_underline(true)
+        .with_reverse(true)
+        .with_foreground(Color::Indexed(196))
+        .with_background(Color::Rgb(10, 20, 30));
+    state.feed_bytes(b"\x1b[1;4;7;38;5;196;48;2;10;20;30m");
+    assert_eq!(
+        *state.attributes(),
+        expected,
+        "{context}: compound SGR sets the pen"
+    );
+    state.feed_bytes(b"\x1b[1;1HN");
+    assert_eq!(
+        state.screen().cell(0, 0).expect("probe cell").attributes(),
+        &expected,
+        "{context}: cell captures the pen"
+    );
+    // The colon sub-parameter form of extended color must parse too.
+    state.feed_bytes(b"\x1b[38:2::1:2:3m");
+    assert_eq!(
+        state.attributes().foreground(),
+        Color::Rgb(1, 2, 3),
+        "{context}: colon-form extended color sets the pen"
+    );
+    // And `SGR 0` must clear it all through the cell path as well.
+    state.feed_bytes(b"\x1b[0m\x1b[1;1HN");
+    assert_eq!(
+        state.screen().cell(0, 0).expect("probe cell").attributes(),
+        &CellAttributes::DEFAULT,
+        "{context}: SGR 0 clears attributes on later cells"
+    );
+    // An SGR list overflowing the CSI parameter cap is dropped whole, so
+    // the pen is untouched (still default here).
+    let mut overflow = b"\x1b[".to_vec();
+    overflow.extend(b"1;".repeat(40));
+    overflow.push(b'm');
+    state.feed_bytes(&overflow);
+    assert_eq!(
+        *state.attributes(),
+        CellAttributes::DEFAULT,
+        "{context}: overflowing SGR leaves the pen untouched"
+    );
+
+    // SCS final-byte non-leak: charset designators (and the DECALN-shaped
+    // `ESC # 8`) must neither print their final byte nor move the cursor.
+    state.feed_bytes(b"\x1b[1;1Hy");
+    let before = (state.cursor(), state.is_wrap_pending());
+    state.feed_bytes(b"\x1b(B\x1b)0\x1b#8");
+    assert_eq!(
+        state.screen().cell(0, 0).expect("probe cell").text(),
+        "y",
+        "{context}: SCS final byte does not print"
+    );
+    assert_eq!(
+        (state.cursor(), state.is_wrap_pending()),
+        before,
+        "{context}: SCS does not move the cursor"
+    );
+
+    // Tab-stop bounds: tabs clamp inside the current row and never leave
+    // autowrap pending.
+    state.feed_bytes(b"\x1b[1;1H\t\t\t\t");
+    let cursor = state.cursor();
+    assert_eq!(cursor.row(), 0, "{context}: tab keeps the row");
+    assert!(cursor.column() < cols, "{context}: tab stays in the row");
+    assert!(
+        !state.is_wrap_pending(),
+        "{context}: tab clears wrap pending"
+    );
+
+    // Alternate-screen consistency: the mode flag follows 1049 exactly, a
+    // write while switched lands on the active (alternate) buffer, and the
+    // primary buffer keeps its own content.
+    state.feed_bytes(b"\x1b[?1049l");
+    assert!(
+        !state.modes().is_alternate_screen_active(),
+        "{context}: 1049l leaves the alternate screen"
+    );
+    state.feed_bytes(b"\x1b[1;1HP");
+    assert_eq!(
+        state.screen().cell(0, 0).expect("probe cell").text(),
+        "P",
+        "{context}: primary witness round-trip"
+    );
+    state.feed_bytes(b"\x1b[?1049h");
+    assert!(
+        state.modes().is_alternate_screen_active(),
+        "{context}: 1049h enters the alternate screen"
+    );
+    state.feed_bytes(b"\x1b[1;1HZ");
+    assert_eq!(
+        state.screen().cell(0, 0).expect("probe cell").text(),
+        "Z",
+        "{context}: alternate witness round-trip"
+    );
+    state.feed_bytes(b"\x1b[?1049l");
+    assert!(
+        !state.modes().is_alternate_screen_active(),
+        "{context}: alternate screen left again"
+    );
+    assert_eq!(
+        state.screen().cell(0, 0).expect("probe cell").text(),
+        "P",
+        "{context}: alternate-screen writes never touch the primary buffer"
+    );
+
+    // The probes themselves must leave the any-input oracles holding.
+    assert_state_oracles(state, &format!("{context} (post-probe)"));
 }
 
 // ===== Seeded PRNG: same design as tests/soak_feed_bytes.rs =====
@@ -640,9 +960,10 @@ struct CaseOutcome {
 }
 
 /// Execute one case: fresh tiny terminal, feed the planned stream in the
-/// planned mode, assert the invariant oracle after EVERY chunk (and every
-/// resize), catch any panic. Tiny grids keep the sweep fast and far below
-/// the cell cap.
+/// planned mode, assert the shape oracle and the any-input state oracles
+/// after EVERY chunk (and every resize), then run the deterministic
+/// content probes on the terminal the stream left behind, and catch any
+/// panic. Tiny grids keep the sweep fast and far below the cell cap.
 fn run_case(root_seed: u64, case: u64, trace: bool) -> CaseOutcome {
     let mut rng = case_rng(root_seed, case);
     let plan = plan_case(&mut rng);
@@ -668,31 +989,39 @@ fn run_case(root_seed: u64, case: u64, trace: bool) -> CaseOutcome {
         if let Some((rows, cols)) = resize_queue.next().copied() {
             let _ = state.resize(rows, cols);
             assert_invariants(state, &format!("{context} resize {label}"));
+            assert_state_oracles(state, &format!("{context} resize {label}"));
         }
         state.feed_bytes(chunk);
         assert_invariants(state, &format!("{context} feed {label}"));
+        assert_state_oracles(state, &format!("{context} feed {label}"));
     };
 
-    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| match &plan.feed {
-        FeedMode::ByteAtATime => {
-            for (index, byte) in plan.stream.iter().enumerate() {
-                feed_and_check(
-                    &mut state,
-                    std::slice::from_ref(byte),
-                    &format!("byte {index}"),
-                );
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        match &plan.feed {
+            FeedMode::ByteAtATime => {
+                for (index, byte) in plan.stream.iter().enumerate() {
+                    feed_and_check(
+                        &mut state,
+                        std::slice::from_ref(byte),
+                        &format!("byte {index}"),
+                    );
+                }
+            }
+            FeedMode::Chunks(cuts) => {
+                for window in cuts.windows(2) {
+                    let chunk = &plan.stream[window[0]..window[1]];
+                    feed_and_check(
+                        &mut state,
+                        chunk,
+                        &format!("chunk {}/{}", window[0], window[1]),
+                    );
+                }
             }
         }
-        FeedMode::Chunks(cuts) => {
-            for window in cuts.windows(2) {
-                let chunk = &plan.stream[window[0]..window[1]];
-                feed_and_check(
-                    &mut state,
-                    chunk,
-                    &format!("chunk {}/{}", window[0], window[1]),
-                );
-            }
-        }
+        // Content probes run after the hostile stream on the SAME terminal,
+        // so every case also asserts decode/pen/buffer content identity
+        // over whatever state the fuzz stream left behind.
+        run_content_probes(&mut state, &context);
     }));
 
     CaseOutcome {
@@ -809,18 +1138,28 @@ fn fuzz_feed_bytes_generated_streams() {
 /// and INSERTION (seven hostile bytes) of every entry is fed through
 /// `feed_bytes` on a fresh terminal with the oracle asserted after. This
 /// guarantees each corpus entry's malformed neighbourhood is covered, not
-/// sampled.
+/// sampled. The shape/structural oracles run on every variant; the content
+/// probe suite (see [`run_content_probes`]) runs on every original and on a
+/// deterministic one-in-eight lattice of the mutations — the probes
+/// re-establish their own preconditions, so their sensitivity does not
+/// depend on which variant preceded them, and every GENERATED case carries
+/// the full probe suite anyway.
 #[test]
 fn fuzz_feed_bytes_seed_corpus_mutation_sweep() {
-    let check = |bytes: &[u8], provenance: &str| {
+    let check = |bytes: &[u8], provenance: &str, probes: bool| {
         let mut state = TerminalState::new(4, 8).expect("valid terminal");
         let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
             state.feed_bytes(bytes);
             assert_invariants(&state, provenance);
+            assert_state_oracles(&state, provenance);
             for byte in bytes {
                 state.feed_bytes(std::slice::from_ref(byte));
             }
             assert_invariants(&state, &format!("{provenance} (byte-at-a-time)"));
+            assert_state_oracles(&state, &format!("{provenance} (byte-at-a-time)"));
+            if probes {
+                run_content_probes(&mut state, provenance);
+            }
         }));
         if outcome.is_err() {
             panic!(
@@ -830,25 +1169,39 @@ fn fuzz_feed_bytes_seed_corpus_mutation_sweep() {
         }
     };
 
+    let mut variant = 0_u64;
+
     for (entry_index, entry) in real_sequence_corpus().iter().enumerate() {
         let base = format!("corpus entry {entry_index}");
-        check(entry, &format!("{base} original"));
+        check(entry, &format!("{base} original"), true);
 
         for end in 0..entry.len() {
-            check(&entry[..end], &format!("{base} truncated to {end}"));
+            variant += 1;
+            check(
+                &entry[..end],
+                &format!("{base} truncated to {end}"),
+                variant % 8 == 0,
+            );
         }
         for position in 0..entry.len() {
             for mask in [0x01_u8, 0x20, 0x80] {
                 let mut flipped = entry.to_vec();
                 flipped[position] ^= mask;
-                check(&flipped, &format!("{base} byte {position} ^ {mask:#04x}"));
+                variant += 1;
+                check(
+                    &flipped,
+                    &format!("{base} byte {position} ^ {mask:#04x}"),
+                    variant % 8 == 0,
+                );
             }
             for replacement in [0x1b_u8, 0x07, b'[', b';', b':', 0xff, 0x00] {
                 let mut substituted = entry.to_vec();
                 substituted[position] = replacement;
+                variant += 1;
                 check(
                     &substituted,
                     &format!("{base} byte {position} -> {replacement:#04x}"),
+                    variant % 8 == 0,
                 );
             }
         }
@@ -856,9 +1209,11 @@ fn fuzz_feed_bytes_seed_corpus_mutation_sweep() {
             for insertion in [0x1b_u8, 0x07, b'[', b';', b':', 0xff, 0x00] {
                 let mut inserted = entry.to_vec();
                 inserted.insert(position, insertion);
+                variant += 1;
                 check(
                     &inserted,
                     &format!("{base} inserted {insertion:#04x} at {position}"),
+                    variant % 8 == 0,
                 );
             }
         }
