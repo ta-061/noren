@@ -114,11 +114,19 @@ binary. What now actually happens on screen:
   `included_fifo_sources_return_promptly`).
 
 It is still **not** the full workspace product that [ADR
-0003](adr/0003-noren-zellij-responsibility-boundary.md) describes — one live
-PTY at a time; configured SSH targets are now discoverable in the sidebar, and
-selecting one launches the system `ssh` client for that alias in the single
-terminal PTY (one non-local launch path exists; there is still no
-multi-session switching). See "What does not work"
+0003](adr/0003-noren-zellij-responsibility-boundary.md) describes — several
+sessions can be live at once and switching between them is real
+(`switch_live_session` in `main.rs` parks the previous surface — its PTY
+keeps running and is still drained (`drain_parked_sessions`) — and
+re-attaches the selected session's own screen; pinned by
+`sidebar_click_switches_the_live_surface_between_sessions` and
+`a_parked_session_that_exits_is_observed_and_detached` in
+`src/main/tests.rs`), but exactly one session owns the viewport at a time:
+there is no split, tiled, or multi-session view. Configured SSH targets are
+now discoverable in the sidebar, and selecting one launches the system `ssh`
+client for that alias in the live view's PTY, replacing the current session
+(the one non-local launch path). See "Session switching exists, within one
+viewport" under "What does not work"
 below, which remains the more useful list. Milestones 3–8 are open on the
 [roadmap](../ROADMAP.md).
 
@@ -256,7 +264,7 @@ Each item states what you would actually see if you ran the build.
   `SidebarEntry::SshConnection` rows. Clicking one validates the alias as an
   `SshDestination` (raw `%h`/`%p`/`%r` tokens are refused with a typed error
   naming the keyword and token) and, if accepted, launches the fixed system
-  `/usr/bin/ssh` client in the single terminal PTY — argv is exactly
+  `/usr/bin/ssh` client in the live view's PTY — argv is exactly
   `ssh -- <alias>`, so no credential, identity, or option is ever
   `ps`-visible — replacing the previous session. Launch, connect, and
   disconnect failures surface as visible per-row and status-row states; the
@@ -299,8 +307,11 @@ Each item states what you would actually see if you ran the build.
   OpenSSH may accept them. A retained `HostName` or `User` can therefore still
   contain literal `%h`, `%p`, or `%r`; it is not safe connection input until a
   future resolver expands it with OpenSSH-equivalent semantics or rejects it.
-  The status row therefore never calls the rows a complete host list. It shows
-  only the first 24 literal aliases and reports an omitted count; selecting a
+  The status row therefore never calls the rows a complete host list. It
+  shows at most the first `MAX_SSH_SIDEBAR_HOSTS` (64) literal aliases — the
+  same bound the sidebar section above states, pinned by
+  `many_ssh_hosts_are_bounded_and_report_the_omitted_count` — and reports an
+  omitted count; selecting a
   row shows where its first literal declaration came from, but does not prove
   the effective configuration that a future connection will use.
 - **Session switching exists, within one viewport.** Clicking a live session
