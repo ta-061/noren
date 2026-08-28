@@ -256,6 +256,30 @@ against it:
   without forwarding it, so Japanese, Chinese, and Korean input methods
   produce nothing; nothing in the tree integrates with assistive
   technology. Both are Milestone 6 scope and neither has started.
+- **HiDPI / Retina displays are unhandled.** No scale-factor awareness
+  exists anywhere in the app: the window is created at a fixed physical
+  900x600 (`with_inner_size(PhysicalSize::new(WINDOW_WIDTH,
+  WINDOW_HEIGHT))` in `main.rs`), the cell is a fixed 10x20 physical
+  pixels (`POC_CELL_WIDTH`/`POC_CELL_HEIGHT` in `lib.rs`), every grid
+  derivation downstream consumes physical pixels, and the string
+  `scale_factor` appears nowhere in the tree. On a Retina display — the
+  common case for an arm64-macOS preview, not an edge case — the window
+  opens at a quarter of the intended area with half-size glyphs, and
+  resizing grows the grid without ever growing the cell. A bigger
+  configured `[font]` cell is a workaround, not scaling. Milestone 6's
+  own line admits HiDPI has not started; the gate section must say it
+  too, because a preview user's first impression on the dominant
+  hardware class is a quarter-area window.
+- **Paste works only inside programs that enable bracketed paste.**
+  `Cmd+V` encodes the clipboard strictly as a bracketed paste:
+  `paste_bytes` in `main.rs` consults the live terminal mode, and when
+  the child has not enabled DEC private mode 2004 it refuses
+  (`PasteReject::Unbracketed` from `clipboard.rs`'s `encode_paste`) and
+  nothing reaches the PTY — the status row's "Noren paste gated:
+  application did not enable bracketed paste (mode 2004)" notice is the
+  only feedback. Pasting into a plain `zsh` prompt or `cat` therefore
+  does nothing. Sending unbracketed bytes is deliberately not done, so
+  a preview must tell users this before they call paste broken.
 - **The view layer is incomplete beyond colour and glyphs.** There is no
   visible cursor: `glyph_vertices` in `renderer.rs` emits sidebar rows,
   per-cell backgrounds, glyph bitmaps, and a status line — never a cursor —
@@ -263,8 +287,13 @@ against it:
   viewport: rendering stays on the newest suffix of the content because no
   scroll-offset input exists (the only scroll offset in `main.rs` is the
   sidebar's own). Selection is tracked and copies correctly but is never
-  highlighted. A terminal in which a stranger cannot see the cursor, cannot
-  scroll back, and cannot see their selection is not preview-ready.
+  highlighted. Scrollback search is unreachable: the terminal core ships a
+  real snapshot search engine (`crates/noren-terminal/src/search.rs`:
+  `Search`, ranked matches, case sensitivity), but nothing in the app
+  references it — no key or palette command starts a search and no renderer
+  surface draws one. A terminal in which a stranger cannot see the cursor,
+  cannot scroll back, cannot see their selection, and cannot search is not
+  preview-ready.
 - **The FR-005 rendered-frame oracle exists and runs, and its boundary is
   the honesty requirement.** It drives the real `wgpu` pipeline offscreen
   (`crates/noren-app/src/renderer_capture.rs`,
