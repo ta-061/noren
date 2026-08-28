@@ -17,13 +17,16 @@
 //! that exists in configuration changes what is drawn.
 //!
 //! The cursor is drawn, not configured into existence (issues #197/#200):
-//! the caret appears at the tracked position with no configuration, in the
-//! theme's cursor colour, honouring DECTCEM (`CSI ?25l` hides it, `?25h`
-//! restores it) because programs like vim rely on both directions. A block
-//! cursor spans both columns of the wide character it sits on (#174/#176),
-//! and the glyph beneath draws inverted so the character stays readable.
-//! `[cursor]` configuration may change shape and colour — never whether a
-//! user who reads nothing still gets a caret.
+//! the caret appears at the tracked position with no configuration, honouring
+//! DECTCEM (`CSI ?25l` hides it, `?25h` restores it) because programs like vim
+//! rely on both directions. Its default is inverse video against the actual
+//! cell pair, not a fixed colour measured only on the theme background. A
+//! background-only SGR can make that pair unusable, so black/white fallback
+//! keeps at least 4.5:1 contrast on every sRGB background. A block spans both
+//! columns of the wide character it sits on (#174/#176), and the glyph beneath
+//! draws in the resolved cell background so it stays readable. `[cursor]`
+//! configuration may change shape and prefer a colour — never whether a user
+//! who reads nothing still gets a usable caret.
 
 use std::borrow::Cow;
 use std::future::Future;
@@ -36,9 +39,9 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use noren_app::cursor::CursorShape;
-use noren_app::theme::Theme;
+use noren_app::theme::{Theme, contrast_ratio};
 use noren_app::{CellMetrics, MAX_RENDER_COLS, MAX_RENDER_ROWS};
-use noren_terminal::{CellAttributes, Color, TerminalSnapshot};
+use noren_terminal::{Cell, CellAttributes, Color, TerminalSnapshot};
 const GLYPH_SCALE: u32 = 2;
 const GLYPH_TOP: u32 = 3;
 const MAX_GLYPH_PIXELS: usize = 35;
@@ -47,6 +50,10 @@ const VERTICES_PER_RECT: usize = 6;
 /// cursor's hollow outline, in pixels — the same granularity glyph pixels
 /// draw at.
 const CURSOR_STROKE: u32 = 2;
+/// A cursor is both a typing target and, for a block, the ground behind a
+/// small text glyph. Keep both sides of that pair at the normal-text WCAG AA
+/// floor used by the theme contract (issue #168).
+const CURSOR_MIN_CONTRAST: f64 = 4.5;
 /// One cell can emit one background rectangle plus the largest 5x7 glyph.
 /// The bound is `MAX_RENDER_ROWS * MAX_RENDER_COLS * (1 + 35) * 6`.
 const MAX_VERTICES: usize = (MAX_RENDER_ROWS as usize)
@@ -581,7 +588,6 @@ fn glyph_vertices_with_budget(
         return Vec::new();
     }
     let cell_width = metrics.width();
-    let cell_height = metrics.height();
     let window_cols = usize::try_from(width / cell_width).unwrap_or(usize::MAX);
 
     let has_sidebar = sidebar.is_some();
@@ -671,117 +677,62 @@ fn glyph_vertices_with_budget(
                 let cells = rows
                     .get(line_index)
                     .expect("terminal layout only names display rows");
-                for (col, cell) in cells.iter().take(terminal_cols).enumerate() {
-                    // The cursor cell, when this is it. Both sides of the
-                    // glyph emission below need this: the focused block
-                    // draws under the glyph (which inverts over it), every
-                    // other mark draws over the glyph.
-                    let cursor_here =
-                        cursor_plan.is_some_and(|plan| plan.frame_row == row && plan.column == col);
-                    let invert_glyph = cursor_here
-                        && target.cursor.shape == CursorShape::Block
-                        && target.cursor.focused;
-                    if let Some(color) = resolve_background(&theme, cell.attributes()) {
-                        push_rect(
-                            &mut vertices,
-                            u32::try_from(col_offset + col).unwrap_or(u32::MAX) * cell_width,
-                            u32::try_from(row).unwrap_or(u32::MAX) * cell_height,
-                            cell_width,
-                            cell_height,
-                            color,
-                            target,
-                        );
-                    }
-                    if vertices.len() >= vertex_budget {
+                let visible_len = cells.len().min(terminal_cols);
+                let visible = &cells[..visible_len];
+                if let Some(plan) = cursor_plan
+                    && plan.frame_row == row
+                    && plan.column < visible_len
+                {
+                    // Split out the one cursor-bearing span. Ordinary cells
+                    // therefore do not pay a cursor-position/shape branch on
+                    // every iteration — important on dense frames, where the
+                    // caret affects one cell out of thousands.
+                    let (before, cursor_and_after) = visible.split_at(plan.column);
+                    if push_terminal_cells(
+                        &mut vertices,
+                        before,
+                        0,
+                        row,
+                        col_offset,
+                        target,
+                        vertex_budget,
+                    ) {
                         return vertices;
                     }
-                    if invert_glyph && let Some(plan) = cursor_plan {
-                        push_cursor_block(
-                            &mut vertices,
-                            plan,
-                            col_offset,
-                            target.cursor.color,
-                            target,
-                        );
-                        if vertices.len() >= vertex_budget {
-                            return vertices;
-                        }
+                    let cursor_len = plan.columns.min(cursor_and_after.len());
+                    let (cursor_cells, after) = cursor_and_after.split_at(cursor_len);
+                    if push_cursor_cells(
+                        &mut vertices,
+                        cursor_cells,
+                        plan,
+                        row,
+                        col_offset,
+                        target,
+                        vertex_budget,
+                    ) {
+                        return vertices;
                     }
-                    // A continuation cell draws no glyph but still owns its
-                    // column, exactly as the placeholder space did in
-                    // `display_lines`. A block cursor on the lead already
-                    // covered this column via its two-column span.
-                    if cell.is_continuation() {
-                        continue;
+                    if push_terminal_cells(
+                        &mut vertices,
+                        after,
+                        plan.column + cursor_len,
+                        row,
+                        col_offset,
+                        target,
+                        vertex_budget,
+                    ) {
+                        return vertices;
                     }
-                    // Inside a focused block the glyph draws in the theme
-                    // background — the reading pair inverted — so the
-                    // character under the caret stays readable.
-                    let color = if invert_glyph {
-                        theme.background()
-                    } else {
-                        resolve_foreground(&theme, cell.attributes())
-                    };
-                    for character in cell.text().chars() {
-                        push_glyph(
-                            &mut vertices,
-                            character,
-                            color,
-                            col_offset + col,
-                            row,
-                            target,
-                        );
-                        if vertices.len() >= vertex_budget {
-                            return vertices;
-                        }
-                    }
-                    // Marks that draw over the glyph: the focused bar and
-                    // underline strokes, and the unfocused hollow outline.
-                    if cursor_here
-                        && !invert_glyph
-                        && let Some(plan) = cursor_plan
-                    {
-                        if target.cursor.focused {
-                            match target.cursor.shape {
-                                CursorShape::Block => {}
-                                CursorShape::Bar => {
-                                    push_cursor_bar(
-                                        &mut vertices,
-                                        plan,
-                                        col_offset,
-                                        target.cursor.color,
-                                        target,
-                                    );
-                                    if vertices.len() >= vertex_budget {
-                                        return vertices;
-                                    }
-                                }
-                                CursorShape::Underline => {
-                                    push_cursor_underline(
-                                        &mut vertices,
-                                        plan,
-                                        col_offset,
-                                        target.cursor.color,
-                                        target,
-                                    );
-                                    if vertices.len() >= vertex_budget {
-                                        return vertices;
-                                    }
-                                }
-                            }
-                        } else {
-                            push_cursor_hollow(
-                                &mut vertices,
-                                plan,
-                                col_offset,
-                                target.cursor.color,
-                                target,
-                            );
-                            if vertices.len() >= vertex_budget {
-                                return vertices;
-                            }
-                        }
-                    }
+                } else if push_terminal_cells(
+                    &mut vertices,
+                    visible,
+                    0,
+                    row,
+                    col_offset,
+                    target,
+                    vertex_budget,
+                ) {
+                    return vertices;
                 }
             }
             FrameRow::Status => {
@@ -808,6 +759,173 @@ fn glyph_vertices_with_budget(
         }
     }
     vertices
+}
+
+/// Draw a run of ordinary terminal cells. Cursor-bearing rows are split
+/// around their one affected span before reaching this helper, so this hot
+/// path contains no per-cell cursor checks.
+#[inline(always)]
+fn push_terminal_cells(
+    vertices: &mut Vec<Vertex>,
+    cells: &[Cell],
+    start_column: usize,
+    row: usize,
+    col_offset: usize,
+    target: Target,
+    vertex_budget: usize,
+) -> bool {
+    for (offset, cell) in cells.iter().enumerate() {
+        if push_terminal_cell(
+            vertices,
+            cell,
+            start_column + offset,
+            row,
+            col_offset,
+            target,
+            vertex_budget,
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Draw one ordinary terminal cell, returning whether the vertex budget has
+/// been reached after a complete emitted primitive.
+#[inline(always)]
+fn push_terminal_cell(
+    vertices: &mut Vec<Vertex>,
+    cell: &Cell,
+    column: usize,
+    row: usize,
+    col_offset: usize,
+    target: Target,
+    vertex_budget: usize,
+) -> bool {
+    if let Some(color) = resolve_background(&target.theme, cell.attributes()) {
+        push_rect(
+            vertices,
+            u32::try_from(col_offset + column).unwrap_or(u32::MAX) * target.metrics.width(),
+            u32::try_from(row).unwrap_or(u32::MAX) * target.metrics.height(),
+            target.metrics.width(),
+            target.metrics.height(),
+            color,
+            target,
+        );
+    }
+    if vertices.len() >= vertex_budget {
+        return true;
+    }
+    // A continuation cell owns its display column and background but never
+    // emits a second glyph for the wide character's trailing half.
+    if cell.is_continuation() {
+        return false;
+    }
+    let color = resolve_foreground(&target.theme, cell.attributes());
+    for character in cell.text().chars() {
+        push_glyph(vertices, character, color, col_offset + column, row, target);
+        if vertices.len() >= vertex_budget {
+            return true;
+        }
+    }
+    false
+}
+
+/// Draw the single cell span carrying the cursor. A focused block is inverse
+/// video: its ink becomes the block and the resolved cell background becomes
+/// the glyph colour. Other shapes leave the cell glyph untouched and add
+/// their contrast-safe mark after it.
+fn push_cursor_cells(
+    vertices: &mut Vec<Vertex>,
+    cells: &[Cell],
+    plan: CursorPlacement,
+    row: usize,
+    col_offset: usize,
+    target: Target,
+    vertex_budget: usize,
+) -> bool {
+    let Some(lead) = cells.first() else {
+        return false;
+    };
+    let foreground = resolve_foreground(&target.theme, lead.attributes());
+    let inverse_foreground = if lead.attributes().foreground() == Color::Default {
+        target.cursor.theme_color
+    } else {
+        foreground
+    };
+    let background =
+        resolve_background(&target.theme, lead.attributes()).unwrap_or(target.theme.background());
+    let cursor_color = target.cursor.visible_color(inverse_foreground, background);
+
+    if target.cursor.focused && target.cursor.shape == CursorShape::Block {
+        // Preserve the established background-first emission order and paint
+        // every column of a wide cell before covering the complete span. In
+        // particular, a continuation background must not overwrite half of
+        // the cursor after the block has been drawn.
+        for (offset, cell) in cells.iter().enumerate() {
+            if let Some(color) = resolve_background(&target.theme, cell.attributes()) {
+                push_rect(
+                    vertices,
+                    u32::try_from(col_offset + plan.column + offset).unwrap_or(u32::MAX)
+                        * target.metrics.width(),
+                    u32::try_from(row).unwrap_or(u32::MAX) * target.metrics.height(),
+                    target.metrics.width(),
+                    target.metrics.height(),
+                    color,
+                    target,
+                );
+                if vertices.len() >= vertex_budget {
+                    return true;
+                }
+            }
+        }
+        push_cursor_block(vertices, plan, col_offset, cursor_color, target);
+        if vertices.len() >= vertex_budget {
+            return true;
+        }
+        if !lead.is_continuation() {
+            for character in lead.text().chars() {
+                push_glyph(
+                    vertices,
+                    character,
+                    background,
+                    col_offset + plan.column,
+                    row,
+                    target,
+                );
+                if vertices.len() >= vertex_budget {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    if push_terminal_cells(
+        vertices,
+        cells,
+        plan.column,
+        row,
+        col_offset,
+        target,
+        vertex_budget,
+    ) {
+        return true;
+    }
+    if target.cursor.focused {
+        match target.cursor.shape {
+            CursorShape::Block => {}
+            CursorShape::Bar => {
+                push_cursor_bar(vertices, plan, col_offset, cursor_color, target);
+            }
+            CursorShape::Underline => {
+                push_cursor_underline(vertices, plan, col_offset, cursor_color, target);
+            }
+        }
+    } else {
+        push_cursor_hollow(vertices, plan, col_offset, cursor_color, target);
+    }
+    vertices.len() >= vertex_budget
 }
 
 /// Where the cursor marks this frame: the frame row and lead display
@@ -1024,27 +1142,34 @@ impl Target {
     }
 }
 
-/// The resolved cursor drawing style for one frame: shape, colour, focus.
+/// The resolved cursor drawing style for one frame: shape, optional preferred
+/// colour, and focus.
 ///
-/// The colour arrives already resolved — the theme's cursor colour unless a
-/// configuration override named another — because one frame draws against
-/// one theme. Focus changes the treatment, not the colour: the focused
-/// caret is the shape itself; the unfocused caret is a hollow outline of
-/// the block footprint, the classic terminal signal that the window no
+/// The final ink is cell-relative and therefore resolved only when drawing
+/// the cursor-bearing cell. With no override, inverse video starts from that
+/// cell's foreground. An override is preferred where it clears the same 4.5:1
+/// floor; otherwise drawing falls back to the usable inverse foreground or to
+/// contrast-maximising black/white. Focus changes the treatment, not that
+/// safety rule: the focused caret is the shape itself; the unfocused caret is
+/// a hollow block outline, the classic terminal signal that the window no
 /// longer receives keys (issue #200's focused/unfocused requirement).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CursorStyle {
     shape: CursorShape,
-    color: [f32; 3],
+    theme_color: [f32; 3],
+    color_override: Option<[f32; 3]>,
     focused: bool,
 }
 
 impl CursorStyle {
-    /// The default cursor: a focused block in the theme's cursor colour.
+    /// The default cursor: a focused inverse-video block. Every built-in
+    /// theme's cursor colour equals its default foreground, so an unstyled
+    /// cell remains pixel-identical to the theme-owned default.
     pub(crate) fn theme_default(theme: &Theme) -> Self {
         Self {
             shape: CursorShape::Block,
-            color: theme.cursor(),
+            theme_color: theme.cursor(),
+            color_override: None,
             focused: true,
         }
     }
@@ -1055,12 +1180,10 @@ impl CursorStyle {
         self
     }
 
-    /// Replace the colour when a configuration override named one; `None`
-    /// keeps the theme's cursor colour.
+    /// Prefer a configured colour where it is usable against the cursor
+    /// cell. `None` keeps inverse-video colour selection.
     pub(crate) fn with_color_override(mut self, color: Option<[f32; 3]>) -> Self {
-        if let Some(color) = color {
-            self.color = color;
-        }
+        self.color_override = color;
         self
     }
 
@@ -1069,6 +1192,42 @@ impl CursorStyle {
         self.focused = focused;
         self
     }
+
+    /// Resolve visible cursor ink against the cell it actually covers.
+    ///
+    /// The configured colour gets first refusal. If it misses AA, the cell's
+    /// foreground supplies normal inverse video when that pair is itself
+    /// readable. A background-only SGR can make even that foreground vanish;
+    /// choosing the better of black and white then guarantees at least 4.5:1
+    /// for every possible sRGB background. A block redraws its glyph in the
+    /// same background used here, so cursor and glyph share this guarantee.
+    fn visible_color(self, foreground: [f32; 3], background: [f32; 3]) -> [f32; 3] {
+        if let Some(color) = self.color_override
+            && color_contrast(color, background) >= CURSOR_MIN_CONTRAST
+        {
+            return color;
+        }
+        if color_contrast(foreground, background) >= CURSOR_MIN_CONTRAST {
+            return foreground;
+        }
+
+        const BLACK: [f32; 3] = [0.0, 0.0, 0.0];
+        const WHITE: [f32; 3] = [1.0, 1.0, 1.0];
+        if color_contrast(BLACK, background) >= color_contrast(WHITE, background) {
+            BLACK
+        } else {
+            WHITE
+        }
+    }
+}
+
+/// Contrast as it will be measured on the frame oracle's RGBA8 readback.
+fn color_contrast(first: [f32; 3], second: [f32; 3]) -> f64 {
+    contrast_ratio(quantize_color(first), quantize_color(second))
+}
+
+fn quantize_color(color: [f32; 3]) -> [u8; 3] {
+    color.map(|channel| (channel * 255.0).round() as u8)
 }
 
 /// Emit the 5×7 bitmap glyph for `character` at grid cell `(col, row)`.
@@ -1677,6 +1836,105 @@ mod tests {
         assert_eq!(
             (dark.r, dark.g, dark.b, dark.a),
             (CLEAR_COLOR.r, CLEAR_COLOR.g, CLEAR_COLOR.b, CLEAR_COLOR.a)
+        );
+    }
+
+    #[test]
+    fn cursor_ink_uses_inversion_then_contrast_safe_fallbacks() {
+        let style = CursorStyle::theme_default(&DARK);
+        let default_foreground = DARK.foreground();
+        let default_background = DARK.background();
+        assert_eq!(
+            style.visible_color(default_foreground, default_background),
+            default_foreground,
+            "a readable cell pair uses ordinary inverse video"
+        );
+
+        for background in [
+            [229, 229, 229],
+            [121, 121, 121],
+            [204, 235, 209],
+            [17, 119, 221],
+        ] {
+            let background = channels_to_floats(background);
+            let ink = style.visible_color(default_foreground, background);
+            assert!(
+                color_contrast(ink, background) >= CURSOR_MIN_CONTRAST,
+                "cursor {ink:?} must clear AA on {background:?}"
+            );
+        }
+
+        let readable_foreground = channels_to_floats([20, 30, 40]);
+        let light_background = channels_to_floats([240, 240, 240]);
+        let unsafe_override =
+            CursorStyle::theme_default(&DARK).with_color_override(Some(light_background));
+        assert_eq!(
+            unsafe_override.visible_color(readable_foreground, light_background),
+            readable_foreground,
+            "an unusable override falls back to inverse video"
+        );
+
+        let dark_background = channels_to_floats([8, 18, 28]);
+        let white = [1.0, 1.0, 1.0];
+        let safe_override = CursorStyle::theme_default(&DARK).with_color_override(Some(white));
+        assert_eq!(
+            safe_override.visible_color(default_foreground, dark_background),
+            white,
+            "a usable override must remain under user control"
+        );
+    }
+
+    #[test]
+    fn focused_block_keeps_every_glyph_vertex_in_the_inverted_background() {
+        const BYTES: &[u8] = b"\x1b[38;2;20;30;40;48;2;240;240;240mA\r";
+        let shown = snapshot(1, 2, BYTES);
+        let mut hidden_bytes = BYTES.to_vec();
+        hidden_bytes.extend_from_slice(b"\x1b[?25l");
+        let hidden = snapshot(1, 2, &hidden_bytes);
+        let shown_vertices = frame_vertices(Some(&shown), None, None, 900, 600, poc_metrics());
+        let hidden_vertices = frame_vertices(Some(&hidden), None, None, 900, 600, poc_metrics());
+        let foreground = channels_to_floats([20, 30, 40]);
+        let background = channels_to_floats([240, 240, 240]);
+
+        assert!(
+            hidden_vertices.len() > VERTICES_PER_RECT,
+            "the hidden-cursor control must contain a background and glyph"
+        );
+        assert!(
+            shown_vertices.len() > 2 * VERTICES_PER_RECT,
+            "the visible frame must contain a background, block, and glyph"
+        );
+        assert!(
+            shown_vertices[..VERTICES_PER_RECT]
+                .iter()
+                .all(|vertex| vertex.color == background),
+            "the cell background must be emitted first"
+        );
+        assert!(
+            shown_vertices[VERTICES_PER_RECT..2 * VERTICES_PER_RECT]
+                .iter()
+                .all(|vertex| vertex.color == foreground),
+            "the inverse foreground must fill the cursor block"
+        );
+
+        let hidden_glyph = &hidden_vertices[VERTICES_PER_RECT..];
+        let shown_glyph = &shown_vertices[2 * VERTICES_PER_RECT..];
+        assert_eq!(
+            shown_glyph.len(),
+            hidden_glyph.len(),
+            "inversion must retain every glyph rectangle"
+        );
+        assert!(
+            hidden_glyph.iter().all(|vertex| vertex.color == foreground),
+            "the control glyph must use the cell foreground"
+        );
+        assert!(
+            shown_glyph.iter().all(|vertex| vertex.color == background),
+            "the block glyph must swap to the cell background"
+        );
+        assert!(
+            color_contrast(foreground, background) >= CURSOR_MIN_CONTRAST,
+            "the inverted glyph/block pair must remain readable"
         );
     }
 

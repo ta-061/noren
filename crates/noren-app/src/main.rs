@@ -1198,10 +1198,10 @@ struct NorenApp {
     /// resolution, clear colour — follows the `[theme]` selection. The
     /// default (`dark`) is exactly the pre-theme palette.
     theme: Theme,
-    /// The configured cursor appearance (`[cursor]` shape and colour over
-    /// the theme's cursor colour), handed to the renderer at creation.
-    /// Visibility is not part of it: the caret ships drawn and only DECTCEM
-    /// hides it (issues #197/#200).
+    /// The configured cursor appearance (`[cursor]` shape and preferred
+    /// colour), handed to the renderer at creation. Final ink is resolved
+    /// against the actual cursor cell; visibility is not part of this style:
+    /// the caret ships drawn and only DECTCEM hides it (issues #197/#200).
     cursor_style: renderer::CursorStyle,
 }
 

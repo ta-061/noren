@@ -114,24 +114,31 @@ binary. What now actually happens on screen:
   `included_fifo_sources_return_promptly`).
 - **A visible cursor is drawn** (issues #197/#200; the first UI/UX
   evaluations ranked its absence at the top). The renderer draws the caret
-  at the position the terminal state already tracks: a focused block in the
-  active theme's cursor colour — each theme's default foreground, so the
-  caret inherits the measured default-pair WCAG contrast (dark 15.39:1,
-  light 14.56:1, high-contrast 21.0:1) — with the glyph beneath inverted so
-  the character under it stays readable. DECTCEM is honoured (`CSI ?25l`
-  hides the caret and renders byte-identically to the pre-cursor frames,
-  `CSI ?25h` restores it), a block on a wide character covers both its
+  at the position the terminal state already tracks. A focused block uses
+  inverse video against the cell it actually covers: resolved cell foreground
+  becomes the block, and resolved cell background becomes the glyph. An
+  unstyled cell therefore retains the active theme's measured cursor/default
+  pair (dark 15.39:1, light 14.56:1, high-contrast 21.0:1), while an SGR cell
+  is not compared against a background it does not have. If that pair falls
+  below 4.5:1, contrast-maximising black/white guarantees a usable cursor and
+  readable block glyph on any sRGB background. DECTCEM is honoured
+  (`CSI ?25l` hides the caret and renders byte-identically to the pre-cursor
+  frames, `CSI ?25h` restores it), a block on a wide character covers both its
   columns (#174/#176), and window focus loss switches the mark to a hollow
   outline. `[cursor]` in `config.toml` selects
   `shape = "block" | "bar" | "underline"` and an optional
-  `color = "#rrggbb"` override; no configuration is required for a caret.
+  `color = "#rrggbb"` preference; a preference is used when it clears 4.5:1
+  on the actual cell and otherwise falls back rather than erasing the caret.
+  No configuration is required for a cursor.
   Proven on real pixels by the cursor tests in
   `crates/noren-app/tests/frame_oracle.rs` (drawn-by-default,
   blank-screen caret, move-changes-pixels, wide-character coverage, DECTCEM
-  hide/restore, per-theme pixel contrast, hollow-vs-filled focus), and both
-  failure modes were mutation-tested before landing: never drawing the
-  cursor fails eight tests, and counting cells instead of display columns
-  after a wide character fails the coverage test. Deliberately absent:
+  hide/restore, per-theme pixel contrast, four SGR-background contrasts,
+  readable SGR glyph inversion, safe/unsafe override handling,
+  SGR-plus-DECTCEM, hollow-vs-filled focus), and both original failure modes
+  were mutation-tested before landing: never drawing the cursor fails the
+  cursor oracle suite, and counting cells instead of display columns after a
+  wide character fails the coverage test. Deliberately absent:
   blink — a blinking caret forces timer-driven repaints roughly twice a
   second even while idle (this renderer rebuilds the full vertex list every
   frame), which is a CPU/battery decision, not a visual one.

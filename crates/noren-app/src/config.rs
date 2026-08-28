@@ -266,11 +266,11 @@ impl ThemeConfig {
 
 /// Cursor appearance settings (issues #197/#200).
 ///
-/// [`CursorConfig::default`] is a visible block in the theme's cursor
-/// colour: the caret is drawn with no configuration, and this table only
-/// changes *how* it looks. Visibility is not a setting — it belongs to the
-/// program through DECTCEM, never to a user preference that could quietly
-/// reproduce the every-keystroke-blind defect.
+/// [`CursorConfig::default`] is a visible inverse-video block: the caret is
+/// drawn with no configuration, and this table only changes *how* it looks.
+/// Visibility is not a setting — it belongs to the program through DECTCEM,
+/// never to a user preference that could quietly reproduce the
+/// every-keystroke-blind defect.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CursorConfig {
     shape: CursorShape,
@@ -284,8 +284,9 @@ impl CursorConfig {
         self.shape
     }
 
-    /// The configured colour override as `#rrggbb` channels; `None` keeps
-    /// the theme's cursor colour.
+    /// The configured preferred colour as `#rrggbb` channels; `None` keeps
+    /// cell-relative inverse video. The renderer uses a preference only where
+    /// it clears 4.5:1 against the actual cursor-cell background.
     #[must_use]
     pub const fn color(self) -> Option<[u8; 3]> {
         self.color
@@ -2424,10 +2425,9 @@ mod tests {
         );
     }
 
-    /// A well-formed `#rrggbb` colour overrides the theme's cursor colour;
-    /// anything else is a typed error naming the key, and the boundary
-    /// cases (missing `#`, wrong length, non-hex) are all rejected rather
-    /// than guessed at.
+    /// A well-formed `#rrggbb` colour becomes the cursor preference; anything
+    /// else is a typed error naming the key, and the boundary cases (missing
+    /// `#`, wrong length, non-hex) are all rejected rather than guessed at.
     #[test]
     fn cursor_color_accepts_exact_hex_and_rejects_everything_else() {
         let config = AppConfig::parse("[cursor]\ncolor = \"#3fb27f\"\n").expect("valid");

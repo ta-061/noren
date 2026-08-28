@@ -5,7 +5,7 @@
 //! configuration, and this vocabulary only changes *how* it is drawn —
 //! shape and colour are user choices, visibility of the product is not.
 //! The `[cursor]` configuration table selects a shape here; the renderer
-//! resolves it against the active theme.
+//! resolves its ink against the actual terminal cell.
 
 use std::fmt;
 
@@ -13,9 +13,8 @@ use std::fmt;
 /// configuration table.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum CursorShape {
-    /// A filled cell rectangle; the glyph beneath draws inverted (in the
-    /// theme background colour) so the character under the caret stays
-    /// readable. The default.
+    /// A filled cell rectangle; the glyph beneath draws in the resolved cell
+    /// background so the inverse pair stays readable. The default.
     #[default]
     Block,
     /// A narrow vertical stroke on the left edge of the lead cell.

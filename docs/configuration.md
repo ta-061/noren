@@ -155,24 +155,37 @@ floor under any palette.
 ### `[cursor]`
 
 Cursor appearance (issues #197/#200). The table is optional and the caret
-**ships drawn**: an absent `[cursor]` renders a focused block in the active
-theme's cursor colour — the same contrast-verified colour relationship as
-ordinary text — so a user who never opens this file still sees where typing
-lands. Configuration changes how the caret looks, never whether it exists;
-visibility belongs to the program through DECTCEM (`CSI ?25l`/`?25h`), not
-to a preference that could quietly reproduce the every-keystroke-blind
+**ships drawn**: an absent `[cursor]` renders a focused inverse-video block,
+using the cursor cell's resolved foreground for the block and its resolved
+background for the glyph. On an unstyled cell this is the active theme's
+contrast-verified cursor/default-foreground pair. On an SGR-painted cell it
+is the pair that actually occupies that cell, not a fixed colour measured
+only on the theme background. If that inverse foreground misses 4.5:1, the
+renderer chooses whichever of black/white has greater contrast; this keeps
+both the caret and the glyph inside a block at or above 4.5:1 on every sRGB
+background. Configuration changes how the caret looks, never whether it
+exists; visibility belongs to the program through DECTCEM (`CSI ?25l`/`?25h`),
+not to a preference that could quietly reproduce the every-keystroke-blind
 defect.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `shape` | string | `"block"` | `block` (filled, glyph inverted beneath), `bar` (left stroke), or `underline` (bottom stroke). |
-| `color` | string | the theme's cursor colour | One `#rrggbb` value overriding the theme colour. |
+| `color` | string | inverse cell foreground | One preferred `#rrggbb` cursor colour. |
 
 Accepted shapes, matched exactly (case-sensitive, closed vocabulary):
 `block`, `bar`, `underline`. An unfocused window always draws the caret as
 a hollow outline of the block footprint regardless of shape — the classic
 signal that the window no longer receives keys — because the shape setting
 is a *focused* typing aid.
+
+`color` is a preference, not permission to draw an invisible cursor. The
+configured colour is used exactly when it reaches 4.5:1 against the actual
+cursor-cell background. If it does not, the renderer falls back to a readable
+inverse cell foreground, then to contrast-maximising black/white if the cell
+pair itself is below 4.5:1. A usable override therefore remains fully under
+user control, while an override equal to an SGR background cannot silently
+erase the caret.
 
 Rejections follow the hard-error discipline: an unknown shape is a typed
 error naming the offending value (clipped to 120 characters, like the

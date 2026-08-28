@@ -33,10 +33,11 @@
 //!   pair lands at its display column — the width contract whose loss corrupts
 //!   the rest of the line;
 //! - a combining mark is drawn over its base cell without consuming a cell;
-//! - the cursor is drawn by default at the tracked position, in the theme's
-//!   cursor colour, spanning both columns of a wide character, hidden by
-//!   DECTCEM (`CSI ?25l`) and restored by `CSI ?25h`, with focused and
-//!   unfocused treatments that differ in pixels (issues #197/#200).
+//! - the cursor is drawn by default at the tracked position, inverse to its
+//!   actual cell with a 4.5:1 safety fallback on arbitrary SGR backgrounds,
+//!   spanning both columns of a wide character, hidden by DECTCEM (`CSI ?25l`)
+//!   and restored by `CSI ?25h`, with focused and unfocused treatments that
+//!   differ in pixels (issues #197/#200).
 //!
 //! ## The lit/blank gate
 //!
@@ -236,6 +237,20 @@ fn cell_color(frame: &CapturedFrame, row: u32, col: u32) -> [u8; 3] {
         "cell ({row},{col}) should hold exactly one lit colour, found {colors:?}"
     );
     colors[0]
+}
+
+/// Number of pixels inside one cell matching a concrete rendered colour.
+fn cell_color_pixel_count(frame: &CapturedFrame, row: u32, col: u32, color: [u8; 3]) -> usize {
+    let mut count = 0;
+    for y in 0..CELL_HEIGHT {
+        for x in 0..CELL_WIDTH {
+            let pixel = frame.pixel(col * CELL_WIDTH + x, row * CELL_HEIGHT + y);
+            if colors_match([pixel[0], pixel[1], pixel[2]], color) {
+                count += 1;
+            }
+        }
+    }
+    count
 }
 
 /// The default foreground as captured bytes, derived from the renderer's own
@@ -1467,8 +1482,8 @@ fn cell_is_solid(frame: &CapturedFrame, row: u32, col: u32, color: [u8; 3]) -> b
     })
 }
 
-/// The theme's cursor colour as captured bytes (the same quantization
-/// `Theme::cursor_u8` performs).
+/// The theme's unstyled cursor baseline as captured bytes (the same
+/// quantization `Theme::cursor_u8` performs).
 fn cursor_rgb(theme: &Theme) -> [u8; 3] {
     theme.cursor_u8()
 }
@@ -1701,10 +1716,11 @@ fn dectcem_hides_and_restores_the_cursor_in_pixels() {
     );
 }
 
-/// The cursor colour is theme-owned, so the caret must be visible — with
-/// measured WCAG contrast — on every theme's background, asserted on the
-/// readback bytes themselves (dark 15.39:1, light 14.56:1, high-contrast
-/// 21.0:1; `tests/theme.rs` pins the same numbers at the palette level).
+/// On an unstyled cell the cursor baseline is theme-owned, so the caret must
+/// be visible — with measured WCAG contrast — on every theme's background,
+/// asserted on the readback bytes themselves (dark 15.39:1, light 14.56:1,
+/// high-contrast 21.0:1; `tests/theme.rs` pins the same numbers at the palette
+/// level). SGR cells have their separate cell-relative regression below.
 #[test]
 fn the_cursor_colour_comes_from_the_theme_and_clears_contrast_in_pixels() {
     let Some(renderer) =
@@ -1739,6 +1755,165 @@ fn the_cursor_colour_comes_from_the_theme_and_clears_contrast_in_pixels() {
             "{theme:?} cursor {block:?} on {ground:?} is {ratio:.2}:1, below {floor}:1"
         );
     }
+}
+
+/// Regression for the SGR-background defect found after issues #197/#200:
+/// cursor ink is resolved against the cell it covers, not the theme ground.
+/// These are real terminal attributes driven through the parser and real
+/// readback pixels from the shipped render pipeline.
+#[test]
+fn cursor_contrast_tracks_four_real_sgr_backgrounds() {
+    let Some(renderer) = renderer_or_skip("cursor_contrast_tracks_four_real_sgr_backgrounds")
+    else {
+        return;
+    };
+    let cases: [(&str, &[u8], [u8; 3]); 4] = [
+        ("light ANSI SGR 47", b"\x1b[47m", DARK.ansi()[7]),
+        ("dark ANSI SGR 40", b"\x1b[40m", DARK.ansi()[0]),
+        (
+            "background equal to the theme cursor",
+            b"\x1b[48;2;204;235;209m",
+            cursor_rgb(&DARK),
+        ),
+        (
+            "truecolor SGR 48;2;17;119;221",
+            b"\x1b[48;2;17;119;221m",
+            [17, 119, 221],
+        ),
+    ];
+
+    for (label, sgr, expected_background) in cases {
+        // Two background-painted spaces, then return the cursor to the first:
+        // cell 0 is the caret and cell 1 exposes the actual comparison ground.
+        let mut bytes = sgr.to_vec();
+        bytes.extend_from_slice(b"  \r\x1b[?25h");
+        let snap = snapshot(1, 3, &bytes);
+        let frame = render(&renderer, &snap);
+
+        assert!(
+            cell_is_solid(&frame, 0, 0, [0, 0, 0]),
+            "{label}: the unusable inverse foreground must fall back to black"
+        );
+        assert!(
+            cell_is_solid(&frame, 0, 1, expected_background),
+            "{label}: comparison cell must expose SGR background {expected_background:?}"
+        );
+        let ink_pixel = frame.pixel(CELL_WIDTH / 2, CELL_HEIGHT / 2);
+        let ground_pixel = frame.pixel(CELL_WIDTH + CELL_WIDTH / 2, CELL_HEIGHT / 2);
+        let ink = [ink_pixel[0], ink_pixel[1], ink_pixel[2]];
+        let ground = [ground_pixel[0], ground_pixel[1], ground_pixel[2]];
+        let ratio = contrast_ratio(ink, ground);
+        eprintln!("cursor SGR oracle: {label} ink={ink:?} ground={ground:?} ratio={ratio:.6}:1");
+        assert!(
+            ratio >= 4.5,
+            "{label}: cursor {ink:?} on actual cell ground {ground:?} is only {ratio:.6}:1"
+        );
+    }
+}
+
+/// A focused block swaps the readable cell pair: cell foreground becomes the
+/// block and cell background becomes the glyph. The glyph keeps the same
+/// raster coverage it has without a cursor, proving readability rather than
+/// merely proving that two colours occur somewhere in the cell.
+#[test]
+fn block_cursor_keeps_the_sgr_glyph_readable_after_inversion() {
+    let Some(renderer) =
+        renderer_or_skip("block_cursor_keeps_the_sgr_glyph_readable_after_inversion")
+    else {
+        return;
+    };
+    const FOREGROUND: [u8; 3] = [20, 30, 40];
+    const BACKGROUND: [u8; 3] = [240, 240, 240];
+    let visible = snapshot(1, 3, b"\x1b[38;2;20;30;40;48;2;240;240;240mA\r\x1b[?25h");
+    let hidden = snapshot(1, 3, b"\x1b[38;2;20;30;40;48;2;240;240;240mA\r\x1b[?25l");
+    let visible_frame = render(&renderer, &visible);
+    let hidden_frame = render(&renderer, &hidden);
+
+    let ordinary_glyph_pixels = cell_color_pixel_count(&hidden_frame, 0, 0, FOREGROUND);
+    let inverted_glyph_pixels = cell_color_pixel_count(&visible_frame, 0, 0, BACKGROUND);
+    assert!(ordinary_glyph_pixels > 0, "the control A must draw a glyph");
+    assert_eq!(
+        inverted_glyph_pixels, ordinary_glyph_pixels,
+        "the inverted A must retain every glyph pixel"
+    );
+    assert_eq!(
+        cell_color_pixel_count(&visible_frame, 0, 0, FOREGROUND) + inverted_glyph_pixels,
+        (CELL_WIDTH * CELL_HEIGHT) as usize,
+        "the cursor cell may contain only its block and readable glyph"
+    );
+    let ratio = contrast_ratio(FOREGROUND, BACKGROUND);
+    assert!(ratio >= 4.5, "fixture pair must itself be readable");
+}
+
+/// `[cursor] color` remains meaningful, but cannot command invisible output:
+/// a safe colour is used exactly, while a colour matching the cell background
+/// falls back first to the cell's readable inverse foreground.
+#[test]
+fn cursor_override_is_used_when_safe_and_falls_back_when_not() {
+    let Some(renderer) =
+        renderer_or_skip("cursor_override_is_used_when_safe_and_falls_back_when_not")
+    else {
+        return;
+    };
+    let white = [1.0, 1.0, 1.0];
+    let dark = snapshot(1, 3, b"\x1b[48;2;8;18;28m  \r");
+    let safe = render_with_cursor_style(
+        &renderer,
+        &DARK,
+        CursorStyle::theme_default(&DARK).with_color_override(Some(white)),
+        &dark,
+    );
+    assert!(
+        cell_is_solid(&safe, 0, 0, [255, 255, 255]),
+        "a safe override must be drawn exactly"
+    );
+
+    let light = snapshot(1, 3, b"\x1b[38;2;20;30;40;48;2;240;240;240m  \r");
+    let matching_background = [240.0 / 255.0; 3];
+    let fallback = render_with_cursor_style(
+        &renderer,
+        &DARK,
+        CursorStyle::theme_default(&DARK).with_color_override(Some(matching_background)),
+        &light,
+    );
+    assert!(
+        cell_is_solid(&fallback, 0, 0, [20, 30, 40]),
+        "an invisible override must fall back to the readable inverse foreground"
+    );
+    assert!(
+        !cell_is_solid(&fallback, 0, 0, [240, 240, 240]),
+        "an override equal to the ground must never erase the caret"
+    );
+}
+
+/// Vim could not be driven in the independent review's WindowServer-less UI,
+/// so exercise the relevant contract directly: DECTCEM hide and show while
+/// the cursor sits on an SGR-painted light cell.
+#[test]
+fn dectcem_hide_and_show_work_on_an_sgr_background() {
+    let mut terminal = TerminalState::new(1, 3).expect("valid test terminal");
+    terminal.feed_bytes(b"\x1b[47m  \r\x1b[?25l");
+    let hidden = terminal.snapshot();
+    assert!(!hidden.is_cursor_visible());
+
+    terminal.feed_bytes(b"\x1b[?25h");
+    let shown = terminal.snapshot();
+    assert!(shown.is_cursor_visible());
+
+    // Keep the parser/state half of this contract live even on hosts where
+    // the rendered-frame half must skip because no GPU adapter is exposed.
+    let Some(renderer) = renderer_or_skip("dectcem_hide_and_show_work_on_an_sgr_background") else {
+        return;
+    };
+    let hidden_frame = render(&renderer, &hidden);
+    let shown_frame = render(&renderer, &shown);
+
+    let light = DARK.ansi()[7];
+    assert!(cell_is_solid(&hidden_frame, 0, 0, light));
+    assert!(cell_is_solid(&shown_frame, 0, 0, [0, 0, 0]));
+    assert!(cell_is_solid(&hidden_frame, 0, 1, light));
+    assert!(cell_is_solid(&shown_frame, 0, 1, light));
+    assert_ne!(hidden_frame.rgba, shown_frame.rgba);
 }
 
 /// Shape is configuration, not existence: bar and underline marks draw their
@@ -1877,9 +2052,9 @@ fn an_unfocused_cursor_is_a_hollow_outline_and_differs_from_focused() {
     }
 }
 
-/// A colour override is the power-user half of the contract: the theme
-/// colour is the default, and `[cursor]` colour configuration replaces it
-/// without touching any other drawn colour.
+/// A safe colour preference is the power-user half of the contract: on this
+/// dark unstyled cell the configured orange clears 4.5:1 and therefore
+/// replaces the inverse default without touching any other drawn colour.
 #[test]
 fn a_cursor_colour_override_replaces_only_the_caret_colour() {
     let Some(renderer) =
@@ -2135,12 +2310,17 @@ fn empty_state_message_is_drawn_in_the_sidebar() {
 
 /// Re-run one adapter-dependent oracle test in this very binary under a
 /// forced adapter mode, returning its exit status plus both captured streams:
-/// the harness prints its failure report (panic text included) to stdout,
-/// while the skip notice bypasses capture and lands on real stderr.
+/// The successful adapter-absence case needs `--nocapture` so libtest does not
+/// suppress its skip notice before the parent can inspect stderr. The failing
+/// device case deliberately keeps normal capture so libtest places its panic
+/// report on stdout, preserving the two externally distinct contracts.
 fn rerun_forced(test: &str, mode: &str) -> (bool, String, String) {
-    let output = Command::new(std::env::current_exe().expect("locate the test binary"))
-        .arg("--exact")
-        .arg(test)
+    let mut command = Command::new(std::env::current_exe().expect("locate the test binary"));
+    command.arg("--exact").arg(test);
+    if mode == "absent" {
+        command.arg("--nocapture");
+    }
+    let output = command
         .env("NOREN_FRAME_ORACLE_ADAPTER", mode)
         .output()
         .unwrap_or_else(|error| panic!("re-run `{test}` with adapter mode `{mode}`: {error}"));

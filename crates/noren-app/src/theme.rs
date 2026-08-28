@@ -12,7 +12,7 @@
 //!
 //! - the default foreground (unstyled text, sidebar, status line),
 //! - the default background (the render target's clear colour),
-//! - the cursor colour (the block drawn at the tracked cursor position),
+//! - the cursor colour (the inverse-video baseline on an unstyled cell),
 //! - the sixteen ANSI palette entries (`SGR 30..37`, `90..97`, `40..47`,
 //!   `100..107`) that programs select by name.
 //!
@@ -380,24 +380,26 @@ impl Theme {
         quantize(self.background)
     }
 
-    /// The cursor colour as shader floats: the block, bar, or underline
-    /// drawn at the tracked cursor position.
+    /// The cursor colour as shader floats: the inverse-video baseline for a
+    /// cursor on a cell with the default foreground.
     ///
     /// Every built-in theme sets this to its default foreground, so the
-    /// caret inverts the reading pair (cursor block in the foreground
-    /// colour, glyph inside it in the background colour) and inherits the
-    /// measured default-pair WCAG contrast — the order-independent ratio is
-    /// identical in both directions. A user configuration may override the
-    /// colour; the override is applied at render-target construction, not
-    /// by editing the theme.
+    /// caret inverts the reading pair (cursor block in the foreground colour,
+    /// glyph inside it in the background colour) and inherits the measured
+    /// default-pair WCAG contrast — the order-independent ratio is identical
+    /// in both directions. On an SGR foreground/background pair the renderer
+    /// instead starts from that cell's resolved foreground; if either the
+    /// inverse foreground or a configured override misses 4.5:1 against the
+    /// actual cell background, it falls back to the better of black/white.
+    /// The theme value therefore remains the unstyled default without making
+    /// a fixed-colour promise on backgrounds the theme did not choose.
     #[must_use]
     pub const fn cursor(self) -> [f32; 3] {
         self.cursor
     }
 
-    /// The cursor colour as the 8-bit triple actually stored by the RGBA8
-    /// render target — the value cursor contrast is measured on; see
-    /// [`Theme::foreground_u8`].
+    /// The unstyled cursor baseline as the 8-bit triple actually stored by
+    /// the RGBA8 render target; see [`Theme::foreground_u8`].
     #[must_use]
     pub fn cursor_u8(self) -> [u8; 3] {
         quantize(self.cursor)
