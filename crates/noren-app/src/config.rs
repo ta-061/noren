@@ -103,6 +103,10 @@ const MAX_ERROR_DETAIL_CHARS: usize = 120;
 /// the bounded 64 KiB read, and gives the sidebar label arithmetic a
 /// reasonable worst case. Longer values are
 /// [`ConfigError::OutOfRange`] errors, never truncated.
+///
+/// This equals [`noren_pty::MAX_AGENT_ARGV_ELEMENT_BYTES`] — the launch
+/// policy re-enforces the same cap at its own layer — and a pin test
+/// below holds the two constants equal so the layers can never diverge.
 pub const MAX_AGENT_FIELD_BYTES: usize = 1024;
 
 /// Font geometry settings.
@@ -2274,5 +2278,28 @@ mod tests {
             !rendered.contains(SENTINEL),
             "AgentConfig Debug leaked file text: {rendered}"
         );
+    }
+
+    /// The config-layer per-field cap and the policy-layer per-element cap
+    /// are the same number: a configuration the schema accepted can never be
+    /// refused by [`noren_pty::AgentLaunchPolicy`], while the policy still
+    /// enforces the bound against callers that skipped this schema. Diverging
+    /// the constants would create a silent dead range in one direction and a
+    /// launch-time surprise in the other, so the pin is a test.
+    #[test]
+    fn agent_field_cap_matches_the_launch_policy_element_cap() {
+        assert_eq!(
+            MAX_AGENT_FIELD_BYTES,
+            noren_pty::MAX_AGENT_ARGV_ELEMENT_BYTES,
+            "the config and policy layers must enforce the same argv element cap"
+        );
+        // The caps compose, not just match: the largest schema-accepted
+        // command and arg construct a valid policy. The command's cap
+        // includes its leading `/`.
+        let command = format!("/{}", "a".repeat(MAX_AGENT_FIELD_BYTES - 1));
+        let arg = "a".repeat(MAX_AGENT_FIELD_BYTES);
+        let policy = noren_pty::AgentLaunchPolicy::new(&command, &[arg])
+            .expect("a schema-accepted element always fits the policy");
+        assert_eq!(policy.args().len(), 1);
     }
 }

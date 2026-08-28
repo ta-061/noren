@@ -46,6 +46,15 @@ pub const REPLY_BYTES_PER_MESSAGE: usize = 4 * 1024;
 pub const REPLY_BYTES_PER_SECOND: usize = 64 * 1024;
 /// Total orderly-shutdown deadline.
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
+/// Maximum accepted bytes for one [`AgentLaunchPolicy`] argv element —
+/// the program or any single argument.
+///
+/// The policy is the boundary, not its callers: this is the same
+/// 1024-byte per-field cap the configuration schema enforces
+/// (`noren_app::config::MAX_AGENT_FIELD_BYTES`; a pin test holds the two
+/// equal), so a config-accepted command can never be refused here while
+/// a direct policy caller gets the same typed rejection.
+pub const MAX_AGENT_ARGV_ELEMENT_BYTES: usize = 1024;
 
 const ZSH_PROGRAM: &str = "/bin/zsh";
 /// Fixed system SSH client. An absolute path deliberately bypasses `PATH`
@@ -512,6 +521,10 @@ fn build_ssh_command(policy: &SshLaunchPolicy) -> CommandBuilder {
 ///   absolute with a leading `/` ([`PtyError::CommandNotAbsolute`]); no
 ///   `PATH` lookup is performed, so a writable `PATH` entry cannot
 ///   substitute a different binary;
+/// - each argv element — the program and every argument — is bounded to
+///   [`MAX_AGENT_ARGV_ELEMENT_BYTES`] ([`PtyError::CommandTooLarge`]), so
+///   the boundary does not depend on its caller's own validation to keep
+///   argv memory sane;
 /// - the launch is an **argv vector, never a shell invocation**: there is no
 ///   `sh -c` and no `-c` anywhere in the build, so a configured value
 ///   containing `;`, `$(...)`, or a backtick reaches the agent program as
@@ -536,13 +549,23 @@ impl AgentLaunchPolicy {
     ///
     /// `program` must be non-empty and absolute; `args` are taken verbatim
     /// (each element is exactly one argv word; no quoting, splitting, or
-    /// expansion is ever applied).
+    /// expansion is ever applied). Every element — `program` included —
+    /// must fit [`MAX_AGENT_ARGV_ELEMENT_BYTES`] bytes.
     pub fn new(program: &str, args: &[String]) -> Result<Self, PtyError> {
         if program.is_empty() {
             return Err(PtyError::CommandEmpty);
         }
         if !program.starts_with('/') {
             return Err(PtyError::CommandNotAbsolute);
+        }
+        if program.len() > MAX_AGENT_ARGV_ELEMENT_BYTES {
+            return Err(PtyError::CommandTooLarge);
+        }
+        if args
+            .iter()
+            .any(|argument| argument.len() > MAX_AGENT_ARGV_ELEMENT_BYTES)
+        {
+            return Err(PtyError::CommandTooLarge);
         }
         Ok(Self {
             program: program.to_owned(),
@@ -637,6 +660,10 @@ pub enum PtyError {
     /// An [`AgentLaunchPolicy`](crate::AgentLaunchPolicy) program was not an
     /// absolute path; `PATH` lookup is deliberately not performed.
     CommandNotAbsolute,
+    /// An [`AgentLaunchPolicy`](crate::AgentLaunchPolicy) argv element — the
+    /// program or one argument — exceeded
+    /// [`MAX_AGENT_ARGV_ELEMENT_BYTES`](crate::MAX_AGENT_ARGV_ELEMENT_BYTES).
+    CommandTooLarge,
     Backend {
         operation: PtyOperation,
     },
@@ -679,6 +706,9 @@ impl fmt::Display for PtyError {
             Self::CommandEmpty => f.write_str("agent command must not be empty"),
             Self::CommandNotAbsolute => {
                 f.write_str("agent command must be an absolute path; PATH lookup is not performed")
+            }
+            Self::CommandTooLarge => {
+                f.write_str("agent command argv element exceeds its byte limit")
             }
             Self::Backend { operation } => {
                 write!(f, "PTY backend operation {operation:?} failed")
@@ -1793,6 +1823,38 @@ mod tests {
         // Accessors expose the real values for argv construction.
         assert_eq!(policy.program(), format!("/opt/{SECRET}/agent"));
         assert_eq!(policy.args().len(), 2);
+    }
+
+    /// The policy is the boundary: no argv element may exceed
+    /// [`MAX_AGENT_ARGV_ELEMENT_BYTES`], whatever its caller already
+    /// checked. The cap itself is accepted, on every element kind.
+    #[test]
+    fn agent_launch_policy_bounds_each_argv_element() {
+        let at_cap = format!("/{}", "a".repeat(MAX_AGENT_ARGV_ELEMENT_BYTES - 1));
+        let over_cap = format!("/{}", "a".repeat(MAX_AGENT_ARGV_ELEMENT_BYTES));
+        // The cap is accepted, for the program and an argument alike.
+        assert!(
+            AgentLaunchPolicy::new(&at_cap, &[at_cap.clone()]).is_ok(),
+            "an element of exactly the cap is accepted"
+        );
+        assert_eq!(
+            AgentLaunchPolicy::new(&over_cap, &[]),
+            Err(PtyError::CommandTooLarge),
+            "an over-cap program is refused by the policy itself"
+        );
+        assert_eq!(
+            AgentLaunchPolicy::new("/bin/true", &[at_cap, over_cap]),
+            Err(PtyError::CommandTooLarge),
+            "one over-cap argument refuses the whole vector"
+        );
+        // The refusal is byte-length, not char-count: a multi-byte string
+        // under the char cap but over the byte cap is still refused.
+        let wide = "é".repeat(MAX_AGENT_ARGV_ELEMENT_BYTES / 2 + 1);
+        assert!(wide.chars().count() <= MAX_AGENT_ARGV_ELEMENT_BYTES);
+        assert_eq!(
+            AgentLaunchPolicy::new("/bin/true", &[wide]),
+            Err(PtyError::CommandTooLarge)
+        );
     }
 
     /// The agent command is the configured argv VERBATIM: no shell, no `-c`,
