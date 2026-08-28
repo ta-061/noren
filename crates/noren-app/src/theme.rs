@@ -13,6 +13,7 @@
 //! - the default foreground (unstyled text, sidebar, status line),
 //! - the default background (the render target's clear colour),
 //! - the cursor colour (the inverse-video baseline on an unstyled cell),
+//! - the selection foreground and background (the default pair inverted),
 //! - the sixteen ANSI palette entries (`SGR 30..37`, `90..97`, `40..47`,
 //!   `100..107`) that programs select by name.
 //!
@@ -308,6 +309,8 @@ pub struct Theme {
     foreground: [f32; 3],
     background: [f32; 3],
     cursor: [f32; 3],
+    selection_foreground: [f32; 3],
+    selection_background: [f32; 3],
 }
 
 /// The built-in `dark` theme: the pre-theme renderer's colours, except the
@@ -323,6 +326,8 @@ pub const DARK: Theme = Theme {
     foreground: DARK_FOREGROUND,
     background: DARK_BACKGROUND,
     cursor: DARK_FOREGROUND,
+    selection_foreground: DARK_BACKGROUND,
+    selection_background: DARK_FOREGROUND,
 };
 
 /// The built-in `light` theme.
@@ -332,6 +337,8 @@ pub const LIGHT: Theme = Theme {
     foreground: LIGHT_FOREGROUND,
     background: LIGHT_BACKGROUND,
     cursor: LIGHT_FOREGROUND,
+    selection_foreground: LIGHT_BACKGROUND,
+    selection_background: LIGHT_FOREGROUND,
 };
 
 /// The built-in `high-contrast` theme.
@@ -341,6 +348,8 @@ pub const HIGH_CONTRAST: Theme = Theme {
     foreground: HIGH_CONTRAST_FOREGROUND,
     background: HIGH_CONTRAST_BACKGROUND,
     cursor: HIGH_CONTRAST_FOREGROUND,
+    selection_foreground: HIGH_CONTRAST_BACKGROUND,
+    selection_background: HIGH_CONTRAST_FOREGROUND,
 };
 
 impl Default for Theme {
@@ -403,6 +412,34 @@ impl Theme {
     #[must_use]
     pub fn cursor_u8(self) -> [u8; 3] {
         quantize(self.cursor)
+    }
+
+    /// Glyph colour inside a selected cell. Every built-in theme uses its
+    /// normal background, completing an inverse-video pair with
+    /// [`Theme::selection_background`].
+    #[must_use]
+    pub const fn selection_foreground(self) -> [f32; 3] {
+        self.selection_foreground
+    }
+
+    /// Background painted over every selected cell. Every built-in theme
+    /// uses its normal foreground, so selection is visible without
+    /// configuration and follows the active `[theme]` palette.
+    #[must_use]
+    pub const fn selection_background(self) -> [f32; 3] {
+        self.selection_background
+    }
+
+    /// Selected glyph colour as stored by the RGBA8 render target.
+    #[must_use]
+    pub fn selection_foreground_u8(self) -> [u8; 3] {
+        quantize(self.selection_foreground)
+    }
+
+    /// Selection background as stored by the RGBA8 render target.
+    #[must_use]
+    pub fn selection_background_u8(self) -> [u8; 3] {
+        quantize(self.selection_background)
     }
 
     /// The theme's sixteen ANSI palette entries, in palette-index order.

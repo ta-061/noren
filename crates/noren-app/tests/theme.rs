@@ -110,6 +110,54 @@ fn every_theme_cursor_colour_meets_its_theme_contrast_floor() {
     }
 }
 
+/// Selection is theme-owned inverse video, not an unmeasured overlay. The
+/// selected glyph/background pair is exactly the normal theme pair reversed,
+/// so WCAG contrast is identical in both directions and the background is
+/// visibly different from the unselected screen without configuration.
+///
+/// Ratios are computed by `contrast_ratio` from RGBA8 channel values using
+/// the WCAG sRGB transfer (`0.04045`, `/12.92`, exponent `2.4`) and luminance
+/// weights `0.2126/0.7152/0.0722`: dark 15.3887:1, light 14.5632:1, and
+/// high-contrast 21.0:1.
+#[test]
+fn every_theme_selection_pair_is_inverted_visible_and_meets_aa() {
+    let expected = [
+        (ThemeName::Dark, 15.388_665_85),
+        (ThemeName::Light, 14.563_243_88),
+        (ThemeName::HighContrast, 21.0),
+    ];
+    for (name, expected_ratio) in expected {
+        let theme = name.palette();
+        assert_eq!(
+            theme.selection_background_u8(),
+            theme.foreground_u8(),
+            "{name}: selection background must be the normal foreground"
+        );
+        assert_eq!(
+            theme.selection_foreground_u8(),
+            theme.background_u8(),
+            "{name}: selected glyphs must use the normal background"
+        );
+        assert_ne!(
+            theme.selection_background_u8(),
+            theme.background_u8(),
+            "{name}: selecting a blank cell must change its pixels"
+        );
+        let ratio = contrast_ratio(
+            theme.selection_foreground_u8(),
+            theme.selection_background_u8(),
+        );
+        assert!(
+            (ratio - expected_ratio).abs() < 0.000_001,
+            "{name}: selection contrast moved to {ratio:.8}:1; expected {expected_ratio:.8}:1"
+        );
+        assert!(
+            ratio >= 4.5,
+            "{name}: selected text is {ratio:.4}:1, below the AA 4.5:1 floor"
+        );
+    }
+}
+
 /// The light theme was designed, not assumed: every ANSI slot keeps AA on
 /// the light background. Measured minimum: 5.07:1 (`bright green`).
 #[test]
