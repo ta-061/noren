@@ -39,6 +39,7 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use noren_app::cursor::CursorShape;
+use noren_app::sidebar_text::{DEFAULT_SIDEBAR_COLUMNS, lifecycle_marker_color};
 use noren_app::theme::{Theme, contrast_ratio};
 use noren_app::{CellMetrics, MAX_RENDER_COLS, MAX_RENDER_ROWS};
 use noren_terminal::{Cell, CellAttributes, Color, TerminalSnapshot};
@@ -68,7 +69,7 @@ const MAX_VERTICES: usize = (MAX_RENDER_ROWS as usize)
 /// Exposed as `pub(crate)` so `main.rs` can subtract it from the PTY/terminal
 /// grid, and so the frame oracle (`renderer_capture.rs`) can render sidebar
 /// content through the same pipeline.
-pub(crate) const SIDEBAR_COLS: usize = 16;
+pub(crate) const SIDEBAR_COLS: usize = DEFAULT_SIDEBAR_COLUMNS;
 
 /// What owns one row in a rendered terminal frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,6 +266,17 @@ pub(crate) fn resolve_background(theme: &Theme, attributes: &CellAttributes) -> 
         Color::Default => None,
         background => Some(resolve_color(theme, background, theme.background())),
     }
+}
+
+/// Theme-owned colour reinforcing one lifecycle marker's collision-checked
+/// shape. Non-marker sidebar text keeps the default foreground.
+fn sidebar_glyph_color(theme: &Theme, character: char, column: usize) -> [f32; 3] {
+    if column + 1 == SIDEBAR_COLS
+        && let Some(color) = lifecycle_marker_color(character)
+    {
+        return resolve_color(theme, Color::Ansi(color), theme.foreground());
+    }
+    theme.foreground()
 }
 
 /// Clear colour used by the glyph pipeline's load op.
@@ -641,8 +653,9 @@ fn glyph_vertices_with_budget(
     let cursor_plan = terminal.and_then(|snapshot| plan_cursor(snapshot, &layout, terminal_cols));
     let mut vertices = Vec::new();
 
-    // The sidebar is chrome, not terminal content: it carries no cell
-    // attributes, so it draws in the theme's default foreground. Unlike
+    // The sidebar is chrome, not terminal content: ordinary text draws in the
+    // theme's default foreground, while the reserved final-cell lifecycle
+    // marker receives a theme-owned semantic colour as reinforcement. Unlike
     // terminal and status rows, sidebar rows are interactive chrome and are
     // only drawn when the whole cell is visible; sidebar hit testing uses
     // this same count.
@@ -656,7 +669,7 @@ fn glyph_vertices_with_budget(
                 push_glyph(
                     &mut vertices,
                     character,
-                    theme.foreground(),
+                    sidebar_glyph_color(&theme, character, col),
                     col,
                     row,
                     target,
@@ -1341,6 +1354,10 @@ pub(crate) fn vertex_bytes(vertices: &[Vertex]) -> Vec<u8> {
 
 const QUESTION_MARK_GLYPH: [u8; 7] = [14, 17, 1, 2, 4, 0, 4];
 const UNICODE_REPLACEMENT_GLYPH: [u8; 7] = [4, 10, 17, 21, 17, 10, 4];
+const STARTING_MARKER_GLYPH: [u8; 7] = [14, 17, 16, 16, 17, 14, 4];
+const RUNNING_MARKER_GLYPH: [u8; 7] = [8, 12, 14, 15, 14, 12, 8];
+const EXITED_MARKER_GLYPH: [u8; 7] = [0, 14, 14, 14, 14, 14, 0];
+const FAILED_MARKER_GLYPH: [u8; 7] = [17, 10, 4, 14, 4, 10, 17];
 
 /// Add one visible diacritic row to an ASCII base glyph.
 ///
@@ -1689,6 +1706,10 @@ fn box_drawing_rows(character: char) -> Option<[u8; 7]> {
 #[rustfmt::skip]
 fn glyph_rows(character: char) -> [u8; 7] {
     match character {
+        '◌' => STARTING_MARKER_GLYPH,
+        '▶' => RUNNING_MARKER_GLYPH,
+        '■' => EXITED_MARKER_GLYPH,
+        '✕' => FAILED_MARKER_GLYPH,
         ' ' => [0, 0, 0, 0, 0, 0, 0],
         'A' => [14, 17, 17, 31, 17, 17, 17],
         'B' => [30, 17, 17, 30, 17, 17, 30],
@@ -2380,6 +2401,63 @@ mod tests {
         }
 
         assert_eq!(seen.len(), 95, "printable ASCII must contain 95 glyphs");
+    }
+
+    #[test]
+    fn lifecycle_markers_collide_with_none_of_320_existing_sidebar_glyphs() {
+        use noren_app::sidebar_text::LIFECYCLE_MARKERS;
+
+        // The sidebar can receive every renderer-covered text glyph through a
+        // configured or discovered label: 95 printable ASCII, 96 Latin-1
+        // Supplement, and 128 Box Drawing characters. Unsupported Unicode
+        // adds one replacement glyph. Check marker shapes against all 320
+        // inputs, not only against the three pre-existing chrome markers.
+        let mut existing: Vec<char> = (0x20_u8..=0x7e).map(char::from).collect();
+        existing.extend((0x00a0..=0x00ff).filter_map(char::from_u32));
+        existing.extend((0x2500..=0x257f).filter_map(char::from_u32));
+        assert_eq!(existing.len(), 319);
+
+        for (index, marker) in LIFECYCLE_MARKERS.into_iter().enumerate() {
+            let marker_rows = glyph_rows(marker);
+            assert_ne!(
+                marker_rows, UNICODE_REPLACEMENT_GLYPH,
+                "lifecycle marker {marker:?} collides with Unicode replacement"
+            );
+            for existing_glyph in &existing {
+                assert_ne!(
+                    marker_rows,
+                    glyph_rows(*existing_glyph),
+                    "lifecycle marker {marker:?} collides with existing sidebar glyph \
+                     {existing_glyph:?}"
+                );
+            }
+            for other in &LIFECYCLE_MARKERS[index + 1..] {
+                assert_ne!(
+                    marker_rows,
+                    glyph_rows(*other),
+                    "lifecycle markers {marker:?} and {other:?} collide"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_marker_colors_clear_aa_on_every_shipped_sidebar_background() {
+        use noren_app::sidebar_text::LIFECYCLE_MARKERS;
+        use noren_app::theme::{DARK, HIGH_CONTRAST, LIGHT};
+
+        for theme in [DARK, LIGHT, HIGH_CONTRAST] {
+            for marker in LIFECYCLE_MARKERS {
+                let ansi = lifecycle_marker_color(marker).expect("known lifecycle marker");
+                let color = theme.ansi()[usize::from(ansi.palette_index())];
+                let ratio = contrast_ratio(color, theme.background_u8());
+                assert!(
+                    ratio >= 4.5,
+                    "marker {marker:?} has only {ratio:.4}:1 contrast on {:?}",
+                    theme.background_u8()
+                );
+            }
+        }
     }
 
     /// Distinct covered characters may share a bitmap only where a 5×7 grid

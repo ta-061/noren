@@ -630,7 +630,7 @@ fn sidebar_text_lines_format_a_real_workspace_sidebar() {
     assert_eq!(lines.len(), 2, "one formatted line per sidebar row");
 
     // The selected row is prefixed with '>' and the unselected with a
-    // space; both carry the real descriptor's label and detail.
+    // space; both carry the real descriptor's label.
     assert!(
         lines[0].starts_with("> "),
         "selected row must be marked with '>': {:?}",
@@ -651,13 +651,11 @@ fn sidebar_text_lines_format_a_real_workspace_sidebar() {
         "unselected row carries the session label: {:?}",
         lines[1]
     );
-    // A freshly created session sits at the Starting status, so the detail
-    // is derived from the real descriptor, not a constant.
-    assert!(
-        lines[0].contains("local · starting"),
-        "detail comes from the real descriptor: {:?}",
-        lines[0]
-    );
+    // A freshly created session sits at Starting, whose reserved final cell
+    // carries the dotted-circle marker. The full detail remains on the view
+    // model; compact rendering never lets it push state beyond column 16.
+    assert_eq!(lines[0].chars().count(), renderer::SIDEBAR_COLS);
+    assert_eq!(lines[0].chars().last(), Some('◌'));
 }
 
 // ── Pass-through gate integration tests ──────────────────────────────

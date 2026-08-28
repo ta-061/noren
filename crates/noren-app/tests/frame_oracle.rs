@@ -85,13 +85,18 @@ use std::io::Write;
 use std::process::Command;
 
 use noren_app::cursor::CursorShape;
+use noren_app::session::{SessionKind, SessionRegistry, SessionStatus};
+use noren_app::sidebar::{SidebarEntry, SidebarView};
+use noren_app::sidebar_text::visible_sidebar_text_lines_at_width;
 use noren_app::theme::{DARK, HIGH_CONTRAST, LIGHT, Theme, contrast_ratio};
 use noren_app::{
     GridGeometry, MAX_RENDER_COLS, MAX_RENDER_ROWS, POC_CELL_HEIGHT as CELL_HEIGHT,
     POC_CELL_WIDTH as CELL_WIDTH,
 };
 use noren_terminal::{TerminalSnapshot, TerminalState};
-use renderer_capture::renderer_source::{CLEAR_COLOR, CursorStyle, SIDEBAR_COLS, Target};
+use renderer_capture::renderer_source::{
+    CLEAR_COLOR, CursorStyle, SIDEBAR_COLS, Target, glyph_vertices_for,
+};
 use renderer_capture::{CaptureError, CapturedFrame, OffscreenRenderer};
 
 /// The PoC default cell metrics, used by every frame-oracle capture call so
@@ -2174,6 +2179,174 @@ fn render_with_sidebar(
         Some(sidebar),
         None,
     )
+}
+
+/// Build one real session row through the domain model and production text
+/// projection. No process is involved: the registry records an explicit
+/// observation and the view projects it into the same line the app renders.
+fn lifecycle_sidebar_line(status: SessionStatus) -> String {
+    let mut registry = SessionRegistry::new();
+    let id = registry.create(SessionKind::Local);
+    if status != SessionStatus::Starting {
+        registry
+            .observe(id, status)
+            .expect("fixture lifecycle advances monotonically");
+    }
+    let entries = [SidebarEntry::Session(
+        registry.get(id).expect("fixture id remains live"),
+    )];
+    let view = SidebarView::build(&entries, Some(id));
+    visible_sidebar_text_lines_at_width(&view, 0, 1, SIDEBAR_COLS)
+        .into_iter()
+        .next()
+        .expect("one session produces one sidebar line")
+}
+
+fn lifecycle_cases() -> [(SessionStatus, char, usize); 4] {
+    [
+        (SessionStatus::Starting, '◌', 3),
+        (SessionStatus::Running, '▶', 2),
+        (SessionStatus::Exited { code: Some(0) }, '■', 8),
+        (
+            SessionStatus::Failed {
+                reason: "frame fixture".to_string(),
+            },
+            '✕',
+            1,
+        ),
+    ]
+}
+
+/// Rectangle fingerprint and colours emitted inside one sidebar cell by the
+/// production vertex path. This is a frame oracle that needs no GPU adapter:
+/// the same vertices feed the shipped shader and the offscreen pixel capture.
+type GlyphRect = (u32, u32, u32, u32);
+type SidebarCellVertexOracle = (Vec<GlyphRect>, Vec<[f32; 3]>);
+
+fn sidebar_cell_vertex_oracle(line: &str, theme: &Theme, column: u32) -> SidebarCellVertexOracle {
+    let width = SIDEBAR_COLS as u32 * CELL_WIDTH;
+    let height = CELL_HEIGHT;
+    let lines = [line.to_string()];
+    let vertices = glyph_vertices_for(
+        Target::new(theme, width, height, poc_metrics()),
+        None,
+        Some(&lines),
+        None,
+    );
+    let pixel_x = |ndc: f32| (((ndc + 1.0) * 0.5 * width as f32).round()) as u32;
+    let pixel_y = |ndc: f32| (((1.0 - ndc) * 0.5 * height as f32).round()) as u32;
+    let mut signature = Vec::new();
+    let mut colors = Vec::new();
+    for rectangle in vertices.chunks_exact(6) {
+        let left = pixel_x(rectangle[0].position[0]);
+        if left / CELL_WIDTH != column {
+            continue;
+        }
+        let top = pixel_y(rectangle[0].position[1]);
+        let right = pixel_x(rectangle[2].position[0]);
+        let bottom = pixel_y(rectangle[2].position[1]);
+        signature.push((left - column * CELL_WIDTH, top, right - left, bottom - top));
+        colors.push(rectangle[0].color);
+    }
+    (signature, colors)
+}
+
+#[test]
+fn session_lifecycle_markers_are_identifiable_and_on_row_at_16_columns() {
+    let mut signatures = Vec::new();
+    for (status, expected_marker, expected_ansi) in lifecycle_cases() {
+        let line = lifecycle_sidebar_line(status);
+        assert_eq!(
+            line.chars().count(),
+            SIDEBAR_COLS,
+            "the compact session row must end at the shipped sidebar edge: {line:?}"
+        );
+        assert_eq!(
+            line.chars().nth(SIDEBAR_COLS - 1),
+            Some(expected_marker),
+            "each lifecycle owns an identifiable literal in visible column 16"
+        );
+
+        let (signature, _) = sidebar_cell_vertex_oracle(
+            &line,
+            &DARK,
+            u32::try_from(SIDEBAR_COLS - 1).expect("sidebar width fits u32"),
+        );
+        assert!(
+            !signature.is_empty(),
+            "marker {expected_marker:?} emitted no geometry in visible column 16"
+        );
+        assert!(
+            !signatures.contains(&signature),
+            "marker {expected_marker:?} rendered the same shape as another lifecycle"
+        );
+        signatures.push(signature);
+
+        for theme in [DARK, LIGHT, HIGH_CONTRAST] {
+            let (_, colors) = sidebar_cell_vertex_oracle(
+                &line,
+                &theme,
+                u32::try_from(SIDEBAR_COLS - 1).expect("sidebar width fits u32"),
+            );
+            let expected = theme.ansi()[expected_ansi].map(|channel| f32::from(channel) / 255.0);
+            assert!(
+                colors.iter().all(|color| *color == expected),
+                "marker {expected_marker:?} did not use ANSI slot {expected_ansi} on theme \
+                 background {:?}: {colors:?}",
+                theme.background_u8()
+            );
+            assert!(
+                contrast_ratio(theme.ansi()[expected_ansi], theme.background_u8()) >= 4.5,
+                "marker {expected_marker:?} fails WCAG AA on {:?}",
+                theme.background_u8()
+            );
+        }
+    }
+    assert_eq!(
+        signatures.len(),
+        4,
+        "all four lifecycle shapes were checked"
+    );
+}
+
+#[test]
+fn session_lifecycle_markers_reach_distinct_frame_pixels_at_16_columns() {
+    let Some(renderer) =
+        renderer_or_skip("session_lifecycle_markers_reach_distinct_frame_pixels_at_16_columns")
+    else {
+        return;
+    };
+    let width = SIDEBAR_COLS as u32 * CELL_WIDTH;
+    let marker_column = u32::try_from(SIDEBAR_COLS - 1).expect("sidebar width fits u32");
+    let mut patterns = Vec::new();
+    for (status, expected_marker, expected_ansi) in lifecycle_cases() {
+        let line = lifecycle_sidebar_line(status);
+        let lines = [line];
+        let frame = renderer.capture(
+            Target::new(&DARK, width, CELL_HEIGHT, poc_metrics()),
+            None,
+            Some(&lines),
+            None,
+        );
+        assert!(
+            cell_is_lit(&frame, 0, marker_column),
+            "marker {expected_marker:?} is not visible in column 16"
+        );
+        assert!(
+            colors_match(
+                cell_color(&frame, 0, marker_column),
+                DARK.ansi()[expected_ansi]
+            ),
+            "marker {expected_marker:?} pixel colour is not its semantic palette role"
+        );
+        let pattern = cell_pattern(&frame, 0, marker_column);
+        assert!(
+            !patterns.contains(&pattern),
+            "marker {expected_marker:?} has the same frame pixels as another lifecycle"
+        );
+        patterns.push(pattern);
+    }
+    assert_eq!(patterns.len(), 4, "all four rendered markers were checked");
 }
 
 #[test]

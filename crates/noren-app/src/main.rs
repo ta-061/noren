@@ -44,6 +44,7 @@ use noren_app::{
         SESSION_STATE_FILE_NAME, SessionPersistenceError, load_snapshot, save_snapshot, snapshot,
     },
     sidebar::{SidebarEntry, SidebarView},
+    sidebar_text::visible_sidebar_text_lines,
     ssh_config::{HostDiscoveryKind, SshConfig},
     theme::Theme,
 };
@@ -3492,46 +3493,14 @@ impl RuntimeGridSize {
     }
 }
 
-/// Convert the sidebar view into text lines the renderer can draw.
+/// Convert the sidebar view into text lines at the shipped width.
 ///
-/// Each row is prefixed with `>` when selected, space otherwise, followed by
-/// the label and optional detail — using [`SidebarRow::label`] and
-/// [`SidebarRow::detail`] verbatim. When the sidebar is empty the
-/// empty-state message is returned as the sole line.
+/// Production and the integration frame oracle share the width-aware
+/// implementation in `sidebar_text`; this test seam keeps existing binary
+/// tests on the exact same projection.
 #[cfg(test)]
 fn sidebar_text_lines(sidebar: &SidebarView) -> Vec<String> {
     visible_sidebar_text_lines(sidebar, 0, usize::MAX)
-}
-
-/// Format only the visible slice of the sidebar. The scroll offset is clamped
-/// to the last full page so redraw work stays proportional to frame rows, not
-/// to hidden entries.
-fn visible_sidebar_text_lines(
-    sidebar: &SidebarView,
-    offset: usize,
-    max_rows: usize,
-) -> Vec<String> {
-    if max_rows == 0 {
-        return Vec::new();
-    }
-    if sidebar.is_empty() {
-        return sidebar
-            .empty_state()
-            .map(|state| vec![state.message().to_string()])
-            .unwrap_or_default();
-    }
-    let offset = offset.min(sidebar.rows().len().saturating_sub(max_rows));
-    sidebar.rows()[offset..]
-        .iter()
-        .take(max_rows)
-        .map(|row| {
-            let marker = if row.is_selected() { '>' } else { ' ' };
-            match row.detail() {
-                Some(detail) => format!("{marker} {} {}", row.label(), detail),
-                None => format!("{marker} {}", row.label()),
-            }
-        })
-        .collect()
 }
 
 /// Build text lines for the palette display, drawn at the top of the sidebar
