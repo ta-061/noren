@@ -1737,7 +1737,34 @@ fn readable_config_without_literal_aliases_reports_none_found() {
     assert!(app.workspace.sidebar().rows().is_empty());
     assert_eq!(
         app.ssh_diagnostic.as_deref(),
-        Some("Noren SSH: partial literal aliases; none found")
+        Some(
+            "Noren SSH: partial literal aliases; none found; \
+             1 wildcard pattern not listed"
+        )
+    );
+}
+
+#[test]
+fn wildcard_patterns_add_no_rows_but_the_notice_explains_them() {
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(b"Host build\nHost *.internal\n  User dee\nHost prod-?\n");
+    let mut app = NorenApp::default();
+
+    app.load_ssh_hosts_from(fixture.path());
+
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(rows.len(), 1, "only the literal alias becomes a row");
+    assert_eq!(rows[0].label(), "SSH-OFF build");
+    assert!(
+        rows.iter().all(|row| !row.label().contains(['*', '?'])),
+        "a wildcard pattern is a rule, not a launchable destination"
+    );
+    assert_eq!(
+        app.ssh_diagnostic.as_deref(),
+        Some(
+            "Noren SSH: partial literal aliases; select one for source; \
+             2 wildcard patterns not listed"
+        )
     );
 }
 
@@ -2430,7 +2457,7 @@ fn rebuild_sidebar_skips_non_ssh_host_facts_without_panicking() {
 #[test]
 fn many_ssh_hosts_are_bounded_and_report_the_omitted_count() {
     let fixture = SshConfigFixture::new();
-    let config: String = (0..30)
+    let config: String = (0..70)
         .map(|index| format!("Host configured-host-{index:02}-with-long-alias\n"))
         .collect();
     fixture.write_new(config);
@@ -2449,13 +2476,13 @@ fn many_ssh_hosts_are_bounded_and_report_the_omitted_count() {
     assert_eq!(
         app.workspace.ssh_hosts.last().map(|host| &host.kind),
         Some(&SessionKind::Ssh {
-            target: "configured-host-23-with-long-alias".to_owned(),
+            target: "configured-host-63-with-long-alias".to_owned(),
         })
     );
     assert!(app.workspace.ssh_hosts.iter().all(|host| {
         host.kind
             != SessionKind::Ssh {
-                target: "configured-host-24-with-long-alias".to_owned(),
+                target: "configured-host-64-with-long-alias".to_owned(),
             }
     }));
     assert!(rows.iter().all(|row| {
@@ -2475,13 +2502,14 @@ fn many_ssh_hosts_are_bounded_and_report_the_omitted_count() {
     assert!(
         app.ssh_diagnostic
             .as_deref()
-            .is_some_and(|line| line.contains("showing first 24; 6 omitted"))
+            .is_some_and(|line| line.contains("showing first 64 of 70; 6 past sidebar bound")),
+        "the notice names how many are shown of how many, and why the rest are absent"
     );
 }
 
 #[test]
-fn ssh_host_cap_is_exact_at_twenty_four() {
-    for count in [23_usize, 24, 25] {
+fn ssh_host_cap_is_exact_at_sixty_four() {
+    for count in [63_usize, 64, 65] {
         let fixture = SshConfigFixture::new();
         let config: String = (0..count)
             .map(|index| format!("Host host-{index:02}\n"))
@@ -2513,9 +2541,12 @@ fn ssh_host_cap_is_exact_at_twenty_four() {
             assert!(notice.contains("select one for source"));
             assert!(!notice.contains("showing first"));
         } else {
-            assert!(notice.contains("showing first 24; 1 omitted"));
+            assert!(
+                notice.contains("showing first 64 of 65; 1 past sidebar bound"),
+                "the notice reports the shown-of-total split and the bound: {notice}"
+            );
             assert!(app.workspace.ssh_hosts.iter().all(|host| {
-                !matches!(&host.kind, SessionKind::Ssh { target } if target == "host-24")
+                !matches!(&host.kind, SessionKind::Ssh { target } if target == "host-64")
             }));
         }
     }

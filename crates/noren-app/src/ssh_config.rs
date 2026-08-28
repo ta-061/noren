@@ -108,6 +108,12 @@ const DEFAULT_LIMITS: ParserLimits = ParserLimits {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HostDiscoveryKind {
     /// Only positive literal aliases written in `Host` directives are listed.
+    ///
+    /// Positive wildcard patterns cannot become rows — a pattern is a rule,
+    /// not a destination — so instead of vanishing silently they are counted
+    /// and reported through [`SshConfig::unlisted_wildcard_patterns`].
+    /// Negations are filters under OpenSSH semantics and never denote a
+    /// host, so they add neither a row nor an absence count.
     #[default]
     PartialLiteralPatterns,
 }
@@ -277,6 +283,7 @@ pub struct SshConfig {
     hosts: Vec<SshHost>,
     sources: Vec<SshSource>,
     discovery_kind: HostDiscoveryKind,
+    unlisted_wildcard_patterns: usize,
 }
 
 impl SshConfig {
@@ -365,6 +372,20 @@ impl SshConfig {
         self.discovery_kind
     }
 
+    /// Positive `Host` patterns containing wildcards that cannot become
+    /// browseable rows, counted per occurrence across the top-level source
+    /// and every followed `Include`.
+    ///
+    /// A wildcard pattern is a matching rule, not a connectable destination,
+    /// so it is excluded from [`Self::hosts`] by design. This count exists so
+    /// callers can say how many pattern groups are absent and why, instead of
+    /// dropping them silently. Negation patterns are filters and are not
+    /// counted. The number carries no source content.
+    #[must_use]
+    pub const fn unlisted_wildcard_patterns(&self) -> usize {
+        self.unlisted_wildcard_patterns
+    }
+
     /// Bounded provenance for a parse-local `id` produced by this config.
     ///
     /// IDs are ordinal tokens, so an ID from another parse with the same
@@ -436,6 +457,7 @@ impl SshConfig {
         let mut fallback_head_masks = Vec::new();
         let mut fallback_pattern_work = 0_u128;
         let mut fallback_setting_work = 0_u128;
+        let mut unlisted_wildcard_patterns = 0_usize;
 
         // Literal-only blocks can be looked up by alias. Blocks with a wildcard
         // (and global blocks) remain in their original order for every alias.
@@ -448,6 +470,16 @@ impl SshConfig {
                 fallback_setting_work = fallback_setting_work.saturating_add(block.settings_work());
                 continue;
             };
+
+            // A positive wildcard pattern can never become a row: it is a
+            // rule, not a destination. Count every occurrence — including in
+            // blocks that also name literals — so the sidebar can explain the
+            // absence instead of dropping the pattern silently (issue #175).
+            // Negations stay uncounted: they are filters, not absent hosts.
+            unlisted_wildcard_patterns += patterns
+                .iter()
+                .filter(|pattern| !pattern.starts_with('!') && has_wildcard(pattern))
+                .count();
 
             let negative_patterns: Vec<_> = patterns
                 .iter()
@@ -600,6 +632,7 @@ impl SshConfig {
             hosts,
             sources,
             discovery_kind: HostDiscoveryKind::PartialLiteralPatterns,
+            unlisted_wildcard_patterns,
         })
     }
 }
