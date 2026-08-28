@@ -88,8 +88,12 @@ pointer and wheel handlers in `main.rs` through their shared
 Colour drawing also landed after the close: `renderer.rs` resolves each cell's
 SGR foreground and any explicit background through the fixed ANSI/256-colour
 palette or as direct RGB, then carries that result to the shader as per-vertex
-colour. The default palette and theme are fixed and not user-configurable. IME
-and accessibility remain deferred.
+colour. The palette is no longer fixed: `[theme]` in `config.toml` now selects
+one of three built-in themes — `dark` (the default, byte-identical to the
+single table this close shipped), `light`, and `high-contrast` — with measured,
+test-pinned WCAG contrast floors (`theme.rs`; see
+[What blocks a public preview](#what-blocks-a-public-preview) for the default
+`dark` palette's open AA failure). IME and accessibility remain deferred.
 
 No milestone date is promised. Implementation advances through scoped Issues,
 Draft PRs, and current-head CI evidence.
