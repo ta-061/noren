@@ -11,6 +11,20 @@ publish.workspace = true
 [dependencies]
 unicode-width.workspace = true
 
+[features]
+# Empty by design: a compile gate for the `benches/` targets so `cargo
+# test --workspace` (and CI) never builds the bench harness. Run with
+# `cargo bench -p noren-terminal --features bench-support`.
+bench-support = []
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "feed_bytes"
+harness = false
+required-features = ["bench-support"]
+
 [lints]
 workspace = true
 

@@ -35,3 +35,13 @@ winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] 
 wgpu = { version = "=30.0.0", default-features = false, features = ["std", "metal", "wgsl"] }
 noren-pty = { path = "crates/noren-pty" }
 noren-terminal = { path = "crates/noren-terminal" }
+# Bench harness for the M7 quality slice. Listed here because workspace
+# inheritance has one shared table; it is consumed only as a member
+# `[dev-dependencies]` entry, so it never enters a shipped build graph.
+# Pinned `=` per the policy above: recorded baselines are only comparable
+# when the harness cannot drift. Only `cargo_bench_support` is enabled — no
+# rayon, plotters, or HTML reports — keeping the bench-only compile cost
+# small. Every bench target in the workspace carries
+# `required-features = ["bench-support"]`, so a normal `cargo test
+# --workspace` never compiles this dependency.
+criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
