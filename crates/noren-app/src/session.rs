@@ -64,12 +64,13 @@ impl fmt::Display for SessionId {
 
 /// The launch shape of a session.
 ///
-/// Conforms to D-M3-001: five variants. [`Local`], [`Worktree`], and
-/// [`Agent`] have implemented launch paths (a worktree session is a local
-/// PTY whose working directory is the worktree checkout; an agent session is
-/// a PTY running a configured, shell-free argv vector); [`Project`] and
-/// [`Ssh`] are carried as data so the enum is stable for exhaustive
-/// matching.
+/// Conforms to D-M3-001: five variants. [`Local`], [`Project`],
+/// [`Worktree`], and [`Agent`] have implemented launch paths (a project
+/// session and a worktree session are local PTYs whose working directory is
+/// the configured root / the worktree checkout; an agent session is a PTY
+/// running a configured, shell-free argv vector); [`Ssh`] is carried as
+/// data — its launch runs the system ssh client through a separate
+/// connection path, not the spawn layer this gate guards.
 ///
 /// D-M3-001 records the concrete payloads used here: `root`/`path` for the
 /// local-rooted kinds and `target`/`name` for the remote/agent kinds.
@@ -133,17 +134,20 @@ impl fmt::Debug for SessionKind {
 impl SessionKind {
     /// Whether this kind has an implemented launch path.
     ///
-    /// [`Local`](SessionKind::Local), [`Worktree`](SessionKind::Worktree),
-    /// and [`Agent`](SessionKind::Agent) do today — a worktree session
-    /// launches the fixed zsh policy in the worktree directory, and an agent
-    /// session launches a configured, shell-free argv vector in a PTY. The
-    /// spawn layer gates on this rather than guessing; the other kinds are
-    /// carried as reserved data.
+    /// [`Local`](SessionKind::Local), [`Project`](SessionKind::Project),
+    /// [`Worktree`](SessionKind::Worktree), and
+    /// [`Agent`](SessionKind::Agent) do today — a project session launches
+    /// the fixed zsh policy in the configured root directory, a worktree
+    /// session launches it in the worktree directory, and an agent session
+    /// launches a configured, shell-free argv vector in a PTY. The spawn
+    /// layer gates on this rather than guessing; the other kinds are carried
+    /// as reserved data (an SSH launch runs the system client through its
+    /// own connection path, never this gate).
     #[must_use]
     pub const fn is_launchable(&self) -> bool {
         matches!(
             self,
-            Self::Local | Self::Worktree { .. } | Self::Agent { .. }
+            Self::Local | Self::Project { .. } | Self::Worktree { .. } | Self::Agent { .. }
         )
     }
 }
@@ -528,13 +532,20 @@ mod tests {
     }
 
     #[test]
-    fn local_worktree_and_agent_kinds_are_launchable() {
-        // The worktree kind gained a real launch path (a local PTY whose
-        // working directory is the worktree checkout) and the agent kind a
-        // configured shell-free argv launch; the other kinds stay reserved
-        // data. A mutation reverting either to non-launchable fails this
-        // test.
+    fn local_project_worktree_and_agent_kinds_are_launchable() {
+        // The project kind gained a real launch path (a local PTY whose
+        // working directory is the configured root), like the worktree kind
+        // before it and the agent kind's configured shell-free argv launch;
+        // the SSH kind stays reserved data here — its launch runs the system
+        // client through the connection path, not this gate. A mutation
+        // reverting any launchable kind to non-launchable fails this test.
         assert!(SessionKind::Local.is_launchable());
+        assert!(
+            SessionKind::Project {
+                root: PathBuf::from("/p")
+            }
+            .is_launchable()
+        );
         assert!(
             SessionKind::Worktree {
                 path: PathBuf::from("/w")
@@ -544,12 +555,6 @@ mod tests {
         assert!(
             SessionKind::Agent {
                 name: "a".to_owned()
-            }
-            .is_launchable()
-        );
-        assert!(
-            !SessionKind::Project {
-                root: PathBuf::from("/p")
             }
             .is_launchable()
         );

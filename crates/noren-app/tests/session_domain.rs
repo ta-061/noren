@@ -520,7 +520,7 @@ fn a_descriptor_has_a_generated_title_for_every_kind() {
 // ── Reserved session kinds ──────────────────────────────────────────────
 
 #[test]
-fn project_and_ssh_kinds_can_be_bookkept_but_are_not_launchable() {
+fn ssh_and_other_reserved_kinds_can_be_bookkept_but_are_not_launchable() {
     let mut registry = SessionRegistry::new();
     let project = registry.create(SessionKind::Project {
         root: PathBuf::from("/p"),
@@ -533,10 +533,11 @@ fn project_and_ssh_kinds_can_be_bookkept_but_are_not_launchable() {
     });
 
     // The registry accepts reserved shapes as entries (bookkeeping only); it
-    // never launches anything, so this stays pure data. Project and SSH stay
-    // reserved; the agent kind gained a launch path (pinned separately
-    // below) but is still bookkept here exactly like every other kind.
-    assert!(!registry.get(project).unwrap().kind().is_launchable());
+    // never launches anything, so this stays pure data. SSH stays reserved
+    // here; the project and agent kinds gained launch paths (pinned
+    // separately below) but are still bookkept exactly like every other
+    // kind.
+    assert!(registry.get(project).unwrap().kind().is_launchable());
     assert!(!registry.get(ssh).unwrap().kind().is_launchable());
     assert!(registry.get(agent).unwrap().kind().is_launchable());
     let local = registry.create(SessionKind::Local);
@@ -561,6 +562,20 @@ fn the_worktree_kind_is_launchable() {
         path: PathBuf::from("/w"),
     });
     assert!(registry.get(worktree).unwrap().kind().is_launchable());
+}
+
+#[test]
+fn the_project_kind_is_launchable() {
+    // The project kind gained a real launch path: a local PTY whose working
+    // directory is the configured project root. The registry still only
+    // bookkeeps (it never spawns); this pins that the launch gate classifies
+    // the kind as launchable so a mutation reverting it to reserved data
+    // fails here.
+    let mut registry = SessionRegistry::new();
+    let project = registry.create(SessionKind::Project {
+        root: PathBuf::from("/srv/noren"),
+    });
+    assert!(registry.get(project).unwrap().kind().is_launchable());
 }
 
 #[test]
