@@ -150,9 +150,22 @@ Each item states what you would actually see if you ran the build.
   upper/lower case, the Latin-1 Supplement (`U+00A0..=U+00FF`) and Box
   Drawing (`U+2500..=U+257F`) blocks have per-character bitmaps, and every
   other code point draws a visible replacement glyph rather than `?` — so
-  CJK text and emoji still do not render, even though the terminal state
-  core measures their display width correctly (Unicode/CJK display width,
-  recorded in the [roadmap](../ROADMAP.md)). Coverage is deliberately **not**
+  CJK text and emoji still do not render. What **is** true end to end is
+  their layout: the terminal state core measures CJK and emoji display
+  width correctly (Unicode/CJK display width, recorded in the
+  [roadmap](../ROADMAP.md)), and the renderer honours that model — a wide
+  character occupies two columns (its lead draws the replacement glyph,
+  the continuation column stays blank), the glyph after the pair lands at
+  its correct display column, and a combining mark is drawn over its base
+  cell without consuming a cell. Japanese output therefore appears as
+  unreadable replacement boxes that keep every surrounding column aligned,
+  not as corrupted text; the frame oracle pins this width contract through
+  real pixels (`cjk_text_occupies_two_cells_per_character_and_fails_visibly_not_corruptingly`,
+  `wide_character_then_ascii_keeps_the_ascii_at_its_display_column`,
+  `combining_marks_consume_no_cell_through_the_pipeline` in
+  `crates/noren-app/tests/frame_oracle.rs`). Rendering actual CJK glyphs
+  needs a real font stack, which is its own milestone decision and is
+  deliberately not claimed here. Coverage is deliberately **not**
   claimed collision-free: seven pairs of distinct characters are visually
   identical because at 5x7 their pixel grids genuinely coincide —
   space/`U+00A0` (both blank), and hyphen/`─`, slash/`╱`, equals/`═`,
@@ -166,7 +179,14 @@ Each item states what you would actually see if you ran the build.
 - **IME input is discarded.** `WindowEvent::Ime(_)` is dropped without reaching
   the terminal — the `WindowEvent::Ime(_)` arm in `main.rs`'s event handler
   drops the event without forwarding it. Japanese, Chinese, and
-  Korean input methods produce nothing.
+  Korean input methods produce nothing. For a user typing Japanese into
+  Noren today this means: composing with an IME inserts no text at all
+  (the composition never reaches the PTY), and any Japanese that a running
+  program *outputs* (`cat`, `ls`, a build log) draws as unreadable
+  replacement boxes — laid out at the correct two-column width so the
+  surrounding ASCII stays aligned, but the characters themselves cannot be
+  read. Neither half works today; both are Milestone 6 scope, and the width
+  half is the only half that is verified.
 - **There is no accessibility surface.** Nothing in the tree integrates with
   assistive technology (no AccessKit, AT-SPI, or AppKit accessibility wiring);
   a screen reader has nothing to work with.
@@ -328,7 +348,11 @@ neighbours; the drawn grid matches the state grid; and per-cell lit/blank agrees
 with `TerminalSnapshot` across the FR-005 fixture classes. Its active
 colour-aware assertions also cover distinct SGR foregrounds, unchanged defaults,
 ANSI/256-colour and direct RGB resolution, explicit truecolor backgrounds,
-background-only spaces, and indexed/background equivalence. It does **not**
+background-only spaces, and indexed/background equivalence. The Milestone 6
+CJK slice added pixel-level pins of the wide-character width contract through
+the whole `feed_bytes` → state → GPU chain: `日本語` and a wide emoji occupy
+two cells per character with the follower at its display column, and a
+combining mark consumes no cell. It does **not**
 assert an `A` looks like an A — only that the structure and resolved pixel
 colours are right. Its two former defect specifications
 (`lowercase_distinct_from_uppercase`, `non_ascii_glyph_is_not_the_question_mark`)
