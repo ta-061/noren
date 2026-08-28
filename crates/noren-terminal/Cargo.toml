@@ -25,6 +25,11 @@ name = "feed_bytes"
 harness = false
 required-features = ["bench-support"]
 
+[[bench]]
+name = "search"
+harness = false
+required-features = ["bench-support"]
+
 [lints]
 workspace = true
 
