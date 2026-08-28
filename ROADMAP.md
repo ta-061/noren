@@ -11,7 +11,7 @@ Only evidence-backed work is marked complete.
 | 3 — Workspace | External workspace management (sidebar: projects, git worktrees, SSH connections, agents, terminal sessions), single-session view, session lifecycle, sidebar-state persistence, palette, configurable keybindings, Zellij pass-through — no native tabs/panes/layout (delegated to Zellij per [ADR 0003](docs/adr/0003-noren-zellij-responsibility-boundary.md)) | In progress — vertical slice landed; see [Milestone 3 status](#milestone-3-status) |
 | 4 — SSH and remote | OpenSSH configuration, connections, reconnect, remote panes, daemon decision/PoC and recovery | In progress — bounded, explicitly partial literal-alias discovery landed, and selecting an alias launches the fixed system `ssh` client in the terminal's PTY (PR #138); reconnect, remote panes, the daemon decision/PoC, and recovery are not started |
 | 5 — Agent experience | Launchers, verified adapters, trustworthy state, notifications and jump-to-source | In progress — the first launcher slice landed: `[[agents]]` configuration rows launch a configured, shell-free argv command in a real PTY (`AgentLaunchPolicy` requires an absolute program path, no shell, no `PATH` lookup; a missing or non-executable command is a visible per-row and status-row failure; agent sessions persist through `sessions.toml`). Verified adapters, trustworthy state, notifications, and jump-to-source are not started |
-| 6 — Themes and accessibility | Light/dark/high-contrast palettes, contrast checks, IME/CJK/HiDPI and keyboard/accessibility work | In progress — the foundation slice landed: `[theme]` selects built-in `dark`/`light`/`high-contrast` palettes with measured, test-pinned WCAG contrast floors (`theme.rs`, `crates/noren-app/tests/theme.rs`; the default `dark` palette still fails AA on five slots, pinned deliberately as issue #168), and CJK display width is verified end to end through real pixels (`crates/noren-app/tests/frame_oracle.rs`). IME input is still discarded, and HiDPI, keyboard accessibility, custom palettes, and colour-vision-friendly work remain not started |
+| 6 — Themes and accessibility | Light/dark/high-contrast palettes, contrast checks, IME/CJK/HiDPI and keyboard/accessibility work | In progress — the foundation slice landed: `[theme]` selects built-in `dark`/`light`/`high-contrast` palettes with measured, test-pinned WCAG contrast floors (`theme.rs`, `crates/noren-app/tests/theme.rs`; the default `dark` palette clears AA on every theme-owned slot since the issue-168 lift), and CJK display width is verified end to end through real pixels (`crates/noren-app/tests/frame_oracle.rs`). IME input is still discarded, and HiDPI, keyboard accessibility, custom palettes, and colour-vision-friendly work remain not started |
 | 7 — Quality | Unit/integration/compatibility/fault/security/visual tests, fuzzing, soak tests and benchmarks | In progress — the benchmark slice landed (PR #171): a criterion suite over the paths with a defect history (`feed_bytes`, `ssh_config_parse` incl. the #137 shape, renderer frame prep, per-frame `snapshot`, `search`) behind a `bench-support` feature gate with a recorded reference-machine baseline and a report-never-gate policy ([docs/testing/benchmarks.md](docs/testing/benchmarks.md)); its first finding (46.3 ms per-frame `snapshot` at full scrollback, filed as #172) has since been remediated — `TerminalSnapshot::from_state` shares scrollback rows instead of deep-copying them. A seeded soak harness (`crates/noren-terminal/tests/soak_feed_bytes.rs`) and a hand-rolled, dependency-free fuzz harness with a decoded-content oracle (`crates/noren-terminal/tests/fuzz_feed_bytes.rs`) landed; the fuzz campaign's first finding — SD/SU/DL stranding the cursor
 on a wide-character continuation cell — is remediated at this tree: those
 operations now end in the same shared `snap_cursor_to_lead` re-snap as
@@ -104,11 +104,12 @@ Colour drawing also landed after the close: `renderer.rs` resolves each cell's
 SGR foreground and any explicit background through the fixed ANSI/256-colour
 palette or as direct RGB, then carries that result to the shader as per-vertex
 colour. The palette is no longer fixed: `[theme]` in `config.toml` now selects
-one of three built-in themes — `dark` (the default, byte-identical to the
-single table this close shipped), `light`, and `high-contrast` — with measured,
-test-pinned WCAG contrast floors (`theme.rs`; see
-[What blocks a public preview](#what-blocks-a-public-preview) for the default
-`dark` palette's open AA failure). IME and accessibility remain deferred.
+one of three built-in themes — `dark` (the default), `light`, and
+`high-contrast` — with measured, test-pinned WCAG contrast floors (`theme.rs`;
+the five `dark` entries that began below the AA floor were lifted past it by
+the issue-168 fix, and the contrast contract that remains bounded is stated in
+[What blocks a public preview](#what-blocks-a-public-preview)). IME and
+accessibility remain deferred.
 
 No milestone date is promised. Implementation advances through scoped Issues,
 Draft PRs, and current-head CI evidence.
@@ -221,25 +222,33 @@ against it:
   row's shell does not exist until it is relaunched, and SSH discovery stays
   explicitly partial by design — no wildcard, `Match`, or token-expansion
   enumeration ever happens.
-- **The default `dark` palette fails WCAG AA on its own background.**
+- **The default `dark` palette's former WCAG AA failure is fixed; the
+  contrast contract that remains is bounded, and a preview must say so.**
   `[theme] name` in `config.toml` selects one of three built-in themes —
   `dark` (the default), `light`, and `high-contrast` — and every theme
   carries a measured, test-pinned contrast floor (`theme.rs` and
   `crates/noren-app/tests/theme.rs`; the selection reaching the renderer is
   pinned app-level by `configured_theme_reaches_the_app_renderer_input`).
-  The blocker is the default itself: the `dark` palette's worst slot is ANSI
-  black at **1.06:1**, and five of its sixteen ANSI entries fall below the
-  4.5:1 AA floor for normal text — pinned deliberately by
-  `default_dark_palette_minimum_is_pinned_below_the_aa_floor`, because the
-  no-`[theme]` default must stay byte-identical to the pre-theme renderer
-  (`dark_theme_is_byte_identical_to_the_pre_theme_renderer`) and changing
-  the values is a separate decision tracked as
-  [#168](https://github.com/ta-061/noren/issues/168) — the pins above hold
-  until that decision lands in the tree. `light`
-  (minimum 5.07:1) and `high-contrast` (7.84:1, beyond AAA) pass every slot,
-  so a user who needs AA must know to opt in — a preview whose default look
-  is below AA cannot ship as the product's face. Themes are built-in only:
-  no custom-palette or colour-vision-friendly surface exists.
+  The five `dark` entries that used to sit below the 4.5:1 AA floor for
+  normal text — the worst was ANSI black at **1.06:1** — were lifted the
+  minimum distance past it, so the default's measured minimum now clears
+  the floor (magenta at 4.50:1, pinned by
+  `dark_theme_keeps_aa_on_every_theme_owned_foreground` and
+  `the_five_fixed_dark_entries_measure_above_their_old_failures` in
+  `crates/noren-app/tests/theme.rs`, confirmed on drawn pixels by
+  `the_issue_168_aa_fixes_reach_the_drawn_pixels` in
+  `crates/noren-app/tests/frame_oracle.rs`; an absent `[theme]` table
+  still renders exactly the explicit `dark` theme,
+  `theme_absent_config_renders_byte_identically_to_the_explicit_dark_theme`).
+  `light` (minimum 5.07:1) and `high-contrast` (7.84:1, beyond AAA) clear
+  every slot as before, so no user is forced to opt in for AA. What a
+  preview must still state: the contract covers only theme-owned
+  foregrounds on the theme's default background — the 240-colour
+  cube/grayscale tail, truecolor, and program-paired foreground/background
+  combinations remain unchecked and can draw below the floor — ANSI black
+  and bright black sit close together in the default (two neutral greys a
+  shade apart), and themes are built-in only: no custom-palette or
+  colour-vision-friendly surface exists.
 - **The font is a hand-built 5x7 bitmap with bounded coverage.** Printable
   ASCII keeps distinct upper/lower case, and the Latin-1 Supplement
   (`U+00A0..=U+00FF`) and Box Drawing (`U+2500..=U+257F`) blocks have

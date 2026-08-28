@@ -60,13 +60,19 @@ paths as of macOS 26; exact wording varies by version):
 **Second thing to read before launching:** this is an explicitly dated
 developer preview whose limits are enumerated in
 [known limitations](../known-limitations.md). The short version of what you
-will and will not see: a window titled **"Noren PoC"** with a workspace
+will and will not see: a window titled **"Noren" followed by the crate
+version** (`window_title()` in `crates/noren-app/src/main.rs` builds it from
+`PRODUCT_NAME` and `CARGO_PKG_VERSION`, so it always states the version the
+binary was built as) with a workspace
 sidebar and a working local `zsh` — but **no visible cursor**, a 5x7 bitmap
 font with bounded coverage (CJK and emoji draw as replacement boxes),
 discarded IME input, no accessibility surface, and no native tabs or panes
 (panes are Zellij's job by design). Programs that emit colour do render
-colour; the default dark theme ships five ANSI slots below the WCAG AA
-contrast floor (`light` and `high-contrast` themes clear it). If any of that
+colour; the default dark theme clears the WCAG AA floor on every
+theme-owned slot (the issue-168 fix lifted the five entries that used to
+fall below), as do `light` and `high-contrast` — the contract does not
+cover the 256-colour tail, truecolor, or program-paired colour
+combinations. If any of that
 would read to you as "broken", read the full page first — it is the honest
 description of what this is.
 
@@ -140,7 +146,8 @@ cd noren-0.1.0-preview-<sha>-aarch64-apple-darwin
 
 What you should observe, and when to worry:
 
-- **Within a couple of seconds** a window titled **"Noren PoC"** opens. Its
+- **Within a couple of seconds** a window titled **"Noren" followed by the
+  crate version** opens. Its
   left columns are the workspace sidebar (a session row for the shell it
   started, plus any discovered git worktrees or configured SSH hosts,
   projects, and agents); the rest is the terminal.
