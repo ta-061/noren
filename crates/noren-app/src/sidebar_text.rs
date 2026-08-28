@@ -5,11 +5,19 @@
 //! the name for space. This projection stays separate from [`crate::sidebar`]
 //! so the view model remains renderer- and geometry-independent.
 
+use crate::MAX_RENDER_COLS;
 use crate::sidebar::{SessionLifecycle, SidebarRow, SidebarView};
 use noren_terminal::AnsiColor;
 
 /// Shipped sidebar width in cell columns.
 pub const DEFAULT_SIDEBAR_COLUMNS: usize = 16;
+
+/// Narrowest configurable sidebar: selection, one identity cell, ellipsis,
+/// separator, and the reserved lifecycle cell all remain representable.
+pub const MIN_SIDEBAR_COLUMNS: usize = 8;
+
+/// Widest configurable sidebar while retaining one drawable terminal column.
+pub const MAX_SIDEBAR_COLUMNS: usize = MAX_RENDER_COLS as usize - 1;
 
 /// Marker glyphs in lifecycle order: starting, running, exited, failed.
 ///

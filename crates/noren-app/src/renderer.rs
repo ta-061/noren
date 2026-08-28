@@ -270,8 +270,13 @@ pub(crate) fn resolve_background(theme: &Theme, attributes: &CellAttributes) -> 
 
 /// Theme-owned colour reinforcing one lifecycle marker's collision-checked
 /// shape. Non-marker sidebar text keeps the default foreground.
-fn sidebar_glyph_color(theme: &Theme, character: char, column: usize) -> [f32; 3] {
-    if column + 1 == SIDEBAR_COLS
+fn sidebar_glyph_color(
+    theme: &Theme,
+    character: char,
+    column: usize,
+    sidebar_columns: usize,
+) -> [f32; 3] {
+    if column + 1 == sidebar_columns
         && let Some(color) = lifecycle_marker_color(character)
     {
         return resolve_color(theme, Color::Ansi(color), theme.foreground());
@@ -337,6 +342,7 @@ pub(crate) struct Renderer {
     vertex_capacity: u64,
     device_lost: Arc<AtomicBool>,
     metrics: CellMetrics,
+    sidebar_columns: usize,
     theme: Theme,
     cursor: CursorStyle,
 }
@@ -345,6 +351,7 @@ impl Renderer {
     pub(crate) fn new(
         window: Arc<Window>,
         metrics: CellMetrics,
+        sidebar_columns: usize,
         theme: Theme,
         cursor: CursorStyle,
     ) -> Result<Self, RendererError> {
@@ -437,6 +444,7 @@ impl Renderer {
             vertex_capacity,
             device_lost,
             metrics,
+            sidebar_columns,
             cursor,
             theme,
         })
@@ -473,6 +481,7 @@ impl Renderer {
             self.config.height,
             self.metrics,
         )
+        .with_sidebar_columns(self.sidebar_columns)
         .with_cursor_style(self.cursor);
         let vertices = glyph_vertices_for(target, terminal, sidebar, status);
         let bytes = vertex_bytes(&vertices);
@@ -566,14 +575,12 @@ fn block_on<F: Future>(future: F) -> F::Output {
 /// Exposed as `pub(crate)` for the offscreen frame-oracle (see
 /// `renderer_capture.rs`); no behaviour change.
 ///
-/// When `sidebar` is `Some`, the first [`SIDEBAR_COLS`] columns are reserved
-/// for the sidebar text and the terminal is drawn starting at column
-/// `SIDEBAR_COLS`. When `sidebar` is `None`, the terminal occupies the full
-/// width starting at column 0 (preserving the pre-sidebar behaviour the frame
-/// oracle's existing tests rely on). Every colour decision — palette
-/// resolution, the sidebar/status default foreground, the clear colour the
-/// caller loads — reads from the target's theme, which is how a configured
-/// theme changes what is drawn.
+/// When `sidebar` is `Some`, the target's configured sidebar columns are
+/// reserved for sidebar text and the terminal starts immediately after them.
+/// [`Target::new`] defaults to the shipped [`SIDEBAR_COLS`] for existing
+/// callers; production replaces it with validated configuration. When
+/// `sidebar` is `None`, the terminal occupies the full width starting at
+/// column 0. Every colour decision reads from the target's theme.
 pub(crate) fn glyph_vertices_for(
     target: Target,
     terminal: Option<&TerminalSnapshot>,
@@ -594,8 +601,13 @@ fn glyph_vertices_with_budget(
     status: Option<&str>,
     vertex_budget: usize,
 ) -> Vec<Vertex> {
-    let (width, height, metrics, theme) =
-        (target.width, target.height, target.metrics, target.theme);
+    let (width, height, metrics, theme, sidebar_columns) = (
+        target.width,
+        target.height,
+        target.metrics,
+        target.theme,
+        target.sidebar_columns,
+    );
     if width == 0 || height == 0 {
         return Vec::new();
     }
@@ -603,10 +615,10 @@ fn glyph_vertices_with_budget(
     let window_cols = usize::try_from(width / cell_width).unwrap_or(usize::MAX);
 
     let has_sidebar = sidebar.is_some();
-    let col_offset = if has_sidebar { SIDEBAR_COLS } else { 0 };
+    let col_offset = if has_sidebar { sidebar_columns } else { 0 };
     // Reserve the sidebar, then clamp the terminal to the renderer's drawable
-    // budget (`MAX_RENDER_COLS - SIDEBAR_COLS`), floored at one. This is the
-    // same formula `main::terminal_cols` applies — kept independent rather than
+    // budget (`MAX_RENDER_COLS - sidebar_columns`), floored at one. This is the
+    // same formula `main::terminal_cols_at_width` applies — kept independent rather than
     // shared so the sidebar geometry test can still pin that the two sites
     // agree (a single shared function would make their agreement structural and
     // the sidebar subtraction itself un-testable). The sidebar lives *inside*
@@ -614,9 +626,9 @@ fn glyph_vertices_with_budget(
     // than the renderer can draw beside it.
     let terminal_cols = if has_sidebar {
         let budget = usize::from(MAX_RENDER_COLS)
-            .saturating_sub(SIDEBAR_COLS)
+            .saturating_sub(sidebar_columns)
             .max(1);
-        window_cols.saturating_sub(SIDEBAR_COLS).clamp(1, budget)
+        window_cols.saturating_sub(sidebar_columns).clamp(1, budget)
     } else {
         // No sidebar (offscreen oracle's pre-sidebar mode): the terminal fills
         // the window, clamped to the renderer's column ceiling.
@@ -665,11 +677,11 @@ fn glyph_vertices_with_budget(
             .take(fully_drawable_rows(height, metrics))
             .enumerate()
         {
-            for (col, character) in line.chars().take(SIDEBAR_COLS).enumerate() {
+            for (col, character) in line.chars().take(sidebar_columns).enumerate() {
                 push_glyph(
                     &mut vertices,
                     character,
-                    sidebar_glyph_color(&theme, character, col),
+                    sidebar_glyph_color(&theme, character, col, sidebar_columns),
                     col,
                     row,
                     target,
@@ -1121,7 +1133,7 @@ fn push_cursor_hollow(
 /// The draw surface a frame is laid out against: the selected theme plus the
 /// pixel dimensions and cell size the grid is drawn at.
 ///
-/// These four travel together through every emit call and are constant for a
+/// These frame properties travel together through every emit call and are constant for a
 /// frame, so passing them as one value keeps the glyph/rect helpers to a
 /// readable arity; bundling the theme here is also what keeps the public
 /// vertex and capture seams under the argument-count lint without scattering
@@ -1132,6 +1144,7 @@ pub(crate) struct Target {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) metrics: CellMetrics,
+    pub(crate) sidebar_columns: usize,
     pub(crate) cursor: CursorStyle,
 }
 
@@ -1143,8 +1156,15 @@ impl Target {
             width,
             height,
             metrics,
+            sidebar_columns: SIDEBAR_COLS,
             cursor: CursorStyle::theme_default(theme),
         }
+    }
+
+    /// Replace the shipped sidebar width with validated configuration.
+    pub(crate) fn with_sidebar_columns(mut self, columns: usize) -> Self {
+        self.sidebar_columns = columns;
+        self
     }
 
     /// Replace the cursor drawing style (a `[cursor]` configuration
