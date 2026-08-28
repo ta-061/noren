@@ -110,6 +110,46 @@ fn endpoints_on_a_continuation_round_to_the_whole_character() {
 }
 
 #[test]
+fn drawable_columns_cover_both_halves_of_a_wide_character() {
+    // Columns: a=0, 日=1(+2 continuation), b=3. Selecting either half of
+    // 日 normalizes to its lead and exposes both display columns for drawing.
+    let state = grid(1, 6, "a日b".as_bytes());
+    for endpoint in [GridPoint::new(0, 1), GridPoint::new(0, 2)] {
+        let selection = Selection::new(&state, SelectionMode::Char, endpoint, endpoint);
+        assert_eq!(selection.extract(&state), "日");
+        assert_eq!(selection.columns_in_line(&state, 0), Some(1..=2));
+    }
+
+    // An adjacent narrow character does not accidentally inherit the wide
+    // character's continuation column.
+    let narrow = Selection::new(
+        &state,
+        SelectionMode::Char,
+        GridPoint::new(0, 3),
+        GridPoint::new(0, 3),
+    );
+    assert_eq!(narrow.columns_in_line(&state, 0), Some(3..=3));
+}
+
+#[test]
+fn drawable_columns_follow_character_selection_across_wrapped_rows() {
+    // `e` triggers the pending wrap after `abcd`, producing two physical
+    // screen rows. A cross-row selection owns only the tail of the first row
+    // and the head of the second — never either whole row.
+    let state = grid(2, 4, b"abcdef");
+    let selection = Selection::new(
+        &state,
+        SelectionMode::Char,
+        GridPoint::new(0, 2),
+        GridPoint::new(1, 0),
+    );
+    assert_eq!(selection.extract(&state), "cd\ne");
+    assert_eq!(selection.columns_in_line(&state, 0), Some(2..=3));
+    assert_eq!(selection.columns_in_line(&state, 1), Some(0..=0));
+    assert_eq!(selection.columns_in_line(&state, 2), None);
+}
+
+#[test]
 fn word_selection_expands_to_word_boundaries() {
     let state = grid(2, 16, b"foo bar.baz_qux");
 
@@ -251,6 +291,7 @@ fn resize_expires_a_selection() {
     assert!(!selection.is_valid(&state));
     // Expired selections yield empty text, never stale or wrong text.
     assert_eq!(selection.extract(&state), "");
+    assert_eq!(selection.columns_in_line(&state, 0), None);
 }
 
 #[test]

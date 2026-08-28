@@ -54,6 +54,8 @@
 //! include the rest of the first row and the start of the last row, like
 //! classic terminal selection. A selection over only blank cells yields `""`.
 
+use std::ops::RangeInclusive;
+
 use crate::{Cell, ScreenBuffer, TerminalSnapshot, TerminalState};
 
 /// How a selection expands its endpoints when captured.
@@ -316,6 +318,48 @@ impl Selection {
     #[must_use]
     pub fn is_valid(&self, grid: &impl SelectionGrid) -> bool {
         self.stamp.matches(grid)
+    }
+
+    /// Inclusive display columns selected on one absolute grid line.
+    ///
+    /// Returns `None` when the selection has expired or does not cover
+    /// `line`. The returned range is the drawing counterpart of
+    /// [`Selection::extract`]: it uses the same normalized endpoints, and if
+    /// the last selected character is wide, its continuation columns are
+    /// included as well. A continuation cell can therefore never appear in
+    /// this range without the lead cell that owns it.
+    #[must_use]
+    pub fn columns_in_line(
+        &self,
+        grid: &impl SelectionGrid,
+        line: usize,
+    ) -> Option<RangeInclusive<usize>> {
+        if !self.is_valid(grid) || line < self.start.line || line > self.end.line {
+            return None;
+        }
+        let cells = grid.row_cells(line)?;
+        if cells.is_empty() {
+            return None;
+        }
+        let from = if line == self.start.line {
+            self.start.column
+        } else {
+            0
+        };
+        let mut to = if line == self.end.line {
+            self.end.column
+        } else {
+            cells.len() - 1
+        }
+        .min(cells.len() - 1);
+
+        // Endpoints are lead cells. Extend the drawable span over every
+        // continuation owned by the final selected character so a wide glyph
+        // is highlighted as one indivisible unit.
+        while to + 1 < cells.len() && cells[to + 1].is_continuation() {
+            to += 1;
+        }
+        (from <= to).then_some(from..=to)
     }
 
     /// Extract the selected text, or `""` when the selection has expired.
