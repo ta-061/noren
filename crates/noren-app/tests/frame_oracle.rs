@@ -2202,17 +2202,23 @@ fn lifecycle_sidebar_line(status: SessionStatus) -> String {
         .expect("one session produces one sidebar line")
 }
 
-fn lifecycle_cases() -> [(SessionStatus, char, usize); 4] {
+fn lifecycle_cases() -> [(SessionStatus, char, usize, [u8; 7]); 4] {
     [
-        (SessionStatus::Starting, '◌', 3),
-        (SessionStatus::Running, '▶', 2),
-        (SessionStatus::Exited { code: Some(0) }, '■', 8),
+        (SessionStatus::Starting, '◌', 3, [14, 17, 16, 16, 17, 14, 4]),
+        (SessionStatus::Running, '▶', 2, [8, 12, 14, 15, 14, 12, 8]),
+        (
+            SessionStatus::Exited { code: Some(0) },
+            '■',
+            8,
+            [0, 14, 14, 14, 14, 14, 0],
+        ),
         (
             SessionStatus::Failed {
                 reason: "frame fixture".to_string(),
             },
             '✕',
             1,
+            [17, 10, 4, 14, 4, 10, 17],
         ),
     ]
 }
@@ -2222,6 +2228,34 @@ fn lifecycle_cases() -> [(SessionStatus, char, usize); 4] {
 /// the same vertices feed the shipped shader and the offscreen pixel capture.
 type GlyphRect = (u32, u32, u32, u32);
 type SidebarCellVertexOracle = (Vec<GlyphRect>, Vec<[f32; 3]>);
+
+/// Reconstruct the renderer's 5x7 bitmap from the rectangles emitted inside
+/// one text cell. Keeping this decoder in the independent frame oracle makes
+/// the expected row registration separate from the renderer's glyph table:
+/// shifting a marker down while preserving its shape must fail here.
+fn glyph_rows_from_rectangles(rectangles: &[GlyphRect]) -> [u8; 7] {
+    const GLYPH_SCALE: u32 = 2;
+    const GLYPH_TOP: u32 = 3;
+
+    let mut rows = [0_u8; 7];
+    for &(left, top, width, height) in rectangles {
+        assert_eq!((width, height), (GLYPH_SCALE, GLYPH_SCALE));
+        assert_eq!(left % GLYPH_SCALE, 0, "glyph pixel is off the x grid");
+        assert!(top >= GLYPH_TOP, "glyph pixel is above the text inset");
+        assert_eq!(
+            (top - GLYPH_TOP) % GLYPH_SCALE,
+            0,
+            "glyph pixel is off the y grid"
+        );
+
+        let glyph_x = left / GLYPH_SCALE;
+        let glyph_y = (top - GLYPH_TOP) / GLYPH_SCALE;
+        assert!(glyph_x < 5, "glyph pixel exceeds the 5-column bitmap");
+        assert!(glyph_y < 7, "glyph pixel exceeds the 7-row bitmap");
+        rows[glyph_y as usize] |= 1 << (4 - glyph_x);
+    }
+    rows
+}
 
 fn sidebar_cell_vertex_oracle(line: &str, theme: &Theme, column: u32) -> SidebarCellVertexOracle {
     let width = SIDEBAR_COLS as u32 * CELL_WIDTH;
@@ -2254,7 +2288,7 @@ fn sidebar_cell_vertex_oracle(line: &str, theme: &Theme, column: u32) -> Sidebar
 #[test]
 fn session_lifecycle_markers_are_identifiable_and_on_row_at_16_columns() {
     let mut signatures = Vec::new();
-    for (status, expected_marker, expected_ansi) in lifecycle_cases() {
+    for (status, expected_marker, expected_ansi, expected_rows) in lifecycle_cases() {
         let line = lifecycle_sidebar_line(status);
         assert_eq!(
             line.chars().count(),
@@ -2279,6 +2313,11 @@ fn session_lifecycle_markers_are_identifiable_and_on_row_at_16_columns() {
         assert!(
             !signatures.contains(&signature),
             "marker {expected_marker:?} rendered the same shape as another lifecycle"
+        );
+        assert_eq!(
+            glyph_rows_from_rectangles(&signature),
+            expected_rows,
+            "marker {expected_marker:?} moved within its cell"
         );
         signatures.push(signature);
 
@@ -2319,7 +2358,7 @@ fn session_lifecycle_markers_reach_distinct_frame_pixels_at_16_columns() {
     let width = SIDEBAR_COLS as u32 * CELL_WIDTH;
     let marker_column = u32::try_from(SIDEBAR_COLS - 1).expect("sidebar width fits u32");
     let mut patterns = Vec::new();
-    for (status, expected_marker, expected_ansi) in lifecycle_cases() {
+    for (status, expected_marker, expected_ansi, _) in lifecycle_cases() {
         let line = lifecycle_sidebar_line(status);
         let lines = [line];
         let frame = renderer.capture(
