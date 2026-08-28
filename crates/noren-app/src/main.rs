@@ -1198,6 +1198,11 @@ struct NorenApp {
     /// resolution, clear colour — follows the `[theme]` selection. The
     /// default (`dark`) is exactly the pre-theme palette.
     theme: Theme,
+    /// The configured cursor appearance (`[cursor]` shape and preferred
+    /// colour), handed to the renderer at creation. Final ink is resolved
+    /// against the actual cursor cell; visibility is not part of this style:
+    /// the caret ships drawn and only DECTCEM hides it (issues #197/#200).
+    cursor_style: renderer::CursorStyle,
 }
 
 /// Which application-owned line, if any, occupies the renderer's status row.
@@ -1321,6 +1326,15 @@ impl NorenApp {
             passthrough_policy: palette_policy(config.keys()),
             keys: config.keys(),
             theme: config.theme().palette(),
+            cursor_style: renderer::CursorStyle::theme_default(&config.theme().palette())
+                .with_shape(config.cursor().shape())
+                .with_color_override(config.cursor().color().map(|[r, g, b]| {
+                    [
+                        f32::from(r) / 255.0,
+                        f32::from(g) / 255.0,
+                        f32::from(b) / 255.0,
+                    ]
+                })),
         }
     }
 
@@ -2230,6 +2244,7 @@ impl NorenApp {
             Arc::clone(&window),
             self.geometry.cell_metrics(),
             self.theme,
+            self.cursor_style,
         ) {
             Ok(renderer) => Some(renderer),
             Err(_) => {
@@ -3395,6 +3410,15 @@ impl ApplicationHandler for NorenApp {
         match event {
             WindowEvent::CloseRequested => self.close(event_loop),
             WindowEvent::Resized(physical) => self.handle_resize(physical),
+            WindowEvent::Focused(focused) => {
+                // Focus loss must be visible in the caret (issue #200): the
+                // renderer switches between the focused mark and the
+                // unfocused hollow outline.
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.set_focused(focused);
+                }
+                self.redraw_needed = true;
+            }
             WindowEvent::ModifiersChanged(modifiers) => self.update_modifiers(modifiers.state()),
             WindowEvent::CursorMoved { position, .. } => self.handle_mouse_move(position),
             WindowEvent::MouseInput { state, button, .. } => {

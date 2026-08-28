@@ -112,6 +112,36 @@ binary. What now actually happens on screen:
   races are handled at open time (`open_regular_file`) and pinned by bounded
   subprocess regression tests (`top_level_fifo_returns_promptly`,
   `included_fifo_sources_return_promptly`).
+- **A visible cursor is drawn** (issues #197/#200; the first UI/UX
+  evaluations ranked its absence at the top). The renderer draws the caret
+  at the position the terminal state already tracks. A focused block uses
+  inverse video against the cell it actually covers: resolved cell foreground
+  becomes the block, and resolved cell background becomes the glyph. An
+  unstyled cell therefore retains the active theme's measured cursor/default
+  pair (dark 15.39:1, light 14.56:1, high-contrast 21.0:1), while an SGR cell
+  is not compared against a background it does not have. If that pair falls
+  below 4.5:1, contrast-maximising black/white guarantees a usable cursor and
+  readable block glyph on any sRGB background. DECTCEM is honoured
+  (`CSI ?25l` hides the caret and renders byte-identically to the pre-cursor
+  frames, `CSI ?25h` restores it), a block on a wide character covers both its
+  columns (#174/#176), and window focus loss switches the mark to a hollow
+  outline. `[cursor]` in `config.toml` selects
+  `shape = "block" | "bar" | "underline"` and an optional
+  `color = "#rrggbb"` preference; a preference is used when it clears 4.5:1
+  on the actual cell and otherwise falls back rather than erasing the caret.
+  No configuration is required for a cursor.
+  Proven on real pixels by the cursor tests in
+  `crates/noren-app/tests/frame_oracle.rs` (drawn-by-default,
+  blank-screen caret, move-changes-pixels, wide-character coverage, DECTCEM
+  hide/restore, per-theme pixel contrast, four SGR-background contrasts,
+  readable SGR glyph inversion, safe/unsafe override handling,
+  SGR-plus-DECTCEM, hollow-vs-filled focus), and both original failure modes
+  were mutation-tested before landing: never drawing the cursor fails the
+  cursor oracle suite, and counting cells instead of display columns after a
+  wide character fails the coverage test. Deliberately absent:
+  blink — a blinking caret forces timer-driven repaints roughly twice a
+  second even while idle (this renderer rebuilds the full vertex list every
+  frame), which is a CPU/battery decision, not a visual one.
 
 It is still **not** the full workspace product that [ADR
 0003](adr/0003-noren-zellij-responsibility-boundary.md) describes — several
@@ -134,14 +164,6 @@ below, which remains the more useful list. Milestones 3–8 are open on the
 
 Each item states what you would actually see if you ran the build.
 
-- **There is no visible cursor.** The terminal state tracks a cursor position
-  and moves it correctly, but the render path never draws it: the
-  `glyph_vertices` function (`crates/noren-app/src/renderer.rs`) emits sidebar
-  rows, optional per-cell background rectangles, character bitmaps from
-  `display_cells`, and an optional status line — never a cursor — and the
-  word "cursor" does not appear anywhere in `renderer.rs`. In practice: you type, characters appear,
-  and nothing shows you where the insertion point is. This is the first thing
-  most people notice.
 - **Colours render through a selectable theme; the default palette now
   clears WCAG AA on every slot, with two residual caveats.** `[theme] name`
   in `config.toml` selects one of three built-in palettes — `dark` (the
@@ -447,7 +469,7 @@ rather than trusting a copy from elsewhere. Nothing here should be
 read as "nearly done": the honest summary is that the foundation is tested, a
 first workspace slice is now real and visible, and what stands between this and
 a usable daily terminal is not workspace plumbing but the display itself — a
-real font and a cursor (the default theme's palette cleared WCAG AA on every
-slot with issue #168). SGR colour is drawn through selectable
+real font (the caret now ships drawn, and the default theme's palette cleared
+WCAG AA on every slot with issue #168). SGR colour is drawn through selectable
 light/dark/high-contrast themes with verified contrast, but the built-in
 palettes are not yet a custom theming system.

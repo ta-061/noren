@@ -77,6 +77,39 @@ fn every_theme_default_pair_meets_aa() {
     }
 }
 
+/// The cursor colour is theme-owned and therefore inside the contrast
+/// contract (issues #197/#200): a caret a user cannot locate is as much a
+/// defect as text they cannot read. Every built-in theme draws the cursor
+/// in its default foreground, so the measured ratios are the default-pair
+/// ratios — dark 15.39:1, light 14.56:1, high-contrast 21.0:1 — each
+/// clearing its theme's documented floor (AA for dark/light, AAA for
+/// high-contrast) with the same margin as ordinary text.
+#[test]
+fn every_theme_cursor_colour_meets_its_theme_contrast_floor() {
+    for name in [ThemeName::Dark, ThemeName::Light, ThemeName::HighContrast] {
+        let theme = name.palette();
+        let ratio = contrast_ratio(theme.cursor_u8(), theme.background_u8());
+        let floor = if matches!(name, ThemeName::HighContrast) {
+            7.0
+        } else {
+            4.5
+        };
+        assert!(
+            ratio >= floor,
+            "{name}: cursor colour is {ratio:.2}:1, below the {floor}:1 floor"
+        );
+        // A block cursor is the reading pair inverted (block in the cursor
+        // colour, glyph in the background colour); WCAG ratios are
+        // order-independent, so the glyph inside the block measures the
+        // same ratio as the block itself. Pin that identity structurally.
+        assert_eq!(
+            contrast_ratio(theme.cursor_u8(), theme.background_u8()),
+            contrast_ratio(theme.foreground_u8(), theme.background_u8()),
+            "{name}: cursor colour must inherit the measured default-pair contrast"
+        );
+    }
+}
+
 /// The light theme was designed, not assumed: every ANSI slot keeps AA on
 /// the light background. Measured minimum: 5.07:1 (`bright green`).
 #[test]
