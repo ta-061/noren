@@ -74,19 +74,31 @@ binary. What now actually happens on screen:
   spawn and `Exited { code }` on child exit.
 - **The SSH sidebar is bounded and explicitly partial.** `SshConfig` labels its
   scope as `HostDiscoveryKind::PartialLiteralPatterns`: only positive literal
-  aliases written in `Host` directives become browseable targets. `HostName`,
+  aliases written in `Host` directives become browseable targets. Wildcard
+  patterns never become rows — a pattern is a matching rule, not a connectable
+  destination — but they are counted per occurrence (including patterns inside
+  blocks that also name literals, and patterns reached through followed
+  Includes) and reported as `N wildcard patterns not listed` in the status
+  notice, so a pattern-built config is never silently under-represented
+  (issue #175). Negations are OpenSSH filters rather than destinations: they
+  suppress matches during resolution and self-negated literals during
+  discovery, and they add no row and no absence count. `HostName`,
   `User`, and `Port` participate in bounded first-value resolution, but
   `HostName` and `User` remain literal: `%h`, `%p`, `%r`, and other percent
   tokens are not expanded. Those values are discovery metadata and must be
   resolved with OpenSSH-equivalent semantics or rejected before any future
   connection use. Root-relative `Include` files are followed in lexical order
   only when their canonical targets remain below the top-level config
-  directory. That canonical-root confinement is intentionally stricter than
-  OpenSSH: absolute, `~`, `..`, and symlinked targets outside the root are
-  ignored. `Match`, wildcard-only destinations, system configuration, token
+  directory — the same block list feeds discovery and resolution, so a host
+  declared only in an included file is discovered exactly like one in the
+  top-level file. That canonical-root confinement is intentionally stricter
+  than OpenSSH: absolute, `~`, `..`, and symlinked targets outside the root are
+  ignored. `Match`, system configuration, token
   expansion, and other dynamic OpenSSH behaviour cannot make this a complete
   host inventory. The UI says `partial literal aliases`, retains at most
-  `MAX_SSH_SIDEBAR_HOSTS` (24), and shows the selected alias's stable source tag
+  `MAX_SSH_SIDEBAR_HOSTS` (64), and beyond the cap reports how many are shown
+  of how many and why (`showing first 64 of 70; 6 past sidebar bound`); it
+  shows the selected alias's stable source tag
   plus a bounded root-relative label; it never retains or displays the
   canonical HOME prefix. Hostile configuration fails closed rather than
   hanging: every budget in `ssh_config.rs` (`MAX_FILE_BYTES`,

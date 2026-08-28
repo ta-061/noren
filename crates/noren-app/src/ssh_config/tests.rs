@@ -487,6 +487,60 @@ fn negation_only_block_does_not_match_other_hosts() {
 }
 
 #[test]
+fn positive_wildcard_patterns_are_counted_but_never_listed() {
+    let config =
+        SshConfig::parse("Host alpha\nHost *.internal\n  User dee\nHost prod-?\nHost beta\n")
+            .expect("wildcard fixture parses");
+
+    let aliases: Vec<_> = config.hosts().iter().map(SshHost::alias).collect();
+    assert_eq!(aliases, ["alpha", "beta"]);
+    assert_eq!(config.unlisted_wildcard_patterns(), 2);
+}
+
+#[test]
+fn a_global_default_block_is_counted_as_one_unlisted_wildcard_pattern() {
+    let config = SshConfig::parse("Host build\nHost *\n  User nobody\n")
+        .expect("global-default fixture parses");
+
+    assert_eq!(config.hosts().len(), 1);
+    assert_eq!(config.unlisted_wildcard_patterns(), 1);
+}
+
+#[test]
+fn negation_patterns_are_filters_not_missing_hosts() {
+    let config = SshConfig::parse("Host blocked\nHost !blocked\nHost !*.jump\n")
+        .expect("negation fixture parses");
+
+    assert_eq!(config.hosts().len(), 1);
+    assert_eq!(
+        config.unlisted_wildcard_patterns(),
+        0,
+        "a negation filters matches; it is not an absent host, wildcard or not"
+    );
+}
+
+#[test]
+fn repeated_wildcard_patterns_are_counted_per_occurrence() {
+    let config = SshConfig::parse("Host *.a\nHost *.a\n").expect("duplicate fixture parses");
+
+    assert!(config.hosts().is_empty());
+    assert_eq!(config.unlisted_wildcard_patterns(), 2);
+}
+
+#[test]
+fn wildcard_patterns_from_followed_includes_are_counted() {
+    let fixture = Fixture::new("include-wildcard-count");
+    fixture.write("config", "Include wild.conf\nHost literal\n");
+    fixture.write("wild.conf", "Host *.included\n");
+
+    let config = SshConfig::read(&fixture.root.join("config")).expect("include fixture parses");
+
+    let aliases: Vec<_> = config.hosts().iter().map(SshHost::alias).collect();
+    assert_eq!(aliases, ["literal"]);
+    assert_eq!(config.unlisted_wildcard_patterns(), 1);
+}
+
+#[test]
 fn mixed_literal_and_wildcard_blocks_preserve_resolution_order() {
     let config = SshConfig::parse(
             "Host exact\n  HostName exact.example\n  User exact\nHost *.example\n  HostName wildcard.example\n  User wildcard\nHost api.example\n  User api\nHost db.example !api.example\n  Port 2200\nHost *\n  HostName general.example\n  User nobody\n",

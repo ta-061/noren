@@ -72,8 +72,16 @@ const WINDOW_WIDTH: u32 = 900;
 const WINDOW_HEIGHT: u32 = 600;
 const POLL_INTERVAL: Duration = Duration::from_millis(16);
 /// Keep configured-host memory and identity work bounded independently of the
-/// frame height. The sidebar exposes a scroll window over this bounded list.
-const MAX_SSH_SIDEBAR_HOSTS: usize = 24;
+/// frame height, with the same named-constant discipline as the worktree,
+/// project, and agent row caps. The sidebar exposes a scroll window over this
+/// bounded list. 64 rows of already-bounded labels retain a few KiB and keep
+/// rebuild identity scans O(64) — deliberately above the largest
+/// human-maintained alias lists (issue #175's example is 60 hosts) so the
+/// bound exists for safety, not as the effective size of a real config.
+/// Anything past it is reported with a reason, never dropped silently. The
+/// parse-side DoS budgets in `ssh_config.rs` (#137) bound untrusted input
+/// independently of this view cap and are unchanged by it.
+const MAX_SSH_SIDEBAR_HOSTS: usize = 64;
 /// Sidebar rows begin with a selection marker and one separating space.
 const SIDEBAR_ROW_PREFIX_CHARS: usize = 2;
 /// ASCII-only connection state that is always inside the first 16 columns.
@@ -235,6 +243,19 @@ const SSH_STATUS_SOURCE_CHARS: usize = 40;
 /// target budget solely to decide whether the ASCII marker is needed.
 fn ssh_sidebar_label(target: &str) -> String {
     ssh_state_label(SshConnectionPhase::Closed, target)
+}
+
+/// Fixed-text, count-only clause explaining why wildcard pattern groups are
+/// absent from the sidebar: a pattern is a matching rule, not a connectable
+/// destination, so it never becomes a row. The count says the configuration
+/// was still read. Only the number varies — pattern text is file content and
+/// must never reach the status row (TM-08, issue #155).
+fn ssh_unlisted_wildcard_clause(count: usize) -> String {
+    match count {
+        0 => String::new(),
+        1 => "; 1 wildcard pattern not listed".to_owned(),
+        count => format!("; {count} wildcard patterns not listed"),
+    }
 }
 
 /// Build a bounded sidebar label: an eight-character ASCII state `prefix`
@@ -1413,20 +1434,28 @@ impl NorenApp {
 
     fn apply_ssh_config(&mut self, config: &SshConfig) {
         let omitted = self.workspace.load_ssh_config(config);
+        let total = config.hosts().len();
+        let shown = total.saturating_sub(omitted);
+        let unlisted = ssh_unlisted_wildcard_clause(config.unlisted_wildcard_patterns());
         self.ssh_selection_status = None;
         if config.sources().is_empty() {
             self.ssh_diagnostic = None;
         } else {
             self.ssh_diagnostic = Some(match config.discovery_kind() {
-                HostDiscoveryKind::PartialLiteralPatterns if config.hosts().is_empty() => {
-                    "Noren SSH: partial literal aliases; none found".to_owned()
+                HostDiscoveryKind::PartialLiteralPatterns if total == 0 => {
+                    let mut line = "Noren SSH: partial literal aliases; none found".to_owned();
+                    line.push_str(&unlisted);
+                    line
                 }
                 HostDiscoveryKind::PartialLiteralPatterns if omitted == 0 => {
-                    "Noren SSH: partial literal aliases; select one for source".to_owned()
+                    let mut line =
+                        "Noren SSH: partial literal aliases; select one for source".to_owned();
+                    line.push_str(&unlisted);
+                    line
                 }
                 HostDiscoveryKind::PartialLiteralPatterns => format!(
-                    "Noren SSH: partial literal aliases; showing first \
-                     {MAX_SSH_SIDEBAR_HOSTS}; {omitted} omitted"
+                    "Noren SSH: partial literal aliases; showing first {shown} of {total}; \
+                     {omitted} past sidebar bound{unlisted}"
                 ),
             });
         }
