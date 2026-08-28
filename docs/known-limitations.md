@@ -134,27 +134,41 @@ Each item states what you would actually see if you ran the build.
   word "cursor" does not appear anywhere in `renderer.rs`. In practice: you type, characters appear,
   and nothing shows you where the insertion point is. This is the first thing
   most people notice.
-- **Colours render through a selectable theme, but the default palette fails
-  WCAG AA on five slots.** `[theme] name` in `config.toml` selects one of
-  three built-in palettes — `dark` (the default, byte-identical to the
-  pre-theme colours), `light`, and `high-contrast` — and `glyph_vertices_for`
+- **Colours render through a selectable theme; the default palette now
+  clears WCAG AA on every slot, with two residual caveats.** `[theme] name`
+  in `config.toml` selects one of three built-in palettes — `dark` (the
+  default), `light`, and `high-contrast` — and `glyph_vertices_for`
   in `crates/noren-app/src/renderer.rs` resolves every SGR colour, the
   default foreground, and the clear colour through it
   (`resolve_foreground`/`resolve_background` route ANSI and 256-colour
-  values through the theme's table; truecolor passes through). **The known
-  contrast finding:** the default `dark` palette fails the WCAG AA normal-text
-  floor (4.5:1) for five of its sixteen ANSI slots on its own background —
-  black at 1.06:1, blue at 2.10:1, red at 3.38:1, bright blue at 4.16:1, and
-  magenta at 4.21:1 — measured and pinned by
-  `default_dark_palette_minimum_is_pinned_below_the_aa_floor` in
-  `crates/noren-app/tests/theme.rs`. The values stay frozen because the
-  no-`[theme]` default must render byte-identically to the pre-theme
-  renderer (pinned by the frame oracle); fixing them is a separate
-  deliberate decision. `light` (measured minimum 5.07:1) and `high-contrast`
-  (7.84:1, above WCAG AAA) pass every slot. In practice: programs that emit
-  SGR red, blue, bright blue, magenta, or black text on the default dark
-  background draw below the AA floor until the dark palette is revisited;
-  selecting `high-contrast` avoids it. Themes are built-in only — there is
+  values through the theme's table; truecolor passes through). **The
+  issue-168 fix:** the default `dark` palette used to fail the WCAG AA
+  normal-text floor (4.5:1) on five of its sixteen ANSI slots — black at
+  1.06:1, blue at 2.10:1, red at 3.38:1, bright blue at 4.16:1, and
+  magenta at 4.21:1 — which left `\x1b[30m` text effectively invisible.
+  Issue #168 made the decision PR #167 had deliberately frozen and moved
+  exactly those five entries the minimum distance that clears 4.5:1
+  (black `[0,0,0]`→`[121,121,121]` 1.06→4.53, red `[205,0,0]`→`[243,0,0]`
+  3.38→4.52, blue `[0,0,238]`→`[0,113,255]` 2.10→4.52, magenta
+  `[205,0,205]`→`[213,0,213]` 4.21→4.50, bright blue
+  `[92,92,255]`→`[100,100,255]` 4.16→4.52), preserving ANSI slot
+  semantics. The default's measured minimum is now 4.50:1 (magenta),
+  pinned by `dark_theme_keeps_aa_on_every_theme_owned_foreground` and
+  `the_five_fixed_dark_entries_measure_above_their_old_failures` in
+  `crates/noren-app/tests/theme.rs`, and confirmed on drawn pixels by
+  `the_issue_168_aa_fixes_reach_the_drawn_pixels` in
+  `crates/noren-app/tests/frame_oracle.rs`. `light` (measured minimum
+  5.07:1) and `high-contrast` (7.84:1, above WCAG AAA) were untouched and
+  pass every slot. **The caveats:** (1) ANSI black and bright black now
+  sit close together — `[121,121,121]` vs `[127,127,127]` — because any
+  achromatic entry clearing AA on this background must be at least grey
+  121 and bright black was already 127; both remain neutral greys, but a
+  program relying on a large black/bright-black distinction will not find
+  one in the default theme. (2) The contrast contract still covers only
+  theme-owned foregrounds on the theme's default background: the shared
+  240-colour cube/grayscale tail (`16..=255`), truecolor, and
+  program-paired foreground/background combinations remain unchecked and
+  can still draw below the floor. Themes are built-in only — there is
   no custom-palette or colour-vision-friendly configuration.
 - **The bitmap font is coverage-bounded, and seven glyph pairs are visually
   identical.** Glyphs are a hand-built 5x7 bitmap in `glyph_rows`
@@ -422,7 +436,7 @@ rather than trusting a copy from elsewhere. Nothing here should be
 read as "nearly done": the honest summary is that the foundation is tested, a
 first workspace slice is now real and visible, and what stands between this and
 a usable daily terminal is not workspace plumbing but the display itself — a
-theme whose default palette clears WCAG AA on every slot, a real font, and a
-cursor. SGR colour is drawn through selectable light/dark/high-contrast
-themes with verified contrast, but the built-in palettes are not yet a
-custom theming system.
+real font and a cursor (the default theme's palette cleared WCAG AA on every
+slot with issue #168). SGR colour is drawn through selectable
+light/dark/high-contrast themes with verified contrast, but the built-in
+palettes are not yet a custom theming system.

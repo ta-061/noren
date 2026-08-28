@@ -25,14 +25,15 @@
 //! definition, and the cube's black corner fails on every possible
 //! background. See `src/theme.rs` for the full statement.
 //!
-//! # The dark-palette finding
+//! # The dark-palette fix (issue #168)
 //!
-//! The existing default (`dark`) fails 4.5:1 for five ANSI slots on its own
-//! background; its measured minimum, 1.06:1 (ANSI black), is pinned below.
-//! The colours are frozen anyway: this slice's contract is that no
-//! `[theme]` section renders byte-identically to the pre-theme renderer,
-//! and the frame oracle proves that at the pixel level. Changing the dark
-//! values to pass AA is a separate, deliberate decision for a follow-up.
+//! The default (`dark`) used to fail 4.5:1 for five ANSI slots on its own
+//! background, worst at ANSI black 1.06:1 — text a program could emit and a
+//! user could not see. Issue #168 made the product decision PR #167 deferred
+//! and moved exactly those five entries the minimum distance that clears AA;
+//! the before/after measurements are recorded in `src/theme.rs` and pinned
+//! below. The theme's measured minimum is now 4.50:1 (`magenta`, the
+//! tightest of the five minimum moves).
 
 use noren_app::theme::{Theme, ThemeName, contrast_ratio, relative_luminance};
 
@@ -63,7 +64,7 @@ fn contrast_ratio_matches_the_wcag_reference_values() {
 }
 
 /// The pair every unstyled character draws in — the reading path — clears
-/// AA for every theme, including the frozen dark default.
+/// AA for every theme, including the default dark theme.
 #[test]
 fn every_theme_default_pair_meets_aa() {
     for name in [ThemeName::Dark, ThemeName::Light, ThemeName::HighContrast] {
@@ -92,7 +93,7 @@ fn light_theme_keeps_aa_on_every_theme_owned_foreground() {
 /// High-contrast genuinely exceeds the others: it clears AAA (7:1) and its
 /// measured minimum strictly beats both other themes' minima. Measured
 /// minimum: 7.84:1 (`bright black`), against light's 5.07:1 and dark's
-/// 1.06:1.
+/// 4.50:1.
 #[test]
 fn high_contrast_meets_aaa_and_strictly_exceeds_the_other_themes() {
     let (hc_min, hc_slot) = ThemeName::HighContrast
@@ -115,59 +116,112 @@ fn high_contrast_meets_aaa_and_strictly_exceeds_the_other_themes() {
     );
 }
 
-/// The reported finding, pinned: the existing default palette's worst
-/// theme-owned foreground is ANSI black at 1.06:1 — far below AA — and four
-/// more slots (blue 2.10, red 3.38, bright blue 4.16, magenta 4.21) also
-/// fail. The value is pinned so that *any* change to the default palette —
-/// a fix or a regression — breaks this test and forces the decision into
-/// the open. Fixing it is follow-up work precisely because the defaults
-/// must keep rendering byte-identically to the pre-theme renderer.
+/// The dark theme now keeps AA on every theme-owned foreground — the fix
+/// issue #168 made after PR #167 had pinned the 1.06:1 failure. Every ANSI
+/// slot and the default foreground must clear 4.5:1 on the dark background;
+/// the measured minimum is pinned so a future palette edit — regression or
+/// further fix — is a deliberate, visible decision.
 #[test]
-fn default_dark_palette_minimum_is_pinned_below_the_aa_floor() {
+fn dark_theme_keeps_aa_on_every_theme_owned_foreground() {
     let (min, slot) = ThemeName::Dark
         .palette()
         .min_contrast_on_default_background();
-    assert_eq!(slot, "black", "the default's worst slot is ANSI black");
     assert!(
-        (min - 1.0639).abs() < 0.001,
-        "default dark minimum moved to {min:.4}:1 (was 1.0639:1) — changing the \
-         shipped default palette is a deliberate decision, not a side effect"
+        min >= 4.5,
+        "dark theme's worst slot ({slot}) is {min:.2}:1, below the AA 4.5:1 floor"
+    );
+    assert_eq!(
+        slot, "magenta",
+        "the fixed dark palette's worst slot moved — update this pin and the docs"
     );
     assert!(
-        min < 4.5,
-        "if the default now passes AA, update the finding documentation"
+        (min - 4.5025).abs() < 0.001,
+        "dark minimum moved to {min:.4}:1 (was 4.5025:1 after issue #168) — \
+         changing the shipped default palette is a deliberate decision, not a \
+         side effect"
     );
 }
 
-/// The dark theme is the pre-theme renderer's exact colours: the raw shader
-/// floats, the xterm ANSI table, and the shared cube/grayscale tail. This
-/// is the palette-level half of the defaults-preservation contract; the
-/// frame oracle proves the pixel-level half.
+/// Each of the five entries issue #168 fixed now measures above the floor it
+/// used to fail, by the minimum move: the pinned ratios are the before/after
+/// record of the fix, and reverting any entry to its pre-fix value fails
+/// here (and in the AA test above).
 #[test]
-fn dark_theme_is_byte_identical_to_the_pre_theme_renderer() {
+fn the_five_fixed_dark_entries_measure_above_their_old_failures() {
+    let dark = ThemeName::Dark.palette();
+    let ground = dark.background_u8();
+    let fixed = [
+        ("black", [121, 121, 121], [0, 0, 0], 1.0639),
+        ("red", [243, 0, 0], [205, 0, 0], 3.3800),
+        ("blue", [0, 113, 255], [0, 0, 238], 2.1005),
+        ("magenta", [213, 0, 213], [205, 0, 205], 4.2086),
+        ("bright blue", [100, 100, 255], [92, 92, 255], 4.1640),
+    ];
+    for (slot, after, before, old_ratio) in fixed {
+        let ratio = contrast_ratio(after, ground);
+        assert!(
+            ratio >= 4.5,
+            "{slot} at {after:?} measures {ratio:.4}:1 — the AA fix regressed"
+        );
+        // The old value must still fail, so the pin cannot be satisfied by
+        // reverting: the minimum move is what keeps this honest.
+        let old = contrast_ratio(before, ground);
+        assert!(
+            old < 4.5 && (old - old_ratio).abs() < 0.001,
+            "{slot}'s recorded pre-fix failure ({old_ratio:.4}:1) moved — the \
+             history pin is wrong"
+        );
+        // And each fixed value is minimal: one channel step down must fail,
+        // which is what "moved the minimum distance" means for these ramps.
+        let dimmer = after.map(|channel| channel.saturating_sub(1));
+        assert!(
+            contrast_ratio(dimmer, ground) < 4.5 || dimmer == after,
+            "{slot} at {after:?} is not the minimum passing value — {dimmer:?} \
+             already clears AA",
+        );
+    }
+    // The fixed values are what the theme actually serves.
+    assert_eq!(dark.ansi()[0], [121, 121, 121]);
+    assert_eq!(dark.ansi()[1], [243, 0, 0]);
+    assert_eq!(dark.ansi()[4], [0, 113, 255]);
+    assert_eq!(dark.ansi()[5], [213, 0, 213]);
+    assert_eq!(dark.ansi()[12], [100, 100, 255]);
+}
+
+/// The dark theme is the pre-theme renderer's colours except the five
+/// issue-168 fixes: the raw shader floats, the shared cube/grayscale tail,
+/// and eleven of the sixteen ANSI entries are still byte-identical, and the
+/// five that moved are pinned to their fixed values (blue kept red at zero,
+/// magenta stays symmetric R=B, bright blue keeps its R=G balance, black
+/// stays achromatic — slot semantics preserved). This is the palette-level
+/// half of the pin; the frame oracle proves the pixel-level half.
+#[test]
+fn dark_theme_palette_is_pinned_with_the_issue_168_aa_fixes() {
     let dark = ThemeName::Dark.palette();
     // The exact floats the fragment shader returned as constants before
     // themes existed (issue #107/#112); the frame oracle pins their captured
     // form at [204, 235, 209].
     assert_eq!(dark.foreground(), [0.80, 0.92, 0.82]);
     assert_eq!(dark.background(), [0.035, 0.045, 0.04]);
-    // The xterm sixteen.
+    // The xterm sixteen with the five AA fixes (issue #168): entries 0, 1,
+    // 4, 5, and 12 moved the minimum distance to clear 4.5:1; the other
+    // eleven are the untouched xterm values.
     assert_eq!(
         dark.ansi(),
         [
-            [0, 0, 0],
-            [205, 0, 0],
+            [121, 121, 121],
+            [243, 0, 0],
             [0, 205, 0],
             [205, 205, 0],
-            [0, 0, 238],
-            [205, 0, 205],
+            [0, 113, 255],
+            [213, 0, 213],
             [0, 205, 205],
             [229, 229, 229],
             [127, 127, 127],
             [255, 0, 0],
             [0, 255, 0],
             [255, 255, 0],
-            [92, 92, 255],
+            [100, 100, 255],
             [255, 0, 255],
             [0, 255, 255],
             [255, 255, 255],
