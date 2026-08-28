@@ -160,6 +160,15 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(classified["listed"], [])
         self.assertEqual(sum(classified["counted"].values()), 2)
 
+    def test_release_machinery_scope_is_counted_not_listed(self) -> None:
+        # The generator classifying its own commits must not explode or claim
+        # user visibility (the fence rejected `fix(release)` on first contact).
+        classified = gn.classify(
+            self.commits(["fix(release): credit both merge-subject shapes"]), {}
+        )
+        self.assertEqual(classified["listed"], [])
+        self.assertEqual(classified["counted"], {"fix(release)": 1})
+
     def test_unmapped_scope_fails_loudly(self) -> None:
         with self.assertRaises(SystemExit):
             gn.classify(self.commits(["feat(mystery): a new scope appears"]), {})

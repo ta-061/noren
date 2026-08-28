@@ -125,6 +125,7 @@ scope that has not started.
 | `cargo test -p noren-app --test frame_oracle` | 58 passed, 0 failed, 0 ignored |
 | `python3 -m unittest scripts/test_generate_notes.py` | 13 passed |
 | `python3 scripts/check_docs.py` | OK |
+| `python3 scripts/release/audit_notes_prs.py` (new in this branch) | `OK` — notes PR set 108 = gh-merged-and-reachable 108 at the audited head; only #181 excluded (merged into main after this branch's base) |
 
 **Marked unverified, on purpose:** Gatekeeper's first-launch dialogs were
 documented from macOS behavior, not reproduced — a locally built binary

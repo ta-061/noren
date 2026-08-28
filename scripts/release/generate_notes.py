@@ -44,7 +44,9 @@ ROOT = Path(__file__).resolve().parents[2]
 USER_VISIBLE_TYPES = {"feat", "fix", "perf"}
 # Scopes that describe internal quality work even when the type is fix/feat;
 # those land in the counted "not user-visible" bucket instead of the lists.
-INTERNAL_SCOPES = {"test", "bench", "ci", "fleet"}
+# `release` is this branch's own machinery (generate_notes, build.sh, audits):
+# the fence proved itself by rejecting `fix(release): ...` on first contact.
+INTERNAL_SCOPES = {"test", "bench", "ci", "fleet", "release"}
 # Legacy one-off subjects from merged lanes that wrote the scope in the type
 # position (`theme: built-in palettes ...`); mapped to the visible type their
 # content actually is so the theme work is listed, not counted away.
@@ -385,8 +387,12 @@ def main() -> int:
     output.write_text(text, encoding="utf-8")
     classified = classify(commits, pr_map, subsumed)
     listed = sum(1 for _ in classified["listed"])
+    try:
+        shown = output.relative_to(ROOT)
+    except ValueError:
+        shown = output
     print(
-        f"wrote {output.relative_to(ROOT)} "
+        f"wrote {shown} "
         f"({listed} listed commits, {len(commits)} total, "
         f"{len(classified['pr_numbers'])} PRs)"
     )
