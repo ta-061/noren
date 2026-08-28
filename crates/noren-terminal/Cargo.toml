@@ -13,3 +13,11 @@ unicode-width.workspace = true
 
 [lints]
 workspace = true
+
+# Report-only benchmark (issue #172). `harness = false` with no benching
+# dependency; `test = false` keeps `cargo test --workspace` from running the
+# timing loop as if it were a test.
+[[bench]]
+name = "snapshot_scrollback"
+harness = false
+test = false
