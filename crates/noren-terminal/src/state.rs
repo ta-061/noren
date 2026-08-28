@@ -919,11 +919,15 @@ impl TerminalState {
 
     /// Re-snap the active cursor onto a lead cell.
     ///
-    /// Every row-changing control path (LF, IND, NEL, RI) keeps the cursor
-    /// column while the row or the row's content changes, so each of them can
-    /// land the cursor on the continuation half of a wide character. Routing
-    /// all of them through this shared helper keeps the cursor off
-    /// continuations, so a path added later cannot forget the re-snap.
+    /// Every row-changing control path that keeps content under the cursor
+    /// column (LF, IND, NEL, RI, SU, SD, DL) keeps the cursor column while
+    /// the row or the row's content changes, so each of them can land the
+    /// cursor on the continuation half of a wide character. Routing all of
+    /// them through this shared helper keeps the cursor off continuations,
+    /// so a path added later cannot forget the re-snap. IL needs no re-snap
+    /// because it blanks the cursor's own row; every other content-changing
+    /// path (ICH, DCH, ECH, EL, ED) blanks or repairs the cursor cell
+    /// itself.
     fn snap_cursor_to_lead(&mut self) {
         self.active.cursor = snap_to_lead(&self.active.screen, self.active.cursor);
     }
@@ -1113,9 +1117,14 @@ impl TerminalState {
         self.snap_cursor_to_lead();
     }
 
+    /// Scroll the whole scroll region up (`CSI Ps S`, SU) under the
+    /// stationary cursor, ending in the shared lead re-snap: the row that
+    /// moves under the cursor column can carry a wide character's
+    /// continuation half there.
     fn scroll_up(&mut self, count: u16) {
         self.active.wrap_pending = false;
         self.scroll_up_capturing(self.active.scroll_region, count);
+        self.snap_cursor_to_lead();
     }
 
     /// Scroll the active screen's region up and, when rows actually leave the
@@ -1138,11 +1147,16 @@ impl TerminalState {
         }
     }
 
+    /// Scroll the whole scroll region down (`CSI Ps T`, SD) under the
+    /// stationary cursor, ending in the shared lead re-snap: the row that
+    /// moves under the cursor column can carry a wide character's
+    /// continuation half there.
     fn scroll_down(&mut self, count: u16) {
         self.active.wrap_pending = false;
         self.active
             .screen
             .scroll_down(self.active.scroll_region, count);
+        self.snap_cursor_to_lead();
     }
 
     fn erase_in_display(&mut self, mode: EraseMode) {
@@ -1178,6 +1192,12 @@ impl TerminalState {
             .delete_characters(self.active.cursor, count);
     }
 
+    /// Insert `count` blank lines at the cursor row (`CSI Ps L`, IL),
+    /// shifting the rows below it down. No lead re-snap is needed: the shift
+    /// blanks the cursor's own row, so what lands under the cursor column is
+    /// always a blank cell, never a continuation —
+    /// `insert_lines_keeps_the_cursor_off_continuations_and_moves_wide_rows_whole`
+    /// pins that contract.
     fn insert_lines(&mut self, count: u16) {
         self.active.wrap_pending = false;
         let cursor_row = self.active.cursor.row;
@@ -1193,6 +1213,10 @@ impl TerminalState {
         }
     }
 
+    /// Delete `count` lines at the cursor row (`CSI Ps M`, DL), shifting the
+    /// rows below it up under the stationary cursor, and end in the shared
+    /// lead re-snap: the row that moves under the cursor column can carry a
+    /// wide character's continuation half there.
     fn delete_lines(&mut self, count: u16) {
         self.active.wrap_pending = false;
         let cursor_row = self.active.cursor.row;
@@ -1206,6 +1230,7 @@ impl TerminalState {
                 count,
             );
         }
+        self.snap_cursor_to_lead();
     }
 
     fn select_graphic_rendition(&mut self, params: &[u16], separators: &[u8]) {

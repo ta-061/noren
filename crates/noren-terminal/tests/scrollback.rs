@@ -51,6 +51,40 @@ fn lines_scrolled_off_the_top_are_retained_in_order() {
     assert_eq!(first_row[0].text(), "A");
 }
 
+/// Rows evict whole, so a wide character's lead and continuation halves
+/// always travel into scrollback together: the retained row keeps both
+/// cells, and a cursor parked above the eviction can never face a
+/// continuation whose lead left the screen (Issue #176 neighbouring
+/// invariant).
+#[test]
+fn a_scrolled_off_wide_row_is_retained_with_both_halves() {
+    let mut state = TerminalState::new(2, 4).expect("valid terminal");
+    state.feed_bytes("😀".as_bytes());
+    state.feed_bytes(b"\x1b[2;4H");
+    assert_eq!(state.cursor().column(), 3);
+
+    // SU evicts the emoji row under the stationary cursor.
+    state.feed_bytes(b"\x1b[1S");
+    assert_eq!(state.scrollback_len(), 1);
+    let retained = state.scrollback_row(0).expect("retained wide row");
+    assert_eq!(retained[0].text(), "\u{1f600}");
+    assert_eq!(retained[0].width(), 2);
+    assert!(retained[1].is_continuation());
+    assert_eq!(retained.len(), 4);
+
+    // The cursor stayed in bounds and off the shifted content's
+    // continuations (the blank row under it has none).
+    let cursor = state.cursor();
+    assert_eq!(cursor.column(), 3);
+    assert!(
+        !state
+            .screen()
+            .cell(cursor.row(), cursor.column())
+            .is_some_and(Cell::is_continuation)
+    );
+    assert_eq!(scrollback_widths(&state), [4]);
+}
+
 #[test]
 fn the_bound_holds_and_evicts_the_oldest_lines() {
     // One-row grid: every CRLF evicts the just-printed row. Emit well past the
