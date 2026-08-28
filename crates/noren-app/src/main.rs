@@ -3391,7 +3391,8 @@ impl NorenApp {
         let chrome = FrameChrome::new(None, status)
             .with_sidebar_rows(Some(&rows))
             .with_palette_hint(palette_hint.as_deref())
-            .with_workspace_notice(workspace_notice.as_deref());
+            .with_workspace_notice(workspace_notice.as_deref())
+            .with_scroll_offset(0);
         let outcome = self
             .renderer
             .as_mut()
