@@ -884,7 +884,7 @@ fn parse_cursor(table: &dyn TableLike, cursor: &mut CursorConfig) -> Result<(), 
 /// holding one parseable chord. Palette-command chords must avoid the keys
 /// the open palette always interprets structurally (Escape, Enter, and the
 /// vertical arrows), the palette opener must stay claimable by the
-/// pass-through policy, and after applying the table all five chords must
+/// pass-through policy, and after applying the table all seven chords must
 /// stay pairwise distinct — including the chords of actions the table left
 /// at their defaults.
 fn parse_keys(table: &dyn TableLike, keys: &mut KeymapConfig) -> Result<(), ConfigError> {

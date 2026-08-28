@@ -42,15 +42,17 @@ binary. What now actually happens on screen:
   last one. The `f` command dispatches sidebar focus — currently a no-op, since
   the sidebar is always visible. Arrow
   keys and Enter navigate the same command list; Escape dismisses it.
-- **Mouse reporting reaches the program.** `handle_mouse_button`,
-  `handle_mouse_move`, and `handle_mouse_wheel` in `main.rs` each call
-  `encode_and_send_mouse`, the helper that invokes `MouseEncoder::encode` and
-  writes the resulting report bytes to the PTY. Encoding follows the terminal
-  state's authoritative mode tracking (`current_mouse_modes` in `main.rs`): a
-  program that never enables a tracking mode receives no reports, and holding
-  Shift bypasses reporting so local text selection still works
-  (`mouse_reportable`). Clicks, drags, and the wheel therefore reach programs
-  that ask for them — Zellij, `vim` with `set mouse=a`, and `tmux` among them.
+- **Mouse reporting reaches the program.** `handle_mouse_button` and
+  `handle_mouse_move` in `main.rs` call `encode_and_send_mouse`, while
+  `handle_mouse_wheel` makes its ownership decision in
+  `route_terminal_wheel` before sending encoded reports. Encoding follows the
+  terminal state's authoritative mode tracking (`current_mouse_modes` in
+  `main.rs`): a program that never enables a tracking mode receives no
+  reports. Shift bypasses button/motion reporting so local text selection
+  still works (`mouse_reportable`), but a tracked wheel remains application
+  input even with Shift held; without tracking, that wheel navigates Noren's
+  retained history. Clicks, drags, and the wheel therefore reach programs that
+  ask for them — Zellij, `vim` with `set mouse=a`, and `tmux` among them.
 - **Configured cell size reaches the renderer.** `[font] cell_width` /
   `cell_height` flow through `GridGeometry::with_cells` to the drawing path;
   the regression test `configured_cell_sizes_drive_the_app_geometry` in the
