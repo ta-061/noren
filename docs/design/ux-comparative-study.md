@@ -241,3 +241,218 @@ temporary, filterable, keyboard-labelled, and wide enough for the task.
 **F-12 — iTerm2 keeps presets and runtime sessions separate.** Noren's unified
 catalog is faster to scan in principle, but only if dormant resources and live
 sessions remain visually distinct without consuming the resource's name.
+
+## Missing terminal conventions
+
+There is one correction to make to the premise that every peer "shows
+scrollback position." A persistent scrollbar is not universal. WezTerm's
+scrollbar is [disabled by default](https://wezterm.org/config/lua/config/enable_scroll_bar.html),
+and Alacritty documents a line-position indicator specifically for search and
+vi mode rather than a permanent bar. The stronger shared convention is this:
+once the viewport leaves the bottom, the user can navigate history and receives
+some orienting feedback in the products or modes that hide a permanent bar.
+Noren supplies neither navigation nor orientation.
+
+| Terminal | Cursor convention | Selection convention | Scrollback position/orientation convention |
+| --- | --- | --- | --- |
+| cmux — **documented, not observed** | Terminal rendering and preferences come from Ghostty, including visible block/bar/underline cursor behavior. | Ghostty selection is visible; cmux additionally documents optional copy-on-select. | Ghostty supplies terminal scrollback behavior; cmux separately documents transient scroll indicators for overflowing sidebars. [Sources](https://cmux.com/docs/configuration), [changelog](https://cmux.com/docs/changelog) |
+| Terminal.app — **documented, not observed** | Profiles choose block, underline, or bar, blinking, and cursor color. | Profiles choose a selection color. | Profile window/scrollback settings retain history in the standard scrollable terminal view. [Sources](https://support.apple.com/guide/terminal/change-profiles-text-settings-trmltxt/mac), [profiles](https://support.apple.com/guide/terminal/use-profiles-to-change-the-look-of-terminal-windows-trml107/mac) |
+| iTerm2 — **documented, not observed** | Block, vertical bar, underline, blink, cursor guide, context-aware color, and cursor boost are configurable. | Selected foreground/background are configurable and the selected range remains visibly differentiated. | A configured history size is navigable with ordinary terminal scrolling; scrollback and selection can continue while output arrives. [Sources](https://iterm2.com/documentation-preferences-profiles-text.html), [colors](https://iterm2.com/documentation-preferences-profiles-colors.html), [terminal](https://iterm2.com/documentation-preferences-profiles-terminal.html) |
+| WezTerm — **documented, not observed** | The documented default is a visible `SteadyBlock`; applications may request another style. | `selection_fg` and `selection_bg` style the active selection, with default mouse bindings for cell, word, line, and block ranges. | Copy mode and scroll actions navigate history. An optional thumb represents the current viewport, although the scrollbar is off by default. [Sources](https://wezterm.org/config/lua/config/default_cursor_style.html), [appearance](https://wezterm.org/config/appearance.html), [mouse](https://wezterm.org/config/mouse.html), [scrollbar](https://wezterm.org/config/lua/config/enable_scroll_bar.html) |
+| Alacritty — **documented, not observed** | Block, underline, or beam shape plus blink timing and cursor colors are configurable. | Selection foreground/background and save-to-clipboard behavior are configurable; vi-mode movement visibly extends selections. | History defaults to 10,000 lines. Search and vi mode expose a line indicator showing position in history; there is no permanent GUI scrollbar. [Sources](https://github.com/alacritty/alacritty/blob/master/extra/man/alacritty.5.scd), [features](https://github.com/alacritty/alacritty/blob/master/docs/features.md) |
+| kitty — **documented, not observed** | A visible cursor has configurable shape, blink, color, and text color. | Mouse word/line/column selections remain visibly selected and can copy automatically. | An interactive right-edge scrollbar shows the current scrollback position when scrolled by default; keys, mouse, search, and an external pager navigate history. [Sources](https://sw.kovidgoyal.net/kitty/conf.html), [overview](https://sw.kovidgoyal.net/kitty/overview/) |
+| Ghostty — **documented, not observed** | Cursor style, color, opacity, inversion, and blink are configurable. | Selection foreground/background default to contrasting terminal colors and can persist after copy. | `scrollbar = system` is the documented default and follows platform visibility behavior; `never` is an explicit opt-out. [Source](https://ghostty.org/docs/config/reference) |
+| Warp — **documented, not observed** | Bar, block, or underline plus blinking are exposed in Settings and the command palette. | Normal, semantic, rectangular, and whole-block selections are visibly highlighted; a border marks selected blocks. | The scrollable block list has sticky command headers, bookmarks with positional previews, and standard page/top/bottom navigation. [Sources](https://docs.warp.dev/terminal/appearance/text-fonts-cursor/), [selection](https://docs.warp.dev/terminal/more-features/text-selection/), [blocks](https://docs.warp.dev/terminal/blocks/block-basics) |
+| Noren — **observed runtime, source-verified** | Cursor coordinates exist in terminal state, but the shipped renderer emits no cursor geometry. | Drag and select-all state can be copied, but no selected cell is drawn differently. | History is bounded in memory, but rendering is hard-wired to its newest suffix. There is no terminal scroll-offset input, navigation, thumb, percentage, or line indicator. [Source](../known-limitations.md) |
+
+tmux and Zellij are multiplexers rather than font/cursor rasterizers, so they
+inherit the host terminal's basic cursor. Their own management and copy modes
+still make focus and selection visible: tmux's choose/copy modes highlight the
+current item, while Zellij's default top/bottom bars expose tab, session, mode,
+and shortcut state. That makes them additional evidence that invisible state
+is not an expected consequence of a terminal-cell UI.
+
+### Cost rank for the three missing conventions
+
+1. **Cursor — highest cost.** The convention is a visible block, bar, or
+   underline at the terminal's authoritative insertion position, sometimes
+   blinking and sometimes changed by the application. Without it, every shell
+   edit, command-history edit, REPL, password prompt, and full-screen TUI loses
+   the answer to "where will the next byte go?" A user can type, but cannot
+   safely predict insertion or focus. The cost starts before or on the first
+   keystroke.
+2. **Scrollback navigation and position — second-highest cost.** The convention
+   is that wheel/page/search/copy-mode input can leave the bottom, with a thumb,
+   line indicator, status mode, sticky block header, or other feedback showing
+   that the viewport moved. Noren's absence is more costly than a missing
+   scrollbar: build output, test failures, SSH diagnostics, and agent logs that
+   leave the screen cannot be revisited at all. The first long command exposes
+   it.
+3. **Selection highlight — third-highest cost.** The convention is reversible
+   visual contrast over the exact cell range about to be copied, often with
+   word, line, rectangular, or semantic expansion. Noren copies an invisible
+   range. Users cannot verify whether they included a prompt, omitted the final
+   character, crossed a wrapped line, or captured a secret. The first copy
+   attempt exposes it.
+
+**F-13 — The missing cursor is the fastest and most expensive convention
+failure.** Terminal.app, iTerm2, WezTerm, Alacritty, kitty, Ghostty, and Warp
+all document a visible, configurable cursor; cmux inherits one from Ghostty.
+Noren has authoritative cursor state but withholds the feedback needed to use
+that state.
+
+**F-14 — Noren is missing the scrollback interaction, not merely scrollbar
+chrome.** Minimal peers prove that a permanent bar is optional. None of them
+uses Noren's combination of retained history, a permanently bottom-anchored
+view, and no navigation or position feedback.
+
+**F-15 — Invisible selection converts a familiar direct manipulation into a
+blind command.** Every compared emulator documents contrasting selection or
+selected-block state. Noren's copy result may be correct internally, but the
+user has no perceptual evidence before committing it to the clipboard.
+
+## Discoverability of the primary interaction
+
+Noren's default `Super+p` opens a four-command palette at the top of the
+sidebar. Once open, it shows `C`, `S`, `X`, and `F` next to the commands and
+supports arrows, Enter, and Escape. Before it opens, there is no on-screen
+shortcut hint, button, menu, hover target, or welcome message. Sidebar rows do
+respond to click for selection, switching, or launching, but their chrome does
+not advertise that behavior and those clicks do not expose the palette's
+create/close commands. `F` currently dispatches a no-op because the sidebar is
+always visible. Evidence: current
+[`main.rs`](../../crates/noren-app/src/main.rs) and [known
+limitations](../known-limitations.md).
+
+| Product | How the primary management interaction surfaces |
+| --- | --- |
+| cmux — **documented, not observed** | The workspace rail is itself visible. Group headers expose `+` and context menus, rows expose close on hover, and commands also live in a searchable palette. Inline shortcut hints appear in newer navigation surfaces. [Sources](https://cmux.com/docs/workspace-groups), [changelog](https://cmux.com/docs/changelog) |
+| VS Code — **documented, not observed** | Activity Bar icons, Explorer buttons, menus, title-bar layout controls, hover shortcut labels, and the Command Palette all lead to the same capabilities. `Shift+Cmd+P`/F1 is important, not exclusive. [Source](https://code.visualstudio.com/docs/editing/userinterface) |
+| Warp — **documented, not observed** | Warp opens with a dismissible shortcut screen and keeps shortcuts discoverable through the command palette, searchable settings, and Resource Center. Its macOS palette is also `Cmd+P`. It does **not** expect documentation before the primary interaction. [Source](https://docs.warp.dev/getting-started/keyboard-shortcuts) |
+| WezTerm — **documented, not observed** | The visible tab-bar `+` creates a tab; right-clicking it opens the launcher. Inside, selection keys and `/` filtering are explained, and configured launchers can include tabs, domains, workspaces, and commands. Advanced workspace composition may require configuration, but basic launch does **not** require documentation first. [Sources](https://wezterm.org/config/launch.html), [`ShowLauncherArgs`](https://wezterm.org/config/lua/keyassignment/ShowLauncherArgs.html) |
+| Zellij — **documented, not observed** | The default status bar continuously lists mode-entry and context-dependent immediate-action keys; the session manager has a documented default chord and then exposes its actions in a focused surface. [Sources](https://zellij.dev/tutorials/basic-functionality/), [session manager](https://zellij.dev/documentation/session-manager-alias.html) |
+| tmux — **documented, not observed** | tmux is documentation-first for `prefix` sequences such as `C-b s` and `C-b w`, although its persistent status line at least makes sessions/windows and active state visible. It is a keyboard-first precedent, not a GUI-discoverability precedent. [Source](https://github.com/tmux/tmux/wiki/Getting-Started) |
+| kitty — **documented, not observed** | kitty explicitly describes itself as designed for power keyboard users and publishes the default tab, window, scroll, and search bindings in its overview. Advanced operation is documentation/configuration-led. It is the closest GUI terminal to docs-first, but its keyboard model is the product posture rather than one hidden gateway to an otherwise visible workspace manager. [Source](https://sw.kovidgoyal.net/kitty/overview/) |
+| Terminal.app and iTerm2 — **documented, not observed** | Standard macOS menus, tab/window controls, profile windows, and preferences expose the primary objects; shortcuts accelerate visible commands. iTerm2 can show the profiles window at startup. [Sources](https://support.apple.com/guide/terminal/use-profiles-to-change-the-look-of-terminal-windows-trml107/mac), [iTerm2 profiles](https://iterm2.com/documentation-preferences-profiles-general.html) |
+
+**F-16 — Noren is a discoverability outlier among GUI workspace tools, though
+not among all keyboard-first terminal software.** tmux and kitty show that a
+docs-first posture can be deliberate. Noren's mismatch is that its sidebar
+looks product-like while the only command surface for creating or closing a
+session is behind an undisclosed key. Clickable rows partially cover selection
+and launch, but do not reveal that command surface. The palette is recoverable
+only after the user already knows how to recover it. For the yes/no product decision:
+**discoverability outlier = yes**.
+
+## Legibility at normal viewing distance
+
+Noren's printable text uses hand-authored 5×7 bitmaps. Each lit bit becomes a
+2×2 physical-pixel square, so ordinary text has a maximum 10×14-pixel ink
+envelope inside a 10×20-pixel cell, with a fixed three-pixel top inset. The
+bitmap is not anti-aliased or shaped. Increasing configured cell width or
+height increases the grid spacing but leaves ordinary text at the same 2×2
+pixel scale; only box-drawing glyphs stretch to the whole cell. Printable
+ASCII, Latin-1, and Box Drawing have bitmaps. Other Unicode, including CJK and
+emoji, becomes a visible replacement glyph even though cell width remains
+correct.
+
+On a common 2× Retina surface, the default cell corresponds to roughly 5×10
+logical points and the maximum text ink to 5×7 logical points. The comparison
+set normally starts around an 11–13-point real font and lets the rasterizer use
+the display scale. At ordinary laptop distance, Noren's short ASCII is
+decipherable, but visibly stair-stepped and materially smaller in apparent ink
+height. A prompt using Nerd Font symbols, emoji, Japanese, Chinese, or Korean
+does not merely look worse; its distinguishing characters collapse to the same
+replacement form.
+
+| Product | Documented text baseline — **not observed** |
+| --- | --- |
+| cmux | Uses Ghostty's font stack; its own configuration example uses SF Mono 13 for terminal text and a separately configurable 14-point sidebar font. [Source](https://cmux.com/docs/configuration) |
+| Terminal.app | Uses a selected macOS font, typeface, and point size with optional font smoothing. [Source](https://support.apple.com/guide/terminal/change-profiles-text-settings-trmltxt/mac) |
+| iTerm2 | Uses real primary and non-ASCII fonts, anti-aliasing, ligatures, fallback, bold/italic variants, and configurable point sizes. [Source](https://iterm2.com/documentation-preferences-profiles-text.html) |
+| WezTerm | Bundles JetBrains Mono, Symbols Nerd Font, and Noto Color Emoji, with font fallback, shaping, hinting, rasterizer, anti-aliasing, line-height, and point-size controls. [Source](https://wezterm.org/config/fonts.html) |
+| Alacritty | The macOS default is Menlo at 11.25 points; family, style, size, offset, and glyph offset are configurable. [Source](https://github.com/alacritty/alacritty/blob/master/extra/man/alacritty.5.scd) |
+| kitty | Defaults to an 11-point font, supports separate regular/bold/italic faces and Unicode-range fallbacks, and provides an on-screen picker with rendered previews. [Sources](https://sw.kovidgoyal.net/kitty/conf.html), [font picker](https://sw.kovidgoyal.net/kitty/kittens/choose-fonts/) |
+| Ghostty | Embeds JetBrains Mono as a usable zero-config default and resolves configured font families, styles, fallbacks, and color emoji at a point size appropriate to the display. [Sources](https://ghostty.org/docs/config), [reference](https://ghostty.org/docs/config/reference) |
+| Warp | Defaults to Hack and exposes font family, weight, size, line height, stroke treatment, minimum contrast, and ligatures in Settings. [Source](https://docs.warp.dev/terminal/appearance/text-fonts-cursor/) |
+| tmux and Zellij | Render through the host emulator's chosen font. Their text UI therefore inherits Terminal.app/iTerm2/WezTerm/kitty/Ghostty-class glyph coverage rather than imposing a 5×7 raster. |
+
+**F-17 — The legibility gap is a rendering-generation gap, not a font-choice
+preference.** Peers rasterize point-sized fonts with anti-aliasing, shaping,
+styles, fallback, and Unicode coverage. Noren draws a fixed 10×14 physical-pixel
+bitmap envelope, cannot enlarge normal glyph ink through its cell-size setting,
+and substitutes most Unicode. The result reads as a proof-of-concept at first
+glance and becomes functionally unreadable for common international or
+symbol-rich terminal output.
+
+## Where Noren is better
+
+The following are present advantages, not promises:
+
+1. **Cross-kind pre-launch context.** No documented default comparator in this
+   set puts configured projects, discovered worktrees, SSH aliases, agent
+   commands, and live/restored terminal sessions into one continuously visible
+   launch surface. WezTerm combines several runtime/launch categories in a
+   modal launcher and cmux has alternate/custom views, but Noren's five-kind
+   outer catalog is the more direct statement of external context.
+2. **SSH source attribution.** Noren tells the user which bounded config source
+   supplied a selected alias without exposing the HOME prefix, and distinguishes
+   literal aliases from unlistable wildcard rules. cmux reads SSH aliases,
+   WezTerm can enumerate SSH hosts, and iTerm2 profiles can launch SSH, but none
+   of their cited documentation describes equivalent per-alias source-file
+   provenance.
+3. **Honest partial and failure state.** Caps, wildcard omissions, unreadable
+   configuration, missing roots, offline resources, and launch failure become
+   explicit state or diagnostics rather than silent absence. That is unusually
+   careful for preview UI and helps a user distinguish "not configured," "not
+   running," and "could not run."
+4. **One layout authority.** ADR 0003 avoids a Noren tab/pane tree fighting the
+   nested multiplexer. cmux's native panes are richer on screen, but Noren's
+   boundary is conceptually cleaner for a product explicitly built around
+   Zellij—once the user has learned the boundary.
+
+**F-18 — Noren's strongest differentiation is provenance-aware external
+context, not terminal chrome.** The mixed pre-launch catalog, SSH source
+attribution, explicit partial/offline/failure states, and non-duplicated Zellij
+layout ownership are all defensible advantages. They do not offset the basic
+feedback gaps, but they are the reasons the preview is worth making legible.
+
+## Gap ranking by time to notice
+
+This ordering is intentionally **not severity order**. It predicts the first
+session: the trigger that exposes a gap, and which prior-product muscle memory
+makes it obvious.
+
+| Notice rank | Gap | First ordinary trigger | Who notices fastest | Likely first-session reading |
+| ---: | --- | --- | --- | --- |
+| 1 | No visible cursor (F-13) | Looking at the first prompt or pressing the first key: seconds | Users from every terminal, especially shell/REPL and TUI users | "Input or focus is broken." This is the top gap by time to notice. |
+| 2 | Fixed 5×7 bitmap and replacement Unicode (F-17) | Reading the initial prompt; immediate for CJK, emoji, or Nerd Font prompts | Everyone; users from Ghostty, kitty, WezTerm, iTerm2, and Warp notice the rendering regression most sharply | "This is a renderer prototype, not yet a daily terminal." |
+| 3 | Hidden `Super+p` primary gateway (F-16) | First attempt to create or close a session, or to look for all workspace commands: usually under a minute | cmux, VS Code, Warp, WezTerm, Terminal.app, and iTerm2 users who scan visible controls/menus | "I can select rows, but I do not know how to manage the workspace." |
+| 4 | Zellij ownership is not communicated (F-06) | First attempt to make a tab or split | cmux, iTerm2, WezTerm, kitty, and tmux users; Zellij users understand only after starting Zellij themselves | "Tabs/panes are missing," even though their omission is intentional. |
+| 5 | Six-character resource identity and fixed 16-column clipping (F-02/F-04) | First launch with realistic project/host/agent names or several worktrees | cmux and VS Code users with populated sidebars; SSH users with similarly prefixed aliases | "I cannot tell my resources apart." |
+| 6 | Invisible selection (F-15) | First drag or `Cmd+A`, then copy | Users from every terminal; log/SSH users reach it quickly | "Did it select anything, and what will I copy?" |
+| 7 | No terminal scrollback navigation or position (F-14) | First command whose output exceeds the pane | Developers running builds/tests and users arriving from kitty, Warp, iTerm2, or tmux copy mode | "Earlier output is gone," despite being retained internally. |
+| 8 | No unread/progress/attention routing (F-05) | First background agent, build, or remote task completing out of view | cmux and Warp users, then multi-session users generally | "The sidebar lists things but does not tell me where to look." |
+
+### Ranked inventories
+
+- **Missing conventions by ordinary-work cost:** cursor → scrollback
+  navigation/position → selection highlight.
+- **cmux-specific gaps:** progressive disclosure for row identity → grouping
+  and hierarchy → activity/unread/progress state → visible row actions →
+  search/reorder/alternate views → a visible Zellij handoff.
+- **Noren-over-cmux advantages:** one heterogeneous pre-launch catalog → SSH
+  source provenance → explicit partial/offline/failure state → no duplicated
+  pane/layout authority.
+
+## Bottom line
+
+Noren's sidebar model is not a smaller cmux sidebar. It is a different and, in
+some ways, better outer-resource inventory. Yet the preview asks users to infer
+that distinction through clipped labels and a hidden palette while withholding
+the three feedback loops that make terminal interaction trustworthy. The
+first-session abandonment predictor is therefore not missing cmux pane parity;
+it is the absent cursor, followed immediately by bitmap legibility and the
+undisclosed route into workspace management.
+
+**Total findings: 18 (F-01 through F-18).**
