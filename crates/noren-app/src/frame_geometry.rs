@@ -1,6 +1,8 @@
 //! Pure calculations shared by frame sizing and pointer hit testing.
 
-use crate::{NorenApp, renderer};
+use crate::NorenApp;
+#[cfg(test)]
+use crate::renderer;
 use noren_app::MAX_RENDER_COLS;
 
 impl NorenApp {
@@ -33,8 +35,16 @@ impl NorenApp {
 /// otherwise columns are clipped invisibly. `renderer::glyph_vertices` applies
 /// the identical formula independently; the sidebar geometry test pins that the
 /// two sites agree.
+#[cfg(test)]
 pub(super) fn terminal_cols(window_cols: u16) -> u16 {
-    let sidebar = u16::try_from(renderer::SIDEBAR_COLS).unwrap_or(u16::MAX);
+    terminal_cols_at_width(window_cols, renderer::SIDEBAR_COLS)
+}
+
+/// Configured-width form used by the running application. Validation keeps
+/// `sidebar_columns` below `MAX_RENDER_COLS`; the saturating conversion keeps
+/// this pure seam total for direct tests as well.
+pub(super) fn terminal_cols_at_width(window_cols: u16, sidebar_columns: usize) -> u16 {
+    let sidebar = u16::try_from(sidebar_columns).unwrap_or(u16::MAX);
     let budget = MAX_RENDER_COLS.saturating_sub(sidebar).max(1);
     window_cols.saturating_sub(sidebar).clamp(1, budget)
 }
@@ -52,8 +62,15 @@ pub(super) fn pixel_row_index(pixel: f64, cell_size: u32) -> Option<usize> {
 /// Pixel width of the sidebar's left strip: `SIDEBAR_COLS` cell columns. The
 /// terminal is drawn to the right of this edge, so a click at exactly this x is
 /// the first terminal column.
+#[cfg(test)]
 pub(super) fn sidebar_pixel_width(cell_width: u32) -> f64 {
-    f64::from((renderer::SIDEBAR_COLS as u32) * cell_width)
+    sidebar_pixel_width_at_width(cell_width, renderer::SIDEBAR_COLS)
+}
+
+/// Configured-width form used by sidebar hit testing.
+pub(super) fn sidebar_pixel_width_at_width(cell_width: u32, sidebar_columns: usize) -> f64 {
+    let columns = u32::try_from(sidebar_columns).unwrap_or(u32::MAX);
+    f64::from(columns.saturating_mul(cell_width))
 }
 
 /// Terminal cell column under pixel x, or `None` when the click lands in the
@@ -61,12 +78,23 @@ pub(super) fn sidebar_pixel_width(cell_width: u32) -> f64 {
 /// boundary is exclusive: x exactly at [`sidebar_pixel_width`] is the first
 /// terminal column and maps to cell 0; anything strictly left of it is the
 /// sidebar and is rejected.
+#[cfg(test)]
 pub(super) fn terminal_column_at(
     pixel_x: f64,
     terminal_cols: u16,
     cell_width: u32,
 ) -> Option<usize> {
-    let edge = sidebar_pixel_width(cell_width);
+    terminal_column_at_width(pixel_x, terminal_cols, cell_width, renderer::SIDEBAR_COLS)
+}
+
+/// Configured-width form used by terminal selection and mouse reporting.
+pub(super) fn terminal_column_at_width(
+    pixel_x: f64,
+    terminal_cols: u16,
+    cell_width: u32,
+    sidebar_columns: usize,
+) -> Option<usize> {
+    let edge = sidebar_pixel_width_at_width(cell_width, sidebar_columns);
     if !pixel_x.is_finite() || pixel_x < edge {
         return None;
     }

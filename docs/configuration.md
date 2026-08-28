@@ -48,6 +48,23 @@ grid (`MAX_RENDER_ROWS` by `MAX_RENDER_COLS`, 60 by 160), which is far inside
 the terminal foundation's `MAX_SCREEN_CELLS` bound, so no configuration value
 can push the grid past that ceiling.
 
+### `[sidebar]`
+
+Controls how many cell columns the sidebar occupies. This is an optional
+workspace preference: the default 16-column row already shows a distinct
+lifecycle marker in its final cell, without configuration.
+
+| Key | Type | Default | Accepted range | Meaning |
+| --- | --- | --- | --- | --- |
+| `columns` | integer | `16` | `8..=159` | Sidebar width in terminal cell columns. |
+
+Session identity text uses the available cells and truncates with `...` when
+necessary; the lifecycle cell is always reserved and never truncated. The
+upper bound is one less than `MAX_RENDER_COLS`, so even the widest configured
+sidebar leaves one drawable terminal column. Unknown keys, wrong types, and
+out-of-range widths are hard errors under the same closed-schema rules as the
+other tables.
+
 ### `[keys]`
 
 Configurable key chords for workspace chrome. Every key is optional; an
@@ -316,6 +333,9 @@ prints it.
 [font]
 cell_width = 12
 cell_height = 24
+
+[sidebar]
+columns = 24
 
 [keys]
 palette_open = "super+k"

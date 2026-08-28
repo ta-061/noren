@@ -11,8 +11,8 @@ use noren_app::session::{
     SessionDescriptor, SessionId, SessionKind, SessionRegistry, SessionStatus,
 };
 use noren_app::sidebar::{
-    EMPTY_SIDEBAR_MESSAGE, EmptyState, EntryKind, SessionViewport, SidebarEntry, SidebarRow,
-    SidebarView, fixtures,
+    EMPTY_SIDEBAR_MESSAGE, EmptyState, EntryKind, SessionLifecycle, SessionViewport, SidebarEntry,
+    SidebarRow, SidebarView, fixtures,
 };
 
 fn fixture_ids(registry: &SessionRegistry) -> Vec<SessionId> {
@@ -235,6 +235,42 @@ fn session_rows_report_observed_status() {
             Some("local · running"),
             Some("ssh · starting")
         ]
+    );
+    assert_eq!(
+        session_rows
+            .iter()
+            .map(|row| row.lifecycle())
+            .collect::<Vec<_>>(),
+        [
+            Some(SessionLifecycle::Failed),
+            Some(SessionLifecycle::Running),
+            Some(SessionLifecycle::Starting),
+        ]
+    );
+}
+
+#[test]
+fn exited_and_restored_rows_share_the_truthful_non_running_marker_class() {
+    let mut registry = SessionRegistry::new();
+    let exited = registry.create(SessionKind::Local);
+    registry
+        .observe(exited, SessionStatus::Exited { code: Some(0) })
+        .expect("starting may advance to exited");
+    let _restored = registry.restore(SessionKind::Local);
+    let view = SidebarView::build(
+        &registry
+            .sessions()
+            .into_iter()
+            .map(SidebarEntry::Session)
+            .collect::<Vec<_>>(),
+        None,
+    );
+
+    assert_eq!(view.rows().len(), 2);
+    assert!(
+        view.rows()
+            .iter()
+            .all(|row| row.lifecycle() == Some(SessionLifecycle::Exited))
     );
 }
 

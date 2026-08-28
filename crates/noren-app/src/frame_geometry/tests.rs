@@ -28,13 +28,18 @@ fn pixel_row_index_truncates_and_rejects_non_finite() {
 /// arbitrary vertices would count that bleed as a drawn column and over-
 /// count by one. Each rect is emitted as a 6-vertex fan whose first vertex
 /// is its top-left corner, so the left edges are read from every 6th group.
-fn rendered_terminal_columns(vertices: &[renderer::Vertex], width: u32, cell_width: u32) -> usize {
+fn rendered_terminal_columns(
+    vertices: &[renderer::Vertex],
+    width: u32,
+    cell_width: u32,
+    sidebar_columns: usize,
+) -> usize {
     let rect_lefts: Vec<f32> = vertices
         .chunks_exact(6)
         .map(|rect| rect[0].position[0])
         .collect();
     let mut drawn = 0;
-    for col in renderer::SIDEBAR_COLS..usize::from(MAX_RENDER_COLS) {
+    for col in sidebar_columns..usize::from(MAX_RENDER_COLS) {
         let edge = ((col as u32) * cell_width) as f32 / width as f32 * 2.0 - 1.0;
         if rect_lefts.iter().any(|left| (left - edge).abs() < 1e-5) {
             drawn += 1;
@@ -53,12 +58,16 @@ fn rendered_terminal_columns(vertices: &[renderer::Vertex], width: u32, cell_wid
 /// value; instead this exercises the three real consumers and is shared by
 /// the swept agreement test below across every regime where they can drift
 /// apart — including non-default cell sizes.
-fn assert_three_consumers_agree_at(width: u32, metrics: CellMetrics) {
+fn assert_three_consumers_agree_at(
+    width: u32,
+    metrics: CellMetrics,
+    sidebar_columns: usize,
+) {
     let height = 600_u32;
     let cell_width = metrics.width();
     let cell_height = metrics.height();
     let window_cols = u16::try_from(width / cell_width).expect("fits in u16");
-    let cols = terminal_cols(window_cols);
+    let cols = terminal_cols_at_width(window_cols, sidebar_columns);
 
     // Consumer 1: the terminal state stores the sidebar-adjusted width.
     let rows = u16::try_from(height / cell_height).expect("fits in u16");
@@ -96,12 +105,13 @@ fn assert_three_consumers_agree_at(width: u32, metrics: CellMetrics) {
             width,
             height,
             metrics,
-        ),
+        )
+        .with_sidebar_columns(sidebar_columns),
         Some(&snapshot),
         Some(sidebar.as_slice()),
         None,
     );
-    let drawn = rendered_terminal_columns(&vertices, width, cell_width);
+    let drawn = rendered_terminal_columns(&vertices, width, cell_width, sidebar_columns);
     assert_eq!(
         drawn,
         usize::from(cols),
@@ -150,13 +160,23 @@ fn assert_three_consumers_agree_at(width: u32, metrics: CellMetrics) {
 fn terminal_cols_pty_winsize_and_renderer_agree_across_the_width_range() {
     let poc = GridGeometry::poc().cell_metrics();
     for width in [80_u32, 900, 1600, 2000] {
-        assert_three_consumers_agree_at(width, poc);
+        assert_three_consumers_agree_at(width, poc, renderer::SIDEBAR_COLS);
     }
     let big = GridGeometry::with_cells(20, 40)
         .expect("valid geometry")
         .cell_metrics();
     for width in [160_u32, 1800, 3200, 4000] {
-        assert_three_consumers_agree_at(width, big);
+        assert_three_consumers_agree_at(width, big, renderer::SIDEBAR_COLS);
+    }
+}
+
+#[test]
+fn configured_sidebar_width_reaches_terminal_pty_and_renderer_together() {
+    let metrics = GridGeometry::poc().cell_metrics();
+    for sidebar_columns in [8_usize, 24, 80, 159] {
+        for width in [900_u32, 1600, 2000] {
+            assert_three_consumers_agree_at(width, metrics, sidebar_columns);
+        }
     }
 }
 
@@ -246,7 +266,12 @@ fn terminal_cols_and_renderer_floor_at_one_below_the_sidebar() {
         Some(sidebar.as_slice()),
         None,
     );
-    let drawn = rendered_terminal_columns(&vertices, width, cell_width);
+    let drawn = rendered_terminal_columns(
+        &vertices,
+        width,
+        cell_width,
+        renderer::SIDEBAR_COLS,
+    );
     assert_eq!(
         drawn,
         usize::from(cols),

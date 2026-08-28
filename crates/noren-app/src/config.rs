@@ -28,6 +28,12 @@
 //! `Super+Escape` exit leader) is [`ConfigError::UnclaimableChord`] rather
 //! than a silently dead binding.
 //!
+//! The `[sidebar]` table controls the sidebar width in cell columns. Its
+//! absence keeps the shipped 16-column layout, where lifecycle markers are
+//! already visible; configuration is an additive workspace preference, not a
+//! prerequisite for seeing state. Bounds preserve the compact row grammar and
+//! at least one drawable terminal column.
+//!
 //! The `[ui]` table controls optional application chrome. The palette hint is
 //! visible by default so an unconfigured first run remains discoverable; the
 //! sole setting can turn that hint off, but configuration is never required
@@ -81,6 +87,7 @@ use crate::passthrough::{
     CLAIM_ID_PALETTE, Chord, ChordError, ChordSeq, KeyCode, Modifiers, PassthroughAction,
     PassthroughClaim, PassthroughPolicy, default_exit_claim,
 };
+use crate::sidebar_text::{DEFAULT_SIDEBAR_COLUMNS, MAX_SIDEBAR_COLUMNS, MIN_SIDEBAR_COLUMNS};
 use crate::theme::{Theme, ThemeName};
 use crate::{POC_CELL_HEIGHT, POC_CELL_WIDTH};
 use std::env;
@@ -176,6 +183,34 @@ impl FontConfig {
     #[must_use]
     pub const fn cell_height(self) -> u32 {
         self.cell_height
+    }
+}
+
+/// Width of the application-owned sidebar in terminal cell columns.
+///
+/// The default remains the shipped 16 columns. Configuration is additive:
+/// lifecycle markers are already visible at that default, while a user may
+/// allocate more or less workspace without patching source. Validation keeps
+/// enough room for the compact row grammar and always leaves the renderer at
+/// least one terminal column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SidebarConfig {
+    columns: usize,
+}
+
+impl Default for SidebarConfig {
+    fn default() -> Self {
+        Self {
+            columns: DEFAULT_SIDEBAR_COLUMNS,
+        }
+    }
+}
+
+impl SidebarConfig {
+    /// Sidebar width in cell columns; defaults to 16.
+    #[must_use]
+    pub const fn columns(self) -> usize {
+        self.columns
     }
 }
 
@@ -449,6 +484,7 @@ impl ProjectConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct AppConfig {
     font: FontConfig,
+    sidebar: SidebarConfig,
     keys: KeymapConfig,
     ui: UiConfig,
     theme: ThemeConfig,
@@ -462,6 +498,12 @@ impl AppConfig {
     #[must_use]
     pub const fn font(&self) -> FontConfig {
         self.font
+    }
+
+    /// Sidebar geometry settings.
+    #[must_use]
+    pub const fn sidebar(&self) -> SidebarConfig {
+        self.sidebar
     }
 
     /// Workspace key chord settings.
@@ -556,6 +598,7 @@ impl AppConfig {
                         .ok_or_else(|| ConfigError::WrongType { key: clip(key) })?;
                     match key {
                         "font" => parse_font(table, &mut config.font)?,
+                        "sidebar" => parse_sidebar(table, &mut config.sidebar)?,
                         "keys" => parse_keys(table, &mut config.keys)?,
                         "ui" => parse_ui(table, &mut config.ui)?,
                         "theme" => parse_theme(table, &mut config.theme)?,
@@ -710,6 +753,19 @@ fn parse_font(table: &dyn TableLike, font: &mut FontConfig) -> Result<(), Config
                 font.cell_height = integer_in_range(key, item, min_height, max_edge)?
                     .try_into()
                     .expect("range-checked value fits u32");
+            }
+            _ => return Err(ConfigError::UnknownKey(clip(key))),
+        }
+    }
+    Ok(())
+}
+
+fn parse_sidebar(table: &dyn TableLike, sidebar: &mut SidebarConfig) -> Result<(), ConfigError> {
+    for (key, item) in table.iter() {
+        match key {
+            "columns" => {
+                sidebar.columns =
+                    integer_in_range(key, item, MIN_SIDEBAR_COLUMNS, MAX_SIDEBAR_COLUMNS)?;
             }
             _ => return Err(ConfigError::UnknownKey(clip(key))),
         }
@@ -1561,6 +1617,7 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(config.font().cell_width(), POC_CELL_WIDTH);
         assert_eq!(config.font().cell_height(), POC_CELL_HEIGHT);
+        assert_eq!(config.sidebar().columns(), DEFAULT_SIDEBAR_COLUMNS);
         assert_eq!(config, AppConfig::default());
     }
 
@@ -1597,6 +1654,46 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_columns_are_bounded_configurable_and_defaulted() {
+        assert_eq!(SidebarConfig::default().columns(), 16);
+        for columns in [MIN_SIDEBAR_COLUMNS, 24, MAX_SIDEBAR_COLUMNS] {
+            let config = AppConfig::parse(&format!("[sidebar]\ncolumns = {columns}\n"))
+                .expect("bounded sidebar width is valid");
+            assert_eq!(config.sidebar().columns(), columns);
+            assert_eq!(config.font(), FontConfig::default());
+        }
+    }
+
+    #[test]
+    fn sidebar_columns_reject_unusable_values_types_and_unknown_keys() {
+        for value in [
+            (MIN_SIDEBAR_COLUMNS - 1).to_string(),
+            (MAX_SIDEBAR_COLUMNS + 1).to_string(),
+            "0".to_string(),
+            "-1".to_string(),
+            "9223372036854775807".to_string(),
+        ] {
+            assert!(
+                matches!(
+                    AppConfig::parse(&format!("[sidebar]\ncolumns = {value}\n")),
+                    Err(ConfigError::OutOfRange { .. })
+                ),
+                "sidebar columns {value} must be rejected"
+            );
+        }
+        assert_eq!(
+            AppConfig::parse("[sidebar]\ncolumns = \"wide\"\n"),
+            Err(ConfigError::WrongType {
+                key: "columns".to_owned()
+            })
+        );
+        assert_eq!(
+            AppConfig::parse("[sidebar]\nwidth = 24\n"),
+            Err(ConfigError::UnknownKey("width".to_owned()))
+        );
+    }
+
+    #[test]
     fn the_terminal_table_is_rejected_until_the_cap_is_enforceable() {
         // `scrollback_lines` cannot be honored yet (the terminal foundation
         // retains a fixed hard cap), so accepting it would be a silent no-op.
@@ -1614,10 +1711,11 @@ mod tests {
 
     #[test]
     fn every_supported_key_applies_together() {
-        let text = "[font]\ncell_width = 11\ncell_height = 22\n";
+        let text = "[font]\ncell_width = 11\ncell_height = 22\n\n[sidebar]\ncolumns = 24\n";
         let config = AppConfig::parse(text).expect("valid configuration");
         assert_eq!(config.font().cell_width(), 11);
         assert_eq!(config.font().cell_height(), 22);
+        assert_eq!(config.sidebar().columns(), 24);
     }
 
     #[test]

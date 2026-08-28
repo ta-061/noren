@@ -91,6 +91,9 @@ use std::process::Command;
 
 use noren_app::config::AppConfig;
 use noren_app::cursor::CursorShape;
+use noren_app::session::{SessionKind, SessionRegistry, SessionStatus};
+use noren_app::sidebar::{EntryKind, SidebarEntry, SidebarView};
+use noren_app::sidebar_text::{SidebarTextRow, visible_sidebar_text_rows_at_width};
 use noren_app::theme::{DARK, HIGH_CONTRAST, LIGHT, Theme, contrast_ratio};
 use noren_app::ui::{empty_workspace_recovery, palette_hint};
 use noren_app::{
@@ -99,7 +102,7 @@ use noren_app::{
 };
 use noren_terminal::{TerminalSnapshot, TerminalState};
 use renderer_capture::renderer_source::{
-    CLEAR_COLOR, CursorStyle, FrameChrome, SIDEBAR_COLS, Target,
+    CLEAR_COLOR, CursorStyle, FrameChrome, SIDEBAR_COLS, Target, glyph_vertices_for_sidebar_rows,
 };
 use renderer_capture::{CaptureError, CapturedFrame, OffscreenRenderer};
 
@@ -2355,6 +2358,254 @@ fn render_with_sidebar(
         Some(sidebar),
         None,
     )
+}
+
+/// Build one real session row through the domain model and production text
+/// projection. No process is involved: the registry records an explicit
+/// observation and the view projects it into the same line the app renders.
+fn lifecycle_sidebar_row(status: SessionStatus) -> SidebarTextRow {
+    let mut registry = SessionRegistry::new();
+    let id = registry.create(SessionKind::Local);
+    if status != SessionStatus::Starting {
+        registry
+            .observe(id, status)
+            .expect("fixture lifecycle advances monotonically");
+    }
+    let entries = [SidebarEntry::Session(
+        registry.get(id).expect("fixture id remains live"),
+    )];
+    let view = SidebarView::build(&entries, Some(id));
+    visible_sidebar_text_rows_at_width(&view, 0, 1, SIDEBAR_COLS)
+        .into_iter()
+        .next()
+        .expect("one session produces one sidebar row")
+}
+
+fn lifecycle_cases() -> [(SessionStatus, char, usize, [u8; 7]); 4] {
+    [
+        (
+            SessionStatus::Starting,
+            '⌛',
+            3,
+            [31, 27, 14, 4, 14, 27, 31],
+        ),
+        (SessionStatus::Running, '▶', 2, [8, 12, 14, 15, 14, 12, 8]),
+        (
+            SessionStatus::Exited { code: Some(0) },
+            '■',
+            8,
+            [0, 14, 14, 14, 14, 14, 0],
+        ),
+        (
+            SessionStatus::Failed {
+                reason: "frame fixture".to_string(),
+            },
+            '✕',
+            1,
+            [17, 10, 4, 14, 4, 10, 17],
+        ),
+    ]
+}
+
+/// Rectangle fingerprint and colours emitted inside one sidebar cell by the
+/// production vertex path. This is a frame oracle that needs no GPU adapter:
+/// the same vertices feed the shipped shader and the offscreen pixel capture.
+type GlyphRect = (u32, u32, u32, u32);
+type SidebarCellVertexOracle = (Vec<GlyphRect>, Vec<[f32; 3]>);
+
+/// Reconstruct the renderer's 5x7 bitmap from the rectangles emitted inside
+/// one text cell. Keeping this decoder in the independent frame oracle makes
+/// the expected row registration separate from the renderer's glyph table:
+/// shifting a marker down while preserving its shape must fail here.
+fn glyph_rows_from_rectangles(rectangles: &[GlyphRect]) -> [u8; 7] {
+    const GLYPH_SCALE: u32 = 2;
+    const GLYPH_TOP: u32 = 3;
+
+    let mut rows = [0_u8; 7];
+    for &(left, top, width, height) in rectangles {
+        assert_eq!((width, height), (GLYPH_SCALE, GLYPH_SCALE));
+        assert_eq!(left % GLYPH_SCALE, 0, "glyph pixel is off the x grid");
+        assert!(top >= GLYPH_TOP, "glyph pixel is above the text inset");
+        assert_eq!(
+            (top - GLYPH_TOP) % GLYPH_SCALE,
+            0,
+            "glyph pixel is off the y grid"
+        );
+
+        let glyph_x = left / GLYPH_SCALE;
+        let glyph_y = (top - GLYPH_TOP) / GLYPH_SCALE;
+        assert!(glyph_x < 5, "glyph pixel exceeds the 5-column bitmap");
+        assert!(glyph_y < 7, "glyph pixel exceeds the 7-row bitmap");
+        rows[glyph_y as usize] |= 1 << (4 - glyph_x);
+    }
+    rows
+}
+
+fn sidebar_cell_vertex_oracle(
+    row: &SidebarTextRow,
+    theme: &Theme,
+    column: u32,
+) -> SidebarCellVertexOracle {
+    let width = SIDEBAR_COLS as u32 * CELL_WIDTH;
+    let height = CELL_HEIGHT;
+    let vertices = glyph_vertices_for_sidebar_rows(
+        Target::new(theme, width, height, poc_metrics()),
+        None,
+        Some(std::slice::from_ref(row)),
+        None,
+    );
+    let pixel_x = |ndc: f32| (((ndc + 1.0) * 0.5 * width as f32).round()) as u32;
+    let pixel_y = |ndc: f32| (((1.0 - ndc) * 0.5 * height as f32).round()) as u32;
+    let mut signature = Vec::new();
+    let mut colors = Vec::new();
+    for rectangle in vertices.chunks_exact(6) {
+        let left = pixel_x(rectangle[0].position[0]);
+        if left / CELL_WIDTH != column {
+            continue;
+        }
+        let top = pixel_y(rectangle[0].position[1]);
+        let right = pixel_x(rectangle[2].position[0]);
+        let bottom = pixel_y(rectangle[2].position[1]);
+        signature.push((left - column * CELL_WIDTH, top, right - left, bottom - top));
+        colors.push(rectangle[0].color);
+    }
+    (signature, colors)
+}
+
+#[test]
+fn session_lifecycle_markers_are_identifiable_and_on_row_at_16_columns() {
+    let mut signatures = Vec::new();
+    for (status, expected_marker, expected_ansi, expected_rows) in lifecycle_cases() {
+        let row = lifecycle_sidebar_row(status);
+        let line = row.text();
+        assert_eq!(
+            line.chars().count(),
+            SIDEBAR_COLS,
+            "the compact session row must end at the shipped sidebar edge: {line:?}"
+        );
+        assert_eq!(
+            line.chars().nth(SIDEBAR_COLS - 1),
+            Some(expected_marker),
+            "each lifecycle owns an identifiable literal in visible column 16"
+        );
+
+        let (signature, _) = sidebar_cell_vertex_oracle(
+            &row,
+            &DARK,
+            u32::try_from(SIDEBAR_COLS - 1).expect("sidebar width fits u32"),
+        );
+        assert!(
+            !signature.is_empty(),
+            "marker {expected_marker:?} emitted no geometry in visible column 16"
+        );
+        assert!(
+            !signatures.contains(&signature),
+            "marker {expected_marker:?} rendered the same shape as another lifecycle"
+        );
+        assert_eq!(
+            glyph_rows_from_rectangles(&signature),
+            expected_rows,
+            "marker {expected_marker:?} moved within its cell"
+        );
+        signatures.push(signature);
+
+        for theme in [DARK, LIGHT, HIGH_CONTRAST] {
+            let (_, colors) = sidebar_cell_vertex_oracle(
+                &row,
+                &theme,
+                u32::try_from(SIDEBAR_COLS - 1).expect("sidebar width fits u32"),
+            );
+            let expected = theme.ansi()[expected_ansi].map(|channel| f32::from(channel) / 255.0);
+            assert!(
+                colors.iter().all(|color| *color == expected),
+                "marker {expected_marker:?} did not use ANSI slot {expected_ansi} on theme \
+                 background {:?}: {colors:?}",
+                theme.background_u8()
+            );
+            assert!(
+                contrast_ratio(theme.ansi()[expected_ansi], theme.background_u8()) >= 4.5,
+                "marker {expected_marker:?} fails WCAG AA on {:?}",
+                theme.background_u8()
+            );
+        }
+    }
+    assert_eq!(
+        signatures.len(),
+        4,
+        "all four lifecycle shapes were checked"
+    );
+}
+
+#[test]
+fn session_lifecycle_markers_reach_distinct_frame_pixels_at_16_columns() {
+    let Some(renderer) =
+        renderer_or_skip("session_lifecycle_markers_reach_distinct_frame_pixels_at_16_columns")
+    else {
+        return;
+    };
+    let width = SIDEBAR_COLS as u32 * CELL_WIDTH;
+    let marker_column = u32::try_from(SIDEBAR_COLS - 1).expect("sidebar width fits u32");
+    let mut patterns = Vec::new();
+    for (status, expected_marker, expected_ansi, _) in lifecycle_cases() {
+        let row = lifecycle_sidebar_row(status);
+        let frame = renderer.capture_sidebar_rows(
+            Target::new(&DARK, width, CELL_HEIGHT, poc_metrics()),
+            None,
+            Some(std::slice::from_ref(&row)),
+            None,
+        );
+        assert!(
+            cell_is_lit(&frame, 0, marker_column),
+            "marker {expected_marker:?} is not visible in column 16"
+        );
+        assert!(
+            colors_match(
+                cell_color(&frame, 0, marker_column),
+                DARK.ansi()[expected_ansi]
+            ),
+            "marker {expected_marker:?} pixel colour is not its semantic palette role"
+        );
+        let pattern = cell_pattern(&frame, 0, marker_column);
+        assert!(
+            !patterns.contains(&pattern),
+            "marker {expected_marker:?} has the same frame pixels as another lifecycle"
+        );
+        patterns.push(pattern);
+    }
+    assert_eq!(patterns.len(), 4, "all four rendered markers were checked");
+}
+
+#[test]
+fn project_name_ending_in_running_marker_keeps_default_vertex_color() {
+    let entries = [SidebarEntry::Project {
+        name: "aaaaaaaaaaaaa▶".to_string(),
+        root: "/project".to_string(),
+    }];
+    let view = SidebarView::build(&entries, None);
+    let rows = visible_sidebar_text_rows_at_width(&view, 0, 1, SIDEBAR_COLS);
+    let row = rows.first().expect("one project produces one sidebar row");
+    assert_eq!(row.kind(), Some(EntryKind::Project));
+    assert_eq!(
+        row.text().chars().nth(SIDEBAR_COLS - 1),
+        Some('▶'),
+        "fixture must truncate with the marker-shaped project character in column 16"
+    );
+
+    let (_, colors) = sidebar_cell_vertex_oracle(
+        row,
+        &DARK,
+        u32::try_from(SIDEBAR_COLS - 1).expect("sidebar width fits u32"),
+    );
+    let false_running_signal = DARK.ansi()[2].map(|channel| f32::from(channel) / 255.0);
+    assert_ne!(DARK.foreground(), false_running_signal);
+    assert!(
+        !colors.is_empty(),
+        "project's final glyph emitted no vertices"
+    );
+    assert!(
+        colors.iter().all(|color| *color == DARK.foreground()),
+        "project text borrowed the running-session colour: {colors:?}"
+    );
 }
 
 #[test]
