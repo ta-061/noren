@@ -1173,6 +1173,21 @@ type PtyParts = (
     Receiver<()>,
 );
 
+/// Wait for the reader's armed report within `budget`.
+///
+/// Any failure — the report not arriving in time ([`RecvTimeoutError::Timeout`])
+/// or the reader vanishing before reporting ([`RecvTimeoutError::Disconnected`])
+/// — is the same typed spawn error, because the arming rendezvous is part of
+/// the spawn contract: the child is only forked after this succeeds.
+fn wait_for_reader_armed(report: Receiver<()>, budget: Duration) -> Result<(), PtyError> {
+    match report.recv_timeout(budget) {
+        Ok(()) => Ok(()),
+        Err(_) => Err(PtyError::Backend {
+            operation: PtyOperation::SpawnThread,
+        }),
+    }
+}
+
 fn setup_pty(
     command: CommandBuilder,
     size: PtySize,
@@ -1212,11 +1227,7 @@ fn setup_pty(
         .name("noren-pty-reader".to_owned())
         .spawn(move || reader_main(reader, reader_events, reader_done_tx, armed_tx, closing))
         .map_err(|error| PtyError::io(PtyOperation::SpawnThread, &error))?;
-    armed_rx
-        .recv_timeout(READER_ARMED_BUDGET)
-        .map_err(|_| PtyError::Backend {
-            operation: PtyOperation::SpawnThread,
-        })?;
+    wait_for_reader_armed(armed_rx, READER_ARMED_BUDGET)?;
 
     let child = pair
         .slave
@@ -1957,6 +1968,50 @@ mod tests {
             ),
             "a missing program must fail the spawn, got {result:?}"
         );
+    }
+
+    /// The arming rendezvous failure is the typed
+    /// `Backend { SpawnThread }` error. A reader that never reports armed
+    /// within the budget is the failure `setup_pty` guards against before
+    /// forking the child; the branch is unreachable through the public API
+    /// in a bounded test (production's budget is five seconds and the armed
+    /// send is the reader's first statement, so only scheduler starvation
+    /// exercises it), so the wait itself is the unit under test: a live
+    /// channel that never arms, with a zero budget, is deterministic.
+    #[test]
+    fn reader_arming_timeout_is_the_typed_spawn_thread_error() {
+        let (armed_tx, armed_rx) = mpsc::sync_channel(1);
+        // Timeout shape: the sender is alive but never reports. The zero
+        // budget makes the deadline immediate; no send can race it because
+        // nothing in this test sends. The sender binding is deliberately
+        // held (not dropped) to the end of the scope: dropping it would
+        // turn this into the Disconnected case below.
+        let _held_sender = armed_tx;
+        assert_eq!(
+            wait_for_reader_armed(armed_rx, Duration::ZERO),
+            Err(PtyError::Backend {
+                operation: PtyOperation::SpawnThread
+            })
+        );
+        // Disconnected shape: a reader that dies before reporting arms the
+        // same typed refusal.
+        let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
+        drop(dropped_tx);
+        assert_eq!(
+            wait_for_reader_armed(dropped_rx, Duration::ZERO),
+            Err(PtyError::Backend {
+                operation: PtyOperation::SpawnThread
+            })
+        );
+    }
+
+    /// The armed report arriving in time is success — the shape every real
+    /// spawn takes.
+    #[test]
+    fn reader_arming_success_is_ok() {
+        let (armed_tx, armed_rx) = mpsc::sync_channel(1);
+        armed_tx.send(()).expect("report armed");
+        assert_eq!(wait_for_reader_armed(armed_rx, READER_ARMED_BUDGET), Ok(()));
     }
 
     #[test]
