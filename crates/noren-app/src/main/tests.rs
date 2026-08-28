@@ -1979,6 +1979,7 @@ fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_
             app.status,
             app.ssh_selection_status.as_deref(),
             app.worktree_diagnostic.as_deref(),
+            app.project_diagnostic.as_deref(),
             app.agent_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
@@ -2012,6 +2013,7 @@ fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_
         app.status,
         app.ssh_selection_status.as_deref(),
         app.worktree_diagnostic.as_deref(),
+        app.project_diagnostic.as_deref(),
         app.agent_diagnostic.as_deref(),
         app.ssh_diagnostic.as_deref(),
     );
@@ -2098,6 +2100,7 @@ fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_
             app.status,
             app.ssh_selection_status.as_deref(),
             app.worktree_diagnostic.as_deref(),
+            app.project_diagnostic.as_deref(),
             app.agent_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
@@ -2168,6 +2171,7 @@ fn selecting_an_ssh_row_keeps_a_pending_choice_and_never_a_registry_connection()
             app.status,
             app.ssh_selection_status.as_deref(),
             app.worktree_diagnostic.as_deref(),
+            app.project_diagnostic.as_deref(),
             app.agent_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
@@ -5414,6 +5418,7 @@ fn many_configured_agents_are_capped_and_the_omitted_count_is_reported() {
             app.status,
             app.ssh_selection_status.as_deref(),
             app.worktree_diagnostic.as_deref(),
+            app.project_diagnostic.as_deref(),
             app.agent_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
@@ -5719,4 +5724,322 @@ fn agent_commands_never_reach_debug_status_or_state_surfaces() {
         "the agent NAME is the persisted identity, like a worktree path: {text}"
     );
     cleanup_state_file(&path);
+}
+
+// ── Configured projects ([[projects]]) ──────────────────────────────────
+
+/// A synthetic `[[projects]]` configuration with one entry per root, each
+/// with a real temp directory so a row click can launch into it. The roots
+/// are canonicalized before they are written, so the configured text, the
+/// session's launch shape, and the child's own `pwd` answer all name the
+/// same directory (`std::env::temp_dir` on macOS is a symlink whose
+/// canonical form is what a shell reports).
+fn many_projects_config(roots: &[PathBuf]) -> AppConfig {
+    let mut text = String::new();
+    for (index, root) in roots.iter().enumerate() {
+        let canonical = std::fs::canonicalize(root).expect("canonicalize project root");
+        text.push_str(&format!(
+            "[[projects]]\nname = \"pr-{index:02}\"\nroot = \"{}\"\n",
+            canonical.display()
+        ));
+    }
+    AppConfig::parse(&text).expect("synthetic projects configuration parses")
+}
+
+/// Real directories for configured projects: a project row click launches a
+/// session rooted at the configured directory, so the directory must exist
+/// for the launch to succeed.
+fn project_directories(count: usize) -> Vec<PathBuf> {
+    (0..count)
+        .map(|index| {
+            let path = std::env::temp_dir().join(format!(
+                "noren-app-project-{}-{}-{index}",
+                std::process::id(),
+                WT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).expect("create project directory fixture");
+            path
+        })
+        .collect()
+}
+
+/// Configured projects appear as `EntryKind::Project` rows in configuration
+/// order with bounded labels — and are distinguishable at a glance from
+/// worktree rows shown beside them: a project row carries the fixed
+/// `PRJ-OFF` state prefix and a fixed state detail, while a worktree row
+/// shows its checkout's final path component and its branch. The row kinds
+/// are distinct discriminants, so they can never collide.
+#[test]
+fn configured_projects_appear_as_rows_distinguishable_from_worktrees() {
+    let roots = project_directories(2);
+    let config = many_projects_config(&roots);
+    let mut app = NorenApp::new(config);
+    // Worktree facts beside the project rows (pure parsing; no git child).
+    let records = git_worktree::parse_worktree_porcelain(
+        "worktree /srv/pr-main\nbranch refs/heads/pr-main\n\
+         \nworktree /srv/pr-linked\nbranch refs/heads/pr-linked\n",
+    )
+    .expect("synthetic porcelain parses");
+    app.workspace
+        .load_worktrees(WorktreeDiscovery::from_records(records));
+
+    let rows = app.workspace.sidebar().rows();
+    let kinds: Vec<EntryKind> = rows.iter().map(|row| row.kind()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            EntryKind::Project,
+            EntryKind::Project,
+            EntryKind::Worktree,
+            EntryKind::Worktree,
+        ],
+        "project rows render before worktree rows, kinds never colliding"
+    );
+    // Configuration order is preserved; the label is the shared
+    // state-prefix + name shape; the detail is a fixed state, never the
+    // configured root path.
+    assert_eq!(rows[0].label(), "PRJ-OFF pr-00");
+    assert_eq!(rows[0].detail(), Some("not running"));
+    assert_eq!(rows[1].label(), "PRJ-OFF pr-01");
+    // A worktree row beside them has no state prefix and a branch detail:
+    // the two kinds of directory-rooted rows are visually distinct. (The
+    // synthetic worktree directories do not exist, so the detail carries the
+    // honest missing-directory marker.)
+    assert_eq!(rows[2].label(), "pr-main");
+    assert_eq!(rows[2].detail(), Some("pr-main (missing)"));
+    assert_ne!(rows[0].kind(), rows[2].kind());
+    assert!(
+        !rows[2].label().starts_with("PRJ-"),
+        "a worktree row never carries the project state prefix"
+    );
+    for root in &roots {
+        let _ = std::fs::remove_dir(root);
+    }
+}
+
+/// An overlong project name is truncated with the shared ASCII marker
+/// inside the label budget, exactly like an agent name or an SSH target.
+#[test]
+fn configured_project_labels_are_bounded_like_agent_labels() {
+    let roots = project_directories(1);
+    let config = AppConfig::parse(&format!(
+        "[[projects]]\nname = \"a-very-long-project-name-that-exceeds-the-budget\"\nroot = \"{}\"\n",
+        roots[0].display()
+    ))
+    .expect("valid configuration");
+    let app = NorenApp::new(config);
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].label(), "PRJ-OFF a-v...");
+    let _ = std::fs::remove_dir(&roots[0]);
+}
+
+/// More configured projects than the sidebar cap keep the first rows in
+/// configuration order and report the cap and the omitted count on the
+/// status row, exactly like the bounded agent, SSH host, and worktree lists.
+#[test]
+fn many_configured_projects_are_capped_and_the_omitted_count_is_reported() {
+    let cap = MAX_PROJECT_SIDEBAR_ROWS;
+    let roots = project_directories(cap + 2);
+    let config = many_projects_config(&roots);
+    let mut app = NorenApp::new(config);
+
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(
+        rows.len(),
+        cap,
+        "the sidebar keeps exactly the capped row count"
+    );
+    assert_eq!(rows[0].label(), "PRJ-OFF pr-00");
+    assert_eq!(
+        rows[cap - 1].label(),
+        format!("PRJ-OFF pr-{:02}", cap - 1),
+        "the retained block is the FIRST {cap} in configuration order"
+    );
+    assert_eq!(
+        app.workspace.projects_omitted, 2,
+        "beyond-cap projects are counted, not silently dropped"
+    );
+    let notice = app
+        .project_diagnostic
+        .as_deref()
+        .expect("the cap is reported on the status row");
+    assert!(
+        notice.contains("showing first 24") && notice.contains("2 omitted"),
+        "the notice names the cap and the omitted count: {notice}"
+    );
+    // The notice owns the status row whenever no runtime status shows.
+    app.show_status = false;
+    assert_eq!(app.status_row(), StatusRowSource::ProjectDiagnostic);
+    for root in &roots {
+        let _ = std::fs::remove_dir(root);
+    }
+}
+
+/// Selecting a project row must START a session whose working directory IS
+/// the configured root — verified by reading the child's own `pwd` answer
+/// back through the terminal, never by inferring it from the code path.
+///
+/// Mutation checks: making the click add a model row without spawning (no
+/// PTY, no `Running` observation), or starting the child anywhere other
+/// than the configured root, fails the assertions below.
+#[cfg(target_os = "macos")]
+#[test]
+fn selecting_a_project_row_starts_a_session_in_that_directory() {
+    let roots = project_directories(1);
+    let config = many_projects_config(&roots);
+    let home = AppTestHome::new();
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..NorenApp::new(config)
+    };
+
+    assert!(
+        click_sidebar_row(&mut app, 0),
+        "the project row is consumed"
+    );
+
+    // The launch created a real Project-kind session that owns the live
+    // surface and is observed Running, carrying the configured root (the
+    // configuration wrote the canonical form, so every surface agrees).
+    let canonical = std::fs::canonicalize(&roots[0]).expect("canonicalize the project root");
+    let ids = registry_ids(&app);
+    assert_eq!(ids.len(), 1, "one registry session from the project row");
+    let id = ids[0];
+    assert_eq!(
+        app.workspace.registry().get(id).map(|d| d.kind().clone()),
+        Some(SessionKind::Project {
+            root: canonical.clone()
+        }),
+        "the session's launch shape carries the configured project root"
+    );
+    assert_eq!(session_status(&app, id), SessionStatus::Running);
+    assert_eq!(app.active_session, Some(id));
+    assert!(app.pty.is_some(), "the project session owns a real PTY");
+
+    // Read the child's ACTUAL working directory back: wait for the shell,
+    // ask it, and search the terminal text for its own answer. The path the
+    // session claims and the directory the child reports must agree. The
+    // grid wraps long lines across rows, so the comparison strips the row
+    // separators a wrap inserts — a wrapped path must still match whole.
+    wait_for_shell_output(&mut app);
+    app.send_input(b"pwd\n");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.drain_pty();
+        let answered = app.terminal.as_ref().is_some_and(|terminal| {
+            let unwrapped = terminal_text(terminal).replace(['\r', '\n'], "");
+            unwrapped.contains(canonical.display().to_string().as_str())
+        });
+        if answered {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child's own pwd never reported the project root\n\
+             expected: the terminal text to contain the project root {}\n\
+             received: terminal said: {}",
+            canonical.display(),
+            app.terminal.as_ref().map(terminal_text).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = std::fs::remove_dir(&roots[0]);
+}
+
+/// A configured root whose directory no longer exists is refused before any
+/// session or child exists — a visible failure on the row and the status
+/// row, exactly like a registered-but-deleted worktree. Never a hang, never
+/// a session row, never a silent no-op.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_project_row_with_a_missing_directory_is_a_visible_failure_never_a_session() {
+    let missing_root =
+        std::env::temp_dir().join(format!("noren-missing-project-{}", std::process::id()));
+    let config = AppConfig::parse(&format!(
+        "[[projects]]\nname = \"ghost\"\nroot = \"{}\"\n",
+        missing_root.display()
+    ))
+    .expect("valid configuration");
+    let mut app = NorenApp::new(config);
+
+    // The click returns promptly (a hang fails the test runner's deadline);
+    // nothing was spawned and no session exists.
+    assert!(
+        click_sidebar_row(&mut app, 0),
+        "the project row is consumed even when the launch is refused"
+    );
+
+    // The refusal is first-class on every surface a user can see.
+    assert_eq!(app.status, "Noren project directory missing");
+    assert!(app.show_status, "the refusal must be visible");
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(rows[0].kind(), EntryKind::Project);
+    assert_eq!(rows[0].label(), "PRJ-ERR ghost");
+    assert_eq!(rows[0].detail(), Some("launch failed"));
+    assert!(
+        app.workspace.registry().is_empty(),
+        "a refused launch must not create a session row"
+    );
+    assert!(
+        app.pty.is_none(),
+        "a refused launch must leave no PTY behind"
+    );
+}
+
+/// A project root (and name) can embed a username or a private directory
+/// name. Every debug and status surface the configured-project flow can
+/// reach must stay free of the root. The persisted sessions.toml file
+/// deliberately DOES carry the root of a launched session — it is the
+/// user's own private state and exactly what restoration needs, the same
+/// class as a worktree path; the redaction discipline governs Debug and
+/// error output, not the state file.
+#[cfg(target_os = "macos")]
+#[test]
+fn project_paths_never_reach_debug_or_status_surfaces() {
+    let secret = format!("NOREN-PRJ-hunter2-{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("{secret}/proj"));
+    std::fs::create_dir_all(&root).expect("create secret-shaped project root");
+    let config = AppConfig::parse(&format!(
+        "[[projects]]\nname = \"{secret}\"\nroot = \"{}\"\n",
+        root.display()
+    ))
+    .expect("valid configuration");
+
+    let home = AppTestHome::new();
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..NorenApp::new(config)
+    };
+
+    // The workspace (configured projects, sidebar view) never prints it.
+    assert!(
+        !format!("{:?}", app.workspace).contains(&secret),
+        "workspace debug leaked the project root"
+    );
+
+    // A launch selects the session and persists the structural change; the
+    // app-level debug surface still never prints it.
+    assert!(
+        click_sidebar_row(&mut app, 0),
+        "the project row is consumed"
+    );
+    assert!(
+        !format!("{:?}", app.workspace).contains(&secret),
+        "workspace debug leaked the project root after the launch"
+    );
+    // A registry session of this shape (the state a launch or a restore
+    // leaves behind) never prints it through the descriptor either.
+    let ids = registry_ids(&app);
+    let rendered = format!("{:?}", app.workspace.registry().get(ids[0]));
+    assert!(
+        !rendered.contains(&secret),
+        "descriptor debug leaked the project root: {rendered}"
+    );
+    assert!(
+        rendered.contains("Project"),
+        "not vacuous — the descriptor still names its shape: {rendered}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }

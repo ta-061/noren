@@ -123,6 +123,22 @@ const AGENT_SIDEBAR_DETAIL_FAILED: &str = "launch failed";
 /// spawned (missing or non-executable program). Fixed text: the command is
 /// configuration content and never appears on the status row.
 const AGENT_STATUS_LAUNCH_FAILED: &str = "Noren agent launch failed";
+/// Keep configured-project memory and identity work bounded independently of
+/// the frame height, exactly like the agent and SSH bounds. Project rows
+/// share the sidebar's scroll window over this bounded list.
+const MAX_PROJECT_SIDEBAR_ROWS: usize = 24;
+/// ASCII-only project row state that is always inside the first 16 columns.
+/// Eight characters, like the SSH and agent prefixes, so the label
+/// arithmetic is the shared [`sidebar_state_label`] helper.
+const PROJECT_SIDEBAR_PREFIX_IDLE: &str = "PRJ-OFF ";
+const PROJECT_SIDEBAR_PREFIX_FAILED: &str = "PRJ-ERR ";
+const PROJECT_SIDEBAR_DETAIL_IDLE: &str = "not running";
+const PROJECT_SIDEBAR_DETAIL_FAILED: &str = "launch failed";
+/// Status-row text when a project row whose root directory no longer exists
+/// is selected: the launch is refused before any session or child exists.
+const PROJECT_STATUS_MISSING: &str = "Noren project directory missing";
+/// Status-row text when a project session's zsh child could not be spawned.
+const PROJECT_STATUS_LAUNCH_FAILED: &str = "Noren project launch failed";
 
 /// Observed state of the one live SSH launch. This is application-local
 /// runtime state, deliberately outside the session registry: the registry
@@ -283,6 +299,31 @@ fn agent_sidebar_detail(failed: bool) -> &'static str {
     }
 }
 
+/// Build the bounded sidebar label for a configured project row. `failed`
+/// selects the fixed state prefix; the project's display name is bounded
+/// exactly like an SSH target or an agent name. The fixed `PRJ-` prefix is
+/// what distinguishes a project row from a worktree row at a glance: a
+/// worktree row has no state prefix and shows a branch as its detail.
+fn project_sidebar_label(failed: bool, name: &str) -> String {
+    sidebar_state_label(
+        if failed {
+            PROJECT_SIDEBAR_PREFIX_FAILED
+        } else {
+            PROJECT_SIDEBAR_PREFIX_IDLE
+        },
+        name,
+    )
+}
+
+/// The fixed detail text for a configured project row.
+fn project_sidebar_detail(failed: bool) -> &'static str {
+    if failed {
+        PROJECT_SIDEBAR_DETAIL_FAILED
+    } else {
+        PROJECT_SIDEBAR_DETAIL_IDLE
+    }
+}
+
 fn ssh_status_source_label(label: &str) -> String {
     let (path, tag) = label
         .rsplit_once(' ')
@@ -367,6 +408,37 @@ impl fmt::Debug for ConfiguredAgent {
     }
 }
 
+/// One configured project held by the workspace: the display name shown on
+/// its sidebar row plus the absolute root directory a session starts in when
+/// the row is selected.
+///
+/// Sidebar fact until a row is selected, exactly like the configured agents
+/// and SSH hosts and the discovered worktrees. The root was validated at
+/// configuration load (absolute, bounded); copying it here preserves it
+/// verbatim, and it is never displayed — the row shows the configured name
+/// and a fixed state detail — nor debug-printed. Only the launched session's
+/// [`SessionKind::Project`] root reaches `sessions.toml`.
+#[derive(Clone, PartialEq, Eq)]
+struct ConfiguredProject {
+    /// Display name from configuration.
+    name: String,
+    /// Absolute root directory of the project; the working directory of a
+    /// launched session's child.
+    root: PathBuf,
+}
+
+/// Shape-only [`Debug`] (issue #146): the name is user-authored
+/// configuration text, and a root can embed a username or a private
+/// directory name, so neither is printed — only their lengths.
+impl fmt::Debug for ConfiguredProject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfiguredProject")
+            .field("name_chars", &self.name.chars().count())
+            .field("root_chars", &self.root.as_os_str().len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// The dispatchable intent behind each palette command.
 ///
 /// The palette module is action-agnostic by design ([`Palette`] is generic
@@ -433,6 +505,18 @@ fn session_state_path() -> Option<PathBuf> {
 struct WorkspaceState {
     registry: SessionRegistry,
     sidebar: SidebarView,
+    /// Configured projects (`[[projects]]`), bounded by
+    /// [`MAX_PROJECT_SIDEBAR_ROWS`]. Sidebar facts until a row is selected:
+    /// no registry entry or child exists for one. Selecting a row creates a
+    /// `SessionKind::Project` session, which is the shape that persists.
+    projects: Vec<ConfiguredProject>,
+    /// How many configured projects the bounded sidebar policy omitted.
+    projects_omitted: usize,
+    /// Names of configured projects whose most recent launch FAILED.
+    /// Best-effort row marker bounded by the configured project count; the
+    /// session rows the registry owns remain the authority for a launch's
+    /// observed status.
+    project_launch_failures: std::collections::HashSet<String>,
     /// Worktrees discovered in the launch repository at startup: sidebar
     /// facts only until a row is selected, exactly like the configured SSH
     /// hosts. Selecting a row creates a `SessionKind::Worktree` session,
@@ -485,6 +569,12 @@ impl fmt::Debug for WorkspaceState {
             .field("registry", &self.registry.len())
             .field("registry_selection", &self.registry.selected())
             .field("sidebar", &self.sidebar)
+            .field("projects", &self.projects.len())
+            .field("projects_omitted", &self.projects_omitted)
+            .field(
+                "project_launch_failures",
+                &self.project_launch_failures.len(),
+            )
             .field("worktrees", &self.worktrees.len())
             .field("worktrees_omitted", &self.worktrees_omitted)
             .field("ssh_hosts", &self.ssh_hosts.len())
@@ -528,6 +618,9 @@ impl WorkspaceState {
         Self {
             registry: SessionRegistry::new(),
             sidebar: SidebarView::build(&[], None),
+            projects: Vec::new(),
+            projects_omitted: 0,
+            project_launch_failures: std::collections::HashSet::new(),
             worktrees: Vec::new(),
             worktrees_omitted: 0,
             ssh_hosts: Vec::new(),
@@ -670,6 +763,44 @@ impl WorkspaceState {
         Ok(())
     }
 
+    /// Replace the configured project facts without creating sessions. Rows
+    /// are bounded by [`MAX_PROJECT_SIDEBAR_ROWS`] and the omitted count is
+    /// retained for the status notice, exactly like the agent, SSH host, and
+    /// worktree bounds. Returns the number omitted.
+    fn load_projects(&mut self, projects: &[noren_app::config::ProjectConfig]) -> usize {
+        self.projects = projects
+            .iter()
+            .take(MAX_PROJECT_SIDEBAR_ROWS)
+            .map(|project| ConfiguredProject {
+                name: project.name().to_owned(),
+                root: PathBuf::from(project.root()),
+            })
+            .collect();
+        self.projects_omitted = projects.len().saturating_sub(self.projects.len());
+        self.project_launch_failures.clear();
+        self.rebuild_sidebar();
+        self.projects_omitted
+    }
+
+    /// The configured project fact at a stable sidebar position, if that
+    /// position is a project row. Session rows precede project rows; worktree
+    /// rows follow them.
+    fn project_sidebar_row(&self, row_index: usize) -> Option<&ConfiguredProject> {
+        let index = row_index.checked_sub(self.registry.len())?;
+        self.projects.get(index)
+    }
+
+    /// Mark a configured project's most recent launch as failed, so its row
+    /// carries the visible `PRJ-ERR` state.
+    fn record_project_launch_failure(&mut self, name: &str) {
+        self.project_launch_failures.insert(name.to_owned());
+    }
+
+    /// Clear a configured project's failure marker after a successful launch.
+    fn clear_project_launch_failure(&mut self, name: &str) {
+        self.project_launch_failures.remove(name);
+    }
+
     /// Replace the discovered worktree facts without creating sessions.
     /// Rows are bounded by [`git_worktree::MAX_WORKTREE_SIDEBAR_ROWS`] and
     /// the omitted count is retained for the status notice.
@@ -680,10 +811,10 @@ impl WorkspaceState {
     }
 
     /// The worktree fact at a stable sidebar position, if that position is
-    /// a worktree row. Session rows precede worktree rows; SSH host rows
-    /// follow them.
+    /// a worktree row. Session rows and project rows precede worktree rows;
+    /// SSH host rows follow them.
     fn worktree_sidebar_row(&self, row_index: usize) -> Option<&DiscoveredWorktree> {
-        let index = row_index.checked_sub(self.registry.len())?;
+        let index = row_index.checked_sub(self.registry.len() + self.projects.len())?;
         self.worktrees.get(index)
     }
 
@@ -714,8 +845,9 @@ impl WorkspaceState {
     /// Select an SSH row as a pending UI choice, never as a live session.
     fn select_ssh_sidebar_row(&mut self, row_index: usize) -> bool {
         let session_rows = self.registry.len();
+        let project_rows = self.projects.len();
         let worktree_rows = self.worktrees.len();
-        let host_index = row_index.checked_sub(session_rows + worktree_rows);
+        let host_index = row_index.checked_sub(session_rows + project_rows + worktree_rows);
         let Some(Some(ConfiguredSshHost {
             kind: SessionKind::Ssh { target },
             source_label,
@@ -750,12 +882,14 @@ impl WorkspaceState {
     }
 
     /// The configured agent fact at a stable sidebar position, if that
-    /// position is an agent row. Session rows precede worktree rows, SSH
-    /// host rows follow them, and agent rows follow the SSH hosts; the
-    /// subtraction chain mirrors the order the sidebar renders.
+    /// position is an agent row. Session rows precede project rows, project
+    /// rows precede worktree rows, SSH host rows follow them, and agent rows
+    /// follow the SSH hosts; the subtraction chain mirrors the order the
+    /// sidebar renders.
     fn agent_sidebar_row(&self, row_index: usize) -> Option<&ConfiguredAgent> {
-        let index = row_index
-            .checked_sub(self.registry.len() + self.worktrees.len() + self.ssh_hosts.len())?;
+        let index = row_index.checked_sub(
+            self.registry.len() + self.projects.len() + self.worktrees.len() + self.ssh_hosts.len(),
+        )?;
         self.agents.get(index)
     }
 
@@ -815,8 +949,9 @@ impl WorkspaceState {
     /// Rebuild the sidebar from the registry's current sessions and selection.
     ///
     /// Called after every mutation so the view never lags the model. Row
-    /// order is stable: session rows first, then discovered worktree facts,
-    /// then configured SSH host facts, then configured agent facts.
+    /// order is stable: session rows first, then configured project facts,
+    /// then discovered worktree facts, then configured SSH host facts, then
+    /// configured agent facts.
     fn rebuild_sidebar(&mut self) {
         let entries: Vec<SidebarEntry> = self
             .registry
@@ -825,6 +960,17 @@ impl WorkspaceState {
             .map(SidebarEntry::Session)
             .collect();
         let mut entries = entries;
+        // A project row shows its configured name behind the fixed `PRJ-`
+        // state prefix and a fixed state detail — never the root path — so
+        // it is distinguishable at a glance from a worktree row (final path
+        // component plus branch, no state prefix).
+        entries.extend(self.projects.iter().map(|project| {
+            let failed = self.project_launch_failures.contains(&project.name);
+            SidebarEntry::Project {
+                name: project_sidebar_label(failed, &project.name),
+                root: project_sidebar_detail(failed).to_owned(),
+            }
+        }));
         entries.extend(
             self.worktrees
                 .iter()
@@ -952,6 +1098,9 @@ struct NorenApp {
     ssh_selection_status: Option<String>,
     /// Bounded, content-free worktree-discovery notice (cap or failure).
     worktree_diagnostic: Option<String>,
+    /// Bounded, content-free configured-projects notice (cap only; project
+    /// launch failures surface as runtime statuses and row markers instead).
+    project_diagnostic: Option<String>,
     /// Bounded, content-free configured-agents notice (cap only; agent
     /// launch failures surface as runtime statuses instead).
     agent_diagnostic: Option<String>,
@@ -1027,6 +1176,7 @@ enum StatusRowSource {
     Runtime,
     SshSelection,
     WorktreeDiagnostic,
+    ProjectDiagnostic,
     AgentDiagnostic,
     SshDiagnostic,
 }
@@ -1037,6 +1187,7 @@ impl StatusRowSource {
         runtime: &'a str,
         ssh_selection_status: Option<&'a str>,
         worktree_diagnostic: Option<&'a str>,
+        project_diagnostic: Option<&'a str>,
         agent_diagnostic: Option<&'a str>,
         ssh_diagnostic: Option<&'a str>,
     ) -> &'a str {
@@ -1047,6 +1198,9 @@ impl StatusRowSource {
             }
             Self::WorktreeDiagnostic => {
                 worktree_diagnostic.expect("worktree diagnostic source requires diagnostic text")
+            }
+            Self::ProjectDiagnostic => {
+                project_diagnostic.expect("project diagnostic source requires diagnostic text")
             }
             Self::AgentDiagnostic => {
                 agent_diagnostic.expect("agent diagnostic source requires diagnostic text")
@@ -1071,10 +1225,17 @@ impl NorenApp {
         let geometry =
             GridGeometry::with_cells(config.font().cell_width(), config.font().cell_height())
                 .unwrap_or_else(GridGeometry::poc);
-        // Configured agents are sidebar facts from the same validated file:
-        // the names come from configuration (already bounded), the sidebar
-        // bound applies on top, and the omitted count reaches the status row.
+        // Configured agents and projects are sidebar facts from the same
+        // validated file: the names come from configuration (already
+        // bounded), the sidebar bound applies on top, and the omitted count
+        // reaches the status row.
         let mut workspace = WorkspaceState::new();
+        let projects_omitted = workspace.load_projects(config.projects());
+        let project_diagnostic = (projects_omitted > 0).then(|| {
+            format!(
+                "Noren projects: showing first {MAX_PROJECT_SIDEBAR_ROWS}; {projects_omitted} omitted"
+            )
+        });
         let agents_omitted = workspace.load_agents(config.agents());
         let agent_diagnostic = (agents_omitted > 0).then(|| {
             format!(
@@ -1097,6 +1258,7 @@ impl NorenApp {
             ssh_diagnostic: None,
             ssh_selection_status: None,
             worktree_diagnostic: None,
+            project_diagnostic,
             agent_diagnostic,
             ssh_eof_since: None,
             ssh_spawn_enabled: true,
@@ -1132,6 +1294,8 @@ impl NorenApp {
             StatusRowSource::SshSelection
         } else if self.worktree_diagnostic.is_some() {
             StatusRowSource::WorktreeDiagnostic
+        } else if self.project_diagnostic.is_some() {
+            StatusRowSource::ProjectDiagnostic
         } else if self.agent_diagnostic.is_some() {
             StatusRowSource::AgentDiagnostic
         } else if self.ssh_diagnostic.is_some() {
@@ -1524,28 +1688,28 @@ impl NorenApp {
         }
     }
 
-    /// Spawn the PTY for a worktree session, whose working directory is the
-    /// worktree itself.
+    /// Spawn the PTY for a directory-scoped session (a worktree or a
+    /// configured project root), whose working directory is that directory.
     ///
     /// Production inherits `HOME` unchanged so the user's own shell
-    /// configuration applies inside the worktree checkout. Tests that drive
-    /// the shell by typing redirect the child's `HOME` to the isolated
-    /// empty home (see [`NorenApp::test_pty_home`]) for the same reason as
+    /// configuration applies inside the directory. Tests that drive the
+    /// shell by typing redirect the child's `HOME` to the isolated empty
+    /// home (see [`NorenApp::test_pty_home`]) for the same reason as
     /// [`Self::spawn_pty_session`]: a developer's real `$HOME` may carry
     /// startup files that take arbitrarily long or read the terminal, which
     /// would make every shell-driving test depend on personal configuration.
-    /// The working directory is the worktree in both shapes, so the child's
-    /// actual cwd stays observable through its own `pwd` answer.
-    fn spawn_worktree_pty_session(
+    /// The working directory is the supplied directory in both shapes, so
+    /// the child's actual cwd stays observable through its own `pwd` answer.
+    fn spawn_directory_pty_session(
         &self,
-        path: &std::path::Path,
+        dir: &std::path::Path,
         size: PtySize,
     ) -> Result<PtySession, noren_pty::PtyError> {
         #[cfg(test)]
         if let Some(home) = &self.test_pty_home {
-            return PtySession::spawn_in_dir_with_home(path, home, size);
+            return PtySession::spawn_in_dir_with_home(dir, home, size);
         }
-        PtySession::spawn_in_dir(path, size)
+        PtySession::spawn_in_dir(dir, size)
     }
 
     /// Spawn a real PTY session whose working directory is the worktree at
@@ -1571,7 +1735,7 @@ impl NorenApp {
             );
             return None;
         };
-        match self.spawn_worktree_pty_session(path, pty_size) {
+        match self.spawn_directory_pty_session(path, pty_size) {
             Ok(pty) => {
                 self.workspace.observe_session(id, SessionStatus::Running);
                 self.park_active_session();
@@ -1597,6 +1761,73 @@ impl NorenApp {
                     },
                 );
                 self.status = WORKTREE_STATUS_LAUNCH_FAILED;
+                self.show_status = true;
+                self.redraw_needed = true;
+                None
+            }
+        }
+    }
+
+    /// Spawn a real PTY session whose working directory is the configured
+    /// project root, and give it the live view.
+    ///
+    /// This is the project-row runtime: the new sidebar row is a
+    /// `SessionKind::Project` registry session backed by an actual `/bin/zsh`
+    /// PTY whose child starts *in* the project root (HOME inherited, so the
+    /// user's shell configuration still applies) — the same launch shape and
+    /// conventions as a worktree session, distinguished by the kind that
+    /// persists. The registry observes `Running` when the spawn succeeds and
+    /// `Failed` when it does not. A configured root whose directory no longer
+    /// exists is refused before this method runs (the caller checks), exactly
+    /// like a registered-but-deleted worktree.
+    fn spawn_project_session(&mut self, project: &ConfiguredProject) -> Option<SessionId> {
+        let id = self.workspace.create_session(SessionKind::Project {
+            root: project.root.clone(),
+        });
+        let Some((terminal, pty_size)) = self.session_surfaces() else {
+            self.workspace.observe_session(
+                id,
+                SessionStatus::Failed {
+                    reason: "terminal surface unavailable".to_owned(),
+                },
+            );
+            self.workspace.record_project_launch_failure(&project.name);
+            self.workspace.rebuild_sidebar();
+            self.redraw_needed = true;
+            return None;
+        };
+        match self.spawn_directory_pty_session(&project.root, pty_size) {
+            Ok(pty) => {
+                self.workspace.observe_session(id, SessionStatus::Running);
+                self.workspace.clear_project_launch_failure(&project.name);
+                self.park_active_session();
+                self.pty = Some(pty);
+                self.terminal = Some(terminal);
+                self.active_session = Some(id);
+                self.pty_child = PtyChildStatus::Running;
+                self.selection = None;
+                self.drag_origin = None;
+                self.exited_surface_session = None;
+                self.workspace
+                    .select_session(id)
+                    .expect("freshly spawned session is live");
+                self.ssh_selection_status = None;
+                self.redraw_needed = true;
+                Some(id)
+            }
+            Err(_) => {
+                self.workspace.observe_session(
+                    id,
+                    SessionStatus::Failed {
+                        reason: "PTY spawn failed".to_owned(),
+                    },
+                );
+                // observe_session already rebuilt once; recording the row
+                // marker after it needs a second rebuild or the configured
+                // row keeps its idle label.
+                self.workspace.record_project_launch_failure(&project.name);
+                self.workspace.rebuild_sidebar();
+                self.status = PROJECT_STATUS_LAUNCH_FAILED;
                 self.show_status = true;
                 self.redraw_needed = true;
                 None
@@ -2399,6 +2630,24 @@ impl NorenApp {
             }
             return true;
         }
+        if let Some(project) = self.workspace.project_sidebar_row(row_index) {
+            // A project row whose configured root still exists launches a
+            // real session rooted at that directory; a configured-but-gone
+            // root is refused before any session or child exists — exactly
+            // like a registered-but-deleted worktree. Both are first-class,
+            // visible outcomes.
+            let project = project.clone();
+            if project.root.is_dir() {
+                self.spawn_project_session(&project);
+            } else {
+                self.workspace.record_project_launch_failure(&project.name);
+                self.workspace.rebuild_sidebar();
+                self.status = PROJECT_STATUS_MISSING;
+                self.show_status = true;
+            }
+            self.redraw_needed = true;
+            return true;
+        }
         if let Some(worktree) = self.workspace.worktree_sidebar_row(row_index) {
             // A present worktree row launches a real session rooted at the
             // worktree directory; a registered-but-deleted one is refused
@@ -3021,6 +3270,7 @@ impl NorenApp {
                 self.status,
                 self.ssh_selection_status.as_deref(),
                 self.worktree_diagnostic.as_deref(),
+                self.project_diagnostic.as_deref(),
                 self.agent_diagnostic.as_deref(),
                 self.ssh_diagnostic.as_deref(),
             )
