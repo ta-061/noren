@@ -346,6 +346,97 @@ fn reverse_index_at_the_top_margin_keeps_wide_rows_intact() {
     assert!(cell(&state, 2, 3).is_continuation());
 }
 
+/// Issue #176 (fuzz case 1336, seed 0xc0ffee42deadbeef): the three
+/// content-scrolling paths that shift rows under a STATIONARY cursor — SD
+/// (`CSI T`), SU (`CSI S`), and DL (`CSI M`) — must re-snap through the same
+/// `snap_cursor_to_lead` the vertical-movement paths use, because the row
+/// landing under the cursor column can carry the continuation half of a wide
+/// character.
+#[test]
+fn scroll_down_up_and_delete_lines_snap_the_cursor_off_continuations() {
+    // SD (CSI T): the fuzz-found arrangement verbatim — the emoji pair from
+    // row 0 scrolls down under the cursor at (1,1), its continuation column.
+    let mut state = TerminalState::new(2, 4).expect("valid terminal");
+    state.feed_bytes(b"\xf0\x9f\x98\x80\n\x08\x1b[1T");
+    assert_eq!(cursor(&state), (1, 0));
+    assert_cursor_off_continuation(&state);
+    assert_eq!(cell(&state, 1, 0).text(), "\u{1f600}");
+    assert_eq!(cell(&state, 1, 0).width(), 2);
+    assert!(cell(&state, 1, 1).is_continuation());
+
+    // SU (CSI S): the wide row below scrolls up under the cursor at (0,1).
+    let mut state = TerminalState::new(3, 4).expect("valid terminal");
+    state.feed_bytes(b"\n\xf0\x9f\x98\x80\x1b[1;2H\x1b[1S");
+    assert_eq!(cursor(&state), (0, 0));
+    assert_cursor_off_continuation(&state);
+    assert_eq!(cell(&state, 0, 0).text(), "\u{1f600}");
+    assert!(cell(&state, 0, 1).is_continuation());
+
+    // DL (CSI M): deleting the line above shifts the wide row up under the
+    // cursor at (0,1).
+    let mut state = TerminalState::new(3, 4).expect("valid terminal");
+    state.feed_bytes(b"\n\xf0\x9f\x98\x80\x1b[1;2H\x1b[1M");
+    assert_eq!(cursor(&state), (0, 0));
+    assert_cursor_off_continuation(&state);
+    assert_eq!(cell(&state, 0, 0).text(), "\u{1f600}");
+    assert!(cell(&state, 0, 1).is_continuation());
+}
+
+/// IL (`CSI L`) blanks the cursor's own row, so it cannot strand the cursor
+/// by itself — this test pins that it stays off continuations and moves the
+/// wide row below it down with both halves intact, so the contract holds if
+/// its semantics ever change.
+#[test]
+fn insert_lines_keeps_the_cursor_off_continuations_and_moves_wide_rows_whole() {
+    let mut state = TerminalState::new(3, 4).expect("valid terminal");
+    state.feed_bytes(b"\n\xf0\x9f\x98\x80\x1b[1;2H\x1b[1L");
+    assert_eq!(cursor(&state), (0, 1));
+    assert_cursor_off_continuation(&state);
+    assert_eq!(cell(&state, 2, 0).text(), "\u{1f600}");
+    assert_eq!(cell(&state, 2, 0).width(), 2);
+    assert!(cell(&state, 2, 1).is_continuation());
+}
+
+/// The corruption the stranding caused: a print at a stranded cursor blanks
+/// the lead from the continuation side and leaves a hole one column left of
+/// the glyph it replaced. With the re-snap the print replaces the pair at
+/// its lead column.
+#[test]
+fn printing_after_a_snapped_delete_lines_replaces_the_pair_at_the_lead() {
+    let mut state = TerminalState::new(3, 4).expect("valid terminal");
+    state.feed_bytes(b"\n\xf0\x9f\x98\x80\x1b[1;2H\x1b[1MX");
+
+    assert_eq!(cursor(&state), (0, 1));
+    assert_eq!(cell(&state, 0, 0).text(), "X");
+    assert_eq!(cell(&state, 0, 1).text(), " ");
+    assert!(!cell(&state, 0, 1).is_continuation());
+    assert_cursor_off_continuation(&state);
+}
+
+/// Neighbouring invariant: DL evicting a wide row into scrollback must keep
+/// the pair whole there (rows evict atomically, so a continuation's lead can
+/// never strand behind in the live grid), and the cursor column stays in
+/// bounds and off continuations.
+#[test]
+fn delete_lines_evicting_a_wide_row_to_scrollback_keeps_the_pair_whole() {
+    let mut state = TerminalState::new(3, 4).expect("valid terminal");
+    state.feed_bytes(b"\xf0\x9f\x98\x80");
+    state.feed_bytes(b"\r\n\r\n");
+    state.feed_bytes(b"\x1b[1;1H");
+    state.feed_bytes(b"\x1b[1M");
+    assert_eq!(state.scrollback_len(), 1);
+
+    let retained = state.scrollback_row(0).expect("retained row");
+    assert_eq!(retained[0].text(), "\u{1f600}");
+    assert_eq!(retained[0].width(), 2);
+    assert!(retained[1].is_continuation());
+    let (row, column) = cursor(&state);
+    let (_, cols) = state.size();
+    assert!(column < cols);
+    assert!(row < 3);
+    assert_cursor_off_continuation(&state);
+}
+
 #[test]
 fn printing_after_a_snapped_line_feed_replaces_the_pair_at_the_lead() {
     let mut state = reproduction_state();
