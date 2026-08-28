@@ -152,6 +152,41 @@ bright black now sit close together (`[121,121,121]` vs
 cube, truecolor, and program-paired colours — those can draw below the
 floor under any palette.
 
+### `[cursor]`
+
+Cursor appearance (issues #197/#200). The table is optional and the caret
+**ships drawn**: an absent `[cursor]` renders a focused block in the active
+theme's cursor colour — the same contrast-verified colour relationship as
+ordinary text — so a user who never opens this file still sees where typing
+lands. Configuration changes how the caret looks, never whether it exists;
+visibility belongs to the program through DECTCEM (`CSI ?25l`/`?25h`), not
+to a preference that could quietly reproduce the every-keystroke-blind
+defect.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `shape` | string | `"block"` | `block` (filled, glyph inverted beneath), `bar` (left stroke), or `underline` (bottom stroke). |
+| `color` | string | the theme's cursor colour | One `#rrggbb` value overriding the theme colour. |
+
+Accepted shapes, matched exactly (case-sensitive, closed vocabulary):
+`block`, `bar`, `underline`. An unfocused window always draws the caret as
+a hollow outline of the block footprint regardless of shape — the classic
+signal that the window no longer receives keys — because the shape setting
+is a *focused* typing aid.
+
+Rejections follow the hard-error discipline: an unknown shape is a typed
+error naming the offending value (clipped to 120 characters, like the
+`[theme]` name echo: shape names are closed-vocabulary grammar text, never
+a credential); a non-string value, an unknown key (including `blink`,
+deliberately not offered), or a colour that is not one `#rrggbb` value is
+an error naming the key — never a silent fallback, and never a guessed
+colour.
+
+Blink is deliberately absent: a blinking caret forces timer-driven
+repaints roughly twice a second even while idle, and this renderer rebuilds
+the full vertex list every frame. That is a CPU/battery decision, not a
+visual one, and it is not taken silently by a default.
+
 ### `[[agents]]`
 
 Configured AI-agent entries: each `[[agents]]` table names one agent with a

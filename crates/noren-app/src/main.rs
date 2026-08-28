@@ -1198,6 +1198,11 @@ struct NorenApp {
     /// resolution, clear colour — follows the `[theme]` selection. The
     /// default (`dark`) is exactly the pre-theme palette.
     theme: Theme,
+    /// The configured cursor appearance (`[cursor]` shape and colour over
+    /// the theme's cursor colour), handed to the renderer at creation.
+    /// Visibility is not part of it: the caret ships drawn and only DECTCEM
+    /// hides it (issues #197/#200).
+    cursor_style: renderer::CursorStyle,
 }
 
 /// Which application-owned line, if any, occupies the renderer's status row.
@@ -1321,6 +1326,15 @@ impl NorenApp {
             passthrough_policy: palette_policy(config.keys()),
             keys: config.keys(),
             theme: config.theme().palette(),
+            cursor_style: renderer::CursorStyle::theme_default(&config.theme().palette())
+                .with_shape(config.cursor().shape())
+                .with_color_override(config.cursor().color().map(|[r, g, b]| {
+                    [
+                        f32::from(r) / 255.0,
+                        f32::from(g) / 255.0,
+                        f32::from(b) / 255.0,
+                    ]
+                })),
         }
     }
 
@@ -2230,6 +2244,7 @@ impl NorenApp {
             Arc::clone(&window),
             self.geometry.cell_metrics(),
             self.theme,
+            self.cursor_style,
         ) {
             Ok(renderer) => Some(renderer),
             Err(_) => {

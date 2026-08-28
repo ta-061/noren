@@ -60,3 +60,26 @@ impl fmt::Display for CursorShape {
         f.write_str(self.as_str())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::CursorShape;
+
+    /// The closed vocabulary round-trips through its exact names, and the
+    /// case-sensitive rule rejects second spellings.
+    #[test]
+    fn shape_names_parse_exactly_and_round_trip() {
+        for name in CursorShape::NAMES {
+            let shape = CursorShape::parse(name).expect("a documented name parses");
+            assert_eq!(shape.as_str(), name);
+            assert_eq!(shape.to_string(), name);
+        }
+        assert_eq!(CursorShape::default(), CursorShape::Block);
+        for near_miss in ["Block", "BLOCK", "bars", "under-line", ""] {
+            assert!(
+                CursorShape::parse(near_miss).is_none(),
+                "{near_miss:?} must not parse — the vocabulary is closed"
+            );
+        }
+    }
+}

@@ -327,6 +327,7 @@ impl Renderer {
         window: Arc<Window>,
         metrics: CellMetrics,
         theme: Theme,
+        cursor: CursorStyle,
     ) -> Result<Self, RendererError> {
         let size = window.inner_size();
         let mut instance_descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
@@ -417,7 +418,7 @@ impl Renderer {
             vertex_capacity,
             device_lost,
             metrics,
-            cursor: CursorStyle::theme_default(&theme),
+            cursor,
             theme,
         })
     }
@@ -1046,6 +1047,21 @@ impl CursorStyle {
             color: theme.cursor(),
             focused: true,
         }
+    }
+
+    /// Replace the shape (a `[cursor]` configuration selection).
+    pub(crate) fn with_shape(mut self, shape: CursorShape) -> Self {
+        self.shape = shape;
+        self
+    }
+
+    /// Replace the colour when a configuration override named one; `None`
+    /// keeps the theme's cursor colour.
+    pub(crate) fn with_color_override(mut self, color: Option<[f32; 3]>) -> Self {
+        if let Some(color) = color {
+            self.color = color;
+        }
+        self
     }
 
     /// Record the window's focus state.

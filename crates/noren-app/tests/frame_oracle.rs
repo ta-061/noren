@@ -83,6 +83,7 @@ use std::fs;
 use std::io::Write;
 use std::process::Command;
 
+use noren_app::cursor::CursorShape;
 use noren_app::theme::{DARK, HIGH_CONTRAST, LIGHT, Theme, contrast_ratio};
 use noren_app::{
     GridGeometry, MAX_RENDER_COLS, MAX_RENDER_ROWS, POC_CELL_HEIGHT as CELL_HEIGHT,
@@ -1740,6 +1741,89 @@ fn the_cursor_colour_comes_from_the_theme_and_clears_contrast_in_pixels() {
     }
 }
 
+/// Shape is configuration, not existence: bar and underline marks draw their
+/// strokes without inverting the glyph beneath them (only the focused block
+/// inverts), over the glyph so the mark stays solid.
+#[test]
+fn bar_and_underline_shapes_mark_the_cell_without_inverting_the_glyph() {
+    let Some(renderer) =
+        renderer_or_skip("bar_and_underline_shapes_mark_the_cell_without_inverting_the_glyph")
+    else {
+        return;
+    };
+    let stroke = 2_u32; // CURSOR_STROKE in the renderer
+
+    // A bar on a blank cell: the left stroke runs the full cell height in
+    // the cursor colour; the rest of the cell stays clear.
+    let blank = snapshot(1, 4, b"");
+    let bar = render_with_cursor_style(
+        &renderer,
+        &DARK,
+        CursorStyle::theme_default(&DARK).with_shape(CursorShape::Bar),
+        &blank,
+    );
+    for y in 0..CELL_HEIGHT {
+        for x in 0..CELL_WIDTH {
+            let pixel = bar.pixel(x, y);
+            let rgb = [pixel[0], pixel[1], pixel[2]];
+            let in_bar = x < stroke;
+            assert_eq!(
+                colors_match(rgb, cursor_rgb(&DARK)),
+                in_bar,
+                "bar cursor: pixel ({x},{y}) must be {} — bar pixels are the \
+                 left {stroke} columns only",
+                if in_bar { "cursor-coloured" } else { "clear" }
+            );
+        }
+    }
+
+    // An underline on a blank cell: the bottom stroke spans the cell width.
+    let underline = render_with_cursor_style(
+        &renderer,
+        &DARK,
+        CursorStyle::theme_default(&DARK).with_shape(CursorShape::Underline),
+        &blank,
+    );
+    for y in 0..CELL_HEIGHT {
+        for x in 0..CELL_WIDTH {
+            let pixel = underline.pixel(x, y);
+            let rgb = [pixel[0], pixel[1], pixel[2]];
+            let in_underline = y >= CELL_HEIGHT - stroke;
+            assert_eq!(
+                colors_match(rgb, cursor_rgb(&DARK)),
+                in_underline,
+                "underline cursor: pixel ({x},{y}) must be {} — underline \
+                 pixels are the bottom {stroke} rows only",
+                if in_underline {
+                    "cursor-coloured"
+                } else {
+                    "clear"
+                }
+            );
+        }
+    }
+
+    // Neither shape inverts the glyph it shares a cell with: the 'A' under
+    // a bar keeps the default foreground outside the stroke.
+    let over_a = snapshot(1, 4, b"A\r");
+    let bar_over_a = render_with_cursor_style(
+        &renderer,
+        &DARK,
+        CursorStyle::theme_default(&DARK).with_shape(CursorShape::Bar),
+        &over_a,
+    );
+    let colors = cell_colors(&bar_over_a, 0, 0);
+    for color in colors {
+        assert!(
+            colors_match(color, cursor_rgb(&DARK)) || colors_match(color, default_foreground_rgb()),
+            "a bar must not invert the glyph beneath it; found {color:?}"
+        );
+    }
+    // And both differ from the block default.
+    let block = render(&renderer, &over_a);
+    assert_ne!(bar_over_a.rgba, block.rgba);
+}
+
 /// Focus loss is visible (issue #200): the unfocused caret is a hollow
 /// outline of the block footprint — border lit, interior clear — and the
 /// two treatments differ in pixels.
@@ -1791,6 +1875,36 @@ fn an_unfocused_cursor_is_a_hollow_outline_and_differs_from_focused() {
             );
         }
     }
+}
+
+/// A colour override is the power-user half of the contract: the theme
+/// colour is the default, and `[cursor]` colour configuration replaces it
+/// without touching any other drawn colour.
+#[test]
+fn a_cursor_colour_override_replaces_only_the_caret_colour() {
+    let Some(renderer) =
+        renderer_or_skip("a_cursor_colour_override_replaces_only_the_caret_colour")
+    else {
+        return;
+    };
+    let orange: [f32; 3] = [255.0 / 255.0, 140.0 / 255.0, 0.0];
+    let snap = snapshot(1, 4, b"a");
+    let overridden = render_with_cursor_style(
+        &renderer,
+        &DARK,
+        CursorStyle::theme_default(&DARK).with_color_override(Some(orange)),
+        &snap,
+    );
+    let orange_u8 = orange.map(|channel| (channel * 255.0).round() as u8);
+    assert!(
+        cell_is_solid(&overridden, 0, 1, orange_u8),
+        "the override colour {orange_u8:?} must draw the caret"
+    );
+    // The 'a' keeps the theme's default foreground.
+    assert!(colors_match(
+        cell_color(&overridden, 0, 0),
+        default_foreground_rgb()
+    ));
 }
 
 // ===========================================================================
