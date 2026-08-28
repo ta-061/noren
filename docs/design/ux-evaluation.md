@@ -286,11 +286,11 @@ without blocking the task.
 
 ## Ranked proposals: smallest changes with the largest effect
 
-1. **Add an always-visible `⌘P Commands` affordance and make the empty state
-   actionable.** Show `No sessions — press ⌘P, then C to create one` when
-   empty, and retain a compact opener hint during normal use. Rank 1 because a
-   few cells of copy unlock every existing Noren action for every new user;
-   nothing else matters if the product cannot be discovered.
+1. **Add an always-visible command-palette affordance and make the empty state
+   actionable.** Show the configured opener—`⌘P Commands` by default—and, when
+   empty, `No sessions — press ⌘P, then C to create one`. Rank 1 because a few
+   cells of accurate copy unlock every existing Noren action for every new
+   user; nothing else matters if the product cannot be discovered.
 2. **Render the terminal cursor.** Draw a theme-aware block/bar/underline at
    the snapshot cursor, with clear focused/unfocused behavior. Rank 2 because
    it repairs the most frequent baseline terminal feedback failure with a
@@ -320,11 +320,19 @@ The deliberately omitted "improvements" are animations, decorative icons,
 rounded panels, and theme proliferation. They would be nicer, but none fixes a
 task failure observed here.
 
-## Filed issues
+## Issue filing status
 
-Issue links will be added after duplicate checking and creation:
+Live duplicate searches found no matching open issues. Creation was attempted,
+but every available write path was unavailable: the GitHub connector requires
+an approval mode this environment cannot grant, the GitHub CLI token is
+invalid, and the browser extension is not installed in the connected Chrome
+profile. No issue number is claimed.
 
-- palette discoverability and actionable empty state — pending
-- visible terminal cursor — pending
-- sidebar width, hierarchy, and persistent state — pending
-- selection highlight and scrollback orientation — pending
+These five titles and acceptance directions are ready to file from the ranked
+proposals above:
+
+1. `Make the command palette discoverable and the empty state actionable`
+2. `Render a visible terminal cursor`
+3. `Preserve sidebar type, identity, and lifecycle state without 16-column clipping`
+4. `Render selection highlight and scrollback orientation feedback`
+5. `Replace the 5x7 bitmap font with a terminal-grade monospace text path`
