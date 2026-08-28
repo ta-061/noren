@@ -111,21 +111,20 @@
 //! `0xF00F_BEEF_5EED_0A11`: 46_126 cases / ~4.2 MiB, ZERO panics, ZERO
 //! violations. Seed `0x1`: 77_008 cases / ~7.0 MiB, ZERO panics, ZERO
 //! violations. Seed `0xC0FF_EE42_DEAD_BEEF`: HALTED at case 1336 by the
-//! open defect below (1 violation). Iteration rates are lower than the
+//! defect below (1 violation). Iteration rates are lower than the
 //! shape-only revision (718k+ cases in 60 s there) because every case now
 //! also runs the any-input state oracles per feed and the full content
 //! probe suite; the machine was also under heavy load (load average ~58).
 //! The committed default seed/bound (2500 cases) stays green. Future
 //! campaigns should append their totals here.
 //!
-//! # OPEN DEFECT FOUND BY THE CONTENT ORACLES (unfixed, pre-existing on
-//! # main, reported for its own issue/review)
+//! # DEFECT FOUND BY THE CONTENT ORACLES (fixed in Issue #176; record kept)
 //!
 //! The "cursor never rests on a wide-character continuation cell"
 //! invariant — which `move_cursor` documents and which LF/IND/NEL/RI
 //! maintain via `snap_cursor_to_lead` ("a path added later cannot forget
-//! the re-snap") — is VIOLATED by the three content-scrolling paths that
-//! shift rows under a STATIONARY cursor and do not re-snap:
+//! the re-snap") — was VIOLATED by the three content-scrolling paths that
+//! shift rows under a STATIONARY cursor and did not re-snap:
 //!
 //! - `CSI Ps T` (SD, scroll down): `TerminalState::new(2,4)` +
 //!   `feed_bytes(b"\xf0\x9f\x98\x80\n\x08\x1b[1T")` — the emoji pair from
@@ -142,9 +141,25 @@
 //! destroyed one column to the left of where a snapped cursor would have
 //! replaced it. Fuzz repro: `FUZZ_ROOT_SEED=0xc0ffee42deadbeef
 //! FUZZ_CASE_INDEX=1336 cargo test -p noren-terminal --test fuzz_feed_bytes
-//! fuzz_feed_bytes_generated_streams -- --nocapture` (fails at "feed byte
-//! 23"). The oracle stays enabled on purpose; the committed default bound
-//! does not reach a triggering case.
+//! fuzz_feed_bytes_generated_streams -- --nocapture` (failed at "feed byte
+//! 23" pre-fix). The fix routes SU/SD/DL through the same shared
+//! `snap_cursor_to_lead`; the deterministic pin is
+//! `scroll_down_up_and_delete_lines_snap_the_cursor_off_continuations` in
+//! `tests/unicode_width.rs`, and re-injecting the defect (deleting the
+//! three re-snaps) is still caught at exactly case 1336 by this oracle —
+//! a fix that disabled its own detector would be worse than the defect.
+//! A sweep of every other row-shifting / column-occupancy operation (IL,
+//! ICH, DCH, ECH, EL, ED, DECSTBM, resize, alternate-screen switching)
+//! found no further stranding: IL blanks the cursor's own row, the
+//! character ops blank or `repair_row` the cursor cell, and the remaining
+//! paths home, restore, or resize the cursor already snapped.
+//!
+//! Campaign evidence after the Issue #176 fix (2026-08-28, macOS arm64
+//! debug): seed `0xC0FF_EE42_DEAD_BEEF` `FUZZ_SECONDS=60`: 704_053 cases /
+//! ~67.0 MiB, ZERO panics, ZERO violations (previously halted at 1336).
+//! Seed `0xF00F_BEEF_5EED_0A11` 20 s: 203_369 cases, ZERO violations.
+//! Seed `0x1` 20 s: 176_358 cases, ZERO violations. Combined 1_083_780
+//! cases past the finding seed's halt point.
 
 use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
