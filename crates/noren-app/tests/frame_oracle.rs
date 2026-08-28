@@ -2208,8 +2208,11 @@ fn palette_hint_default_and_rebind_are_drawn_in_frame_pixels() {
     // Compare that cell against independently rendered P/K glyph pixels so a
     // hard-coded default cannot satisfy the rebound half of the assertion.
     let configured_key_col = SIDEBAR_COLS as u32 + 6;
-    let p_reference = render(&renderer, &snapshot(1, 1, b"P"));
-    let k_reference = render(&renderer, &snapshot(1, 1, b"K"));
+    // A one-column terminal leaves delayed autowrap armed with the cursor on
+    // the glyph cell. Hide that cursor so these controls measure the ordinary
+    // P/K glyph masks, not #206's inverse-video caret over those glyphs.
+    let p_reference = render(&renderer, &snapshot(1, 1, b"\x1b[?25lP"));
+    let k_reference = render(&renderer, &snapshot(1, 1, b"\x1b[?25lK"));
     let default_key_pixels = cell_pattern(&default_frame, 0, configured_key_col);
     let rebound_key_pixels = cell_pattern(&rebound_frame, 0, configured_key_col);
 
@@ -2291,9 +2294,12 @@ fn empty_workspace_recovery_action_is_drawn_in_terminal_frame_pixels() {
         .expect("n is a valid create-session rebind");
     let rebound_frame = render_empty_workspace(&renderer, &rebound);
 
-    let c_reference = render(&renderer, &snapshot(1, 1, b"C"));
-    let n_reference = render(&renderer, &snapshot(1, 1, b"N"));
-    let p_reference = render(&renderer, &snapshot(1, 1, b"P"));
+    // These are ordinary-glyph controls for cursor-free application chrome.
+    // On a one-column terminal the delayed-wrap cursor occupies the glyph
+    // cell, so hide it rather than comparing against inverse-video masks.
+    let c_reference = render(&renderer, &snapshot(1, 1, b"\x1b[?25lC"));
+    let n_reference = render(&renderer, &snapshot(1, 1, b"\x1b[?25lN"));
+    let p_reference = render(&renderer, &snapshot(1, 1, b"\x1b[?25lP"));
     let action_key_col = SIDEBAR_COLS as u32 + 6; // `Press ` then the key.
 
     assert!(
