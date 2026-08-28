@@ -96,11 +96,11 @@ shasum -a 256 -c SHA256SUMS
 ```
 
 Expected (the digest and file name as published; shown for the candidate
-built at commit `2bb7972`):
+built at commit `23ce308`):
 
 ```text
-383a3e2980a2eba48965a899f0b0c7a10c169f2a3b7e287eb67102597d955ee2  noren-0.1.0-preview-2bb7972-aarch64-apple-darwin.tar.gz
-noren-0.1.0-preview-2bb7972-aarch64-apple-darwin.tar.gz: OK
+923f14d10215b5792c204d3dfebc8f699c0297b2a765e5b0f6f5b2c676e398b8  noren-0.1.0-preview-23ce308-aarch64-apple-darwin.tar.gz
+noren-0.1.0-preview-23ce308-aarch64-apple-darwin.tar.gz: OK
 ```
 
 The `OK` line only appears when the file on disk matches the published

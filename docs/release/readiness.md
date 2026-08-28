@@ -129,7 +129,7 @@ scope that has not started.
 | `cargo test -p noren-app --test frame_oracle` | 58 passed, 0 failed, 0 ignored |
 | `python3 -m unittest scripts/test_generate_notes.py` | 26 passed |
 | `python3 scripts/check_docs.py` | OK |
-| `python3 scripts/release/audit_notes_prs.py` (new in this branch) | `OK` — notes PR set 111 = gh-merged-and-reachable 111 at `2bb7972` (the same set `build.sh` now derives at HEAD when it generates the artifact's notes) |
+| `python3 scripts/release/audit_notes_prs.py` (new in this branch) | `OK` — notes PR set 112 = gh-merged-and-reachable 112 at `23ce308` (the same set `build.sh` now derives at HEAD when it generates the artifact's notes) |
 
 **Marked unverified, on purpose:** Gatekeeper's first-launch dialogs were
 documented from macOS behavior, not reproduced — a locally built binary
