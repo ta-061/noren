@@ -337,15 +337,17 @@ pub(crate) enum RenderOutcome {
 
 /// Application-owned chrome drawn around terminal cells for one frame.
 ///
-/// The palette affordance travels separately from runtime status text so the
-/// renderer can keep it first in the permanent terminal-side status row. That
-/// ordering is load-bearing: a long diagnostic may be clipped by a narrow
-/// window, but it must never make the command surface undiscoverable.
+/// Viewport orientation and the palette affordance travel separately from
+/// runtime status text so the renderer can keep them first in the permanent
+/// terminal-side status row. That ordering is load-bearing: a long diagnostic
+/// may be clipped by a narrow window, but it must never hide how to leave
+/// history or make the command surface undiscoverable.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct FrameChrome<'a> {
     sidebar: Option<SidebarInput<'a>>,
     status: Option<&'a str>,
     palette_hint: Option<&'a str>,
+    viewport_indicator: Option<&'a str>,
     workspace_notice: Option<&'a [String]>,
     scroll_offset: usize,
 }
@@ -356,6 +358,7 @@ impl<'a> FrameChrome<'a> {
             sidebar: sidebar.map(SidebarInput::Plain),
             status,
             palette_hint: None,
+            viewport_indicator: None,
             workspace_notice: None,
             scroll_offset: 0,
         }
@@ -374,6 +377,15 @@ impl<'a> FrameChrome<'a> {
     #[must_use]
     pub(crate) const fn with_palette_hint(mut self, hint: Option<&'a str>) -> Self {
         self.palette_hint = hint;
+        self
+    }
+
+    /// Add the scrolled-history orientation/recovery copy. It is emitted
+    /// before every other status segment so a narrow frame cannot clip the
+    /// user's route back to the live tail.
+    #[must_use]
+    pub(crate) const fn with_viewport_indicator(mut self, indicator: Option<&'a str>) -> Self {
+        self.viewport_indicator = indicator;
         self
     }
 
@@ -397,12 +409,11 @@ impl<'a> FrameChrome<'a> {
     }
 
     fn status_line(self) -> Option<String> {
-        match (self.palette_hint, self.status) {
-            (None, None) => None,
-            (Some(hint), None) => Some(hint.to_owned()),
-            (None, Some(status)) => Some(status.to_owned()),
-            (Some(hint), Some(status)) => Some(format!("{hint} | {status}")),
-        }
+        let parts: Vec<&str> = [self.viewport_indicator, self.palette_hint, self.status]
+            .into_iter()
+            .flatten()
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" | "))
     }
 }
 

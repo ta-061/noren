@@ -302,20 +302,19 @@ against it:
   only feedback. Pasting into a plain `zsh` prompt or `cat` therefore
   does nothing. Sending unbracketed bytes is deliberately not done, so
   a preview must tell users this before they call paste broken.
-- **The view layer is incomplete beyond colour and glyphs.** There is no
-  visible cursor: `glyph_vertices` in `renderer.rs` emits sidebar rows,
-  per-cell backgrounds, glyph bitmaps, and a status line — never a cursor —
-  and the word "cursor" does not appear in that file. There is no scrollback
-  viewport: rendering stays on the newest suffix of the content because no
-  scroll-offset input exists (the only scroll offset in `main.rs` is the
-  sidebar's own). Selection is tracked and copies correctly but is never
-  highlighted. Scrollback search is unreachable: the terminal core ships a
+- **The view layer remains incomplete beyond cursor, colour, glyphs, and
+  scrollback navigation.** The cursor is rendered, and retained primary-screen
+  history now has a clamped viewport driven by configurable
+  Shift+PageUp/Shift+PageDown defaults plus the wheel only when the application
+  has not enabled mouse tracking. A `History -N` indicator names the configured
+  route to `Latest`; alternate screens never borrow primary history. Selection
+  is tracked and copies correctly but is never highlighted. Scrollback search
+  is unreachable: the terminal core ships a
   real snapshot search engine (`crates/noren-terminal/src/search.rs`:
   `Search`, ranked matches, case sensitivity), but nothing in the app
   references it — no key or palette command starts a search and no renderer
-  surface draws one. A terminal in which a stranger cannot see the cursor,
-  cannot scroll back, cannot see their selection, and cannot search is not
-  preview-ready.
+  surface draws one. Selection feedback and search therefore remain
+  preview-readiness gaps even though cursor and history navigation now work.
 - **The FR-005 rendered-frame oracle exists and runs, and its boundary is
   the honesty requirement.** It drives the real `wgpu` pipeline offscreen
   (`crates/noren-app/src/renderer_capture.rs`,

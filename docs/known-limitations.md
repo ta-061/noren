@@ -246,15 +246,18 @@ Each item states what you would actually see if you ran the build.
 - **There is no accessibility surface.** Nothing in the tree integrates with
   assistive technology (no AccessKit, AT-SPI, or AppKit accessibility wiring);
   a screen reader has nothing to work with.
-- **Selection and scrollback work, but you cannot see them.** Selection is
-  tracked and copy extracts it, yet the renderer does not highlight the selected
-  region — the comment on the `selection` field in `main.rs` says so in the
-  source itself ("The renderer does not highlight it yet"). Scrollback is
-  bounded and searchable, but `FrameRowLayout::new` derives
-  `terminal_row_count` from `content_rows.min(terminal_capacity)`, then
-  `first_terminal_line` as `content_rows - terminal_row_count`. There is no
-  scroll-offset input, so rendering stays on the newest suffix and you cannot
-  scroll back through it. The data is there; the view onto it is not.
+- **Selection works, but you cannot see it; scrollback search is still
+  unreachable.** Selection is tracked and copy extracts it, yet the renderer
+  does not highlight the selected region — the comment on the `selection`
+  field in `main.rs` says so in the source itself ("The renderer does not
+  highlight it yet"). Retained primary-screen history is now visible through
+  Shift+PageUp/Shift+PageDown (configurable as `scroll_page_up` and
+  `scroll_page_down`) and the mouse wheel when no application mouse mode is
+  active. A `History -N` status indicator names the configured route back to
+  `Latest`; alternate screens remain isolated and an application that enables
+  mouse tracking keeps every wheel event. The terminal core's snapshot search
+  engine is still not exposed by any app key, palette command, or renderer
+  surface.
 - **Paste is bracketed-paste-only.** `Cmd+V` never sends raw clipboard bytes:
   `paste_bytes` in `main.rs` wraps the text in bracketed-paste markers only
   when the program enabled DEC private mode 2004, and every other case is
