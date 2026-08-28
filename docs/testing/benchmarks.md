@@ -18,6 +18,12 @@ Policy, in one line: **benchmarks report; they never gate.**
   the `resolution_work` tests in `src/ssh_config/tests.rs`, the pattern #158
   established). A benchmark number turning red is a signal for a person, not
   for CI.
+- The suite did not introduce the wall-clock assertions that still exist
+  elsewhere in the test tree, and this PR removes none of them (they are
+  pre-existing guards, not benchmark output). The full inventory — 11
+  pre-existing timing assertions with their ceilings and measured margins on
+  the reference machine, and which of them are on the thin-margin watchlist —
+  is recorded in issue #178.
 - Every number below is machine-specific. It is recorded so *this* machine's
   trend is detectable, not as a universal expectation.
 
@@ -30,6 +36,30 @@ Policy, in one line: **benchmarks report; they never gate.**
 | `renderer_frame` | The CPU half of every presented frame (`Target::new` + `glyph_vertices_for` through the shipped renderer source, `#[path]`-included the same way the frame oracle does it). |
 | `snapshot` | The `TerminalEngine::snapshot()` the main loop builds per redraw; deep-clones all retained scrollback, so it grows with history. |
 | `search` | Ctrl+F over a full 10,000-row scrollback — what a user feels. |
+
+## What is deliberately not measured (yet)
+
+Naming the boundary so the next person does not mistake silence for
+coverage — the same discipline the fuzz oracle applies to its unasserted
+invariants. None of these paths has a recorded number; each needs either a
+harness that does not exist today (GPU timing, window events) or a fixture
+shape this suite has not built:
+
+- **startup** — process launch to first presented frame; needs window
+  plumbing no bench target has.
+- **wgpu-init** — adapter/device/surface setup and the first pipeline
+  compile; GPU-side, invisible to a CPU bench profile.
+- **git-worktree-scan** — `git worktree list --porcelain` at startup; a
+  subprocess, so it measures git as much as Noren.
+- **resize** — grid realloc and reflow per size change; needs an event
+  source.
+- **viewport-scroll** — scrolling through retained scrollback (distinct
+  from `snapshot`, which measures the copy, not the view).
+- **session-switch** — swapping the live surface between parked sessions.
+- **persistence-load** — reading `sessions.toml` and restoring rows.
+- **paste** — bracketed-paste of a large clipboard into `feed_bytes`-like
+  parsing (partially covered by `feed_bytes` shapes, but not measured as a
+  paste event).
 
 ## Running
 
