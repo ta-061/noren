@@ -96,13 +96,55 @@
 //! that is the probe suites), so `cargo test --workspace` gains under a
 //! second.
 //!
-//! Campaign evidence (2026-08-28, macOS arm64 debug, `FUZZ_SECONDS=60`
-//! under three root seeds — `0xF00F_BEEF_5EED_0A11`, `0x1`, and
-//! `0xC0FF_EE42_DEAD_BEEF`): 718_097 + 728_935 + 853_179 = 2_300_211
-//! generated cases, ~219 MiB fed, ZERO panics and ZERO invariant
-//! violations. The parser survived; no defect was found and therefore no
-//! new regression fixture was pinned. The committed default seed must stay
-//! green; future campaigns should append their totals here.
+//! Campaign evidence, shape-only revision (2026-08-28, macOS arm64 debug,
+//! `FUZZ_SECONDS=60` under three root seeds — `0xF00F_BEEF_5EED_0A11`,
+//! `0x1`, and `0xC0FF_EE42_DEAD_BEEF`): 718_097 + 728_935 + 853_179 =
+//! 2_300_211 generated cases, ~219 MiB fed, ZERO panics and ZERO
+//! structural violations. Note the limit of that result: the oracle then
+//! asserted shape only, so it could not see decode/pen defects (an
+//! independently injected dropped-UTF-8-continuation defect and an
+//! SGR-0-no-op defect both survived it green; both are caught at case 0 by
+//! the content revision below).
+//!
+//! Campaign evidence, content-oracle revision (2026-08-28, macOS arm64
+//! debug, `FUZZ_SECONDS=20` under the same three root seeds): seed
+//! `0xF00F_BEEF_5EED_0A11`: 46_126 cases / ~4.2 MiB, ZERO panics, ZERO
+//! violations. Seed `0x1`: 77_008 cases / ~7.0 MiB, ZERO panics, ZERO
+//! violations. Seed `0xC0FF_EE42_DEAD_BEEF`: HALTED at case 1336 by the
+//! open defect below (1 violation). Iteration rates are lower than the
+//! shape-only revision (718k+ cases in 60 s there) because every case now
+//! also runs the any-input state oracles per feed and the full content
+//! probe suite; the machine was also under heavy load (load average ~58).
+//! The committed default seed/bound (2500 cases) stays green. Future
+//! campaigns should append their totals here.
+//!
+//! # OPEN DEFECT FOUND BY THE CONTENT ORACLES (unfixed, pre-existing on
+//! # main, reported for its own issue/review)
+//!
+//! The "cursor never rests on a wide-character continuation cell"
+//! invariant — which `move_cursor` documents and which LF/IND/NEL/RI
+//! maintain via `snap_cursor_to_lead` ("a path added later cannot forget
+//! the re-snap") — is VIOLATED by the three content-scrolling paths that
+//! shift rows under a STATIONARY cursor and do not re-snap:
+//!
+//! - `CSI Ps T` (SD, scroll down): `TerminalState::new(2,4)` +
+//!   `feed_bytes(b"\xf0\x9f\x98\x80\n\x08\x1b[1T")` — the emoji pair from
+//!   row 0 lands under the cursor at (1,1), a continuation cell.
+//! - `CSI Ps S` (SU, scroll up): `TerminalState::new(3,4)` +
+//!   `feed_bytes(b"\n\xf0\x9f\x98\x80\x1b[1;2H\x1b[1S")`.
+//! - `CSI Ps M` (DL, delete lines): `TerminalState::new(3,4)` +
+//!   `feed_bytes(b"\n\xf0\x9f\x98\x80\x1b[1;2H\x1b[1M")`.
+//!
+//! LF at the bottom margin scrolls under the cursor too but stays clean
+//! because `index()` re-snaps afterwards. Consequence of the defect: a
+//! print at the stranded position overwrites only the continuation half
+//! and `repair_row` then blanks the orphaned lead, so the wide glyph is
+//! destroyed one column to the left of where a snapped cursor would have
+//! replaced it. Fuzz repro: `FUZZ_ROOT_SEED=0xc0ffee42deadbeef
+//! FUZZ_CASE_INDEX=1336 cargo test -p noren-terminal --test fuzz_feed_bytes
+//! fuzz_feed_bytes_generated_streams -- --nocapture` (fails at "feed byte
+//! 23"). The oracle stays enabled on purpose; the committed default bound
+//! does not reach a triggering case.
 
 use std::panic::AssertUnwindSafe;
 use std::time::{Duration, Instant};
