@@ -6150,3 +6150,116 @@ fn project_paths_never_reach_debug_or_status_surfaces() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Quitting with a project session beside a local, a worktree, and an agent
+/// session persists ALL FOUR creatable kinds through the real sessions.toml
+/// path — quit does not erase them — and the next launch restores every kind
+/// intact. (The fifth kind, SSH, never enters the registry by design; its
+/// round-trip is covered by the persistence suite's five-kind test,
+/// `round_trip_preserves_every_entry_kind_and_the_selection`.) This is also
+/// the direct guard that the project launch path did not reintroduce the
+/// historic quit-path erase: teardown must save exactly the sessions it had.
+#[cfg(target_os = "macos")]
+#[test]
+fn quitting_persists_project_sessions_beside_every_creatable_kind() {
+    let project_paths = project_directories(1);
+    let worktree_paths = mixed_worktree_directories(1);
+    let worktree_records =
+        git_worktree::parse_worktree_porcelain(&synthetic_porcelain(&worktree_paths))
+            .expect("synthetic porcelain parses");
+    let config = AppConfig::parse(&format!(
+        "{}[[agents]]\nname = \"persist-agent\"\ncommand = \"/bin/echo\"\nargs = [\"NOREN-PERSIST\"]\n",
+        projects_toml(&project_paths)
+    ))
+    .expect("valid projects and agents configuration");
+    let path = temp_state_path();
+    let home = AppTestHome::new();
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..app_with_deterministic_ssh_seam_and_config(config)
+    };
+    app.workspace.state_path = Some(path.clone());
+    app.workspace
+        .load_worktrees(WorktreeDiscovery::from_records(worktree_records));
+
+    // One local session (palette), then the project row (row 1), the
+    // worktree row (row 3 after the project launch), and the agent row
+    // (row 5 after the worktree launch).
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    assert!(click_sidebar_row(&mut app, 1), "the project row launches");
+    assert!(click_sidebar_row(&mut app, 3), "the worktree row launches");
+    assert!(click_sidebar_row(&mut app, 5), "the agent row launches");
+    let ids = registry_ids(&app);
+    assert_eq!(ids.len(), 4);
+    for id in &ids {
+        assert_eq!(session_status(&app, *id), SessionStatus::Running);
+    }
+
+    app.teardown();
+
+    let text = std::fs::read_to_string(&path).expect("state saved on quit");
+    assert_eq!(
+        text.matches("kind = \"local\"").count(),
+        1,
+        "the local session still persists: {text}"
+    );
+    assert_eq!(
+        text.matches("kind = \"project\"").count(),
+        1,
+        "the project session persists with its kind: {text}"
+    );
+    assert!(
+        text.contains(&format!("root = \"{}\"", project_paths[0].display())),
+        "the project entry carries its root for restoration: {text}"
+    );
+    assert_eq!(
+        text.matches("kind = \"worktree\"").count(),
+        1,
+        "the worktree session persists with its kind: {text}"
+    );
+    assert_eq!(
+        text.matches("kind = \"agent\"").count(),
+        1,
+        "the agent session persists with its kind: {text}"
+    );
+
+    // The next launch restores all four rows as Restored with intact kinds —
+    // the project root survives the round-trip byte for byte.
+    let relaunched = sidebar_after_relaunch(&path);
+    assert_eq!(relaunched.registry().len(), 4);
+    let kinds: Vec<SessionKind> = relaunched
+        .registry()
+        .sessions()
+        .iter()
+        .map(|descriptor| descriptor.kind().clone())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            SessionKind::Local,
+            SessionKind::Project {
+                root: project_paths[0].clone()
+            },
+            SessionKind::Worktree {
+                path: worktree_paths[0].clone()
+            },
+            SessionKind::Agent {
+                name: "persist-agent".to_owned()
+            },
+        ]
+    );
+    for descriptor in relaunched.registry().sessions() {
+        assert_eq!(
+            descriptor.status(),
+            &SessionStatus::Restored,
+            "a relaunched row must be Restored, never a phantom Running"
+        );
+    }
+    cleanup_state_file(&path);
+    for path in &worktree_paths {
+        let _ = std::fs::remove_dir(path);
+    }
+    for path in &project_paths {
+        let _ = std::fs::remove_dir(path);
+    }
+}
