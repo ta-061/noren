@@ -382,6 +382,54 @@ fn scroll_down_up_and_delete_lines_snap_the_cursor_off_continuations() {
     assert!(cell(&state, 0, 1).is_continuation());
 }
 
+/// SD (`CSI T`) alone must re-snap: the wide pair scrolls down under the
+/// stationary cursor's column. This is the fuzz-found arrangement (fuzz case
+/// 1336) pinned as its OWN test so that removing only the `scroll_down`
+/// re-snap fails exactly here — the combined three-operation test above
+/// stops at its first failing section and cannot prove which snap mattered.
+#[test]
+fn scroll_down_alone_snaps_the_cursor_off_continuations() {
+    let mut state = TerminalState::new(2, 4).expect("valid terminal");
+    state.feed_bytes(b"\xf0\x9f\x98\x80\n\x08\x1b[1T");
+    // Without the re-snap the cursor rests on (1,1), the continuation half.
+    assert_eq!(cursor(&state), (1, 0));
+    assert_cursor_off_continuation(&state);
+    assert_eq!(cell(&state, 1, 0).text(), "\u{1f600}");
+    assert_eq!(cell(&state, 1, 0).width(), 2);
+    assert!(cell(&state, 1, 1).is_continuation());
+}
+
+/// SU (`CSI S`) alone must re-snap: the wide row below the stationary
+/// cursor scrolls up under its column. Pinned separately from SD and DL so
+/// removing only the `scroll_up` re-snap fails exactly here.
+#[test]
+fn scroll_up_alone_snaps_the_cursor_off_continuations() {
+    let mut state = TerminalState::new(3, 4).expect("valid terminal");
+    state.feed_bytes(b"\n\xf0\x9f\x98\x80\x1b[1;2H\x1b[1S");
+    // Without the re-snap the cursor rests on (0,1), the continuation half.
+    assert_eq!(cursor(&state), (0, 0));
+    assert_cursor_off_continuation(&state);
+    assert_eq!(cell(&state, 0, 0).text(), "\u{1f600}");
+    assert_eq!(cell(&state, 0, 0).width(), 2);
+    assert!(cell(&state, 0, 1).is_continuation());
+}
+
+/// DL (`CSI M`) alone must re-snap: deleting the row above the stationary
+/// cursor shifts the wide row up under its column. Pinned separately from
+/// SD and SU so removing only the `delete_lines` re-snap fails exactly
+/// here.
+#[test]
+fn delete_lines_alone_snaps_the_cursor_off_continuations() {
+    let mut state = TerminalState::new(3, 4).expect("valid terminal");
+    state.feed_bytes(b"\n\xf0\x9f\x98\x80\x1b[1;2H\x1b[1M");
+    // Without the re-snap the cursor rests on (0,1), the continuation half.
+    assert_eq!(cursor(&state), (0, 0));
+    assert_cursor_off_continuation(&state);
+    assert_eq!(cell(&state, 0, 0).text(), "\u{1f600}");
+    assert_eq!(cell(&state, 0, 0).width(), 2);
+    assert!(cell(&state, 0, 1).is_continuation());
+}
+
 /// IL (`CSI L`) blanks the cursor's own row, so it cannot strand the cursor
 /// by itself — this test pins that it stays off continuations and moves the
 /// wide row below it down with both halves intact, so the contract holds if
@@ -435,6 +483,47 @@ fn delete_lines_evicting_a_wide_row_to_scrollback_keeps_the_pair_whole() {
     assert!(column < cols);
     assert!(row < 3);
     assert_cursor_off_continuation(&state);
+}
+
+/// Shrinking the grid clamps the cursor column; the clamped column can be
+/// the continuation half of a wide pair that survived the shrink intact, so
+/// resize must re-snap the cursor onto its lead. Guards the active-cursor
+/// re-snap in `ScreenState::resize` (mutation-checked: removing that snap
+/// alone fails exactly this test).
+#[test]
+fn resize_clamping_the_cursor_onto_a_continuation_snaps_to_the_lead() {
+    let mut state = TerminalState::new(2, 5).expect("valid terminal");
+    state.feed_bytes("A\u{1f600}B".as_bytes());
+    state.resize(2, 3).expect("valid resize");
+
+    // The pair fits in 3 columns; only `B` is truncated away. The cursor
+    // clamps from column 4 to column 2 — the continuation — and must land
+    // on the lead at column 1.
+    assert_eq!(cursor(&state), (0, 1));
+    assert_cursor_off_continuation(&state);
+    assert_eq!(cell(&state, 0, 1).text(), "\u{1f600}");
+    assert!(cell(&state, 0, 2).is_continuation());
+}
+
+/// DECRC (`CSI u` / `ESC 7`+`ESC 8`) restores a saved column onto content
+/// that changed while the position was saved: if a wide character's
+/// continuation half now occupies that column, the restore must re-snap to
+/// the lead. Guards the re-snap in `ScreenState::restore_cursor`
+/// (mutation-checked: removing that snap alone fails exactly this test, and
+/// it also catches the double removal of that snap together with the
+/// saved-cursor re-snap in `resize` — the saved-cursor resize snap alone is
+/// unobservable through the public API because every restore re-snaps).
+#[test]
+fn restoring_the_cursor_onto_a_continuation_snaps_to_the_lead() {
+    let mut state = TerminalState::new(2, 4).expect("valid terminal");
+    state.feed_bytes(b"A\x1b7\r\xf0\x9f\x98\x80\x1b[u");
+
+    // The save point (0,1) became the emoji's continuation half; the
+    // restore lands on the lead instead.
+    assert_eq!(cursor(&state), (0, 0));
+    assert_cursor_off_continuation(&state);
+    assert_eq!(cell(&state, 0, 0).text(), "\u{1f600}");
+    assert!(cell(&state, 0, 1).is_continuation());
 }
 
 #[test]
