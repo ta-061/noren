@@ -272,6 +272,9 @@ pub struct TerminalModes {
     application_cursor_key: bool,
     application_keypad: bool,
     bracketed_paste: bool,
+    // Stored hidden-side-out so the derive-Default all-false value means the
+    // historical behaviour: a visible cursor. DECTCEM hides it.
+    cursor_hidden: bool,
     mouse_normal_tracking: bool,
     mouse_button_event_tracking: bool,
     mouse_any_event_tracking: bool,
@@ -307,6 +310,18 @@ impl TerminalModes {
     #[must_use]
     pub const fn is_bracketed_paste_enabled(self) -> bool {
         self.bracketed_paste
+    }
+
+    /// Whether DEC private mode 25 (DECTCEM, text cursor enable) leaves the
+    /// cursor visible.
+    ///
+    /// The default is visible: a terminal that never draws its caret hides
+    /// where typing will land. Programs temporarily hide it during screen
+    /// redraws (`CSI ?25l`, e.g. vim) and re-show it at rest (`CSI ?25h`),
+    /// so a renderer must consult this before drawing.
+    #[must_use]
+    pub const fn is_cursor_visible(self) -> bool {
+        !self.cursor_hidden
     }
 
     /// Whether DEC private mode 1000 (normal mouse tracking) is enabled.
@@ -1330,6 +1345,9 @@ impl TerminalState {
         match (mode, enabled) {
             (PrivateMode::AlternateScreen, true) => self.enter_alternate_screen(),
             (PrivateMode::AlternateScreen, false) => self.leave_alternate_screen(),
+            (PrivateMode::CursorVisibility, enabled) => {
+                self.modes.cursor_hidden = !enabled;
+            }
             (PrivateMode::ApplicationCursorKey, enabled) => {
                 self.modes.application_cursor_key = enabled;
             }
@@ -1586,6 +1604,12 @@ impl TerminalSnapshot {
     #[must_use]
     pub const fn is_wrap_pending(&self) -> bool {
         self.wrap_pending
+    }
+
+    /// Whether DECTCEM leaves the cursor visible, captured with the screen.
+    #[must_use]
+    pub const fn is_cursor_visible(&self) -> bool {
+        self.modes.is_cursor_visible()
     }
 
     /// Terminal modes captured with the visible screen.

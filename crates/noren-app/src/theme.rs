@@ -12,6 +12,7 @@
 //!
 //! - the default foreground (unstyled text, sidebar, status line),
 //! - the default background (the render target's clear colour),
+//! - the cursor colour (the inverse-video baseline on an unstyled cell),
 //! - the sixteen ANSI palette entries (`SGR 30..37`, `90..97`, `40..47`,
 //!   `100..107`) that programs select by name.
 //!
@@ -306,15 +307,22 @@ pub struct Theme {
     palette256: &'static [[u8; 3]; 256],
     foreground: [f32; 3],
     background: [f32; 3],
+    cursor: [f32; 3],
 }
 
 /// The built-in `dark` theme: the pre-theme renderer's colours, except the
 /// five ANSI entries minimally brightened to clear WCAG AA (issue #168).
+///
+/// The cursor colour is the theme's default foreground: the caret is drawn
+/// as the exact inverse of ordinary text (block in the foreground colour,
+/// glyph inside it in the background colour), so it inherits the measured
+/// default-pair contrast instead of introducing an unchecked colour.
 pub const DARK: Theme = Theme {
     ansi: DARK_ANSI,
     palette256: &DARK_PALETTE,
     foreground: DARK_FOREGROUND,
     background: DARK_BACKGROUND,
+    cursor: DARK_FOREGROUND,
 };
 
 /// The built-in `light` theme.
@@ -323,6 +331,7 @@ pub const LIGHT: Theme = Theme {
     palette256: &LIGHT_PALETTE,
     foreground: LIGHT_FOREGROUND,
     background: LIGHT_BACKGROUND,
+    cursor: LIGHT_FOREGROUND,
 };
 
 /// The built-in `high-contrast` theme.
@@ -331,6 +340,7 @@ pub const HIGH_CONTRAST: Theme = Theme {
     palette256: &HIGH_CONTRAST_PALETTE,
     foreground: HIGH_CONTRAST_FOREGROUND,
     background: HIGH_CONTRAST_BACKGROUND,
+    cursor: HIGH_CONTRAST_FOREGROUND,
 };
 
 impl Default for Theme {
@@ -368,6 +378,31 @@ impl Theme {
     #[must_use]
     pub fn background_u8(self) -> [u8; 3] {
         quantize(self.background)
+    }
+
+    /// The cursor colour as shader floats: the inverse-video baseline for a
+    /// cursor on a cell with the default foreground.
+    ///
+    /// Every built-in theme sets this to its default foreground, so the
+    /// caret inverts the reading pair (cursor block in the foreground colour,
+    /// glyph inside it in the background colour) and inherits the measured
+    /// default-pair WCAG contrast — the order-independent ratio is identical
+    /// in both directions. On an SGR foreground/background pair the renderer
+    /// instead starts from that cell's resolved foreground; if either the
+    /// inverse foreground or a configured override misses 4.5:1 against the
+    /// actual cell background, it falls back to the better of black/white.
+    /// The theme value therefore remains the unstyled default without making
+    /// a fixed-colour promise on backgrounds the theme did not choose.
+    #[must_use]
+    pub const fn cursor(self) -> [f32; 3] {
+        self.cursor
+    }
+
+    /// The unstyled cursor baseline as the 8-bit triple actually stored by
+    /// the RGBA8 render target; see [`Theme::foreground_u8`].
+    #[must_use]
+    pub fn cursor_u8(self) -> [u8; 3] {
+        quantize(self.cursor)
     }
 
     /// The theme's sixteen ANSI palette entries, in palette-index order.

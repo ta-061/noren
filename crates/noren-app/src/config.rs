@@ -76,6 +76,7 @@
 //! embed a username or a private directory name, so neither surface is ever
 //! echoed through an error `Display` or a `Debug` rendering (issue #146).
 
+use crate::cursor::CursorShape;
 use crate::passthrough::{
     CLAIM_ID_PALETTE, Chord, ChordError, ChordSeq, KeyCode, Modifiers, PassthroughAction,
     PassthroughClaim, PassthroughPolicy, default_exit_claim,
@@ -295,6 +296,49 @@ impl ThemeConfig {
     }
 }
 
+/// Cursor appearance settings (issues #197/#200).
+///
+/// [`CursorConfig::default`] is a visible inverse-video block: the caret is
+/// drawn with no configuration, and this table only changes *how* it looks.
+/// Visibility is not a setting — it belongs to the program through DECTCEM,
+/// never to a user preference that could quietly reproduce the
+/// every-keystroke-blind defect.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CursorConfig {
+    shape: CursorShape,
+    color: Option<[u8; 3]>,
+}
+
+impl CursorConfig {
+    /// The configured shape; defaults to [`CursorShape::Block`].
+    #[must_use]
+    pub const fn shape(self) -> CursorShape {
+        self.shape
+    }
+
+    /// The configured preferred colour as `#rrggbb` channels; `None` keeps
+    /// cell-relative inverse video. The renderer uses a preference only where
+    /// it clears 4.5:1 against the actual cursor-cell background.
+    #[must_use]
+    pub const fn color(self) -> Option<[u8; 3]> {
+        self.color
+    }
+}
+
+/// Parse one `#rrggbb` colour value. Returns `None` for any other shape —
+/// wrong length, missing `#`, or non-hexadecimal characters — so a typo is
+/// the caller's typed error, never a guess.
+fn parse_hex_color(value: &str) -> Option<[u8; 3]> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 7 || bytes[0] != b'#' {
+        return None;
+    }
+    let channel = |start: usize| -> Option<u8> {
+        u8::from_str_radix(std::str::from_utf8(&bytes[start..start + 2]).ok()?, 16).ok()
+    };
+    Some([channel(1)?, channel(3)?, channel(5)?])
+}
+
 /// One configured agent: a display name plus the argv vector of its launch.
 ///
 /// The command is executed **without a shell** (see [`crate::config`]'s
@@ -408,6 +452,7 @@ pub struct AppConfig {
     keys: KeymapConfig,
     ui: UiConfig,
     theme: ThemeConfig,
+    cursor: CursorConfig,
     agents: Vec<AgentConfig>,
     projects: Vec<ProjectConfig>,
 }
@@ -435,6 +480,12 @@ impl AppConfig {
     #[must_use]
     pub const fn theme(&self) -> ThemeConfig {
         self.theme
+    }
+
+    /// Cursor appearance settings.
+    #[must_use]
+    pub const fn cursor(&self) -> CursorConfig {
+        self.cursor
     }
 
     /// Configured agents, in file order. Empty when `[agents]` is absent.
@@ -508,6 +559,7 @@ impl AppConfig {
                         "keys" => parse_keys(table, &mut config.keys)?,
                         "ui" => parse_ui(table, &mut config.ui)?,
                         "theme" => parse_theme(table, &mut config.theme)?,
+                        "cursor" => parse_cursor(table, &mut config.cursor)?,
                         // `[terminal]` historically attracted a `scrollback_lines` key.
                         // The terminal foundation has no configurable retention cap yet,
                         // so the table is rejected instead of parsed-and-ignored.
@@ -712,6 +764,39 @@ fn parse_theme(table: &dyn TableLike, theme: &mut ThemeConfig) -> Result<(), Con
                     .ok_or_else(|| ConfigError::ThemeNotAString { key: clip(key) })?;
                 theme.name = ThemeName::parse(value)
                     .ok_or_else(|| ConfigError::UnknownTheme { value: clip(value) })?;
+            }
+            _ => return Err(ConfigError::UnknownKey(clip(key))),
+        }
+    }
+    Ok(())
+}
+
+/// Apply the `[cursor]` table to the cursor appearance.
+///
+/// Shape names are a closed vocabulary matched exactly, like `[theme]`
+/// names; an unknown shape is [`ConfigError::UnknownCursorShape`] naming the
+/// offending value, never a fallback to `block`. The colour must be one
+/// `#rrggbb` string; its rejections name the key only — unlike a shape or
+/// theme name, a malformed colour is freeform text with no grammar
+/// bounding what it can hold.
+fn parse_cursor(table: &dyn TableLike, cursor: &mut CursorConfig) -> Result<(), ConfigError> {
+    for (key, item) in table.iter() {
+        match key {
+            "shape" => {
+                let value = item
+                    .as_str()
+                    .ok_or_else(|| ConfigError::CursorShapeNotAString { key: clip(key) })?;
+                cursor.shape = CursorShape::parse(value)
+                    .ok_or_else(|| ConfigError::UnknownCursorShape { value: clip(value) })?;
+            }
+            "color" => {
+                let value = item
+                    .as_str()
+                    .ok_or_else(|| ConfigError::CursorColorNotAString { key: clip(key) })?;
+                cursor.color = Some(
+                    parse_hex_color(value)
+                        .ok_or_else(|| ConfigError::InvalidCursorColor { key: clip(key) })?,
+                );
             }
             _ => return Err(ConfigError::UnknownKey(clip(key))),
         }
@@ -1228,6 +1313,24 @@ pub enum ConfigError {
     /// chord echo is: an error that cannot say which name failed is not
     /// actionable.
     UnknownTheme { value: String },
+    /// A `[cursor]` shape value is not a TOML string.
+    CursorShapeNotAString { key: String },
+    /// A `[cursor]` shape is not one of the accepted shapes.
+    ///
+    /// **Echo allowlist**: `value` carries the `[cursor]` shape text,
+    /// clipped to 120 characters by [`clip`], for the same reason
+    /// [`ConfigError::UnknownTheme`] echoes: a shape name is drawn from a
+    /// closed, published vocabulary (`block`, `bar`, `underline`), and an
+    /// error that cannot say which shape failed is not actionable.
+    UnknownCursorShape { value: String },
+    /// A `[cursor]` colour value is not a TOML string.
+    CursorColorNotAString { key: String },
+    /// A `[cursor]` colour is not one `#rrggbb` value.
+    ///
+    /// No file text appears: a malformed colour is freeform text with no
+    /// grammar bounding what it can hold, and the message states the one
+    /// accepted shape, so the key alone identifies the fix.
+    InvalidCursorColor { key: String },
     /// A `[keys]` value does not parse as a chord.
     ///
     /// **Echo allowlist** (issue #150): `value` and `reason` carry `[keys]`
@@ -1341,6 +1444,24 @@ impl fmt::Display for ConfigError {
                 f,
                 "configuration theme {value} is not a built-in theme; expected one of \
                  dark, light, high-contrast"
+            ),
+            Self::CursorShapeNotAString { key } => write!(
+                f,
+                "configuration key {key} must be a cursor shape string like \"block\""
+            ),
+            Self::UnknownCursorShape { value } => write!(
+                f,
+                "configuration cursor shape {value} is not a known shape; expected one of \
+                 block, bar, underline"
+            ),
+            Self::CursorColorNotAString { key } => write!(
+                f,
+                "configuration key {key} must be a colour string like \"#3fb27f\""
+            ),
+            Self::InvalidCursorColor { key } => write!(
+                f,
+                "configuration key {key} must be one #rrggbb colour value; it is not a \
+                 colour, and no fallback colour is guessed"
             ),
             Self::InvalidChord { key, value, reason } => write!(
                 f,
@@ -2334,6 +2455,143 @@ mod tests {
             config.keys().session_create(),
             chord(KeyCode::Char('t'), Modifiers::empty())
         );
+    }
+
+    // ── [cursor] tests ─────────────────────────────────────────────────
+
+    /// With no `[cursor]` surface at all the caret is a visible block in
+    /// the theme's colour — the drawn-by-default contract of issues
+    /// #197/#200: a user who reads nothing still gets a caret.
+    #[test]
+    fn default_cursor_is_a_visible_block_with_no_colour_override() {
+        assert_eq!(CursorConfig::default().shape(), CursorShape::Block);
+        assert_eq!(CursorConfig::default().color(), None);
+        assert_eq!(AppConfig::default().cursor(), CursorConfig::default());
+        assert_eq!(
+            AppConfig::parse("# nothing\n")
+                .expect("valid")
+                .cursor()
+                .shape(),
+            CursorShape::Block
+        );
+    }
+
+    /// An empty `[cursor]` table is presence without content: the default.
+    #[test]
+    fn empty_cursor_table_keeps_the_default_appearance() {
+        let config = AppConfig::parse("[cursor]\n").expect("an empty table is valid");
+        assert_eq!(config.cursor(), CursorConfig::default());
+    }
+
+    /// Each documented shape is selected by its exact name.
+    #[test]
+    fn every_documented_cursor_shape_is_selected_by_exact_name() {
+        for (text, shape) in [
+            ("block", CursorShape::Block),
+            ("bar", CursorShape::Bar),
+            ("underline", CursorShape::Underline),
+        ] {
+            let config =
+                AppConfig::parse(&format!("[cursor]\nshape = \"{text}\"\n")).expect("valid");
+            assert_eq!(config.cursor().shape(), shape, "{text:?}");
+        }
+    }
+
+    /// An unknown shape is a typed error naming the offending value —
+    /// never a fallback to `block`. The vocabulary is closed and
+    /// case-sensitive, like `[theme]` names.
+    #[test]
+    fn unknown_cursor_shapes_are_rejected_naming_the_offending_value() {
+        for text in [
+            "[cursor]\nshape = \"box\"\n",
+            "[cursor]\nshape = \"Block\"\n",
+            "[cursor]\nshape = \"\"\n",
+        ] {
+            let error = AppConfig::parse(text).expect_err("must not parse");
+            assert!(
+                matches!(&error, ConfigError::UnknownCursorShape { .. }),
+                "{text:?} must be UnknownCursorShape, got {error:?}"
+            );
+        }
+        assert_eq!(
+            AppConfig::parse("[cursor]\nshape = \"box\"\n"),
+            Err(ConfigError::UnknownCursorShape {
+                value: "box".to_owned()
+            })
+        );
+    }
+
+    /// A well-formed `#rrggbb` colour becomes the cursor preference; anything
+    /// else is a typed error naming the key, and the boundary cases (missing
+    /// `#`, wrong length, non-hex) are all rejected rather than guessed at.
+    #[test]
+    fn cursor_color_accepts_exact_hex_and_rejects_everything_else() {
+        let config = AppConfig::parse("[cursor]\ncolor = \"#3fb27f\"\n").expect("valid");
+        assert_eq!(config.cursor().color(), Some([0x3f, 0xb2, 0x7f]));
+
+        for text in [
+            "[cursor]\ncolor = \"orange\"\n",
+            "[cursor]\ncolor = \"3fb27f\"\n",
+            "[cursor]\ncolor = \"#3fb2\"\n",
+            "[cursor]\ncolor = \"#3fb27f0\"\n",
+            "[cursor]\ncolor = \"#zzb27f\"\n",
+            "[cursor]\ncolor = \"\"\n",
+        ] {
+            let error = AppConfig::parse(text).expect_err("must not parse");
+            assert!(
+                matches!(&error, ConfigError::InvalidCursorColor { .. }),
+                "{text:?} must be InvalidCursorColor, got {error:?}"
+            );
+        }
+        // Case-insensitive hex is accepted: `#RRGGBB` spells the same
+        // channels, unlike a shape or theme name where case is a second
+        // spelling of a closed vocabulary.
+        let config = AppConfig::parse("[cursor]\ncolor = \"#3FB27F\"\n").expect("valid");
+        assert_eq!(config.cursor().color(), Some([0x3f, 0xb2, 0x7f]));
+    }
+
+    /// Wrong value types and unknown keys are rejected with the section's
+    /// own typed errors.
+    #[test]
+    fn cursor_table_rejects_wrong_types_and_unknown_keys() {
+        let cases = [
+            (
+                "[cursor]\nshape = 3\n",
+                ConfigError::CursorShapeNotAString {
+                    key: "shape".to_owned(),
+                },
+            ),
+            (
+                "[cursor]\ncolor = 12.5\n",
+                ConfigError::CursorColorNotAString {
+                    key: "color".to_owned(),
+                },
+            ),
+            (
+                "[cursor]\nblink = true\n",
+                ConfigError::UnknownKey("blink".to_owned()),
+            ),
+            (
+                "cursor = \"bar\"\n",
+                ConfigError::WrongType {
+                    key: "cursor".to_owned(),
+                },
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(AppConfig::parse(text), Err(expected), "{text:?}");
+        }
+    }
+
+    /// `[cursor]` composes with the other sections without interference.
+    #[test]
+    fn cursor_applies_alongside_theme_and_font() {
+        let text = "[font]\ncell_width = 12\n\n[theme]\nname = \"light\"\n\n[cursor]\nshape = \"underline\"\ncolor = \"#101010\"\n";
+        let config = AppConfig::parse(text).expect("all sections are valid together");
+        assert_eq!(config.font().cell_width(), 12);
+        assert_eq!(config.theme().name(), ThemeName::Light);
+        assert_eq!(config.cursor().shape(), CursorShape::Underline);
+        assert_eq!(config.cursor().color(), Some([0x10, 0x10, 0x10]));
     }
 
     // ── [[agents]] tests ───────────────────────────────────────────────

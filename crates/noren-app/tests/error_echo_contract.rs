@@ -53,11 +53,14 @@ enum ValueEcho {
     /// Echo allowlist: the variant may carry `[theme]` name text, clipped
     /// to 120 characters, for the reason documented on the variant itself.
     ThemeName,
+    /// Echo allowlist: the variant may carry `[cursor]` shape text, clipped
+    /// to 120 characters, for the reason documented on the variant itself.
+    CursorShapeName,
 }
 
 /// Pinned variant count of [`ConfigError`]; a new variant must extend both
 /// the classifier and the sample table.
-const CONFIG_ERROR_VARIANTS: usize = 27;
+const CONFIG_ERROR_VARIANTS: usize = 31;
 /// Pinned variant count of [`SessionPersistenceError`].
 const SESSION_ERROR_VARIANTS: usize = 14;
 /// Pinned variant count of [`ChordParseError`].
@@ -74,6 +77,9 @@ const CHORD_ALLOWLIST_SIZE: usize = 6;
 /// Pinned size of the `[theme]` name echo allowlist; see
 /// [`CHORD_ALLOWLIST_SIZE`] for the policy.
 const THEME_NAME_ALLOWLIST_SIZE: usize = 1;
+/// Pinned size of the `[cursor]` shape echo allowlist; see
+/// [`CHORD_ALLOWLIST_SIZE`] for the policy.
+const CURSOR_SHAPE_ALLOWLIST_SIZE: usize = 1;
 /// Sample payload convention (policed by the pin test): key-shaped sample
 /// fields carry `sample_key` and may render; any **value-shaped** sample
 /// field must carry this sentinel so the test can check the classification
@@ -101,6 +107,15 @@ fn classify_config(error: &ConfigError) -> ValueEcho {
         // publishes — and naming the failed value is the point of the
         // error, exactly the `[keys]` chord argument.
         ConfigError::UnknownTheme { .. } => ValueEcho::ThemeName,
+        // Allowlist: the `[cursor]` shape vocabulary — the same closed-set
+        // argument as the theme name.
+        ConfigError::UnknownCursorShape { .. } => ValueEcho::CursorShapeName,
+        // The `[cursor]` shape/colour type and format rejections name the
+        // key only: a malformed colour is freeform text, and a wrong-typed
+        // value could be anything.
+        ConfigError::CursorShapeNotAString { .. } => ValueEcho::Never,
+        ConfigError::CursorColorNotAString { .. } => ValueEcho::Never,
+        ConfigError::InvalidCursorColor { .. } => ValueEcho::Never,
         // Allowlist: unparsed chord text plus its clipped parse reason —
         // naming the failed binding is the point of the error.
         ConfigError::InvalidChord { .. } => ValueEcho::ChordText,
@@ -259,6 +274,24 @@ fn config_samples() -> Vec<(ConfigError, ValueEcho)> {
                 value: VALUE_SENTINEL.to_owned(),
             },
             ValueEcho::ThemeName,
+        ),
+        (
+            ConfigError::CursorShapeNotAString { key: key() },
+            ValueEcho::Never,
+        ),
+        (
+            ConfigError::UnknownCursorShape {
+                value: VALUE_SENTINEL.to_owned(),
+            },
+            ValueEcho::CursorShapeName,
+        ),
+        (
+            ConfigError::CursorColorNotAString { key: key() },
+            ValueEcho::Never,
+        ),
+        (
+            ConfigError::InvalidCursorColor { key: key() },
+            ValueEcho::Never,
         ),
         (
             ConfigError::InvalidChord {
@@ -552,6 +585,12 @@ fn every_file_derived_variant_is_classified_and_the_allowlist_is_pinned() {
                 "an allowlisted variant must echo its theme name text: {sample}"
             );
         }
+        ValueEcho::CursorShapeName => {
+            assert!(
+                sample.contains(VALUE_SENTINEL),
+                "an allowlisted variant must echo its cursor shape text: {sample}"
+            );
+        }
     };
     for (sample, class) in &config {
         assert_rendering(sample.to_string(), format!("{sample:?}"), *class);
@@ -598,6 +637,18 @@ fn every_file_derived_variant_is_classified_and_the_allowlist_is_pinned() {
     assert_eq!(
         theme_allowlist, THEME_NAME_ALLOWLIST_SIZE,
         "the [theme] name echo allowlist changed size; admitting a new value \
+         echo is a reviewed decision (update this pin and the variant docs \
+         together)"
+    );
+
+    let cursor_shape_allowlist = config
+        .iter()
+        .map(|(_, class)| *class)
+        .filter(|class| *class == ValueEcho::CursorShapeName)
+        .count();
+    assert_eq!(
+        cursor_shape_allowlist, CURSOR_SHAPE_ALLOWLIST_SIZE,
+        "the [cursor] shape echo allowlist changed size; admitting a new value \
          echo is a reviewed decision (update this pin and the variant docs \
          together)"
     );
@@ -661,6 +712,11 @@ fn config_values_outside_keys_never_reach_display_or_debug() {
         format!("[[projects]]\nname = \"x\"\nroot = \"{SENTINEL}\"\n"),
         format!("[[projects]]\nname = \"{SENTINEL}\"\nroot = 5\n"),
         format!("[[projects]]\nname = \"x\"\nroot = \"~/{SENTINEL}\"\n"),
+        // `[cursor]` colour values: freeform text with no grammar bounding
+        // what a paste can hold, so its rejections name the key only.
+        format!("[cursor]\ncolor = \"{SENTINEL}\"\n"),
+        format!("[cursor]\ncolor = {SENTINEL}\n"),
+        format!("[cursor]\nshape = {SENTINEL}\n"),
     ];
     for text in cases {
         let error = AppConfig::parse(&text).expect_err("every sentinel fixture must fail");
@@ -777,6 +833,48 @@ fn unknown_theme_echoes_the_offending_name_and_wrong_types_name_only_the_key() {
     assert!(
         display.contains("name") && !display.contains("12345"),
         "ThemeNotAString must name the key and not the value: {display}"
+    );
+}
+
+/// The cursor-shape allowlist mirrors the theme-name one: an unknown shape
+/// echoes the offending name (bounded) and names the accepted vocabulary,
+/// while the colour rejections stay key-only.
+#[test]
+fn unknown_cursor_shape_echoes_the_offending_name_and_colour_errors_name_only_the_key() {
+    let error = AppConfig::parse("[cursor]\nshape = \"box\"\n")
+        .expect_err("an unknown cursor shape must fail");
+    let display = error.to_string();
+    assert!(
+        display.contains("box"),
+        "UnknownCursorShape must show the offending shape: {display}"
+    );
+    assert!(
+        display.contains("block") && display.contains("bar") && display.contains("underline"),
+        "UnknownCursorShape must name the accepted vocabulary: {display}"
+    );
+
+    // A hostile value stays bounded in the rendered message.
+    let mut hostile = String::new();
+    hostile.extend(std::iter::repeat_n('a', 10_000));
+    let error = AppConfig::parse(&format!("[cursor]\nshape = \"{hostile}\"\n"))
+        .expect_err("a hostile shape value must fail");
+    assert!(
+        error.to_string().chars().count() < 1024,
+        "the rendered message must stay bounded: {} chars",
+        error.to_string().chars().count()
+    );
+
+    // A malformed colour names the key and the accepted shape, never the text.
+    let error =
+        AppConfig::parse("[cursor]\ncolor = \"orange\"\n").expect_err("a non-hex colour must fail");
+    let display = error.to_string();
+    assert!(
+        display.contains("color") && !display.contains("orange"),
+        "InvalidCursorColor must name the key and not the value: {display}"
+    );
+    assert!(
+        display.contains("#rrggbb"),
+        "InvalidCursorColor must state the accepted shape: {display}"
     );
 }
 
