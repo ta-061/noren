@@ -4,6 +4,7 @@ use crate::{
 };
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Arc;
 
 /// Hard allocation bound for a visible Terminal Core screen.
 pub const MAX_SCREEN_CELLS: usize = 1024 * 1024;
@@ -735,7 +736,14 @@ pub struct TerminalState {
     parser: Parser,
     // Bounded history of lines that scrolled off the top of the primary screen.
     // The alternate screen never contributes; see `push_scrollback_rows`.
-    scrollback: VecDeque<Vec<Cell>>,
+    //
+    // Rows are shared, not copied: a row is immutable from the moment it is
+    // pushed (only push_back/pop_front ever touch the deque, and resize never
+    // reflows retained rows), so each row is a single `Arc<[Cell]>` that
+    // `snapshot` clones by handle. That keeps the per-frame snapshot cost at
+    // one pointer-sized clone per retained row instead of a deep copy that
+    // scales with the user's history (issue #172).
+    scrollback: VecDeque<Arc<[Cell]>>,
 }
 
 impl TerminalState {
@@ -834,7 +842,7 @@ impl TerminalState {
     /// [`TerminalSnapshot::scrollback`] for the cloned ordered view.
     #[must_use]
     pub fn scrollback_row(&self, index: usize) -> Option<&[Cell]> {
-        self.scrollback.get(index).map(Vec::as_slice)
+        self.scrollback.get(index).map(|row| row.as_ref())
     }
 
     /// Save the active screen's cursor position.
@@ -1126,7 +1134,7 @@ impl TerminalState {
             if self.scrollback.len() >= MAX_SCROLLBACK_LINES {
                 self.scrollback.pop_front();
             }
-            self.scrollback.push_back(row);
+            self.scrollback.push_back(Arc::from(row));
         }
     }
 
@@ -1473,6 +1481,14 @@ impl fmt::Debug for TerminalState {
 }
 
 /// Immutable snapshot passed to renderers and deterministic test oracles.
+///
+/// Scrollback rows are **shared** with the state, not copied: a retained row is
+/// immutable from the moment it scrolls off, so the snapshot holds an
+/// [`Arc`] handle per row and cloning the snapshot's history is one
+/// pointer-sized increment per row. Every accessor (including
+/// [`Debug`](std::fmt::Debug) and [`PartialEq`]) still observes the same cell
+/// contents as before the sharing change; only the ownership of unchanged rows
+/// differs (issue #172).
 #[derive(Clone, PartialEq, Eq)]
 pub struct TerminalSnapshot {
     screen: ScreenBuffer,
@@ -1482,12 +1498,12 @@ pub struct TerminalSnapshot {
     modes: TerminalModes,
     lines: Vec<String>,
     display_lines: Vec<String>,
-    scrollback: Vec<Vec<Cell>>,
+    scrollback: Vec<Arc<[Cell]>>,
 }
 
 impl fmt::Debug for TerminalSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let scrollback_cells = self.scrollback.iter().map(Vec::len).sum::<usize>();
+        let scrollback_cells = self.scrollback.iter().map(|row| row.len()).sum::<usize>();
         f.debug_struct("TerminalSnapshot")
             .field("size", &(self.rows(), self.cols()))
             .field("cursor", &self.cursor)
@@ -1607,8 +1623,13 @@ impl TerminalSnapshot {
     /// off the top of the visible grid, captured at the width it had when it
     /// left. The alternate screen never contributes. The slice length is bounded
     /// by [`MAX_SCROLLBACK_LINES`].
+    ///
+    /// Rows are shared with the state rather than deep-copied: each element is
+    /// an [`Arc`] handle to an immutable row, so building the snapshot copies
+    /// one handle per row (8 bytes) instead of `cols * size_of::<Cell>()` bytes
+    /// per row. Indexing and iteration deref to `&[Cell]` exactly as before.
     #[must_use]
-    pub fn scrollback(&self) -> &[Vec<Cell>] {
+    pub fn scrollback(&self) -> &[Arc<[Cell]>] {
         &self.scrollback
     }
 
@@ -1646,7 +1667,7 @@ impl TerminalSnapshot {
         let i = usize::try_from(index).ok()?;
         let sb = self.scrollback.len();
         if i < sb {
-            Some(self.scrollback[i].as_slice())
+            Some(self.scrollback[i].as_ref())
         } else {
             let v = i - sb;
             let cols = usize::from(self.screen.cols);

@@ -10,6 +10,8 @@
 //! down (and scrolls) without returning to column 0, exactly like a real
 //! terminal, so CR is needed to start each label at the left margin.
 
+use std::sync::Arc;
+
 use noren_terminal::{Cell, MAX_SCROLLBACK_LINES, TerminalState};
 
 /// Text rendering of retained scrollback rows, oldest first.
@@ -19,7 +21,12 @@ fn scrollback_lines(state: &TerminalState) -> Vec<String> {
 
 /// Width (cell count) of each retained scrollback row, in order.
 fn scrollback_widths(state: &TerminalState) -> Vec<usize> {
-    state.snapshot().scrollback().iter().map(Vec::len).collect()
+    state
+        .snapshot()
+        .scrollback()
+        .iter()
+        .map(|row| row.len())
+        .collect()
 }
 
 #[test]
@@ -157,6 +164,110 @@ fn resize_does_not_reflow_or_corrupt_retained_lines() {
     let snapshot = state.snapshot();
     let row0 = &snapshot.scrollback()[0];
     assert_eq!(row0.iter().map(Cell::text).collect::<String>(), "AAAA");
+}
+
+/// Fill `state`'s scrollback to exactly the hard cap with labelled lines.
+///
+/// Shared fixture for the per-frame-cost guards below: a 1-row grid makes
+/// every CRLF evict one labelled row, so the retained history is exactly the
+/// last `MAX_SCROLLBACK_LINES` labels, oldest first.
+fn capped_scrollback_state() -> TerminalState {
+    let mut state = TerminalState::new(1, 6).expect("valid terminal");
+    let mut script = String::with_capacity(MAX_SCROLLBACK_LINES * 8);
+    for index in 0..MAX_SCROLLBACK_LINES {
+        script.push_str(&format!("{index:05}\r\n"));
+    }
+    state.feed_bytes(script.as_bytes());
+    assert_eq!(state.scrollback_len(), MAX_SCROLLBACK_LINES);
+    state
+}
+
+/// Issue #172 regression guard: `snapshot()` must copy **zero** scrollback
+/// cells, at any history depth.
+///
+/// This is the copied-work assertion in the style #158 established for #137:
+/// the guard pins the amount of copying (a count), never the wall clock a
+/// copy takes, so it holds on every machine and in every build profile.
+/// Scrollback rows are immutable from the moment they scroll off, so the
+/// snapshot shares each row by `Arc` handle instead of cloning `cols *
+/// size_of::<Cell>()` bytes per row. Two snapshots of one state therefore
+/// reference the same row allocation iff the rows were shared: a deep copy
+/// (the pre-fix `from_state`, or any regression back to it) produces distinct
+/// allocations and fails the pointer equality below — at the full 10_000-row
+/// cap, the exact history depth where the 150x cost showed up.
+#[test]
+fn snapshot_copies_no_scrollback_cells_at_full_history() {
+    let state = capped_scrollback_state();
+
+    let first = state.snapshot();
+    let second = state.snapshot();
+    assert_eq!(first.scrollback().len(), MAX_SCROLLBACK_LINES);
+
+    let deep_copied: Vec<usize> = first
+        .scrollback()
+        .iter()
+        .zip(second.scrollback())
+        .filter(|(a, b)| !Arc::ptr_eq(a, b))
+        .map(|(a, _)| a.len())
+        .collect();
+    assert!(
+        deep_copied.is_empty(),
+        "snapshot deep-copied {} scrollback rows ({} cells) instead of sharing them",
+        deep_copied.len(),
+        deep_copied.iter().sum::<usize>(),
+    );
+
+    // Sharing must not change what the consumer reads: contents, order, and
+    // the text view still match the fixture exactly.
+    assert_eq!(
+        first.scrollback_lines().first().map(String::as_str),
+        Some("00000")
+    );
+    let last_label = format!("{:05}", MAX_SCROLLBACK_LINES - 1);
+    assert_eq!(
+        first.scrollback_lines().last().map(String::as_str),
+        Some(last_label.as_str())
+    );
+}
+
+/// Snapshot isolation under sharing (issue #172): sharing a row with the
+/// state is safe only because retained rows are immutable. This is the
+/// staleness counter-test — it fails if a future change ever lets a state
+/// mutation reach rows a live snapshot already handed out, which is the
+/// failure mode a cache-without-invalidation would have.
+#[test]
+fn snapshot_scrollback_rows_are_stable_after_further_scrolling() {
+    let state = capped_scrollback_state();
+    let frozen = state.snapshot();
+    let frozen_lines = frozen.scrollback_lines();
+
+    // Scroll a full cap of new lines past: every row the snapshot holds is
+    // evicted from the live state, and the visible screen is overwritten.
+    let mut state = state;
+    let mut script = String::with_capacity(MAX_SCROLLBACK_LINES * 8);
+    for index in 0..MAX_SCROLLBACK_LINES {
+        script.push_str(&format!("N{index:04}\r\n"));
+    }
+    state.feed_bytes(script.as_bytes());
+
+    // The live history moved on entirely...
+    assert_eq!(state.scrollback_len(), MAX_SCROLLBACK_LINES);
+    assert_eq!(
+        state
+            .snapshot()
+            .scrollback_lines()
+            .first()
+            .map(String::as_str),
+        Some("N0000")
+    );
+    // ...while the earlier snapshot still holds exactly what it captured:
+    // same length, same contents, unchanged.
+    assert_eq!(frozen.scrollback().len(), MAX_SCROLLBACK_LINES);
+    assert_eq!(frozen.scrollback_lines(), frozen_lines);
+    assert_eq!(
+        frozen.scrollback_lines().first().map(String::as_str),
+        Some("00000")
+    );
 }
 
 #[test]
