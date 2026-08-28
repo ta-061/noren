@@ -164,7 +164,7 @@ fn terminal_cols_pty_winsize_and_renderer_agree_across_the_width_range() {
 fn terminal_rows_pty_winsize_and_renderer_agree_with_permanent_status_chrome() {
     for window_rows in [1_u16, 2, 30, noren_app::MAX_RENDER_ROWS] {
         let mut app = NorenApp {
-            status: "Noren PoC ready",
+            status: STATUS_READY,
             show_status: false,
             ..Default::default()
         };

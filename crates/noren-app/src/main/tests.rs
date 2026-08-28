@@ -7,6 +7,21 @@ use noren_app::sidebar::EntryKind;
 include!("../input_translation/tests.rs");
 include!("../frame_geometry/tests.rs");
 
+/// Issue #185: the artifact's own surfaces read the single product string,
+/// the title states the version the binary was built as, and no surface
+/// calls the binary a proof of concept.
+#[test]
+fn window_title_and_startup_status_read_the_product_name_and_built_version() {
+    let title = window_title();
+    assert!(title.starts_with(noren_app::PRODUCT_NAME));
+    assert!(title.ends_with(env!("CARGO_PKG_VERSION")));
+    assert!(!title.contains("PoC"));
+    for text in [STATUS_STARTING, STATUS_READY] {
+        assert!(text.starts_with(noren_app::PRODUCT_NAME));
+        assert!(!text.contains("PoC"));
+    }
+}
+
 #[test]
 fn terminal_modes_drive_cursor_and_keypad_encoding() {
     let mut app = NorenApp::default();
