@@ -116,7 +116,7 @@ Measured against it, item by item:
 | --- | --- | --- |
 | Sidebar drawn | Done | `SIDEBAR_COLS` reserved in `renderer.rs`; `glyph_vertices` applies the column offset; `sidebar_text_lines` formats rows |
 | — projects, git worktrees | Worktrees and projects launchable | Startup runs `git worktree list --porcelain` in the launch directory (`git_worktree.rs`) and shows at most 24 discovered worktrees as `EntryKind::Worktree` rows (beyond the cap the omitted count is reported); a registered-but-deleted worktree is listed with a `(missing)` marker and refused on selection; selecting a present row creates a `SessionKind::Worktree` session backed by a real `/bin/zsh` PTY whose child's working directory IS the worktree (verified by reading the child's own `pwd` back through the terminal), persisting and restoring through `sessions.toml` like a local session. `[[projects]]` configuration entries (`config.rs`, strict schema: absolute `root`, typed errors naming the offending key, no value echo) appear as at most 24 `EntryKind::Project` rows — the fixed `PRJ-` state prefix distinguishes them from prefix-less worktree rows — and selecting one whose root exists creates a `SessionKind::Project` session with the same directory-rooted launch shape and `pwd` proof; a configured-but-gone root is refused visibly like a deleted worktree. Project sessions persist and restore through `sessions.toml` like every other kind |
-| — SSH connections, agents | Connections run for discovered aliases; discovery explicitly partial; agents launchable from configuration | At most 24 positive literal OpenSSH aliases become `SessionKind::Ssh` and `SidebarEntry::SshConnection` rows; the status identifies partial discovery, and clicking one launches the fixed system `/usr/bin/ssh` client in the terminal's single PTY (argv is exactly `ssh -- <alias>`; no credential is ever argv-visible), with launch, connect, and disconnect failures as visible per-row and status-row states (PR #138). Wildcard/dynamic destinations are not a complete host inventory. `[[agents]]` entries in `config.toml` become at most 24 `EntryKind::Agent` rows (beyond the cap the omitted count is reported); selecting one creates a `SessionKind::Agent` session backed by a real PTY running the configured command as a shell-free argv vector (absolute path, no `PATH` lookup; a missing or non-executable command is a visible per-row and status-row failure), persisting and restoring through `sessions.toml` like every other session kind |
+| — SSH connections, agents | Connections run for discovered aliases; discovery explicitly partial with every absence explained; agents launchable from configuration | At most 64 positive literal OpenSSH aliases become `SessionKind::Ssh` and `SidebarEntry::SshConnection` rows; the status identifies partial discovery, and past the cap it reports how many are shown of how many and why (`showing first 64 of 70; 6 past sidebar bound`). Wildcard `Host` patterns never become rows — a pattern is a rule, not a connectable destination — but they are counted per occurrence (including through followed `Include` files) and the notice reports `N wildcard patterns not listed`, so a pattern-built config is never silently under-represented (issue #175). Negations are filters: they suppress matches and add no row and no absence count. Clicking a row launches the fixed system `/usr/bin/ssh` client in the terminal's single PTY (argv is exactly `ssh -- <alias>`; no credential is ever argv-visible), with launch, connect, and disconnect failures as visible per-row and status-row states (PR #138). Wildcard/dynamic destinations still cannot be enumerated as a complete host inventory; that boundary is now stated with counts rather than silence. `[[agents]]` entries in `config.toml` become at most 24 `EntryKind::Agent` rows (beyond the cap the omitted count is reported); selecting one creates a `SessionKind::Agent` session backed by a real PTY running the configured command as a shell-free argv vector (absolute path, no `PATH` lookup; a missing or non-executable command is a visible per-row and status-row failure), persisting and restoring through `sessions.toml` like every other session kind |
 | — terminal sessions | Runtime for local sessions | Every palette `session_create` spawns a real `SessionKind::Local` PTY (`spawn_local_session`); sidebar clicks and the palette's `session_select` switch the live view between live sessions (`switch_live_session`, parked surfaces keep draining and resizing), and `session_close` reaps the closed child and repairs the view. Rows restored from disk come back `Restored` with no live surface and cannot take the live view |
 | Single-session view | Done | The active terminal is drawn beside the sidebar, narrowed to the remaining columns; switching swaps the active surface whole, and rows without a live surface cannot claim its selection or input owner |
 | Session lifecycle | Done | `SessionStatus` advances `Starting -> Running -> Exited/Failed` via `SessionRegistry::observe`, wired in `main.rs` for spawned, parked, closed, and restored sessions alike |
@@ -125,22 +125,32 @@ Measured against it, item by item:
 | Configurable keybindings | Done for the palette surface | `[keys]` in `config.toml` (`KeymapConfig` in `config.rs`) rebinds the palette opener and the four palette command chords with the previous values as defaults; `palette_policy`/`handle_palette_key` in `main.rs` honor them, unparseable chords and unknown actions are typed errors, and the opener is validated against the pinned Zellij corpus and the exit leader. The exit leader, palette navigation keys, diagnostics chord, and clipboard shortcuts remain fixed |
 | Zellij pass-through | Done against a pinned corpus and a live installed Zellij | The shipped policy (`palette_policy` in `main.rs`) claims exactly two Super-modified chords — `Super+Escape` (exit leader) and `Super+p` (palette opener) — that the pinned Zellij `v0.44.3` default corpus (`ZELLIJ_FIXTURE_TAG`) never binds, and `tests/zellij_live.rs` drives an INSTALLED Zellij in a real PTY through the same parser, gate, and key encoder: attach enables mouse tracking in `TerminalState`, gated `Ctrl+t`/`n`/`Ctrl+p` reach Zellij and render tab #2 and pane #2, typed text reaches the pane's shell, and the installed version's default keybinds bind nothing in the Super/Cmd/Meta space. The harness skips (visibly, on the real stderr) when no `zellij` is on `PATH`. Empirical wire-shape note: Zellij 0.44.3 sends `1002`/`1006` as separate single-parameter DECSETs across its whole lifecycle and does not forward a pane program's multi-parameter DECSET to the host terminal, so the multi-parameter form `CSI ? 1002;1006 h` (the PR #113 regression site) is pinned as a co-located regression guard beside the live assertions, with the live multi-parameter count printed as drift telemetry. Beyond the skip, the suite today runs only where a developer runs it — no gating machine executes it (issue #153) |
 
-One named scope item remains unsatisfied: **host discovery is explicitly
-partial**. Projects are reachable now: a `[[projects]]` configuration entry
+The host-discovery gap that issue
+[#175](https://github.com/ta-061/noren/issues/175) named is closed: positive
+literal aliases appear in a bounded sidebar list (now 64 rows) and a click
+launches a real system-ssh connection (PR #138); wildcard and negation
+patterns are resolved with OpenSSH semantics and, because a pattern is a rule
+rather than a connectable destination, are counted and explained in the
+status notice instead of vanishing; `Include` files feed the same block list
+to discovery and resolution, so an alias declared only in an included file is
+discovered like a top-level one; and past the sidebar cap the notice reports
+how many are shown of how many and why. Discovery is still *explicitly
+partial* by design — no destination enumeration happens here — but no absence
+is silent. Projects are reachable now: a `[[projects]]` configuration entry
 constructs an `EntryKind::Project` row and selecting it creates a
 `SessionKind::Project` session backed by a real PTY whose child starts in
-the configured root. Positive literal aliases appear in a bounded sidebar
-list and a click launches a real system-ssh connection (PR #138), but
-wildcard or dynamic destinations are not presented as a complete host
-inventory. Agent entries are no longer fixtures: `[[agents]]`
+the configured root. Agent entries are no longer fixtures: `[[agents]]`
 configuration rows launch a configured, shell-free argv command in a real
 PTY (the first Milestone 5 slice); the remaining agent-experience scope
 (verified adapters, trustworthy state, notifications, jump-to-source) is
-Milestone 5 work. Configurable keybindings are satisfied for the palette
-surface only; the exit leader, palette navigation, diagnostics chord, and
-clipboard shortcuts remain compiled in. Since "Only evidence-backed work
-is marked complete" and the scope line names the unsatisfied item,
-Milestone 3 stays **In progress** on host discovery.
+Milestone 5 work. Milestone 3 nonetheless stays **In progress**:
+configurable keybindings are satisfied for the palette
+surface only — the exit leader, palette navigation, diagnostics chord, and
+clipboard shortcuts remain compiled in — and the live-Zellij pass-through
+evidence still gates no machine
+([#153](https://github.com/ta-061/noren/issues/153)). Since "Only
+evidence-backed work is marked complete", those items, not host discovery,
+now hold the milestone open.
 
 Open engineering issues a reader of this section should know about: the
 behavior-preserving split of the oversized binary and SSH-parser modules
