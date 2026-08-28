@@ -323,11 +323,14 @@ impl Selection {
     /// Inclusive display columns selected on one absolute grid line.
     ///
     /// Returns `None` when the selection has expired or does not cover
-    /// `line`. The returned range is the drawing counterpart of
-    /// [`Selection::extract`]: it uses the same normalized endpoints, and if
-    /// the last selected character is wide, its continuation columns are
-    /// included as well. A continuation cell can therefore never appear in
-    /// this range without the lead cell that owns it.
+    /// `line`, or when the covered cells contribute no text after extraction's
+    /// trailing-space trim. The returned range is the drawing counterpart of
+    /// [`Selection::extract`]: it uses the same normalized endpoints and ends
+    /// at the last cell whose text survives that trim. Consequently, trailing
+    /// blank rows dropped by extraction have no drawable span. If the last
+    /// selected character is wide, its continuation columns are included as
+    /// well, so a continuation can never appear without the lead cell that
+    /// owns it.
     #[must_use]
     pub fn columns_in_line(
         &self,
@@ -346,12 +349,21 @@ impl Selection {
         } else {
             0
         };
-        let mut to = if line == self.end.line {
+        let to = if line == self.end.line {
             self.end.column
         } else {
             cells.len() - 1
         }
         .min(cells.len() - 1);
+
+        // `extract_row` removes trailing ASCII spaces after concatenating the
+        // selected lead cells. Scan back to the last cell with any text that
+        // survives that exact trim; a blank-only selected slice paints
+        // nothing, including every trailing blank row dropped by `extract`.
+        let mut to = (from..=to).rev().find(|&column| {
+            let cell = &cells[column];
+            !cell.is_continuation() && cell.text().chars().any(|character| character != ' ')
+        })?;
 
         // Endpoints are lead cells. Extend the drawable span over every
         // continuation owned by the final selected character so a wide glyph
