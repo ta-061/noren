@@ -3395,6 +3395,15 @@ impl ApplicationHandler for NorenApp {
         match event {
             WindowEvent::CloseRequested => self.close(event_loop),
             WindowEvent::Resized(physical) => self.handle_resize(physical),
+            WindowEvent::Focused(focused) => {
+                // Focus loss must be visible in the caret (issue #200): the
+                // renderer switches between the focused mark and the
+                // unfocused hollow outline.
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.set_focused(focused);
+                }
+                self.redraw_needed = true;
+            }
             WindowEvent::ModifiersChanged(modifiers) => self.update_modifiers(modifiers.state()),
             WindowEvent::CursorMoved { position, .. } => self.handle_mouse_move(position),
             WindowEvent::MouseInput { state, button, .. } => {

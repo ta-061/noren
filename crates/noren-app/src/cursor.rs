@@ -1,0 +1,62 @@
+//! Cursor shape vocabulary shared by configuration and the renderer
+//! (issues #197/#200).
+//!
+//! A visible cursor ships as the default: the caret is drawn with no
+//! configuration, and this vocabulary only changes *how* it is drawn —
+//! shape and colour are user choices, visibility of the product is not.
+//! The `[cursor]` configuration table selects a shape here; the renderer
+//! resolves it against the active theme.
+
+use std::fmt;
+
+/// The shape the cursor is drawn in, as selected by the `[cursor]`
+/// configuration table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CursorShape {
+    /// A filled cell rectangle; the glyph beneath draws inverted (in the
+    /// theme background colour) so the character under the caret stays
+    /// readable. The default.
+    #[default]
+    Block,
+    /// A narrow vertical stroke on the left edge of the lead cell.
+    Bar,
+    /// A horizontal stroke along the bottom of the cell span.
+    Underline,
+}
+
+impl CursorShape {
+    /// Every accepted `[cursor]` shape name, in documentation order.
+    pub const NAMES: [&'static str; 3] = ["block", "bar", "underline"];
+
+    /// Resolve one configuration value to a shape.
+    ///
+    /// Matching is exact (case-sensitive), the same closed-vocabulary rule
+    /// theme names follow: accepting `Block` or `BLOCK` would be a second
+    /// spelling of one setting, and an unknown value is the caller's typed
+    /// error, never a fallback.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "block" => Some(Self::Block),
+            "bar" => Some(Self::Bar),
+            "underline" => Some(Self::Underline),
+            _ => None,
+        }
+    }
+
+    /// The canonical configuration name of this shape.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Bar => "bar",
+            Self::Underline => "underline",
+        }
+    }
+}
+
+impl fmt::Display for CursorShape {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
