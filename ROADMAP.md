@@ -64,8 +64,19 @@ hostile-input suites, and a per-cell grapheme cap that made the documented memor
 ceiling true rather than aspirational.
 
 Manual macOS gate, re-run at this head: a release build opened a window, owned a
-direct `zsh` child, and that child's tty reported `30 90` — the 900x600 window divided
-by the 10x20 cell, so the window to grid to PTY chain agrees. On termination the app
+direct `zsh` child, and that child's tty reported the window divided by the cell
+with nothing withheld — `30 90`, the 900x600 window over the 10x20 cell of this
+close, which predates the workspace sidebar and the status row that later
+reserved space. On the current tree the same chain still agrees by construction,
+with the grid reported net of those reservations: `terminal_cols` subtracts the
+sidebar's `SIDEBAR_COLS` columns and `content_terminal_rows` subtracts the one
+status row (`frame_geometry.rs`), and the window, PTY winsize, terminal state,
+and renderer are pinned to agree on both by
+`terminal_cols_pty_winsize_and_renderer_agree_across_the_width_range` and
+`terminal_rows_pty_winsize_and_renderer_agree_with_permanent_status_chrome` in
+`crates/noren-app/src/frame_geometry/tests.rs` (so the numbers a launch reports
+move with the window size and the configured cell — read them off the child's
+tty rather than off this page). On termination the app
 exited, the child was reaped, and the pty device was gone.
 
 **What the Milestone 2 close did not itself establish.** A rendered-frame oracle
