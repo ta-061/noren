@@ -96,8 +96,9 @@ modifiers held, as the pre-configuration palette did.
 ### `[theme]`
 
 Selects the built-in colour palette. The table is optional; an absent
-`[theme]` keeps `dark`, which is exactly the palette the app shipped with
-before themes existed — rendering stays byte-identical.
+`[theme]` keeps `dark`, which is the palette the app shipped with before
+themes existed except for the five ANSI entries issue #168 lifted to
+clear WCAG AA.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -105,8 +106,10 @@ before themes existed — rendering stays byte-identical.
 
 Accepted names, matched exactly (case-sensitive, closed vocabulary):
 
-- `dark` — the xterm default ANSI colours on the near-black background
-  (today's behaviour);
+- `dark` — the xterm default ANSI colours on the near-black background,
+  with the five entries that failed WCAG AA minimally brightened to clear
+  4.5:1 (issue #168); every theme-owned foreground keeps AA on the
+  default background;
 - `light` — an off-white background with darkened ANSI entries; every
   theme-owned foreground keeps WCAG AA (≥ 4.5:1) on the default
   background;
@@ -131,15 +134,23 @@ cube (`16..=255`) are outside any palette's control (identical colours
 are 1:1 by definition; the cube's black corner fails on every possible
 background) and are therefore not part of the checked set.
 
-**Known finding, reported not fixed:** the default `dark` palette fails
-the 4.5:1 floor for five ANSI slots on its own background — black at
-1.06:1, blue at 2.10:1, red at 3.38:1, bright blue at 4.16:1, and
-magenta at 4.21:1. The values stay frozen because the no-`[theme]`
-default must render byte-identically to the pre-theme renderer; changing
-them is a separate, deliberate decision. Users who need AA on every slot
-today can select `high-contrast` (measured minimum 7.84:1). The measured
-minima are pinned by tests (`crates/noren-app/tests/theme.rs`), so any
-palette change — fix or regression — is a visible failure.
+**Fixed with issue #168:** the default `dark` palette used to fail the
+4.5:1 floor for five ANSI slots on its own background — black at 1.06:1,
+blue at 2.10:1, red at 3.38:1, bright blue at 4.16:1, and magenta at
+4.21:1. Issue #168 made the deliberate decision to move exactly those
+five entries the minimum distance that clears the floor (black
+`[0,0,0]`→`[121,121,121]`, red `[205,0,0]`→`[243,0,0]`, blue
+`[0,0,238]`→`[0,113,255]`, magenta `[205,0,205]`→`[213,0,213]`, bright
+blue `[92,92,255]`→`[100,100,255]`), preserving ANSI slot semantics; the
+default's measured minimum is now 4.50:1 (magenta) and `high-contrast`
+(7.84:1) remains the choice for AAA. The minima are pinned by tests
+(`crates/noren-app/tests/theme.rs`, plus a pixel-level pin in
+`tests/frame_oracle.rs`), so any further palette change — fix or
+regression — is a visible failure. Residual caveat: ANSI black and
+bright black now sit close together (`[121,121,121]` vs
+`[127,127,127]`), and the contract still excludes the shared 256-colour
+cube, truecolor, and program-paired colours — those can draw below the
+floor under any palette.
 
 ### `[[agents]]`
 
