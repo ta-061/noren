@@ -51,8 +51,8 @@ use std::thread;
 use noren_app::sidebar_text::SidebarTextRow;
 use noren_terminal::TerminalSnapshot;
 use renderer_source::{
-    SHADER, Target, VERTEX_ATTRIBUTES, VERTEX_BYTES, Vertex, glyph_vertices_for,
-    glyph_vertices_for_sidebar_rows, theme_clear_color, vertex_bytes,
+    FrameChrome, SHADER, Target, VERTEX_ATTRIBUTES, VERTEX_BYTES, Vertex, glyph_vertices_for,
+    glyph_vertices_for_chrome, glyph_vertices_for_sidebar_rows, theme_clear_color, vertex_bytes,
 };
 
 /// Linear RGBA8 (non-sRGB) offscreen target.
@@ -269,6 +269,21 @@ impl OffscreenRenderer {
         status: Option<&str>,
     ) -> CapturedFrame {
         let vertices = glyph_vertices_for_sidebar_rows(target, terminal, sidebar, status);
+        self.capture_vertices(target, vertices)
+    }
+
+    /// Render through the same complete chrome seam as the live window.
+    ///
+    /// Palette-hint tests use this path so their assertions are on read-back
+    /// pixels emitted by production vertex generation, not on configuration
+    /// values or pre-rendered strings.
+    pub(crate) fn capture_chrome(
+        &self,
+        target: Target,
+        terminal: Option<&TerminalSnapshot>,
+        chrome: FrameChrome<'_>,
+    ) -> CapturedFrame {
+        let vertices = glyph_vertices_for_chrome(target, terminal, chrome);
         self.capture_vertices(target, vertices)
     }
 

@@ -840,6 +840,55 @@ fn palette_close_reaps_the_live_owner_and_falls_back_to_an_empty_view() {
     assert!(app.show_status, "an empty workspace must say so honestly");
 }
 
+/// Issue #201: the action displayed beside `No sessions` is live, follows the
+/// configured create binding, and creates a real PTY-backed session. Removing
+/// the empty-workspace intercept leaves both tested chords inert and fails the
+/// final state assertions.
+#[test]
+fn empty_workspace_recovery_chord_creates_a_real_session() {
+    let home = AppTestHome::new();
+    let config =
+        AppConfig::parse("[keys]\nsession_create = \"n\"\n").expect("valid create-session rebind");
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..NorenApp::new(config)
+    };
+    assert!(app.workspace.sidebar().is_empty());
+
+    assert!(
+        !app.recover_empty_workspace_with_chord(gate_chord(
+            GateKeyCode::Char('c'),
+            GateModifiers::empty()
+        )),
+        "the old create chord must not claim the empty state after rebinding"
+    );
+    assert!(app.workspace.registry().is_empty());
+
+    assert!(
+        app.recover_empty_workspace_with_chord(gate_chord(
+            GateKeyCode::Char('n'),
+            GateModifiers::empty()
+        )),
+        "the configured recovery chord must be consumed"
+    );
+    assert_eq!(app.workspace.registry().len(), 1);
+    assert!(!app.workspace.sidebar().is_empty());
+    assert!(app.pty.is_some() && app.terminal.is_some());
+    assert!(app.active_session.is_some());
+    assert!(
+        !app.recover_empty_workspace_with_chord(gate_chord(
+            GateKeyCode::Char('n'),
+            GateModifiers::empty()
+        )),
+        "once a session exists the chord returns to palette-only scope"
+    );
+    assert_eq!(
+        app.workspace.registry().len(),
+        1,
+        "the recovery intercept must not steal the create chord in a live workspace"
+    );
+}
+
 /// Escape dismisses the palette without running a command.
 #[test]
 fn escape_dismisses_palette_without_running_a_command() {
