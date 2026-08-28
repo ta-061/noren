@@ -42,6 +42,13 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy (warnings denied)
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Bench targets and the criterion harness sit behind the optional
+      # `bench-support` feature, so the steps above (test/clippy without
+      # features) never compile them. This additive step is the only place
+      # the bench code is linted, so it cannot drift into warnings between
+      # bench runs.
+      - name: Clippy benchmarks (bench-support feature)
+        run: cargo clippy --workspace --all-targets --features noren-terminal/bench-support,noren-app/bench-support -- -D warnings
       - name: Workspace tests
         run: cargo test --workspace
       - name: Documentation checks

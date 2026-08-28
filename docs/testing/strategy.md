@@ -48,6 +48,14 @@ input as a shell command.
 
 ## Performance measurements
 
+Criterion benchmarks over the paths with a defect history — `feed_bytes`
+throughput, `SshConfig::parse` (including the #137 mixed shape), renderer
+frame preparation, per-frame `snapshot`, and scrollback search — live behind
+the `bench-support` feature and are run with `cargo bench`; see
+[benchmarks.md](benchmarks.md) for commands, comparison workflow, the
+recorded reference baseline, and the report-never-gate policy. They are
+deliberately outside `cargo test --workspace`.
+
 On a recorded Apple Silicon reference Mac in `--release`:
 
 1. Timestamp app-owned key receipt, PTY write, helper echo, terminal update, and

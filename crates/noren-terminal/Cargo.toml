@@ -10,6 +10,30 @@ publish.workspace = true
 
 [dependencies]
 unicode-width.workspace = true
+# Not a real dependency. Cargo cannot express an *optional*
+# dev-dependency, and an unconditional one is compiled by every
+# `cargo test` even when the bench targets below are feature-gated
+# (`required-features` filters targets, not the dev-dep graph — measured:
+# +3.8 s cold `cargo test` compile on the reference M4 before this was
+# moved). Hosting the harness as an optional normal dependency behind the
+# non-default `bench-support` feature keeps it out of the build graph
+# unless benches are explicitly requested.
+criterion = { workspace = true, optional = true }
+
+[features]
+# Compile gate for the `benches/` targets and their harness. Run with
+# `cargo bench -p noren-terminal --features bench-support`.
+bench-support = ["dep:criterion"]
+
+[[bench]]
+name = "feed_bytes"
+harness = false
+required-features = ["bench-support"]
+
+[[bench]]
+name = "search"
+harness = false
+required-features = ["bench-support"]
 
 [lints]
 workspace = true

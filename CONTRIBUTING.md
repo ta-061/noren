@@ -56,6 +56,13 @@ cargo deny check
 cargo +<rust-version> check --workspace --all-targets
 ```
 
+Performance-sensitive changes (parser, scrollback, renderer frame prep,
+search, SSH parsing) should run the benchmark suite and quote the
+before/after numbers in the PR; see
+[docs/testing/benchmarks.md](docs/testing/benchmarks.md) for how to run it
+and compare two runs. Benchmarks never gate CI on a timing — regression
+guards are operation counts in the unit suites.
+
 Changes to `crates/noren-terminal/` additionally keep these conventions:
 
 - Internal coordinates are zero-based; CSI parameters are one-based. Convert
