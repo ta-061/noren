@@ -97,9 +97,9 @@ use noren_app::{
     GridGeometry, MAX_RENDER_COLS, MAX_RENDER_ROWS, POC_CELL_HEIGHT as CELL_HEIGHT,
     POC_CELL_WIDTH as CELL_WIDTH,
 };
-use noren_terminal::{TerminalSnapshot, TerminalState};
+use noren_terminal::{GridPoint, Selection, SelectionMode, TerminalSnapshot, TerminalState};
 use renderer_capture::renderer_source::{
-    CLEAR_COLOR, CursorStyle, FrameChrome, SIDEBAR_COLS, Target,
+    CLEAR_COLOR, CursorStyle, FrameChrome, SIDEBAR_COLS, Target, Vertex, glyph_vertices_for_chrome,
 };
 use renderer_capture::{CaptureError, CapturedFrame, OffscreenRenderer};
 
@@ -138,6 +138,22 @@ fn render_with_theme(
         Some(snapshot),
         None,
         None,
+    )
+}
+
+/// Render one app-owned selection through the live frame seam.
+fn render_with_selection(
+    renderer: &OffscreenRenderer,
+    theme: &Theme,
+    snapshot: &TerminalSnapshot,
+    selection: &Selection,
+) -> CapturedFrame {
+    let width = u32::from(snapshot.cols()) * CELL_WIDTH;
+    let height = u32::from(snapshot.rows()) * CELL_HEIGHT;
+    renderer.capture_chrome(
+        Target::new(theme, width, height, poc_metrics()),
+        Some(snapshot),
+        FrameChrome::new(None, None).with_selection(Some(selection)),
     )
 }
 
@@ -260,6 +276,100 @@ fn cell_color_pixel_count(frame: &CapturedFrame, row: u32, col: u32, color: [u8;
         }
     }
     count
+}
+
+/// Cell coordinates whose captured pixels differ between two equal-size
+/// frames, in row-major order. Comparing every pixel in every cell makes this
+/// an exact positional oracle: moving the treatment to a neighbour, widening
+/// it to a whole row, or dropping it changes the returned coordinate set.
+fn changed_cells(
+    before: &CapturedFrame,
+    after: &CapturedFrame,
+    rows: u16,
+    cols: u16,
+) -> Vec<(u32, u32)> {
+    assert_eq!(before.width, after.width, "frame widths must agree");
+    assert_eq!(
+        before.rgba.len(),
+        after.rgba.len(),
+        "frame sizes must agree"
+    );
+    let mut changed = Vec::new();
+    for row in 0..u32::from(rows) {
+        for col in 0..u32::from(cols) {
+            let differs = (row * CELL_HEIGHT..(row + 1) * CELL_HEIGHT).any(|y| {
+                (col * CELL_WIDTH..(col + 1) * CELL_WIDTH)
+                    .any(|x| before.pixel(x, y) != after.pixel(x, y))
+            });
+            if differs {
+                changed.push((row, col));
+            }
+        }
+    }
+    changed
+}
+
+/// Full-cell selection-background rectangles emitted into the production
+/// frame vertex stream, converted back to grid coordinates. This positional
+/// oracle runs even when Metal capture is unavailable; the pixel tests below
+/// remain the authoritative raster proof when an adapter exists.
+fn selection_background_vertex_cells(
+    snapshot: &TerminalSnapshot,
+    selection: &Selection,
+    theme: &Theme,
+) -> Vec<(u32, u32)> {
+    let target = Target::new(
+        theme,
+        u32::from(snapshot.cols()) * CELL_WIDTH,
+        u32::from(snapshot.rows()) * CELL_HEIGHT,
+        poc_metrics(),
+    );
+    let vertices = glyph_vertices_for_chrome(
+        target,
+        Some(snapshot),
+        FrameChrome::new(None, None).with_selection(Some(selection)),
+    );
+    let expected_color = theme.selection_background();
+    let mut cells = Vec::new();
+    for rectangle in vertices.chunks_exact(6) {
+        if !rectangle
+            .iter()
+            .all(|vertex| vertex.color == expected_color)
+        {
+            continue;
+        }
+        let (x0, y0, x1, y1) = rectangle_pixel_bounds(rectangle, target);
+        if x1.saturating_sub(x0) != CELL_WIDTH || y1.saturating_sub(y0) != CELL_HEIGHT {
+            continue;
+        }
+        assert_eq!(x0 % CELL_WIDTH, 0, "selection rectangle is off-grid");
+        assert_eq!(y0 % CELL_HEIGHT, 0, "selection rectangle is off-grid");
+        cells.push((y0 / CELL_HEIGHT, x0 / CELL_WIDTH));
+    }
+    cells
+}
+
+/// Convert one six-vertex axis-aligned rectangle from NDC back to pixel bounds.
+fn rectangle_pixel_bounds(rectangle: &[Vertex], target: Target) -> (u32, u32, u32, u32) {
+    let left = rectangle
+        .iter()
+        .map(|vertex| vertex.position[0])
+        .fold(f32::INFINITY, f32::min);
+    let right = rectangle
+        .iter()
+        .map(|vertex| vertex.position[0])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let top = rectangle
+        .iter()
+        .map(|vertex| vertex.position[1])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let bottom = rectangle
+        .iter()
+        .map(|vertex| vertex.position[1])
+        .fold(f32::INFINITY, f32::min);
+    let x = |ndc: f32| (((ndc + 1.0) * target.width as f32) / 2.0).round() as u32;
+    let y = |ndc: f32| (((1.0 - ndc) * target.height as f32) / 2.0).round() as u32;
+    (x(left), y(top), x(right), y(bottom))
 }
 
 /// The default foreground as captured bytes, derived from the renderer's own
@@ -1446,6 +1556,199 @@ fn high_contrast_theme_draws_its_own_verified_palette() {
         [0, 0, 0],
         "high-contrast clear must be pure black"
     );
+}
+
+// ===========================================================================
+// Selection highlight (issue #202): the app-owned range about to be copied
+// must change exactly those frame cells. These tests compare every pixel of
+// every cell before/after selection, so whole-row, shifted-column, and dropped
+// overlays cannot satisfy the oracle by merely lighting some distinct pixels.
+// ===========================================================================
+
+#[test]
+fn selection_highlight_vertex_oracle_pins_the_ascii_range() {
+    let mut state = TerminalState::new(1, 6).expect("valid terminal");
+    state.feed_bytes(b"abcdef\x1b[?25l");
+    let selection = Selection::new(
+        &state,
+        SelectionMode::Char,
+        GridPoint::new(0, 1),
+        GridPoint::new(0, 2),
+    );
+    assert_eq!(
+        selection_background_vertex_cells(&state.snapshot(), &selection, &DARK),
+        [(0, 1), (0, 2)]
+    );
+}
+
+#[test]
+fn selection_highlight_vertex_oracle_pins_the_wrapped_range() {
+    let mut state = TerminalState::new(2, 4).expect("valid terminal");
+    state.feed_bytes(b"abcdef\x1b[?25l");
+    let selection = Selection::new(
+        &state,
+        SelectionMode::Char,
+        GridPoint::new(0, 2),
+        GridPoint::new(1, 0),
+    );
+    assert_eq!(
+        selection_background_vertex_cells(&state.snapshot(), &selection, &DARK),
+        [(0, 2), (0, 3), (1, 0)]
+    );
+}
+
+#[test]
+fn selection_highlight_vertex_oracle_pins_both_wide_columns() {
+    let mut state = TerminalState::new(1, 6).expect("valid terminal");
+    state.feed_bytes("a日bc\x1b[?25l".as_bytes());
+    let selection = Selection::new(
+        &state,
+        SelectionMode::Char,
+        GridPoint::new(0, 2),
+        GridPoint::new(0, 2),
+    );
+    assert_eq!(
+        selection_background_vertex_cells(&state.snapshot(), &selection, &DARK),
+        [(0, 1), (0, 2)]
+    );
+}
+
+#[test]
+fn selection_highlight_changes_only_the_selected_cells() {
+    let Some(renderer) = renderer_or_skip("selection_highlight_changes_only_the_selected_cells")
+    else {
+        return;
+    };
+    let mut state = TerminalState::new(1, 6).expect("valid terminal");
+    state.feed_bytes(b"abcdef\x1b[?25l");
+    let selection = Selection::new(
+        &state,
+        SelectionMode::Char,
+        GridPoint::new(0, 1),
+        GridPoint::new(0, 2),
+    );
+    assert_eq!(selection.extract(&state), "bc");
+    let snap = state.snapshot();
+    let before = render(&renderer, &snap);
+    let after = render_with_selection(&renderer, &DARK, &snap, &selection);
+
+    assert_ne!(
+        before.rgba, after.rgba,
+        "a real selection must change pixels"
+    );
+    assert_eq!(
+        changed_cells(&before, &after, snap.rows(), snap.cols()),
+        [(0, 1), (0, 2)],
+        "only the two copied cells may change"
+    );
+}
+
+#[test]
+fn selection_highlight_tracks_the_exact_wrapped_range() {
+    let Some(renderer) = renderer_or_skip("selection_highlight_tracks_the_exact_wrapped_range")
+    else {
+        return;
+    };
+    let mut state = TerminalState::new(2, 4).expect("valid terminal");
+    // `e` triggers the pending wrap after `abcd`; the selected copy range is
+    // the tail `cd` on row 0 plus `e` on row 1.
+    state.feed_bytes(b"abcdef\x1b[?25l");
+    let selection = Selection::new(
+        &state,
+        SelectionMode::Char,
+        GridPoint::new(0, 2),
+        GridPoint::new(1, 0),
+    );
+    assert_eq!(selection.extract(&state), "cd\ne");
+    let snap = state.snapshot();
+    let before = render(&renderer, &snap);
+    let after = render_with_selection(&renderer, &DARK, &snap, &selection);
+
+    assert_eq!(
+        changed_cells(&before, &after, snap.rows(), snap.cols()),
+        [(0, 2), (0, 3), (1, 0)],
+        "wrapping must not widen either selected row"
+    );
+}
+
+#[test]
+fn selection_highlight_covers_both_wide_columns_and_never_continuation_alone() {
+    let Some(renderer) = renderer_or_skip(
+        "selection_highlight_covers_both_wide_columns_and_never_continuation_alone",
+    ) else {
+        return;
+    };
+    let mut state = TerminalState::new(1, 6).expect("valid terminal");
+    // Columns: a=0, 日=1(+2 continuation), b=3, c=4. Deliberately capture
+    // both endpoints on column 2: normalization must paint the lead and its
+    // continuation, with neither neighbour changed.
+    state.feed_bytes("a日bc\x1b[?25l".as_bytes());
+    let selection = Selection::new(
+        &state,
+        SelectionMode::Char,
+        GridPoint::new(0, 2),
+        GridPoint::new(0, 2),
+    );
+    assert_eq!(selection.extract(&state), "日");
+    let snap = state.snapshot();
+    let before = render(&renderer, &snap);
+    let after = render_with_selection(&renderer, &DARK, &snap, &selection);
+
+    assert_eq!(
+        changed_cells(&before, &after, snap.rows(), snap.cols()),
+        [(0, 1), (0, 2)],
+        "a wide character is one selection unit spanning exactly two columns"
+    );
+    for col in [1, 2] {
+        assert!(
+            cell_color_pixel_count(&after, 0, col, DARK.selection_background_u8()) > 0,
+            "wide selection column {col} lacks the theme background"
+        );
+    }
+}
+
+#[test]
+fn selection_highlight_follows_each_configured_theme_in_frame_pixels() {
+    let Some(renderer) =
+        renderer_or_skip("selection_highlight_follows_each_configured_theme_in_frame_pixels")
+    else {
+        return;
+    };
+    let mut state = TerminalState::new(1, 3).expect("valid terminal");
+    state.feed_bytes(b"abc\x1b[?25l");
+    let selection = Selection::new(
+        &state,
+        SelectionMode::Char,
+        GridPoint::new(0, 1),
+        GridPoint::new(0, 1),
+    );
+    let snap = state.snapshot();
+
+    for name in ["dark", "light", "high-contrast"] {
+        let config = AppConfig::parse(&format!("[theme]\nname = \"{name}\"\n"))
+            .expect("shipped theme is configurable");
+        let theme = config.theme().palette();
+        let before = render_with_theme(&renderer, &theme, &snap);
+        let after = render_with_selection(&renderer, &theme, &snap, &selection);
+        assert_eq!(
+            changed_cells(&before, &after, snap.rows(), snap.cols()),
+            [(0, 1)],
+            "{name}: only the configured theme's selected cell may change"
+        );
+        let corner = after.pixel(2 * CELL_WIDTH - 1, CELL_HEIGHT - 1);
+        assert!(
+            colors_match(
+                [corner[0], corner[1], corner[2]],
+                theme.selection_background_u8()
+            ),
+            "{name}: selected-cell corner {corner:?} is not the theme background {:?}",
+            theme.selection_background_u8()
+        );
+        assert!(
+            cell_color_pixel_count(&after, 0, 1, theme.selection_foreground_u8()) > 0,
+            "{name}: selected glyph does not use the readable theme foreground"
+        );
+    }
 }
 
 // ===========================================================================

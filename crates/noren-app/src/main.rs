@@ -1155,9 +1155,9 @@ struct NorenApp {
     #[cfg(test)]
     ssh_spawn_force_failure: bool,
     redraw_needed: bool,
-    // User-initiated selection state. The renderer does not highlight it yet;
-    // copy still extracts it. Any PTY output or resize invalidates it because
-    // grid coordinates only address the content they were captured on.
+    // User-initiated selection state. The renderer paints this exact range and
+    // copy extracts the same model. Any PTY output or resize invalidates it
+    // because grid coordinates only address the content they were captured on.
     selection: Option<Selection>,
     drag_origin: Option<GridPoint>,
     drag_mode: SelectionMode,
@@ -3372,7 +3372,8 @@ impl NorenApp {
             .then(|| noren_app::ui::empty_workspace_recovery(self.keys));
         let chrome = FrameChrome::new(Some(&lines), status)
             .with_palette_hint(palette_hint.as_deref())
-            .with_workspace_notice(workspace_notice.as_deref());
+            .with_workspace_notice(workspace_notice.as_deref())
+            .with_selection(self.selection.as_ref());
         let outcome = self
             .renderer
             .as_mut()

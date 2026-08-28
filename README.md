@@ -18,6 +18,9 @@
 > default), `light`, and `high-contrast` — via `[theme] name` in `config.toml`
 > (`theme.rs`, `docs/configuration.md` §`[theme]`; the selection reaching the
 > renderer is pinned by `configured_theme_reaches_the_app_renderer_input`);
+> text selections are visible by default through each palette's theme-owned
+> inverse pair, over the exact copied cell range (including wrapped rows and
+> both columns of a wide character);
 > the built-in palettes themselves are fixed tables — no custom-palette or
 > colour-vision-friendly configuration. The renderer still uses a
 > hand-built 5x7 bitmap font with bounded coverage — distinct ASCII case plus
