@@ -25,7 +25,7 @@ use noren_app::{
 };
 use noren_app::{
     CursorKeyMode, GridGeometry, GridSize, InputMode, KeyEncoder, KeypadMode, Modifiers,
-    PARSE_BUDGET_BYTES_PER_TURN, PasteReject, Resize, SystemClipboard,
+    PARSE_BUDGET_BYTES_PER_TURN, PRODUCT_NAME, PasteReject, Resize, SystemClipboard,
     config::{AppConfig, KeymapConfig},
     diagnostics::{self, PtyChildStatus},
     encode_paste,
@@ -147,6 +147,23 @@ const PROJECT_SIDEBAR_DETAIL_FAILED: &str = "launch failed";
 const PROJECT_STATUS_MISSING: &str = "Noren project directory missing";
 /// Status-row text when a project session's zsh child could not be spawned.
 const PROJECT_STATUS_LAUNCH_FAILED: &str = "Noren project launch failed";
+
+/// The window title: [`PRODUCT_NAME`] plus the crate version the binary was
+/// built as, so the first surface a user sees states the product and the
+/// version they actually launched — and moves with `Cargo.toml` automatically
+/// instead of restating a frozen framing like "PoC" (issue #185).
+fn window_title() -> String {
+    format!("{PRODUCT_NAME} {}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Status-row text while the first local PTY is starting. Both startup
+/// statuses are prefixed with [`PRODUCT_NAME`]; the issue-185 pin test
+/// `window_title_and_startup_status_read_the_product_name_and_built_version`
+/// asserts the prefix so the status row and the window title cannot drift
+/// apart again.
+const STATUS_STARTING: &str = "Noren starting";
+/// Status-row text once the first local PTY's child is running.
+const STATUS_READY: &str = "Noren ready";
 
 /// Observed state of the one live SSH launch. This is application-local
 /// runtime state, deliberately outside the session registry: the registry
@@ -1272,7 +1289,7 @@ impl NorenApp {
             pty: None,
             pty_child: PtyChildStatus::NotLaunched,
             modifiers: Modifiers::empty(),
-            status: "Noren PoC starting",
+            status: STATUS_STARTING,
             show_status: true,
             diagnostics_visible: false,
             diagnostics_line: String::new(),
@@ -1599,7 +1616,7 @@ enum SshConnectOutcome {
 
 impl NorenApp {
     fn record_pty_started(&mut self) {
-        self.status = "Noren PoC ready";
+        self.status = STATUS_READY;
         self.show_status = false;
         self.pty_child = PtyChildStatus::Running;
         let session_id = self.workspace.create_session(SessionKind::Local);
@@ -2174,7 +2191,7 @@ impl NorenApp {
             return;
         }
         let attributes = Window::default_attributes()
-            .with_title("Noren PoC")
+            .with_title(window_title())
             .with_inner_size(PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
         let Ok(window) = event_loop.create_window(attributes) else {
             eprintln!("Noren window creation failed");
@@ -3049,7 +3066,7 @@ impl NorenApp {
         if !self.diagnostics_visible {
             self.diagnostics_line.clear();
             if let Some(window) = &self.window {
-                window.set_title("Noren PoC");
+                window.set_title(&window_title());
             }
             return;
         }

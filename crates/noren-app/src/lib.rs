@@ -63,6 +63,11 @@ pub const REPLY_BUDGET_BYTES_PER_SECOND: usize = 64 * 1024;
 /// the same deadline rather than hang.
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
 
+/// The product string in every user-visible surface: the window title, the
+/// status-row texts, and any release artifact naming all read this constant
+/// (issue #185) so they cannot drift apart again.
+pub const PRODUCT_NAME: &str = "Noren";
+
 /// Fixed PoC cell width in physical pixels.
 pub const POC_CELL_WIDTH: u32 = 10;
 /// Fixed PoC cell height in physical pixels.
