@@ -21,7 +21,7 @@ use input_translation::{
 use persistence_state::{AttemptOutcome, Observation, PersistenceState, SaveOutcome};
 
 #[cfg(test)]
-use noren_app::sidebar_text::visible_sidebar_text_lines;
+use noren_app::sidebar_text::{visible_sidebar_text_lines, visible_sidebar_text_lines_at_width};
 #[cfg(test)]
 use noren_app::{
     Arrow, CellMetrics, FunctionKey, Key, KeyDropReason, KeyInput, KeyPhase, KeypadInput,
@@ -50,7 +50,7 @@ use noren_app::{
         SESSION_STATE_FILE_NAME, SessionPersistenceError, load_snapshot, save_snapshot, snapshot,
     },
     sidebar::{SidebarEntry, SidebarView},
-    sidebar_text::visible_sidebar_text_lines_at_width,
+    sidebar_text::{SidebarTextRow, visible_sidebar_text_rows_at_width},
     ssh_config::{HostDiscoveryKind, SshConfig},
     theme::Theme,
 };
@@ -3327,19 +3327,22 @@ impl NorenApp {
             .ok()
             .and_then(|rows| self.rendered_status_row(rows));
         self.clamp_sidebar_scroll(visible_rows);
-        let sidebar_lines = visible_sidebar_text_lines_at_width(
+        let sidebar_rows = visible_sidebar_text_rows_at_width(
             self.workspace.sidebar(),
             self.sidebar_scroll_offset,
             visible_rows,
             self.sidebar_columns,
         );
-        let lines = if self.palette_open {
-            let mut lines =
-                palette_text_lines(self.workspace.palette(), self.palette_selection, &self.keys);
-            lines.extend(sidebar_lines);
-            lines
+        let rows = if self.palette_open {
+            let mut rows: Vec<_> =
+                palette_text_lines(self.workspace.palette(), self.palette_selection, &self.keys)
+                    .into_iter()
+                    .map(SidebarTextRow::chrome)
+                    .collect();
+            rows.extend(sidebar_rows);
+            rows
         } else {
-            sidebar_lines
+            sidebar_rows
         };
         let status = status_row.map(|source| {
             source.text(
@@ -3354,7 +3357,7 @@ impl NorenApp {
         let outcome = self
             .renderer
             .as_mut()
-            .map(|renderer| renderer.render(snapshot.as_ref(), Some(&lines), status));
+            .map(|renderer| renderer.render(snapshot.as_ref(), Some(&rows), status));
         match outcome {
             Some(RenderOutcome::DeviceLost) => {
                 self.status = "Noren renderer device lost";

@@ -39,7 +39,8 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use noren_app::cursor::CursorShape;
-use noren_app::sidebar_text::{DEFAULT_SIDEBAR_COLUMNS, lifecycle_marker_color};
+use noren_app::sidebar::EntryKind;
+use noren_app::sidebar_text::{DEFAULT_SIDEBAR_COLUMNS, SidebarTextRow, lifecycle_marker_color};
 use noren_app::theme::{Theme, contrast_ratio};
 use noren_app::{CellMetrics, MAX_RENDER_COLS, MAX_RENDER_ROWS};
 use noren_terminal::{Cell, CellAttributes, Color, TerminalSnapshot};
@@ -275,8 +276,10 @@ fn sidebar_glyph_color(
     character: char,
     column: usize,
     sidebar_columns: usize,
+    row_kind: Option<EntryKind>,
 ) -> [f32; 3] {
-    if column + 1 == sidebar_columns
+    if row_kind == Some(EntryKind::Session)
+        && column + 1 == sidebar_columns
         && let Some(color) = lifecycle_marker_color(character)
     {
         return resolve_color(theme, Color::Ansi(color), theme.foreground());
@@ -468,7 +471,7 @@ impl Renderer {
     pub(crate) fn render(
         &mut self,
         terminal: Option<&TerminalSnapshot>,
-        sidebar: Option<&[String]>,
+        sidebar: Option<&[SidebarTextRow]>,
         status: Option<&str>,
     ) -> RenderOutcome {
         if self.device_lost.load(Ordering::Acquire) {
@@ -483,7 +486,7 @@ impl Renderer {
         )
         .with_sidebar_columns(self.sidebar_columns)
         .with_cursor_style(self.cursor);
-        let vertices = glyph_vertices_for(target, terminal, sidebar, status);
+        let vertices = glyph_vertices_for_sidebar_rows(target, terminal, sidebar, status);
         let bytes = vertex_bytes(&vertices);
         let required = u64::try_from(bytes.len()).unwrap_or(u64::MAX).max(8);
         if required > self.vertex_capacity {
@@ -581,23 +584,89 @@ fn block_on<F: Future>(future: F) -> F::Output {
 /// callers; production replaces it with validated configuration. When
 /// `sidebar` is `None`, the terminal occupies the full width starting at
 /// column 0. Every colour decision reads from the target's theme.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn glyph_vertices_for(
     target: Target,
     terminal: Option<&TerminalSnapshot>,
     sidebar: Option<&[String]>,
     status: Option<&str>,
 ) -> Vec<Vertex> {
-    glyph_vertices_with_budget(target, terminal, sidebar, status, MAX_VERTICES)
+    glyph_vertices_with_input_budget(
+        target,
+        terminal,
+        sidebar.map(SidebarInput::Plain),
+        status,
+        MAX_VERTICES,
+    )
+}
+
+/// Production vertex path for sidebar text that retains its domain row kind.
+///
+/// Lifecycle colour is semantic reinforcement for session rows only; the
+/// text-only [`glyph_vertices_for`] seam deliberately supplies no row kind.
+pub(crate) fn glyph_vertices_for_sidebar_rows(
+    target: Target,
+    terminal: Option<&TerminalSnapshot>,
+    sidebar: Option<&[SidebarTextRow]>,
+    status: Option<&str>,
+) -> Vec<Vertex> {
+    glyph_vertices_with_input_budget(
+        target,
+        terminal,
+        sidebar.map(SidebarInput::Typed),
+        status,
+        MAX_VERTICES,
+    )
 }
 
 /// Internal seam for exercising the production vertex-budget backstop without
 /// allocating a clamp-sized frame. The shipped path above always supplies
 /// [`MAX_VERTICES`]; tests use a smaller budget but traverse this same emission
 /// code and the same post-primitive guards.
+#[cfg_attr(not(test), allow(dead_code))]
 fn glyph_vertices_with_budget(
     target: Target,
     terminal: Option<&TerminalSnapshot>,
     sidebar: Option<&[String]>,
+    status: Option<&str>,
+    vertex_budget: usize,
+) -> Vec<Vertex> {
+    glyph_vertices_with_input_budget(
+        target,
+        terminal,
+        sidebar.map(SidebarInput::Plain),
+        status,
+        vertex_budget,
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy)]
+enum SidebarInput<'a> {
+    Plain(&'a [String]),
+    Typed(&'a [SidebarTextRow]),
+}
+
+impl<'a> SidebarInput<'a> {
+    fn len(self) -> usize {
+        match self {
+            Self::Plain(lines) => lines.len(),
+            Self::Typed(rows) => rows.len(),
+        }
+    }
+
+    fn row(self, index: usize) -> (&'a str, Option<EntryKind>) {
+        match self {
+            Self::Plain(lines) => (&lines[index], None),
+            Self::Typed(rows) => (rows[index].text(), rows[index].kind()),
+        }
+    }
+}
+
+fn glyph_vertices_with_input_budget(
+    target: Target,
+    terminal: Option<&TerminalSnapshot>,
+    sidebar: Option<SidebarInput<'_>>,
     status: Option<&str>,
     vertex_budget: usize,
 ) -> Vec<Vertex> {
@@ -672,16 +741,14 @@ fn glyph_vertices_with_budget(
     // only drawn when the whole cell is visible; sidebar hit testing uses
     // this same count.
     if let Some(lines) = sidebar {
-        for (row, line) in lines
-            .iter()
-            .take(fully_drawable_rows(height, metrics))
-            .enumerate()
-        {
+        let visible_rows = lines.len().min(fully_drawable_rows(height, metrics));
+        for row in 0..visible_rows {
+            let (line, row_kind) = lines.row(row);
             for (col, character) in line.chars().take(sidebar_columns).enumerate() {
                 push_glyph(
                     &mut vertices,
                     character,
-                    sidebar_glyph_color(&theme, character, col, sidebar_columns),
+                    sidebar_glyph_color(&theme, character, col, sidebar_columns, row_kind),
                     col,
                     row,
                     target,

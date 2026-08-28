@@ -48,10 +48,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 
+use noren_app::sidebar_text::SidebarTextRow;
 use noren_terminal::TerminalSnapshot;
 use renderer_source::{
-    SHADER, Target, VERTEX_ATTRIBUTES, VERTEX_BYTES, glyph_vertices_for, theme_clear_color,
-    vertex_bytes,
+    SHADER, Target, VERTEX_ATTRIBUTES, VERTEX_BYTES, Vertex, glyph_vertices_for,
+    glyph_vertices_for_sidebar_rows, theme_clear_color, vertex_bytes,
 };
 
 /// Linear RGBA8 (non-sRGB) offscreen target.
@@ -254,12 +255,29 @@ impl OffscreenRenderer {
         sidebar: Option<&[String]>,
         status: Option<&str>,
     ) -> CapturedFrame {
+        let vertices = glyph_vertices_for(target, terminal, sidebar, status);
+        self.capture_vertices(target, vertices)
+    }
+
+    /// Render sidebar rows whose domain kinds are retained by the production
+    /// text projection, including the session-only lifecycle colour gate.
+    pub(crate) fn capture_sidebar_rows(
+        &self,
+        target: Target,
+        terminal: Option<&TerminalSnapshot>,
+        sidebar: Option<&[SidebarTextRow]>,
+        status: Option<&str>,
+    ) -> CapturedFrame {
+        let vertices = glyph_vertices_for_sidebar_rows(target, terminal, sidebar, status);
+        self.capture_vertices(target, vertices)
+    }
+
+    fn capture_vertices(&self, target: Target, vertices: Vec<Vertex>) -> CapturedFrame {
         assert!(
             target.width > 0 && target.height > 0,
             "capture target must be non-zero"
         );
 
-        let vertices = glyph_vertices_for(target, terminal, sidebar, status);
         let bytes = vertex_bytes(&vertices);
         let (width, height) = (target.width, target.height);
 

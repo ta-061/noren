@@ -6,7 +6,7 @@
 //! so the view model remains renderer- and geometry-independent.
 
 use crate::MAX_RENDER_COLS;
-use crate::sidebar::{SessionLifecycle, SidebarRow, SidebarView};
+use crate::sidebar::{EntryKind, SessionLifecycle, SidebarRow, SidebarView};
 use noren_terminal::AnsiColor;
 
 /// Shipped sidebar width in cell columns.
@@ -29,6 +29,49 @@ pub const LIFECYCLE_MARKERS: [char; 4] = ['◌', '▶', '■', '✕'];
 const ROW_PREFIX_COLUMNS: usize = 2;
 const STATE_SUFFIX_COLUMNS: usize = 2;
 const ELLIPSIS: &str = "...";
+
+/// One projected sidebar row with its domain kind preserved for rendering.
+///
+/// Text alone cannot identify a lifecycle row: non-session labels are
+/// user-derived and may place a marker-shaped character in the final visible
+/// cell. `None` is reserved for chrome that has no workspace entry, such as
+/// the empty-state notice or command palette rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidebarTextRow {
+    text: String,
+    kind: Option<EntryKind>,
+}
+
+impl SidebarTextRow {
+    /// Build a text-only chrome row that carries no workspace entry kind.
+    #[must_use]
+    pub fn chrome(text: String) -> Self {
+        Self { text, kind: None }
+    }
+
+    /// The text cells emitted for this row.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// The domain entry kind, or `None` for non-entry chrome.
+    #[must_use]
+    pub const fn kind(&self) -> Option<EntryKind> {
+        self.kind
+    }
+
+    fn entry(text: String, kind: EntryKind) -> Self {
+        Self {
+            text,
+            kind: Some(kind),
+        }
+    }
+
+    fn into_text(self) -> String {
+        self.text
+    }
+}
 
 /// The marker glyph assigned to one lifecycle class.
 #[must_use]
@@ -76,20 +119,37 @@ pub fn visible_sidebar_text_lines_at_width(
     max_rows: usize,
     columns: usize,
 ) -> Vec<String> {
+    visible_sidebar_text_rows_at_width(sidebar, offset, max_rows, columns)
+        .into_iter()
+        .map(SidebarTextRow::into_text)
+        .collect()
+}
+
+/// Format visible rows while preserving the entry kind each line came from.
+///
+/// The renderer consumes this projection so semantic lifecycle colour is
+/// gated by `EntryKind::Session`, never by user-controlled text alone.
+#[must_use]
+pub fn visible_sidebar_text_rows_at_width(
+    sidebar: &SidebarView,
+    offset: usize,
+    max_rows: usize,
+    columns: usize,
+) -> Vec<SidebarTextRow> {
     if max_rows == 0 || columns == 0 {
         return Vec::new();
     }
     if sidebar.is_empty() {
         return sidebar
             .empty_state()
-            .map(|state| vec![state.message().to_string()])
+            .map(|state| vec![SidebarTextRow::chrome(state.message().to_string())])
             .unwrap_or_default();
     }
     let offset = offset.min(sidebar.rows().len().saturating_sub(max_rows));
     sidebar.rows()[offset..]
         .iter()
         .take(max_rows)
-        .map(|row| format_row(row, columns))
+        .map(|row| SidebarTextRow::entry(format_row(row, columns), row.kind()))
         .collect()
 }
 

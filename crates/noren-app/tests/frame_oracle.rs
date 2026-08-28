@@ -86,8 +86,8 @@ use std::process::Command;
 
 use noren_app::cursor::CursorShape;
 use noren_app::session::{SessionKind, SessionRegistry, SessionStatus};
-use noren_app::sidebar::{SidebarEntry, SidebarView};
-use noren_app::sidebar_text::visible_sidebar_text_lines_at_width;
+use noren_app::sidebar::{EntryKind, SidebarEntry, SidebarView};
+use noren_app::sidebar_text::{SidebarTextRow, visible_sidebar_text_rows_at_width};
 use noren_app::theme::{DARK, HIGH_CONTRAST, LIGHT, Theme, contrast_ratio};
 use noren_app::{
     GridGeometry, MAX_RENDER_COLS, MAX_RENDER_ROWS, POC_CELL_HEIGHT as CELL_HEIGHT,
@@ -95,7 +95,7 @@ use noren_app::{
 };
 use noren_terminal::{TerminalSnapshot, TerminalState};
 use renderer_capture::renderer_source::{
-    CLEAR_COLOR, CursorStyle, SIDEBAR_COLS, Target, glyph_vertices_for,
+    CLEAR_COLOR, CursorStyle, SIDEBAR_COLS, Target, glyph_vertices_for_sidebar_rows,
 };
 use renderer_capture::{CaptureError, CapturedFrame, OffscreenRenderer};
 
@@ -2184,7 +2184,7 @@ fn render_with_sidebar(
 /// Build one real session row through the domain model and production text
 /// projection. No process is involved: the registry records an explicit
 /// observation and the view projects it into the same line the app renders.
-fn lifecycle_sidebar_line(status: SessionStatus) -> String {
+fn lifecycle_sidebar_row(status: SessionStatus) -> SidebarTextRow {
     let mut registry = SessionRegistry::new();
     let id = registry.create(SessionKind::Local);
     if status != SessionStatus::Starting {
@@ -2196,10 +2196,10 @@ fn lifecycle_sidebar_line(status: SessionStatus) -> String {
         registry.get(id).expect("fixture id remains live"),
     )];
     let view = SidebarView::build(&entries, Some(id));
-    visible_sidebar_text_lines_at_width(&view, 0, 1, SIDEBAR_COLS)
+    visible_sidebar_text_rows_at_width(&view, 0, 1, SIDEBAR_COLS)
         .into_iter()
         .next()
-        .expect("one session produces one sidebar line")
+        .expect("one session produces one sidebar row")
 }
 
 fn lifecycle_cases() -> [(SessionStatus, char, usize, [u8; 7]); 4] {
@@ -2257,14 +2257,17 @@ fn glyph_rows_from_rectangles(rectangles: &[GlyphRect]) -> [u8; 7] {
     rows
 }
 
-fn sidebar_cell_vertex_oracle(line: &str, theme: &Theme, column: u32) -> SidebarCellVertexOracle {
+fn sidebar_cell_vertex_oracle(
+    row: &SidebarTextRow,
+    theme: &Theme,
+    column: u32,
+) -> SidebarCellVertexOracle {
     let width = SIDEBAR_COLS as u32 * CELL_WIDTH;
     let height = CELL_HEIGHT;
-    let lines = [line.to_string()];
-    let vertices = glyph_vertices_for(
+    let vertices = glyph_vertices_for_sidebar_rows(
         Target::new(theme, width, height, poc_metrics()),
         None,
-        Some(&lines),
+        Some(std::slice::from_ref(row)),
         None,
     );
     let pixel_x = |ndc: f32| (((ndc + 1.0) * 0.5 * width as f32).round()) as u32;
@@ -2289,7 +2292,8 @@ fn sidebar_cell_vertex_oracle(line: &str, theme: &Theme, column: u32) -> Sidebar
 fn session_lifecycle_markers_are_identifiable_and_on_row_at_16_columns() {
     let mut signatures = Vec::new();
     for (status, expected_marker, expected_ansi, expected_rows) in lifecycle_cases() {
-        let line = lifecycle_sidebar_line(status);
+        let row = lifecycle_sidebar_row(status);
+        let line = row.text();
         assert_eq!(
             line.chars().count(),
             SIDEBAR_COLS,
@@ -2302,7 +2306,7 @@ fn session_lifecycle_markers_are_identifiable_and_on_row_at_16_columns() {
         );
 
         let (signature, _) = sidebar_cell_vertex_oracle(
-            &line,
+            &row,
             &DARK,
             u32::try_from(SIDEBAR_COLS - 1).expect("sidebar width fits u32"),
         );
@@ -2323,7 +2327,7 @@ fn session_lifecycle_markers_are_identifiable_and_on_row_at_16_columns() {
 
         for theme in [DARK, LIGHT, HIGH_CONTRAST] {
             let (_, colors) = sidebar_cell_vertex_oracle(
-                &line,
+                &row,
                 &theme,
                 u32::try_from(SIDEBAR_COLS - 1).expect("sidebar width fits u32"),
             );
@@ -2359,12 +2363,11 @@ fn session_lifecycle_markers_reach_distinct_frame_pixels_at_16_columns() {
     let marker_column = u32::try_from(SIDEBAR_COLS - 1).expect("sidebar width fits u32");
     let mut patterns = Vec::new();
     for (status, expected_marker, expected_ansi, _) in lifecycle_cases() {
-        let line = lifecycle_sidebar_line(status);
-        let lines = [line];
-        let frame = renderer.capture(
+        let row = lifecycle_sidebar_row(status);
+        let frame = renderer.capture_sidebar_rows(
             Target::new(&DARK, width, CELL_HEIGHT, poc_metrics()),
             None,
-            Some(&lines),
+            Some(std::slice::from_ref(&row)),
             None,
         );
         assert!(
@@ -2386,6 +2389,39 @@ fn session_lifecycle_markers_reach_distinct_frame_pixels_at_16_columns() {
         patterns.push(pattern);
     }
     assert_eq!(patterns.len(), 4, "all four rendered markers were checked");
+}
+
+#[test]
+fn project_name_ending_in_running_marker_keeps_default_vertex_color() {
+    let entries = [SidebarEntry::Project {
+        name: "aaaaaaaaaaaaa▶".to_string(),
+        root: "/project".to_string(),
+    }];
+    let view = SidebarView::build(&entries, None);
+    let rows = visible_sidebar_text_rows_at_width(&view, 0, 1, SIDEBAR_COLS);
+    let row = rows.first().expect("one project produces one sidebar row");
+    assert_eq!(row.kind(), Some(EntryKind::Project));
+    assert_eq!(
+        row.text().chars().nth(SIDEBAR_COLS - 1),
+        Some('▶'),
+        "fixture must truncate with the marker-shaped project character in column 16"
+    );
+
+    let (_, colors) = sidebar_cell_vertex_oracle(
+        row,
+        &DARK,
+        u32::try_from(SIDEBAR_COLS - 1).expect("sidebar width fits u32"),
+    );
+    let false_running_signal = DARK.ansi()[2].map(|channel| f32::from(channel) / 255.0);
+    assert_ne!(DARK.foreground(), false_running_signal);
+    assert!(
+        !colors.is_empty(),
+        "project's final glyph emitted no vertices"
+    );
+    assert!(
+        colors.iter().all(|color| *color == DARK.foreground()),
+        "project text borrowed the running-session colour: {colors:?}"
+    );
 }
 
 #[test]
