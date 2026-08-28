@@ -171,52 +171,114 @@ session's child starts in the worktree.
 Two independent specification reviews, run without sight of each other, both
 concluded that the current tree cannot honestly be released as "0.1.0-preview of
 the Noren terminal." The reasoning and the decision are recorded in
-[D-M8-001](docs/coordination/decisions/D-M8-001-preview-scope.md). In short:
+[D-M8-001](docs/coordination/decisions/D-M8-001-preview-scope.md). Much of what
+those reviews named has since been fixed — the workspace slice reaches the
+binary, colour reaches the pixels, and both font defects are retired — so this
+section states what blocks a preview **at this tree**, each item verified
+against it:
 
-- **The workspace is a slice, not a product.** The Milestone 3 modules now
-  reach the binary: the sidebar is drawn, the palette opens on `Super+p`,
-  local sessions spawn real PTYs that switch, park, and close through the
-  live view, mouse reports reach the active PTY, and sidebar state persists
-  across a restart. What is still missing is breadth —
-  bounded OpenSSH configuration now produces an explicitly partial list of at
-  most 24 positive literal aliases as `SessionKind::Ssh` values and
-  `SidebarEntry::SshConnection` rows, and selecting one launches the fixed
-  system `ssh` client in the terminal's PTY. Git
-  worktrees of the launch repository ARE reachable now (discovered from
-  `git worktree list --porcelain`, shown as bounded rows, and launched as
-  worktree-scoped sessions), configured agents are launchable through the
-  `[[agents]]` section (a shell-free argv PTY launch with visible failure
-  states), and configured projects are launchable through the
-  `[[projects]]` section (a directory-rooted PTY launch in the configured
-  root, with the same visible-failure discipline); keybindings ARE
-  configurable through the `[keys]` section since this milestone (see
-  [Milestone 3 status](#milestone-3-status)).
-- **Colour rendering exists, but themes are fixed.** `renderer.rs` resolves
-  each cell's SGR foreground and any explicit background through its compiled-in
-  ANSI/256-colour palette or as direct RGB truecolor. The vertex layout carries
-  the resolved colour alongside position and `fs_main` returns that per-vertex
-  input. There is no configuration surface for the default palette or theme,
-  so light, dark, high-contrast, and colour-vision-friendly themes remain
-  Milestone 6 work.
+- **The workspace is real but single-viewport.** The sidebar is drawn, the
+  palette opens on `Super+p`, local sessions spawn real PTYs that switch,
+  park, and close through the live view, mouse reports reach the active PTY,
+  and sidebar state persists across a restart. Git worktrees of the launch
+  repository are discovered (`git worktree list --porcelain`, driven from
+  `git_worktree.rs`) and launched as sessions whose child's working directory
+  IS the worktree, proven by reading the child's own `pwd` back through the
+  terminal. `[[projects]]` entries launch directory-rooted sessions,
+  `[[agents]]` entries launch their configured command as a shell-free argv
+  vector (`AgentLaunchPolicy` in `noren-pty` requires an absolute program and
+  never consults a shell or `PATH`), and OpenSSH discovery surfaces at most
+  `MAX_SSH_SIDEBAR_HOSTS` (64) positive literal aliases as
+  `SidebarEntry::SshConnection` rows that launch the fixed system `ssh`
+  client in the terminal's PTY, with wildcard patterns counted and explained
+  rather than silently dropped (`SshConfig::unlisted_wildcard_patterns`).
+  Keybindings are configurable through `[keys]` (see
+  [Milestone 3 status](#milestone-3-status)). What still blocks is breadth
+  and depth: exactly one session owns the viewport at a time, a restored
+  row's shell does not exist until it is relaunched, and SSH discovery stays
+  explicitly partial by design — no wildcard, `Match`, or token-expansion
+  enumeration ever happens.
+- **The default `dark` palette fails WCAG AA on its own background.**
+  `[theme] name` in `config.toml` selects one of three built-in themes —
+  `dark` (the default), `light`, and `high-contrast` — and every theme
+  carries a measured, test-pinned contrast floor (`theme.rs` and
+  `crates/noren-app/tests/theme.rs`; the selection reaching the renderer is
+  pinned app-level by `configured_theme_reaches_the_app_renderer_input`).
+  The blocker is the default itself: the `dark` palette's worst slot is ANSI
+  black at **1.06:1**, and five of its sixteen ANSI entries fall below the
+  4.5:1 AA floor for normal text — pinned deliberately by
+  `default_dark_palette_minimum_is_pinned_below_the_aa_floor`, because the
+  no-`[theme]` default must stay byte-identical to the pre-theme renderer
+  (`dark_theme_is_byte_identical_to_the_pre_theme_renderer`) and changing the
+  values is a separate, currently-untaken decision (issue #168). `light`
+  (minimum 5.07:1) and `high-contrast` (7.84:1, beyond AAA) pass every slot,
+  so a user who needs AA must know to opt in — a preview whose default look
+  is below AA cannot ship as the product's face. Themes are built-in only:
+  no custom-palette or colour-vision-friendly surface exists.
 - **The font is a hand-built 5x7 bitmap with bounded coverage.** Printable
   ASCII keeps distinct upper/lower case, and the Latin-1 Supplement
   (`U+00A0..=U+00FF`) and Box Drawing (`U+2500..=U+257F`) blocks have
   per-character bitmaps, but every other code point — CJK text and emoji
-  included — draws a fixed replacement glyph, and seven glyph pairs are
-  visually identical by an allowlisted collision set (pinned by
+  included — draws a fixed replacement glyph: unreadable boxes laid out at
+  the **correct** two-column width, pinned through real pixels by
+  `cjk_text_occupies_two_cells_per_character_and_fails_visibly_not_corruptingly`
+  and its wide-character and combining-mark neighbours in
+  `crates/noren-app/tests/frame_oracle.rs`, but with no glyphs. Rendering
+  real CJK needs a real font stack, which is deliberately not claimed.
+  Seven glyph pairs remain visually identical by an allowlisted collision
+  set (pinned by
   `covered_range_glyph_collisions_match_the_hardcoded_allowlist` in
   `renderer.rs`'s tests). Both former font defects — case-folding and
-  non-ASCII rendering as `?` — were retired by PR #141 and are now guarded by
-  running tests, not `#[ignore]`d ones.
-- **The FR-005 rendered-frame oracle now exists** (PR #89). It drives the real
-  pipeline offscreen; active colour-aware assertions cover SGR foregrounds,
-  ANSI/256-colour and direct RGB resolution, defaults, and explicit backgrounds.
-  Its former defect tests (`lowercase_distinct_from_uppercase`,
-  `non_ascii_glyph_is_not_the_question_mark`) now run and pass, guarding the
-  PR #141 font fixes — see the font bullet above for what the font still cannot
-  do.
+  non-ASCII rendering as `?` — are retired and guarded by running, passing
+  tests (`lowercase_distinct_from_uppercase`,
+  `non_ascii_glyph_is_not_the_question_mark`), not `#[ignore]`d ones.
+- **IME input is discarded, and there is no accessibility surface.** The
+  `WindowEvent::Ime(_)` arm in `main.rs`'s event handler drops the event
+  without forwarding it, so Japanese, Chinese, and Korean input methods
+  produce nothing; nothing in the tree integrates with assistive
+  technology. Both are Milestone 6 scope and neither has started.
+- **The view layer is incomplete beyond colour and glyphs.** There is no
+  visible cursor: `glyph_vertices` in `renderer.rs` emits sidebar rows,
+  per-cell backgrounds, glyph bitmaps, and a status line — never a cursor —
+  and the word "cursor" does not appear in that file. There is no scrollback
+  viewport: rendering stays on the newest suffix of the content because no
+  scroll-offset input exists (the only scroll offset in `main.rs` is the
+  sidebar's own). Selection is tracked and copies correctly but is never
+  highlighted. A terminal in which a stranger cannot see the cursor, cannot
+  scroll back, and cannot see their selection is not preview-ready.
+- **An open correctness defect sits on the CJK layout path.** `CSI T` (SD),
+  `CSI S` (SU), and `CSI M` (DL) shift rows without re-snapping the cursor
+  to a wide character's lead cell, so the cursor can be stranded on a
+  continuation cell — the very contract the frame oracle pins. Found by the
+  parser fuzz harness (`crates/noren-terminal/tests/fuzz_feed_bytes.rs`),
+  reported as issue #176, and deliberately not yet fixed. It is reachable
+  by any pager or TUI that scrolls a region while CJK text is on screen.
+- **The FR-005 rendered-frame oracle exists and runs, and its boundary is
+  the honesty requirement.** It drives the real `wgpu` pipeline offscreen
+  (`crates/noren-app/src/renderer_capture.rs`,
+  `crates/noren-app/tests/frame_oracle.rs`); its active assertions cover
+  structure, SGR foregrounds, ANSI/256-colour and direct RGB resolution,
+  defaults, explicit backgrounds, and the CJK width contract. It does
+  **not** verify that an `A` is shaped like an A, and there is still no key
+  injection into the real window, so live keyboard input remains unverified
+  by automation — the manual macOS gate is the only perceptual check. A
+  preview must state this boundary rather than imply the oracle proves more.
+- **Live-Zellij pass-through evidence is gathered by CI but gates nothing.**
+  `.github/workflows/zellij-live.yml` installs the pinned Zellij release
+  and runs `crates/noren-app/tests/zellij_live.rs` for real on every PR,
+  push to `main`, and nightly, with guards that fail the job on a failed
+  install, a checksum or version mismatch, or any skip notice. The job is
+  deliberately **not** in the branch-protection required-check list
+  (advisory by choice, because the pinned artifact lives upstream): a red
+  live suite does not block a merge, so a pass-through regression can land
+  between the runs that notice it.
 - **NFR-009 requires release-integrity gates** — signing, notarization,
-  packaging — to pass before any Preview claim.
+  packaging — to pass before any Preview claim. A local `cargo build`
+  produces an arm64 binary carrying only macOS's automatic ad-hoc signature
+  (`codesign -dvvv` reports `Signature=adhoc` and `TeamIdentifier=not
+  set`), so a distributed binary would meet Gatekeeper as an unidentified
+  developer. Checksums, release tags, and publication are
+  release-integrity concerns under the same requirement, and none exist.
 
 Milestone 8 therefore stops at a release candidate. Signing keys, Apple
 certificates, tagging, and publication are owner decisions and are not taken
