@@ -57,7 +57,7 @@ chords the app shipped with before configuration existed.
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `palette_open` | string | `"super+p"` | Chord that opens the command palette while it is closed. |
-| `session_create` | string | `"c"` | Palette command dispatching `session.create` (New Session). |
+| `session_create` | string | `"c"` | Palette command dispatching `session.create` (New Session); also the direct recovery action while the workspace is empty. |
 | `session_select` | string | `"s"` | Palette command dispatching `session.select` (Switch Session). |
 | `session_close` | string | `"x"` | Palette command dispatching `session.close` (Close Session). |
 | `sidebar_focus` | string | `"f"` | Palette command dispatching `sidebar.focus` (Focus Sidebar). |
@@ -86,12 +86,33 @@ never a silent fallback and never a silently dead binding:
   `down`, which the open palette always interprets as dismissal, confirm,
   and navigation.
 
-The four command chords apply only while the palette is open — the palette
-intercepts all keys then, so command chords never steal input from Zellij or
-the terminal — which is why only `palette_open` is validated against the
-Zellij corpus. Chords with modifiers dispatch on the exact modifier set; a
-modifier-free character binding also matches the character with any
-modifiers held, as the pre-configuration palette did.
+The four command chords normally apply only while the palette is open — the
+palette intercepts all keys then, so command chords never steal input from
+Zellij or the terminal — which is why only `palette_open` is validated against
+the Zellij corpus. There is one bounded recovery exception: when the entire
+sidebar is empty and no session can receive input, the configured
+`session_create` chord creates a session directly, exactly as the terminal-side
+empty-state action says. Chords with modifiers dispatch on the exact modifier
+set; inside the palette, a modifier-free character binding also matches the
+character with any modifiers held, as the pre-configuration palette did.
+
+### `[ui]`
+
+Optional application chrome. The palette affordance is visible by default in
+the permanent status row and is generated from the active `[keys]`
+`palette_open` binding, so rebinding the command never leaves a stale shortcut
+on screen. Configuration is not required for discoverability.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `show_palette_hint` | boolean | `true` | Show the configured palette opener followed by `Commands` in the terminal-side status row. Set to `false` to remove the persistent hint. |
+
+The setting is an explicit opt-out: omitting `[ui]` keeps the hint visible. A
+non-boolean value or an unknown key is a typed configuration error rather than
+a silently ignored preference. Turning the persistent palette hint off does
+not remove the actionable empty state: `No sessions` still shows the active
+`session_create` chord in the terminal area, and pressing it creates a session
+directly.
 
 ### `[theme]`
 
@@ -299,6 +320,9 @@ cell_height = 24
 [keys]
 palette_open = "super+k"
 session_create = "ctrl+shift+t"
+
+[ui]
+show_palette_hint = false
 
 [theme]
 name = "light"

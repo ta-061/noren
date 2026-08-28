@@ -315,6 +315,53 @@ pub(crate) enum RenderOutcome {
     DeviceLost,
 }
 
+/// Application-owned chrome drawn around terminal cells for one frame.
+///
+/// The palette affordance travels separately from runtime status text so the
+/// renderer can keep it first in the permanent terminal-side status row. That
+/// ordering is load-bearing: a long diagnostic may be clipped by a narrow
+/// window, but it must never make the command surface undiscoverable.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FrameChrome<'a> {
+    sidebar: Option<&'a [String]>,
+    status: Option<&'a str>,
+    palette_hint: Option<&'a str>,
+    workspace_notice: Option<&'a [String]>,
+}
+
+impl<'a> FrameChrome<'a> {
+    pub(crate) const fn new(sidebar: Option<&'a [String]>, status: Option<&'a str>) -> Self {
+        Self {
+            sidebar,
+            status,
+            palette_hint: None,
+            workspace_notice: None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn with_palette_hint(mut self, hint: Option<&'a str>) -> Self {
+        self.palette_hint = hint;
+        self
+    }
+
+    /// Add terminal-side application copy shown in place of absent content.
+    #[must_use]
+    pub(crate) const fn with_workspace_notice(mut self, lines: Option<&'a [String]>) -> Self {
+        self.workspace_notice = lines;
+        self
+    }
+
+    fn status_line(self) -> Option<String> {
+        match (self.palette_hint, self.status) {
+            (None, None) => None,
+            (Some(hint), None) => Some(hint.to_owned()),
+            (None, Some(status)) => Some(status.to_owned()),
+            (Some(hint), Some(status)) => Some(format!("{hint} | {status}")),
+        }
+    }
+}
+
 pub(crate) struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -448,8 +495,7 @@ impl Renderer {
     pub(crate) fn render(
         &mut self,
         terminal: Option<&TerminalSnapshot>,
-        sidebar: Option<&[String]>,
-        status: Option<&str>,
+        chrome: FrameChrome<'_>,
     ) -> RenderOutcome {
         if self.device_lost.load(Ordering::Acquire) {
             return RenderOutcome::DeviceLost;
@@ -462,7 +508,7 @@ impl Renderer {
             self.metrics,
         )
         .with_cursor_style(self.cursor);
-        let vertices = glyph_vertices_for(target, terminal, sidebar, status);
+        let vertices = glyph_vertices_for_chrome(target, terminal, chrome);
         let bytes = vertex_bytes(&vertices);
         let required = u64::try_from(bytes.len()).unwrap_or(u64::MAX).max(8);
         if required > self.vertex_capacity {
@@ -562,6 +608,10 @@ fn block_on<F: Future>(future: F) -> F::Output {
 /// resolution, the sidebar/status default foreground, the clear colour the
 /// caller loads — reads from the target's theme, which is how a configured
 /// theme changes what is drawn.
+// Re-included directly by the frame oracle and benchmark. The live binary
+// uses the richer `glyph_vertices_for_chrome` seam below, so this compatibility
+// entry point is intentionally dead only in that one compilation target.
+#[allow(dead_code)]
 pub(crate) fn glyph_vertices_for(
     target: Target,
     terminal: Option<&TerminalSnapshot>,
@@ -571,15 +621,45 @@ pub(crate) fn glyph_vertices_for(
     glyph_vertices_with_budget(target, terminal, sidebar, status, MAX_VERTICES)
 }
 
+/// Emit a frame through the live application's complete chrome path.
+///
+/// Unlike [`glyph_vertices_for`], which preserves the historical terminal /
+/// sidebar / status seam for focused tests and benches, this entry point also
+/// renders the configured palette affordance. The window renderer and the
+/// frame oracle both call this function, so the oracle observes the same
+/// placement and clipping behavior users see.
+pub(crate) fn glyph_vertices_for_chrome(
+    target: Target,
+    terminal: Option<&TerminalSnapshot>,
+    chrome: FrameChrome<'_>,
+) -> Vec<Vertex> {
+    glyph_vertices_with_chrome_budget(target, terminal, chrome, MAX_VERTICES)
+}
+
 /// Internal seam for exercising the production vertex-budget backstop without
 /// allocating a clamp-sized frame. The shipped path above always supplies
 /// [`MAX_VERTICES`]; tests use a smaller budget but traverse this same emission
 /// code and the same post-primitive guards.
+#[allow(dead_code)]
 fn glyph_vertices_with_budget(
     target: Target,
     terminal: Option<&TerminalSnapshot>,
     sidebar: Option<&[String]>,
     status: Option<&str>,
+    vertex_budget: usize,
+) -> Vec<Vertex> {
+    glyph_vertices_with_chrome_budget(
+        target,
+        terminal,
+        FrameChrome::new(sidebar, status),
+        vertex_budget,
+    )
+}
+
+fn glyph_vertices_with_chrome_budget(
+    target: Target,
+    terminal: Option<&TerminalSnapshot>,
+    chrome: FrameChrome<'_>,
     vertex_budget: usize,
 ) -> Vec<Vertex> {
     let (width, height, metrics, theme) =
@@ -590,6 +670,9 @@ fn glyph_vertices_with_budget(
     let cell_width = metrics.width();
     let window_cols = usize::try_from(width / cell_width).unwrap_or(usize::MAX);
 
+    let sidebar = chrome.sidebar;
+    let status = chrome.status_line();
+    let workspace_notice = chrome.workspace_notice;
     let has_sidebar = sidebar.is_some();
     let col_offset = if has_sidebar { SIDEBAR_COLS } else { 0 };
     // Reserve the sidebar, then clamp the terminal to the renderer's drawable
@@ -636,7 +719,8 @@ fn glyph_vertices_with_budget(
             );
         }
     }
-    let layout = FrameRowLayout::new(height, metrics, rows.len(), status.is_some())
+    let content_rows = rows.len().max(workspace_notice.map_or(0, <[String]>::len));
+    let layout = FrameRowLayout::new(height, metrics, content_rows, status.is_some())
         .expect("non-zero frame height has a row layout");
     let cursor_plan = terminal.and_then(|snapshot| plan_cursor(snapshot, &layout, terminal_cols));
     let mut vertices = Vec::new();
@@ -674,23 +758,56 @@ fn glyph_vertices_with_budget(
             .expect("rendered row count only includes owned rows")
         {
             FrameRow::Terminal(line_index) => {
-                let cells = rows
-                    .get(line_index)
-                    .expect("terminal layout only names display rows");
-                let visible_len = cells.len().min(terminal_cols);
-                let visible = &cells[..visible_len];
-                if let Some(plan) = cursor_plan
-                    && plan.frame_row == row
-                    && plan.column < visible_len
-                {
-                    // Split out the one cursor-bearing span. Ordinary cells
-                    // therefore do not pay a cursor-position/shape branch on
-                    // every iteration — important on dense frames, where the
-                    // caret affects one cell out of thousands.
-                    let (before, cursor_and_after) = visible.split_at(plan.column);
-                    if push_terminal_cells(
+                if let Some(cells) = rows.get(line_index) {
+                    let visible_len = cells.len().min(terminal_cols);
+                    let visible = &cells[..visible_len];
+                    if let Some(plan) = cursor_plan
+                        && plan.frame_row == row
+                        && plan.column < visible_len
+                    {
+                        // Split out the one cursor-bearing span. Ordinary cells
+                        // therefore do not pay a cursor-position/shape branch on
+                        // every iteration — important on dense frames, where the
+                        // caret affects one cell out of thousands.
+                        let (before, cursor_and_after) = visible.split_at(plan.column);
+                        if push_terminal_cells(
+                            &mut vertices,
+                            before,
+                            0,
+                            row,
+                            col_offset,
+                            target,
+                            vertex_budget,
+                        ) {
+                            return vertices;
+                        }
+                        let cursor_len = plan.columns.min(cursor_and_after.len());
+                        let (cursor_cells, after) = cursor_and_after.split_at(cursor_len);
+                        if push_cursor_cells(
+                            &mut vertices,
+                            cursor_cells,
+                            plan,
+                            row,
+                            col_offset,
+                            target,
+                            vertex_budget,
+                        ) {
+                            return vertices;
+                        }
+                        if push_terminal_cells(
+                            &mut vertices,
+                            after,
+                            plan.column + cursor_len,
+                            row,
+                            col_offset,
+                            target,
+                            vertex_budget,
+                        ) {
+                            return vertices;
+                        }
+                    } else if push_terminal_cells(
                         &mut vertices,
-                        before,
+                        visible,
                         0,
                         row,
                         col_offset,
@@ -699,45 +816,27 @@ fn glyph_vertices_with_budget(
                     ) {
                         return vertices;
                     }
-                    let cursor_len = plan.columns.min(cursor_and_after.len());
-                    let (cursor_cells, after) = cursor_and_after.split_at(cursor_len);
-                    if push_cursor_cells(
-                        &mut vertices,
-                        cursor_cells,
-                        plan,
-                        row,
-                        col_offset,
-                        target,
-                        vertex_budget,
-                    ) {
-                        return vertices;
+                }
+                if let Some(line) = workspace_notice.and_then(|lines| lines.get(line_index)) {
+                    for (col, character) in line.chars().take(terminal_cols).enumerate() {
+                        push_glyph(
+                            &mut vertices,
+                            character,
+                            theme.foreground(),
+                            col_offset + col,
+                            row,
+                            target,
+                        );
+                        if vertices.len() >= vertex_budget {
+                            return vertices;
+                        }
                     }
-                    if push_terminal_cells(
-                        &mut vertices,
-                        after,
-                        plan.column + cursor_len,
-                        row,
-                        col_offset,
-                        target,
-                        vertex_budget,
-                    ) {
-                        return vertices;
-                    }
-                } else if push_terminal_cells(
-                    &mut vertices,
-                    visible,
-                    0,
-                    row,
-                    col_offset,
-                    target,
-                    vertex_budget,
-                ) {
-                    return vertices;
                 }
             }
             FrameRow::Status => {
                 // The status line is renderer chrome with no cell backing.
                 for (col, character) in status
+                    .as_deref()
                     .unwrap_or_default()
                     .chars()
                     .take(terminal_cols)
@@ -1794,7 +1893,9 @@ fn glyph_rows(character: char) -> [u8; 7] {
 mod tests {
     use super::*;
     use noren_app::GridGeometry;
+    use noren_app::config::AppConfig;
     use noren_app::theme::DARK;
+    use noren_app::ui::palette_hint;
     use noren_terminal::TerminalState;
 
     /// Default-theme vertex emission for test call sites: the shape the
@@ -1824,6 +1925,48 @@ mod tests {
     /// The PoC default cell metrics for tests that exercise the default path.
     fn poc_metrics() -> CellMetrics {
         GridGeometry::poc().cell_metrics()
+    }
+
+    /// Deterministic companion to the GPU frame oracle: configured chrome
+    /// must reach the production vertex path even on runners where Metal is
+    /// unavailable and the read-back test has to report a skip.
+    #[test]
+    fn configured_palette_hint_reaches_production_vertices() {
+        let metrics = poc_metrics();
+        let target = Target::new(
+            &Theme::default(),
+            (SIDEBAR_COLS as u32 + 48) * metrics.width(),
+            metrics.height(),
+            metrics,
+        );
+        let render = |config: &AppConfig| {
+            let hint = palette_hint(config.keys(), config.ui());
+            glyph_vertices_for_chrome(
+                target,
+                None,
+                FrameChrome::new(Some(&[]), None).with_palette_hint(hint.as_deref()),
+            )
+        };
+
+        let default_vertices = render(&AppConfig::default());
+        let rebound =
+            AppConfig::parse("[keys]\npalette_open = \"super+k\"\n").expect("valid palette rebind");
+        let rebound_vertices = render(&rebound);
+        let hidden = AppConfig::parse("[ui]\nshow_palette_hint = false\n")
+            .expect("valid palette-hint opt-out");
+
+        assert!(
+            !default_vertices.is_empty(),
+            "default chrome must emit the visible palette affordance"
+        );
+        assert!(
+            default_vertices != rebound_vertices,
+            "rebinding palette_open must change production chrome geometry"
+        );
+        assert!(
+            render(&hidden).is_empty(),
+            "the explicit UI opt-out must emit no affordance vertices"
+        );
     }
 
     /// The dark theme's clear colour is the exact historical constant — f64

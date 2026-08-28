@@ -28,6 +28,11 @@
 //! `Super+Escape` exit leader) is [`ConfigError::UnclaimableChord`] rather
 //! than a silently dead binding.
 //!
+//! The `[ui]` table controls optional application chrome. The palette hint is
+//! visible by default so an unconfigured first run remains discoverable; the
+//! sole setting can turn that hint off, but configuration is never required
+//! to obtain the useful behavior.
+//!
 //! The `[theme]` table selects the built-in colour palette. It follows the
 //! same discipline: an absent table keeps `dark` — exactly the colours the
 //! app shipped with before themes existed — a non-string value is
@@ -234,6 +239,33 @@ impl KeymapConfig {
     }
 }
 
+/// Optional application-chrome settings.
+///
+/// The palette affordance defaults to visible. This is deliberately an
+/// opt-out rather than an opt-in: a user who never reads or creates a config
+/// file must still discover the command surface, while a user who prefers no
+/// persistent hint can remove it without patching the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UiConfig {
+    show_palette_hint: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            show_palette_hint: true,
+        }
+    }
+}
+
+impl UiConfig {
+    /// Whether the configured palette chord is shown in permanent chrome.
+    #[must_use]
+    pub const fn show_palette_hint(self) -> bool {
+        self.show_palette_hint
+    }
+}
+
 /// A default keymap chord constant; the values are printable characters and
 /// the Super modifier, which always normalize.
 fn default_chord(code: KeyCode, modifiers: Modifiers) -> Chord {
@@ -418,6 +450,7 @@ impl ProjectConfig {
 pub struct AppConfig {
     font: FontConfig,
     keys: KeymapConfig,
+    ui: UiConfig,
     theme: ThemeConfig,
     cursor: CursorConfig,
     agents: Vec<AgentConfig>,
@@ -435,6 +468,12 @@ impl AppConfig {
     #[must_use]
     pub const fn keys(&self) -> KeymapConfig {
         self.keys
+    }
+
+    /// Optional application-chrome settings.
+    #[must_use]
+    pub const fn ui(&self) -> UiConfig {
+        self.ui
     }
 
     /// Colour theme settings.
@@ -518,6 +557,7 @@ impl AppConfig {
                     match key {
                         "font" => parse_font(table, &mut config.font)?,
                         "keys" => parse_keys(table, &mut config.keys)?,
+                        "ui" => parse_ui(table, &mut config.ui)?,
                         "theme" => parse_theme(table, &mut config.theme)?,
                         "cursor" => parse_cursor(table, &mut config.cursor)?,
                         // `[terminal]` historically attracted a `scrollback_lines` key.
@@ -686,6 +726,26 @@ fn integer_in_range(key: &str, item: &Item, min: usize, max: usize) -> Result<us
         .filter(|value| (min..=max).contains(value))
         .ok_or_else(|| ConfigError::OutOfRange { key: clip(key) })?;
     Ok(value)
+}
+
+/// Apply the `[ui]` table to application chrome.
+///
+/// The useful default is compiled in (`show_palette_hint = true`); this table
+/// exists only so a user who wants less chrome can explicitly turn it off.
+/// Wrong-typed values are rejected rather than silently preserving the
+/// default and pretending the override worked.
+fn parse_ui(table: &dyn TableLike, ui: &mut UiConfig) -> Result<(), ConfigError> {
+    for (key, item) in table.iter() {
+        match key {
+            "show_palette_hint" => {
+                ui.show_palette_hint = item
+                    .as_bool()
+                    .ok_or_else(|| ConfigError::UiNotABoolean { key: clip(key) })?;
+            }
+            _ => return Err(ConfigError::UnknownKey(clip(key))),
+        }
+    }
+    Ok(())
 }
 
 /// Apply the `[theme]` table to the theme selection.
@@ -1239,6 +1299,8 @@ pub enum ConfigError {
     ChordNotAString { key: String },
     /// A `[theme]` value is not a TOML string.
     ThemeNotAString { key: String },
+    /// A `[ui]` value is not a TOML boolean.
+    UiNotABoolean { key: String },
     /// A `[theme]` name is not one of the built-in themes.
     ///
     /// **Echo allowlist** (issue #150): `value` carries the `[theme]` name
@@ -1373,6 +1435,10 @@ impl fmt::Display for ConfigError {
             Self::ThemeNotAString { key } => write!(
                 f,
                 "configuration key {key} must be a theme name string like \"light\""
+            ),
+            Self::UiNotABoolean { key } => write!(
+                f,
+                "configuration key {key} must be a boolean (true or false)"
             ),
             Self::UnknownTheme { value } => write!(
                 f,
@@ -1651,10 +1717,40 @@ mod tests {
                 "[terminal]\nscrollback_lines = 250\n",
                 ConfigError::UnknownKey("terminal".to_owned()),
             ),
+            (
+                "[ui]\nshow_palette_hint = \"no\"\n",
+                ConfigError::UiNotABoolean {
+                    key: "show_palette_hint".to_owned(),
+                },
+            ),
+            (
+                "[ui]\npalette_hint = false\n",
+                ConfigError::UnknownKey("palette_hint".to_owned()),
+            ),
         ];
         for (text, expected) in cases {
             assert_eq!(AppConfig::parse(text), Err(expected), "{text:?}");
         }
+    }
+
+    #[test]
+    fn palette_hint_is_visible_by_default_and_can_only_be_explicitly_hidden() {
+        assert!(
+            AppConfig::default().ui().show_palette_hint(),
+            "the discoverability hint must ship visible without configuration"
+        );
+        assert!(
+            AppConfig::parse("[ui]\nshow_palette_hint = true\n")
+                .expect("explicit visible setting is valid")
+                .ui()
+                .show_palette_hint()
+        );
+        assert!(
+            !AppConfig::parse("[ui]\nshow_palette_hint = false\n")
+                .expect("the power-user opt-out is valid")
+                .ui()
+                .show_palette_hint()
+        );
     }
 
     #[test]
