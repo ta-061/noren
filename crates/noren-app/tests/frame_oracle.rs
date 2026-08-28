@@ -2204,7 +2204,12 @@ fn lifecycle_sidebar_row(status: SessionStatus) -> SidebarTextRow {
 
 fn lifecycle_cases() -> [(SessionStatus, char, usize, [u8; 7]); 4] {
     [
-        (SessionStatus::Starting, '◌', 3, [14, 17, 16, 16, 17, 14, 4]),
+        (
+            SessionStatus::Starting,
+            '⌛',
+            3,
+            [31, 27, 14, 4, 14, 27, 31],
+        ),
         (SessionStatus::Running, '▶', 2, [8, 12, 14, 15, 14, 12, 8]),
         (
             SessionStatus::Exited { code: Some(0) },

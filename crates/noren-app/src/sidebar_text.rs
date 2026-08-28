@@ -24,7 +24,7 @@ pub const MAX_SIDEBAR_COLUMNS: usize = MAX_RENDER_COLS as usize - 1;
 /// These code points receive explicit, collision-checked 5x7 bitmaps in the
 /// production renderer. They are shapes as well as colours, so remapped
 /// palettes and colour-vision differences cannot collapse the four states.
-pub const LIFECYCLE_MARKERS: [char; 4] = ['◌', '▶', '■', '✕'];
+pub const LIFECYCLE_MARKERS: [char; 4] = ['⌛', '▶', '■', '✕'];
 
 const ROW_PREFIX_COLUMNS: usize = 2;
 const STATE_SUFFIX_COLUMNS: usize = 2;
@@ -88,7 +88,7 @@ pub const fn lifecycle_marker(lifecycle: SessionLifecycle) -> char {
 #[must_use]
 pub const fn lifecycle_marker_color(marker: char) -> Option<AnsiColor> {
     match marker {
-        '◌' => Some(AnsiColor::Yellow),
+        '⌛' => Some(AnsiColor::Yellow),
         '▶' => Some(AnsiColor::Green),
         '■' => Some(AnsiColor::BrightBlack),
         '✕' => Some(AnsiColor::Red),

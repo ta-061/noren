@@ -409,7 +409,7 @@ fn configured_sidebar_columns_reach_app_terminal_pty_and_text() {
     let lines = visible_sidebar_text_lines_at_width(app.workspace.sidebar(), 0, 1, 24);
     assert_eq!(lines[0].chars().count(), 24);
     assert!(lines[0].contains(&session.to_string()));
-    assert_eq!(lines[0].chars().last(), Some('◌'));
+    assert_eq!(lines[0].chars().last(), Some('⌛'));
     assert_eq!(
         sidebar_pixel_width_at_width(app.geometry.cell_width(), app.sidebar_columns),
         240.0
@@ -683,10 +683,10 @@ fn sidebar_text_lines_format_a_real_workspace_sidebar() {
         lines[1]
     );
     // A freshly created session sits at Starting, whose reserved final cell
-    // carries the dotted-circle marker. The full detail remains on the view
+    // carries the hourglass marker. The full detail remains on the view
     // model; compact rendering never lets it push state beyond column 16.
     assert_eq!(lines[0].chars().count(), renderer::SIDEBAR_COLS);
-    assert_eq!(lines[0].chars().last(), Some('◌'));
+    assert_eq!(lines[0].chars().last(), Some('⌛'));
 }
 
 // ── Pass-through gate integration tests ──────────────────────────────

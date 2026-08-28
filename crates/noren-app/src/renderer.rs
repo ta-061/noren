@@ -1441,7 +1441,7 @@ pub(crate) fn vertex_bytes(vertices: &[Vertex]) -> Vec<u8> {
 
 const QUESTION_MARK_GLYPH: [u8; 7] = [14, 17, 1, 2, 4, 0, 4];
 const UNICODE_REPLACEMENT_GLYPH: [u8; 7] = [4, 10, 17, 21, 17, 10, 4];
-const STARTING_MARKER_GLYPH: [u8; 7] = [14, 17, 16, 16, 17, 14, 4];
+const STARTING_MARKER_GLYPH: [u8; 7] = [31, 27, 14, 4, 14, 27, 31];
 const RUNNING_MARKER_GLYPH: [u8; 7] = [8, 12, 14, 15, 14, 12, 8];
 const EXITED_MARKER_GLYPH: [u8; 7] = [0, 14, 14, 14, 14, 14, 0];
 const FAILED_MARKER_GLYPH: [u8; 7] = [17, 10, 4, 14, 4, 10, 17];
@@ -1793,7 +1793,7 @@ fn box_drawing_rows(character: char) -> Option<[u8; 7]> {
 #[rustfmt::skip]
 fn glyph_rows(character: char) -> [u8; 7] {
     match character {
-        '◌' => STARTING_MARKER_GLYPH,
+        '⌛' => STARTING_MARKER_GLYPH,
         '▶' => RUNNING_MARKER_GLYPH,
         '■' => EXITED_MARKER_GLYPH,
         '✕' => FAILED_MARKER_GLYPH,
@@ -2502,14 +2502,11 @@ mod tests {
         let mut existing: Vec<char> = (0x20_u8..=0x7e).map(char::from).collect();
         existing.extend((0x00a0..=0x00ff).filter_map(char::from_u32));
         existing.extend((0x2500..=0x257f).filter_map(char::from_u32));
-        assert_eq!(existing.len(), 319);
+        existing.push('\u{fffd}');
+        assert_eq!(existing.len(), 320);
 
         for (index, marker) in LIFECYCLE_MARKERS.into_iter().enumerate() {
             let marker_rows = glyph_rows(marker);
-            assert_ne!(
-                marker_rows, UNICODE_REPLACEMENT_GLYPH,
-                "lifecycle marker {marker:?} collides with Unicode replacement"
-            );
             for existing_glyph in &existing {
                 assert_ne!(
                     marker_rows,
@@ -2526,6 +2523,24 @@ mod tests {
                 );
             }
         }
+
+        let starting_rows = glyph_rows(LIFECYCLE_MARKERS[0]);
+        let (nearest_distance, nearest_glyph) = existing
+            .iter()
+            .map(|existing_glyph| {
+                let distance = starting_rows
+                    .iter()
+                    .zip(glyph_rows(*existing_glyph))
+                    .map(|(first, second)| (first ^ second).count_ones())
+                    .sum::<u32>();
+                (distance, *existing_glyph)
+            })
+            .min()
+            .expect("the full 320-glyph comparison set is non-empty");
+        assert_eq!(
+            nearest_distance, 10,
+            "starting marker is only {nearest_distance} bits from {nearest_glyph:?}"
+        );
     }
 
     #[test]
