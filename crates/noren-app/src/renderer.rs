@@ -2524,22 +2524,43 @@ mod tests {
             }
         }
 
-        let starting_rows = glyph_rows(LIFECYCLE_MARKERS[0]);
-        let (nearest_distance, nearest_glyph) = existing
+        // Pin the margin for EVERY marker, not just the starting one. The
+        // narrower single-marker form let a future edit to any of the other
+        // three shrink its margin unnoticed. The comparison set is the full
+        // sidebar glyph inventory plus the other markers, so the assertion
+        // covers the marker-vs-marker minimum as well.
+        let bit_distance = |first: [u8; 7], second: [u8; 7]| -> u32 {
+            first
+                .iter()
+                .zip(second)
+                .map(|(a, b)| (a ^ b).count_ones())
+                .sum()
+        };
+        let (global_minimum, worst_pair) = LIFECYCLE_MARKERS
             .iter()
-            .map(|existing_glyph| {
-                let distance = starting_rows
+            .enumerate()
+            .flat_map(|(index, marker)| {
+                let marker_rows = glyph_rows(*marker);
+                existing
                     .iter()
-                    .zip(glyph_rows(*existing_glyph))
-                    .map(|(first, second)| (first ^ second).count_ones())
-                    .sum::<u32>();
-                (distance, *existing_glyph)
+                    .copied()
+                    .chain(LIFECYCLE_MARKERS[index + 1..].iter().copied())
+                    .map(move |other| {
+                        (
+                            bit_distance(marker_rows, glyph_rows(other)),
+                            (*marker, other),
+                        )
+                    })
             })
             .min()
             .expect("the full 320-glyph comparison set is non-empty");
+        // `▶` vs `■` is the true global minimum: 5 of 7 rows differ, which
+        // reads as an unmistakable triangle against a filled square. This
+        // pins that margin so a redesign of any marker cannot silently
+        // erode it.
         assert_eq!(
-            nearest_distance, 10,
-            "starting marker is only {nearest_distance} bits from {nearest_glyph:?}"
+            global_minimum, 5,
+            "closest marker pair {worst_pair:?} is only {global_minimum} bits apart"
         );
     }
 
