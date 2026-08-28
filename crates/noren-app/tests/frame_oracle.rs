@@ -23,7 +23,12 @@
 //! - two cells carrying different SGR foreground colours draw *different*
 //!   pixel colours, each matching the palette; a cell with no SGR colour keeps
 //!   the unchanged default; truecolor and 256-colour both resolve to their
-//!   expected values (issue #107).
+//!   expected values (issue #107);
+//! - a wide (CJK/emoji) character lights its lead column with the replacement
+//!   glyph, leaves its continuation column unlit, and the glyph after the
+//!   pair lands at its display column — the width contract whose loss corrupts
+//!   the rest of the line;
+//! - a combining mark is drawn over its base cell without consuming a cell.
 //!
 //! ## The lit/blank gate
 //!
@@ -236,21 +241,20 @@ fn default_foreground_rgb() -> [u8; 3] {
 /// is past the line end, or the cell is an ASCII space (the space glyph is the
 /// all-zero row, so it draws nothing).
 ///
-/// Reads `display_lines()` — the renderer's coordinate model — not `lines()`.
-/// They agree for ASCII; only `display_lines()` keeps a wide character's
-/// continuation column aligned with the renderer's per-column enumeration, so
-/// the first wide-character fixture is compared against the same columns the
-/// renderer actually draws.
+/// Reads `display_cells()` — one cell per display column, the renderer's
+/// coordinate model. `display_lines()` encodes the same columns for wide
+/// characters but gives a combining mark its own character index even though
+/// the mark consumes no column (it lives inside the lead cell's text), so a
+/// string index is not a display column once marks are present. Every cell of
+/// a display row is retained here (only whole trailing rows are dropped), so
+/// "past the line end" reduces to "the cell is blank" and absent rows stay
+/// blank.
 fn state_cell_blank(snapshot: &TerminalSnapshot, row: u32, col: u32) -> bool {
-    let line = snapshot
-        .display_lines()
-        .get(row as usize)
-        .map(String::as_str);
-    match line {
+    match snapshot.display_cells().nth(row as usize) {
         None => true,
-        Some(line) => match line.chars().nth(col as usize) {
-            None | Some(' ') => true,
-            Some(_) => false,
+        Some(cells) => match cells.get(col as usize) {
+            None => true,
+            Some(cell) => cell.is_continuation() || cell.text() == " ",
         },
     }
 }
@@ -895,6 +899,180 @@ fn colour_follows_the_cell_across_wide_characters_and_rows() {
         colors_match(cell_color(&frame, 1, 0), DARK.ansi()[4]),
         "'c' on row 1 must be blue"
     );
+}
+
+// ===========================================================================
+// Wide-character width contract (Milestone 6): the terminal state core has
+// modelled CJK/emoji display width since PR #53 (a width-two character is a
+// lead cell plus a continuation cell), and the renderer honours that model by
+// reserving the continuation column without drawing it. These tests drive the
+// whole chain — `feed_bytes` → state → real GPU pixels — because "the state
+// models it" and "the renderer draws it" are different claims, and the pinned
+// properties are exactly the ones whose loss corrupts every following column
+// on the line. The bitmap font carries no CJK glyphs (issue #141): the pinned
+// failure mode is a visible replacement glyph at correct columns, which is
+// the deliberate scope of this slice — width handled correctly, glyphs not.
+// ===========================================================================
+
+/// `日本語` end to end: each character occupies two cells in the state, the
+/// lead column draws the visible replacement glyph, the continuation column
+/// draws nothing, and the whole grid still agrees cell-for-cell between state
+/// and render.
+///
+/// The three leads drawing identical pixels is today's truth pinned on
+/// purpose — the bitmap font cannot distinguish CJK code points, so uniform
+/// replacement is the contract until a real font stack lands (its own
+/// milestone decision). Adding CJK glyphs means updating this assertion, not
+/// deleting the test.
+#[test]
+fn cjk_text_occupies_two_cells_per_character_and_fails_visibly_not_corruptingly() {
+    let Some(renderer) = renderer_or_skip(
+        "cjk_text_occupies_two_cells_per_character_and_fails_visibly_not_corruptingly",
+    ) else {
+        return;
+    };
+    let mut state = TerminalState::new(1, 8).expect("valid test terminal");
+    state.feed_bytes("日本語".as_bytes());
+    let snap = state.snapshot();
+
+    // State half of the claim: three width-two leads at columns 0/2/4, a
+    // continuation cell after each, and the cursor six columns on.
+    assert_eq!(
+        (state.cursor().row(), state.cursor().column()),
+        (0, 6),
+        "three wide characters must advance the cursor six columns"
+    );
+    let cells: Vec<_> = snap
+        .display_cells()
+        .next()
+        .expect("one display row")
+        .to_vec();
+    for (col, expected) in
+        [(0usize, "日"), (2, "本"), (4, "語")].map(|(col, text)| (col, Some(text)))
+    {
+        let cell = &cells[col];
+        assert_eq!(cell.text(), expected.unwrap(), "lead at column {col}");
+        assert_eq!(cell.width(), 2, "lead at column {col}");
+        assert!(!cell.is_continuation());
+        assert!(
+            cells[col + 1].is_continuation(),
+            "column {} must be the continuation of the wide lead before it",
+            col + 1
+        );
+    }
+
+    let frame = render(&renderer, &snap);
+    assert_cells_agree(&frame, &snap);
+
+    // The lead columns are lit, all with the same glyph (uniform replacement
+    // is the pinned boundary), and that glyph is not the '?' glyph.
+    let question = render(&renderer, &snapshot(1, 8, b"?"));
+    for col in [0u32, 2, 4] {
+        assert!(
+            cell_is_lit(&frame, 0, col),
+            "wide lead at column {col} drew nothing — the failure must be visible"
+        );
+        assert_eq!(
+            cell_pattern(&frame, 0, col),
+            cell_pattern(&frame, 0, 0),
+            "CJK leads must draw the uniform replacement glyph (pinned: no CJK coverage)"
+        );
+        assert_ne!(
+            cell_pattern(&frame, 0, col),
+            cell_pattern(&question, 0, 0),
+            "the replacement glyph must not impersonate a typed '?'"
+        );
+    }
+    // Continuation columns own their column without drawing, and everything
+    // after the three wide pairs is untouched.
+    for col in [1u32, 3, 5, 6, 7] {
+        assert!(!cell_is_lit(&frame, 0, col), "column {col} must stay unlit");
+    }
+}
+
+/// The width contract that protects the rest of the line: a wide character
+/// followed by ASCII must place the ASCII at display column 2 (the wide pair
+/// is columns 0–1). A renderer that lets the wide character claim one cell
+/// draws the follower at column 1 and every subsequent column is wrong.
+#[test]
+fn wide_character_then_ascii_keeps_the_ascii_at_its_display_column() {
+    let Some(renderer) =
+        renderer_or_skip("wide_character_then_ascii_keeps_the_ascii_at_its_display_column")
+    else {
+        return;
+    };
+    let b_reference = render(&renderer, &snapshot(1, 4, b"b"));
+    for (label, bytes) in [
+        ("CJK 日", "日b".as_bytes()),
+        ("wide emoji 😀", "😀b".as_bytes()),
+    ] {
+        let snap = snapshot(1, 4, bytes);
+        let frame = render(&renderer, &snap);
+        assert!(cell_is_lit(&frame, 0, 0), "{label}: wide lead drew nothing");
+        assert!(
+            !cell_is_lit(&frame, 0, 1),
+            "{label}: the continuation column must own its column without drawing"
+        );
+        assert_eq!(
+            cell_pattern(&frame, 0, 2),
+            cell_pattern(&b_reference, 0, 0),
+            "{label}: the ASCII after a wide character must land at display column 2"
+        );
+        assert!(
+            !cell_is_lit(&frame, 0, 3),
+            "{label}: column 3 must stay unlit"
+        );
+        assert_cells_agree(&frame, &snap);
+    }
+}
+
+/// A combining mark must not consume a cell: `e` + U+0301 + `f` keeps `f` at
+/// column 1 with its ordinary glyph, while the mark itself is drawn over the
+/// `e` (visible, not dropped) — both compared against a plain `ef` render.
+#[test]
+fn combining_marks_consume_no_cell_through_the_pipeline() {
+    let Some(renderer) = renderer_or_skip("combining_marks_consume_no_cell_through_the_pipeline")
+    else {
+        return;
+    };
+    let marked = snapshot(1, 4, "e\u{0301}f".as_bytes());
+    let plain = snapshot(1, 4, b"ef");
+
+    // State half: the mark lives inside column 0's cell (width unchanged),
+    // and `f` stays at column 1.
+    let cells: Vec<_> = marked
+        .display_cells()
+        .next()
+        .expect("one display row")
+        .to_vec();
+    assert_eq!(cells[0].text(), "e\u{0301}");
+    assert_eq!(cells[0].width(), 1);
+    assert_eq!(cells[1].text(), "f");
+
+    let marked_frame = render(&renderer, &marked);
+    let plain_frame = render(&renderer, &plain);
+    assert!(
+        cell_is_lit(&marked_frame, 0, 0),
+        "'e' with its attached mark drew nothing"
+    );
+    assert_ne!(
+        cell_pattern(&marked_frame, 0, 0),
+        cell_pattern(&plain_frame, 0, 0),
+        "the combining mark drew nothing — it must fail visibly, not vanish"
+    );
+    assert_eq!(
+        cell_pattern(&marked_frame, 0, 1),
+        cell_pattern(&plain_frame, 0, 1),
+        "'f' must land at column 1 exactly as without the mark — a combining \
+         mark must not consume a cell"
+    );
+    assert_cells_agree(&marked_frame, &marked);
+    for col in [2u32, 3] {
+        assert!(
+            !cell_is_lit(&marked_frame, 0, col),
+            "column {col} must stay unlit"
+        );
+    }
 }
 
 // ===========================================================================
