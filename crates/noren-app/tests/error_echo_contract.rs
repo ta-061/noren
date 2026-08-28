@@ -57,7 +57,7 @@ enum ValueEcho {
 
 /// Pinned variant count of [`ConfigError`]; a new variant must extend both
 /// the classifier and the sample table.
-const CONFIG_ERROR_VARIANTS: usize = 26;
+const CONFIG_ERROR_VARIANTS: usize = 27;
 /// Pinned variant count of [`SessionPersistenceError`].
 const SESSION_ERROR_VARIANTS: usize = 14;
 /// Pinned variant count of [`ChordParseError`].
@@ -96,6 +96,7 @@ fn classify_config(error: &ConfigError) -> ValueEcho {
         ConfigError::OutOfRange { .. } => ValueEcho::Never,
         ConfigError::ChordNotAString { .. } => ValueEcho::Never,
         ConfigError::ThemeNotAString { .. } => ValueEcho::Never,
+        ConfigError::UiNotABoolean { .. } => ValueEcho::Never,
         // Allowlist: the theme name vocabulary — a closed set the schema
         // publishes — and naming the failed value is the point of the
         // error, exactly the `[keys]` chord argument.
@@ -252,6 +253,7 @@ fn config_samples() -> Vec<(ConfigError, ValueEcho)> {
             ConfigError::ThemeNotAString { key: key() },
             ValueEcho::Never,
         ),
+        (ConfigError::UiNotABoolean { key: key() }, ValueEcho::Never),
         (
             ConfigError::UnknownTheme {
                 value: VALUE_SENTINEL.to_owned(),
@@ -648,6 +650,7 @@ fn config_values_outside_keys_never_reach_display_or_debug() {
     let cases = [
         format!("[font]\ncell_width = \"{SENTINEL}\"\n"),
         format!("[keys]\nsession_create = {SENTINEL}\n"),
+        format!("[ui]\nshow_palette_hint = \"{SENTINEL}\"\n"),
         // `[[agents]]` values: the command is agent-launch text (may embed a
         // private path), so its rejections name the key, never the text.
         format!("[[agents]]\nname = \"x\"\ncommand = \"{SENTINEL}\"\n"),

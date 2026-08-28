@@ -33,6 +33,12 @@
 //!   pair lands at its display column — the width contract whose loss corrupts
 //!   the rest of the line;
 //! - a combining mark is drawn over its base cell without consuming a cell.
+//! - the default palette affordance is drawn in permanent terminal-side
+//!   chrome, rebinding `palette_open` changes the captured key glyph, and the
+//!   explicit UI opt-out removes those pixels (issue #191);
+//! - after the last session closes, recovery copy and its active create chord
+//!   draw in the otherwise blank terminal area, with status chrome following
+//!   the recovery rows instead of overwriting them (issue #201).
 //!
 //! ## The lit/blank gate
 //!
@@ -75,17 +81,18 @@
 #[path = "../src/renderer_capture.rs"]
 mod renderer_capture;
 
-use std::fs;
 use std::io::Write;
 use std::process::Command;
 
+use noren_app::config::AppConfig;
 use noren_app::theme::{DARK, HIGH_CONTRAST, LIGHT, Theme, contrast_ratio};
+use noren_app::ui::{empty_workspace_recovery, palette_hint};
 use noren_app::{
     GridGeometry, MAX_RENDER_COLS, MAX_RENDER_ROWS, POC_CELL_HEIGHT as CELL_HEIGHT,
     POC_CELL_WIDTH as CELL_WIDTH,
 };
 use noren_terminal::{TerminalSnapshot, TerminalState};
-use renderer_capture::renderer_source::{CLEAR_COLOR, SIDEBAR_COLS, Target};
+use renderer_capture::renderer_source::{CLEAR_COLOR, FrameChrome, SIDEBAR_COLS, Target};
 use renderer_capture::{CaptureError, CapturedFrame, OffscreenRenderer};
 
 /// The PoC default cell metrics, used by every frame-oracle capture call so
@@ -306,15 +313,15 @@ fn report_skip(test: &str) {
          AdapterUnavailable); rendered-frame evidence was NOT gathered. This is a \
          skip, not a pass."
     );
-    match fs::OpenOptions::new().write(true).open("/dev/stderr") {
-        Ok(mut file) => {
-            // One write, notice and newline together: 24 tests skip in
-            // parallel on an adapter-less machine, and two separate writes
-            // interleave into concatenated lines under the pipe buffer.
-            let _ = file.write_all(format!("{notice}\n").as_bytes());
-        }
-        Err(_) => eprintln!("{notice}"),
-    }
+    // Write the process's inherited stderr handle directly. Opening
+    // `/dev/stderr` can resolve to the controlling terminal instead of the
+    // child's piped fd on macOS, which makes `Command::output` observe an
+    // empty stream and defeats the visibility guard below. A direct `Write`
+    // bypasses libtest's print-macro capture while preserving the actual fd.
+    // One write, notice and newline together, also prevents parallel skips
+    // from interleaving into concatenated lines under the pipe buffer.
+    let mut stderr = std::io::stderr().lock();
+    let _ = stderr.write_all(format!("{notice}\n").as_bytes());
 }
 
 /// The offscreen renderer, or `None` after reporting a skip, when this machine
@@ -1433,6 +1440,172 @@ fn utf8_cell_is_at_least_lit_so_the_pipeline_handles_wide_input() {
     let frame = render(&renderer, &snap);
     // c, a, f are ASCII and lit; the final cell holds the non-ASCII 'é' lead.
     assert!(cell_is_lit(&frame, 0, 3), "non-ASCII cell drew nothing");
+}
+
+// ===========================================================================
+// Palette discoverability (issue #191): the configured opener is permanent
+// terminal-side chrome. These assertions parse real AppConfig, derive the
+// label from its active KeymapConfig, run the production chrome vertex path,
+// and inspect read-back pixels. A string-only assertion cannot satisfy this
+// contract: deleting the draw path must make these tests fail.
+// ===========================================================================
+
+/// Render only the palette affordance, with a blank 16-column sidebar and
+/// enough terminal-side width for every ordinary configured chord.
+fn render_palette_hint(
+    renderer: &OffscreenRenderer,
+    config: &AppConfig,
+    status: Option<&str>,
+) -> CapturedFrame {
+    const TERMINAL_COLS: u32 = 48;
+    let hint = palette_hint(config.keys(), config.ui());
+    let empty_sidebar: &[String] = &[];
+    let chrome = FrameChrome::new(Some(empty_sidebar), status).with_palette_hint(hint.as_deref());
+    renderer.capture_chrome(
+        Target::new(
+            &config.theme().palette(),
+            (SIDEBAR_COLS as u32 + TERMINAL_COLS) * CELL_WIDTH,
+            CELL_HEIGHT,
+            poc_metrics(),
+        ),
+        None,
+        chrome,
+    )
+}
+
+#[test]
+fn palette_hint_default_and_rebind_are_drawn_in_frame_pixels() {
+    let Some(renderer) =
+        renderer_or_skip("palette_hint_default_and_rebind_are_drawn_in_frame_pixels")
+    else {
+        return;
+    };
+
+    let default_frame = render_palette_hint(&renderer, &AppConfig::default(), Some("Noren ready"));
+    let rebound = AppConfig::parse("[keys]\npalette_open = \"super+k\"\n")
+        .expect("super+k is a valid palette rebind");
+    let rebound_frame = render_palette_hint(&renderer, &rebound, Some("Noren ready"));
+
+    // Both labels begin `Super+`; the configured key is the seventh glyph.
+    // Compare that cell against independently rendered P/K glyph pixels so a
+    // hard-coded default cannot satisfy the rebound half of the assertion.
+    let configured_key_col = SIDEBAR_COLS as u32 + 6;
+    let p_reference = render(&renderer, &snapshot(1, 1, b"P"));
+    let k_reference = render(&renderer, &snapshot(1, 1, b"K"));
+    let default_key_pixels = cell_pattern(&default_frame, 0, configured_key_col);
+    let rebound_key_pixels = cell_pattern(&rebound_frame, 0, configured_key_col);
+
+    assert_eq!(
+        default_key_pixels,
+        cell_pattern(&p_reference, 0, 0),
+        "default chrome must draw the configured P key in real pixels"
+    );
+    assert_eq!(
+        rebound_key_pixels,
+        cell_pattern(&k_reference, 0, 0),
+        "rebinding palette_open to Super+K must draw K, not stale P, in real pixels"
+    );
+    assert_ne!(
+        default_key_pixels, rebound_key_pixels,
+        "the rebound opener did not change the captured frame"
+    );
+    assert!(
+        cell_is_lit(&default_frame, 0, SIDEBAR_COLS as u32),
+        "the default-on palette hint drew no first glyph in the terminal-side status row"
+    );
+    assert!(
+        !cell_is_lit(&default_frame, 0, 0),
+        "the affordance must not consume the narrow sidebar's first column"
+    );
+}
+
+#[test]
+fn palette_hint_opt_out_removes_its_frame_pixels() {
+    let Some(renderer) = renderer_or_skip("palette_hint_opt_out_removes_its_frame_pixels") else {
+        return;
+    };
+    let hidden = AppConfig::parse("[ui]\nshow_palette_hint = false\n")
+        .expect("the palette-hint opt-out is valid");
+    let frame = render_palette_hint(&renderer, &hidden, None);
+
+    assert!(
+        frame
+            .rgba
+            .chunks_exact(4)
+            .all(|pixel| is_clear([pixel[0], pixel[1], pixel[2], pixel[3]])),
+        "show_palette_hint=false must remove every affordance pixel"
+    );
+}
+
+/// Render the exact chrome the live app supplies after its last session is
+/// closed: the compact sidebar locator, terminal-side recovery copy, and the
+/// permanent palette affordance plus runtime status.
+fn render_empty_workspace(renderer: &OffscreenRenderer, config: &AppConfig) -> CapturedFrame {
+    const TERMINAL_COLS: u32 = 48;
+    const FRAME_ROWS: u32 = 4;
+    let sidebar = vec!["No sessions".to_owned()];
+    let recovery = empty_workspace_recovery(config.keys());
+    let hint = palette_hint(config.keys(), config.ui());
+    let chrome = FrameChrome::new(Some(&sidebar), Some("Noren last session closed"))
+        .with_palette_hint(hint.as_deref())
+        .with_workspace_notice(Some(&recovery));
+    renderer.capture_chrome(
+        Target::new(
+            &config.theme().palette(),
+            (SIDEBAR_COLS as u32 + TERMINAL_COLS) * CELL_WIDTH,
+            FRAME_ROWS * CELL_HEIGHT,
+            poc_metrics(),
+        ),
+        None,
+        chrome,
+    )
+}
+
+#[test]
+fn empty_workspace_recovery_action_is_drawn_in_terminal_frame_pixels() {
+    let Some(renderer) =
+        renderer_or_skip("empty_workspace_recovery_action_is_drawn_in_terminal_frame_pixels")
+    else {
+        return;
+    };
+    let default_frame = render_empty_workspace(&renderer, &AppConfig::default());
+    let rebound = AppConfig::parse("[keys]\nsession_create = \"n\"\n")
+        .expect("n is a valid create-session rebind");
+    let rebound_frame = render_empty_workspace(&renderer, &rebound);
+
+    let c_reference = render(&renderer, &snapshot(1, 1, b"C"));
+    let n_reference = render(&renderer, &snapshot(1, 1, b"N"));
+    let p_reference = render(&renderer, &snapshot(1, 1, b"P"));
+    let action_key_col = SIDEBAR_COLS as u32 + 6; // `Press ` then the key.
+
+    assert!(
+        cell_is_lit(&default_frame, 0, 0),
+        "the 16-column sidebar must retain its compact No sessions locator"
+    );
+    assert!(
+        cell_is_lit(&default_frame, 0, SIDEBAR_COLS as u32),
+        "the otherwise blank terminal area must draw No sessions yet"
+    );
+    assert_eq!(
+        cell_pattern(&default_frame, 1, action_key_col),
+        cell_pattern(&c_reference, 0, 0),
+        "the default direct recovery action must draw C in real pixels"
+    );
+    assert_eq!(
+        cell_pattern(&rebound_frame, 1, action_key_col),
+        cell_pattern(&n_reference, 0, 0),
+        "rebinding session_create must change the recovery action to N pixels"
+    );
+    assert_ne!(
+        cell_pattern(&default_frame, 1, action_key_col),
+        cell_pattern(&rebound_frame, 1, action_key_col),
+        "the recovery action stayed stale after rebinding"
+    );
+    assert_eq!(
+        cell_pattern(&default_frame, 2, SIDEBAR_COLS as u32 + 6),
+        cell_pattern(&p_reference, 0, 0),
+        "two recovery rows must be followed by the configured palette hint in status chrome"
+    );
 }
 
 // ===========================================================================

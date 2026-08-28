@@ -26,7 +26,7 @@ use noren_app::{
 use noren_app::{
     CursorKeyMode, GridGeometry, GridSize, InputMode, KeyEncoder, KeypadMode, Modifiers,
     PARSE_BUDGET_BYTES_PER_TURN, PRODUCT_NAME, PasteReject, Resize, SystemClipboard,
-    config::{AppConfig, KeymapConfig},
+    config::{AppConfig, KeymapConfig, UiConfig},
     diagnostics::{self, PtyChildStatus},
     encode_paste,
     git_worktree::{self, DiscoveredWorktree, WorktreeDiscovery, WorktreeListError},
@@ -53,7 +53,7 @@ use noren_pty::{
 use noren_terminal::{
     GridPoint, Selection, SelectionMode, TerminalEngine, TerminalError, TerminalState,
 };
-use renderer::{RenderOutcome, Renderer};
+use renderer::{FrameChrome, RenderOutcome, Renderer};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -1193,6 +1193,9 @@ struct NorenApp {
     /// commands. The single source of truth for every workspace chord the
     /// binary honors; no hard-coded chord remains on the key paths.
     keys: KeymapConfig,
+    /// Optional application chrome. Its default keeps the palette affordance
+    /// visible; the validated config can explicitly remove that one hint.
+    ui: UiConfig,
     /// The configured colour theme, handed to the renderer at creation so
     /// every palette-derived draw colour — default foreground, ANSI
     /// resolution, clear colour — follows the `[theme]` selection. The
@@ -1320,6 +1323,7 @@ impl NorenApp {
             passthrough_gate: PassthroughGate::new(),
             passthrough_policy: palette_policy(config.keys()),
             keys: config.keys(),
+            ui: config.ui(),
             theme: config.theme().palette(),
         }
     }
@@ -2287,6 +2291,13 @@ impl NorenApp {
     /// same encoder path as before the gate existed, so a closed-palette key
     /// press is byte-identical to the pre-gate behaviour.
     fn handle_passthrough_key(&mut self, event: &KeyEvent) {
+        if event.state == ElementState::Pressed
+            && !event.repeat
+            && let Some(chord) = chord_from_event(event, self.modifiers)
+            && self.recover_empty_workspace_with_chord(chord)
+        {
+            return;
+        }
         let input_mode = self.current_input_mode();
         let encoded = if let Some(input) = translate_keypad_key(event) {
             KeyEncoder::encode_keypad_with(input.with_modifiers(self.modifiers), input_mode)
@@ -2304,6 +2315,21 @@ impl NorenApp {
             return;
         };
         self.send_input(&bytes);
+    }
+
+    /// Honor the configured create-session chord directly at the dead end.
+    ///
+    /// Outside an empty workspace the chord keeps its existing scope inside
+    /// the open palette, so ordinary terminal input is unchanged. When the UI
+    /// says `No sessions`, no PTY can receive the key; consuming the exact
+    /// chord shown by [`noren_app::ui::empty_workspace_recovery`] turns that
+    /// inert state into a real recovery action.
+    fn recover_empty_workspace_with_chord(&mut self, chord: Chord) -> bool {
+        if !self.workspace.sidebar().is_empty() || chord != self.keys.session_create() {
+            return false;
+        }
+        self.run_workspace_action(WorkspaceAction::CreateSession);
+        true
     }
 
     /// Route one pressed chord through the gate.
@@ -3321,10 +3347,16 @@ impl NorenApp {
                 self.ssh_diagnostic.as_deref(),
             )
         });
+        let palette_hint = noren_app::ui::palette_hint(self.keys, self.ui);
+        let workspace_notice = (self.workspace.sidebar().is_empty() && self.terminal.is_none())
+            .then(|| noren_app::ui::empty_workspace_recovery(self.keys));
+        let chrome = FrameChrome::new(Some(&lines), status)
+            .with_palette_hint(palette_hint.as_deref())
+            .with_workspace_notice(workspace_notice.as_deref());
         let outcome = self
             .renderer
             .as_mut()
-            .map(|renderer| renderer.render(snapshot.as_ref(), Some(&lines), status));
+            .map(|renderer| renderer.render(snapshot.as_ref(), chrome));
         match outcome {
             Some(RenderOutcome::DeviceLost) => {
                 self.status = "Noren renderer device lost";
