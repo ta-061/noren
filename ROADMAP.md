@@ -131,7 +131,7 @@ Measured against it, item by item:
 | Sidebar-state persistence | Done | `sessions.toml` (`SESSION_STATE_FILE_NAME`) under the `config::default_path` directory, resolved by `session_state_path` |
 | Palette | Done | `Super+p` via `palette_policy`; `Palette::noren`'s four commands dispatched by `handle_palette_key` |
 | Configurable keybindings | Done for the palette surface | `[keys]` in `config.toml` (`KeymapConfig` in `config.rs`) rebinds the palette opener and the four palette command chords with the previous values as defaults; `palette_policy`/`handle_palette_key` in `main.rs` honor them, unparseable chords and unknown actions are typed errors, and the opener is validated against the pinned Zellij corpus and the exit leader. The exit leader, palette navigation keys, diagnostics chord, and clipboard shortcuts remain fixed |
-| Zellij pass-through | Done against a pinned corpus and a live installed Zellij | The shipped policy (`palette_policy` in `main.rs`) claims exactly two Super-modified chords — `Super+Escape` (exit leader) and `Super+p` (palette opener) — that the pinned Zellij `v0.44.3` default corpus (`ZELLIJ_FIXTURE_TAG`) never binds, and `tests/zellij_live.rs` drives an INSTALLED Zellij in a real PTY through the same parser, gate, and key encoder: attach enables mouse tracking in `TerminalState`, gated `Ctrl+t`/`n`/`Ctrl+p` reach Zellij and render tab #2 and pane #2, typed text reaches the pane's shell, and the installed version's default keybinds bind nothing in the Super/Cmd/Meta space. The harness skips (visibly, on the real stderr) when no `zellij` is on `PATH`. Empirical wire-shape note: Zellij 0.44.3 sends `1002`/`1006` as separate single-parameter DECSETs across its whole lifecycle and does not forward a pane program's multi-parameter DECSET to the host terminal, so   the multi-parameter form `CSI ? 1002;1006 h` (the PR #113 regression site) is pinned as a co-located regression guard beside the live assertions, with the live multi-parameter count printed as drift telemetry. Beyond the skip, the suite is no longer run only where a developer happens to run it: `.github/workflows/zellij-live.yml` installs the pinned Zellij release and runs it for real on every PR, push to `main`, and nightly, failing the job on a failed install, a checksum or version mismatch, or any skip notice — but the job is deliberately advisory, not in branch protection's required-check list, so a red live suite still does not block a merge (the resolution recorded for issue #153) |
+| Zellij pass-through | Done against a pinned corpus and a live installed Zellij | The shipped policy (`palette_policy` in `main.rs`) claims exactly two Super-modified chords — `Super+Escape` (exit leader) and `Super+p` (palette opener) — that the pinned Zellij `v0.44.3` default corpus (`ZELLIJ_FIXTURE_TAG`) never binds, and `tests/zellij_live.rs` drives an INSTALLED Zellij in a real PTY through the same parser, gate, and key encoder: attach enables mouse tracking in `TerminalState`, gated `Ctrl+t`/`n`/`Ctrl+p` reach Zellij and render tab #2 and pane #2, typed text reaches the pane's shell, and the installed version's default keybinds bind nothing in the Super/Cmd/Meta space. The harness skips (visibly, on the real stderr) when no `zellij` is on `PATH`. Empirical wire-shape note: Zellij 0.44.3 sends `1002`/`1006` as separate single-parameter DECSETs across its whole lifecycle and does not forward a pane program's multi-parameter DECSET to the host terminal, so the multi-parameter form `CSI ? 1002;1006 h` (the PR #113 regression site) is pinned as a co-located regression guard beside the live assertions, with the live multi-parameter count printed as drift telemetry. Beyond the skip, the suite is no longer run only where a developer happens to run it: `.github/workflows/zellij-live.yml` installs the pinned Zellij release and runs it for real on every PR, push to `main`, and nightly, failing the job on a failed install, a checksum or version mismatch, or any skip notice — but the job is deliberately advisory, not in branch protection's required-check list, so a red live suite still does not block a merge (the resolution recorded for issue #153) |
 
 The host-discovery gap that issue
 [#175](https://github.com/ta-061/noren/issues/175) named is closed: positive
@@ -168,13 +168,13 @@ remaining production-side splits are tracked there. Two former entries of
 this list are resolved: the live-Zellij pass-through suite now runs in CI on
 every PR, push to `main`, and nightly against the pinned release
 (`.github/workflows/zellij-live.yml`), deliberately advisory rather than a
-required check
-([#153](https://github.com/ta-061/noren/issues/153) is closed); and the
+required check (the resolution recorded in
+[#153](https://github.com/ta-061/noren/issues/153)); and the
 PTY-level `spawn_in_dir_runs_the_child_in_that_directory` test now
 discriminates an honoured working directory from portable-pty's HOME
 fallback by spawning through the `spawn_in_dir_with_home` seam with a home
-fixture distinct from the requested directory
-([#162](https://github.com/ta-061/noren/issues/162) is closed), so both the
+fixture distinct from the requested directory (the
+[#162](https://github.com/ta-061/noren/issues/162) resolution), so both the
 PTY-level test and the app-level `pwd` proof cited in the worktree row above
 guarantee that a worktree session's child starts in the worktree.
 
@@ -221,8 +221,10 @@ against it:
   4.5:1 AA floor for normal text — pinned deliberately by
   `default_dark_palette_minimum_is_pinned_below_the_aa_floor`, because the
   no-`[theme]` default must stay byte-identical to the pre-theme renderer
-  (`dark_theme_is_byte_identical_to_the_pre_theme_renderer`) and changing the
-  values is a separate, currently-untaken decision (issue #168). `light`
+  (`dark_theme_is_byte_identical_to_the_pre_theme_renderer`) and changing
+  the values is a separate decision tracked as
+  [#168](https://github.com/ta-061/noren/issues/168) — the pins above hold
+  until that decision lands in the tree. `light`
   (minimum 5.07:1) and `high-contrast` (7.84:1, beyond AAA) pass every slot,
   so a user who needs AA must know to opt in — a preview whose default look
   is below AA cannot ship as the product's face. Themes are built-in only:
