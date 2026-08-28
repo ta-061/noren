@@ -2533,9 +2533,18 @@ impl NorenApp {
     }
 
     fn select_entire_grid(&mut self) {
-        if let Some(terminal) = &self.terminal {
-            self.selection = Some(Selection::entire_grid(terminal));
+        if let Some(selection) = self.terminal.as_ref().map(Selection::entire_grid) {
+            self.show_selection(selection);
         }
+    }
+
+    /// Install a user-visible selection and schedule the frame that paints it.
+    ///
+    /// Selection input can arrive while the PTY is idle, so relying on output
+    /// to request a redraw would leave the new range invisible indefinitely.
+    fn show_selection(&mut self, selection: Selection) {
+        self.selection = Some(selection);
+        self.redraw_needed = true;
     }
 
     fn copy_selection(&mut self) {
@@ -2622,8 +2631,12 @@ impl NorenApp {
         let Some(point) = self.grid_point_at(position) else {
             return;
         };
-        if let Some(terminal) = &self.terminal {
-            self.selection = Some(Selection::new(terminal, self.drag_mode, origin, point));
+        if let Some(selection) = self
+            .terminal
+            .as_ref()
+            .map(|terminal| Selection::new(terminal, self.drag_mode, origin, point))
+        {
+            self.show_selection(selection);
         }
     }
 
@@ -2661,7 +2674,8 @@ impl NorenApp {
                 };
                 self.drag_mode = mode;
                 self.drag_origin = Some(point);
-                self.selection = Some(Selection::new(terminal, mode, point, point));
+                let selection = Selection::new(terminal, mode, point, point);
+                self.show_selection(selection);
             }
             ElementState::Released => {
                 self.drag_origin = None;
