@@ -118,6 +118,10 @@ pub(crate) enum EraseMode {
 pub(crate) enum PrivateMode {
     AlternateScreen,
     ApplicationCursorKey,
+    /// DECTCEM (DEC text cursor enable mode): whether the terminal should
+    /// display its cursor. Programs hide it during redraws (`vim`) and
+    /// re-show it at rest, so the renderer must honour both directions.
+    CursorVisibility,
     BracketedPaste,
     MouseTrackingNormal,
     MouseTrackingButtonEvent,
@@ -528,6 +532,7 @@ impl Csi {
     fn private_mode(&self, param: u16) -> Option<PrivateMode> {
         match param {
             1 => Some(PrivateMode::ApplicationCursorKey),
+            25 => Some(PrivateMode::CursorVisibility),
             1049 => Some(PrivateMode::AlternateScreen),
             2004 => Some(PrivateMode::BracketedPaste),
             1000 => Some(PrivateMode::MouseTrackingNormal),
@@ -729,6 +734,23 @@ mod tests {
                 Action::SetPrivateMode {
                     mode: PrivateMode::BracketedPaste,
                     enabled: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn cursor_visibility_mode_25_is_tracked_as_a_private_mode() {
+        assert_eq!(
+            actions(b"\x1b[?25l\x1b[?25h"),
+            [
+                Action::SetPrivateMode {
+                    mode: PrivateMode::CursorVisibility,
+                    enabled: false,
+                },
+                Action::SetPrivateMode {
+                    mode: PrivateMode::CursorVisibility,
+                    enabled: true,
                 },
             ]
         );
