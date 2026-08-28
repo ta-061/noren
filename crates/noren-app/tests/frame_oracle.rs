@@ -24,6 +24,10 @@
 //!   pixel colours, each matching the palette; a cell with no SGR colour keeps
 //!   the unchanged default; truecolor and 256-colour both resolve to their
 //!   expected values (issue #107);
+//! - the five issue-168 AA fixes to the default dark palette are pinned on
+//!   the drawn pixels — each fixed slot draws its new value against a
+//!   literal, and the drawn colour measurably clears WCAG AA (4.5:1)
+//!   computed on the readback bytes against the readback clear colour;
 //! - a wide (CJK/emoji) character lights its lead column with the replacement
 //!   glyph, leaves its continuation column unlit, and the glyph after the
 //!   pair lands at its display column — the width contract whose loss corrupts
@@ -75,7 +79,7 @@ use std::fs;
 use std::io::Write;
 use std::process::Command;
 
-use noren_app::theme::{DARK, HIGH_CONTRAST, LIGHT, Theme};
+use noren_app::theme::{DARK, HIGH_CONTRAST, LIGHT, Theme, contrast_ratio};
 use noren_app::{
     GridGeometry, MAX_RENDER_COLS, MAX_RENDER_ROWS, POC_CELL_HEIGHT as CELL_HEIGHT,
     POC_CELL_WIDTH as CELL_WIDTH,
@@ -869,6 +873,52 @@ fn a_dark_coloured_cell_is_still_seen_as_lit() {
         [121, 121, 121],
         "palette black must draw the AA-fixed grey 121, not the pre-168 near-zero"
     );
+}
+
+/// The issue-168 fix must reach drawing, not just the palette table: each
+/// of the five lifted dark entries is drawn as its fixed value — asserted
+/// against literals here, so reverting the palette to the pre-fix xterm
+/// values fails at the pixel level — and each drawn colour measurably
+/// clears WCAG AA *as pixels*, the ratio computed on the readback bytes
+/// against the readback clear colour. This is the pixel-level half of the
+/// fix's evidence; `tests/theme.rs` holds the palette-level half.
+#[test]
+fn the_issue_168_aa_fixes_reach_the_drawn_pixels() {
+    let Some(renderer) = renderer_or_skip("the_issue_168_aa_fixes_reach_the_drawn_pixels") else {
+        return;
+    };
+    // Row 0: the four normal-brightness fixes; row 1: the bright-blue fix
+    // (SGR 94). Distinct glyphs so each cell is unambiguously lit.
+    let snap = snapshot(2, 4, b"\x1b[30ma\x1b[31mb\x1b[34mc\x1b[35md\r\n\x1b[94me");
+    let frame = render(&renderer, &snap);
+
+    let fixed: [(u32, u32, &str, [u8; 3]); 5] = [
+        (0, 0, "SGR 30 black", [121, 121, 121]),
+        (0, 1, "SGR 31 red", [243, 0, 0]),
+        (0, 2, "SGR 34 blue", [0, 113, 255]),
+        (0, 3, "SGR 35 magenta", [213, 0, 213]),
+        (1, 0, "SGR 94 bright blue", [100, 100, 255]),
+    ];
+    let ground = clear_rgb();
+    for (row, col, label, value) in fixed {
+        assert!(
+            cell_is_lit(&frame, row, col),
+            "{label}: the fixed glyph drew nothing"
+        );
+        let drawn = cell_color(&frame, row, col);
+        assert_eq!(
+            drawn, value,
+            "{label} must draw the issue-168 fixed value — the fix did not \
+             reach the pixels"
+        );
+        // The readable-text claim, measured on the pixels themselves.
+        let ratio = contrast_ratio(drawn, ground);
+        assert!(
+            ratio >= 4.5,
+            "{label} drew {drawn:?}, only {ratio:.2}:1 against the drawn \
+             background {ground:?}"
+        );
+    }
 }
 
 #[test]
