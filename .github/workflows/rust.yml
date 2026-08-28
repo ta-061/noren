@@ -55,3 +55,5 @@ jobs:
         run: python3 scripts/check_docs.py
       - name: Documentation checker regression tests
         run: python3 -m unittest scripts/test_check_docs.py
+      - name: Release-notes generator regression tests
+        run: python3 -m unittest scripts/test_generate_notes.py
