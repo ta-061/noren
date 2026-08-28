@@ -57,7 +57,7 @@ enum ValueEcho {
 
 /// Pinned variant count of [`ConfigError`]; a new variant must extend both
 /// the classifier and the sample table.
-const CONFIG_ERROR_VARIANTS: usize = 16;
+const CONFIG_ERROR_VARIANTS: usize = 22;
 /// Pinned variant count of [`SessionPersistenceError`].
 const SESSION_ERROR_VARIANTS: usize = 14;
 /// Pinned variant count of [`ChordParseError`].
@@ -67,7 +67,7 @@ const SSH_ERROR_KINDS: usize = 13;
 /// Pinned variant count of [`WorktreeListError`].
 const WORKTREE_ERROR_VARIANTS: usize = 6;
 /// Pinned variant count of [`PtyError`].
-const PTY_ERROR_VARIANTS: usize = 16;
+const PTY_ERROR_VARIANTS: usize = 19;
 /// Pinned allowlist size across every file-derived enum. Raising this
 /// number is the reviewed decision to admit a new value echo.
 const CHORD_ALLOWLIST_SIZE: usize = 6;
@@ -110,6 +110,15 @@ fn classify_config(error: &ConfigError) -> ValueEcho {
         // No file text: compile-time action names and canonical chord text
         // regenerated from the parsed chord.
         ConfigError::DuplicateChord { .. } => ValueEcho::Never,
+        // `[[agents]]` variants carry only key names and array indices; the
+        // name/command/args values never appear (an agent command can embed
+        // a private path, and an args element anything at all).
+        ConfigError::AgentTableNotAnArray { .. } => ValueEcho::Never,
+        ConfigError::AgentFieldMissing { .. } => ValueEcho::Never,
+        ConfigError::AgentFieldNotAString { .. } => ValueEcho::Never,
+        ConfigError::AgentArgsNotAnArray { .. } => ValueEcho::Never,
+        ConfigError::AgentArgNotAString { .. } => ValueEcho::Never,
+        ConfigError::AgentCommandNotAbsolute { .. } => ValueEcho::Never,
     }
 }
 
@@ -202,6 +211,9 @@ fn classify_pty_error(error: &PtyError) -> ValueEcho {
         PtyError::SessionClosing => ValueEcho::Never,
         PtyError::ReaderJoinTimeout => ValueEcho::Never,
         PtyError::SupervisorJoinTimeout => ValueEcho::Never,
+        PtyError::CommandEmpty => ValueEcho::Never,
+        PtyError::CommandNotAbsolute => ValueEcho::Never,
+        PtyError::CommandTooLarge => ValueEcho::Never,
         PtyError::Backend { .. } => ValueEcho::Never,
         PtyError::Io { .. } => ValueEcho::Never,
     }
@@ -267,6 +279,30 @@ fn config_samples() -> Vec<(ConfigError, ValueEcho)> {
                 second: "b".to_owned(),
                 chord: "c".to_owned(),
             },
+            ValueEcho::Never,
+        ),
+        (
+            ConfigError::AgentTableNotAnArray { key: key() },
+            ValueEcho::Never,
+        ),
+        (
+            ConfigError::AgentFieldMissing { key: key() },
+            ValueEcho::Never,
+        ),
+        (
+            ConfigError::AgentFieldNotAString { key: key() },
+            ValueEcho::Never,
+        ),
+        (
+            ConfigError::AgentArgsNotAnArray { key: key() },
+            ValueEcho::Never,
+        ),
+        (
+            ConfigError::AgentArgNotAString { index: 0 },
+            ValueEcho::Never,
+        ),
+        (
+            ConfigError::AgentCommandNotAbsolute { key: key() },
             ValueEcho::Never,
         ),
     ]
@@ -380,6 +416,9 @@ fn pty_error_samples() -> Vec<(PtyError, ValueEcho)> {
         (PtyError::SessionClosing, ValueEcho::Never),
         (PtyError::ReaderJoinTimeout, ValueEcho::Never),
         (PtyError::SupervisorJoinTimeout, ValueEcho::Never),
+        (PtyError::CommandEmpty, ValueEcho::Never),
+        (PtyError::CommandNotAbsolute, ValueEcho::Never),
+        (PtyError::CommandTooLarge, ValueEcho::Never),
         (
             PtyError::Backend {
                 operation: noren_pty::PtyOperation::Open,
@@ -586,6 +625,11 @@ fn config_values_outside_keys_never_reach_display_or_debug() {
     let cases = [
         format!("[font]\ncell_width = \"{SENTINEL}\"\n"),
         format!("[keys]\nsession_create = {SENTINEL}\n"),
+        // `[[agents]]` values: the command is agent-launch text (may embed a
+        // private path), so its rejections name the key, never the text.
+        format!("[[agents]]\nname = \"x\"\ncommand = \"{SENTINEL}\"\n"),
+        format!("[[agents]]\nname = \"{SENTINEL}\"\ncommand = 5\n"),
+        format!("[[agents]]\nname = \"x\"\ncommand = \"/bin/true\"\nargs = [\"{SENTINEL}\", 1]\n"),
     ];
     for text in cases {
         let error = AppConfig::parse(&text).expect_err("every sentinel fixture must fail");

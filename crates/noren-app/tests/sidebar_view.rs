@@ -68,7 +68,7 @@ fn each_entry_kind_maps_to_a_distinct_view_row() {
         (EntryKind::Project, Some("~/dev/noren")),
         (EntryKind::Worktree, Some("agent/m3-sidebar-view")),
         (EntryKind::SshConnection, Some("web1.internal:22")),
-        (EntryKind::Agent, None),
+        (EntryKind::Agent, Some("not running")),
         (EntryKind::Session, Some("local · running")),
         (EntryKind::Session, Some("local · running")),
         (EntryKind::Session, Some("ssh · starting")),
@@ -311,6 +311,7 @@ fn sentinel_entries(sentinel: &str) -> (Vec<SidebarEntry>, SessionId) {
             },
             SidebarEntry::Agent {
                 label: sentinel.to_string(),
+                status: sentinel.to_string(),
             },
             SidebarEntry::Session(descriptor),
         ],

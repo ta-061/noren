@@ -36,12 +36,25 @@
 //! [`ConfigError::UnknownTheme`] naming the offending value, never a
 //! silent fallback to the default.
 //!
+//! The `[[agents]]` array configures AI-agent sidebar entries: a display
+//! `name` and the `command` (plus optional `args`) to launch when the row is
+//! selected. It follows the same discipline — unknown keys are rejected,
+//! every value is type- and range-checked, and the agent launch is an **argv
+//! vector, never a shell invocation**: a value containing `;`, `$(...)`, or a
+//! backtick is passed to the agent program as literal data, because no shell
+//! ever interprets it. The command must be an absolute path; `PATH` lookup is
+//! deliberately not performed, so a writable `PATH` entry cannot substitute a
+//! different binary.
+//!
 //! # Privacy
 //!
 //! Configuration carries no secrets: no supported key names a credential,
 //! key, or other sensitive path, and the schema deliberately exposes no path
 //! keys at all. The shell program is **not** configurable: the threat model
-//! (TM-01) fixes the spawn at `/bin/zsh` with no configured additions.
+//! (TM-01) fixes the spawn at `/bin/zsh` with no configured additions. An
+//! agent `command` is a different surface: it names a program the user
+//! explicitly asked Noren to launch, and it is validated (absolute, bounded,
+//! shell-free argv) rather than forbidden.
 
 use crate::passthrough::{
     CLAIM_ID_PALETTE, Chord, ChordError, ChordSeq, KeyCode, Modifiers, PassthroughAction,
@@ -82,6 +95,19 @@ pub const CONFIG_FILE_NAME: &str = "config.toml";
 
 /// Maximum characters of hostile input echoed inside any error message.
 const MAX_ERROR_DETAIL_CHARS: usize = 120;
+
+/// Maximum accepted bytes for one `[agents]` string field (`name`,
+/// `command`, or one `args` element).
+///
+/// Policy, like [`MAX_CELL_EDGE`]: keeps a single field from monopolizing
+/// the bounded 64 KiB read, and gives the sidebar label arithmetic a
+/// reasonable worst case. Longer values are
+/// [`ConfigError::OutOfRange`] errors, never truncated.
+///
+/// This equals [`noren_pty::MAX_AGENT_ARGV_ELEMENT_BYTES`] — the launch
+/// policy re-enforces the same cap at its own layer — and a pin test
+/// below holds the two constants equal so the layers can never diverge.
+pub const MAX_AGENT_FIELD_BYTES: usize = 1024;
 
 /// Font geometry settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,34 +237,99 @@ impl ThemeConfig {
     }
 }
 
+/// One configured agent: a display name plus the argv vector of its launch.
+///
+/// The command is executed **without a shell** (see [`crate::config`]'s
+/// module documentation): `command` is `argv[0]` and each `args` element is
+/// one argv word, so shell metacharacters in any field are literal data to
+/// the agent program, never an injection. The command must be an absolute
+/// path; no `PATH` lookup is performed.
+///
+/// # Debug discipline
+///
+/// [`fmt::Debug`] is shape-only (issue #146): the name and command are
+/// user-authored file text, and a command can embed a private path, so
+/// neither is printed. Use the accessors for real values.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentConfig {
+    name: String,
+    command: String,
+    args: Vec<String>,
+}
+
+impl fmt::Debug for AgentConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentConfig")
+            .field("name_chars", &self.name.chars().count())
+            .field("argv", &self.argv().len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AgentConfig {
+    /// The display name shown on the agent's sidebar row.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The absolute program path; `argv[0]` of the launch.
+    #[must_use]
+    pub fn command(&self) -> &str {
+        &self.command
+    }
+
+    /// The argv words after the program, in configured order.
+    #[must_use]
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    /// The full argv vector: `command` followed by `args`.
+    #[must_use]
+    pub fn argv(&self) -> Vec<String> {
+        let mut argv = Vec::with_capacity(self.args.len() + 1);
+        argv.push(self.command.clone());
+        argv.extend(self.args.iter().cloned());
+        argv
+    }
+}
+
 /// Validated application configuration.
 ///
 /// [`AppConfig::default`] is byte-for-byte the behavior the app had before
 /// configuration existed; [`AppConfig::load`] returns it for a missing file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct AppConfig {
     font: FontConfig,
     keys: KeymapConfig,
     theme: ThemeConfig,
+    agents: Vec<AgentConfig>,
 }
 
 impl AppConfig {
     /// Font geometry settings.
     #[must_use]
-    pub const fn font(self) -> FontConfig {
+    pub const fn font(&self) -> FontConfig {
         self.font
     }
 
     /// Workspace key chord settings.
     #[must_use]
-    pub const fn keys(self) -> KeymapConfig {
+    pub const fn keys(&self) -> KeymapConfig {
         self.keys
     }
 
     /// Colour theme settings.
     #[must_use]
-    pub const fn theme(self) -> ThemeConfig {
+    pub const fn theme(&self) -> ThemeConfig {
         self.theme
+    }
+
+    /// Configured agents, in file order. Empty when `[agents]` is absent.
+    #[must_use]
+    pub fn agents(&self) -> &[AgentConfig] {
+        &self.agents
     }
 
     /// Load configuration from the standard path or the [`CONFIG_ENV_VAR`]
@@ -285,21 +376,97 @@ impl AppConfig {
         })?;
         let mut config = Self::default();
         for (key, item) in document.as_table().iter() {
-            let table = item
-                .as_table_like()
-                .ok_or_else(|| ConfigError::WrongType { key: clip(key) })?;
             match key {
-                "font" => parse_font(table, &mut config.font)?,
-                "keys" => parse_keys(table, &mut config.keys)?,
-                "theme" => parse_theme(table, &mut config.theme)?,
-                // `[terminal]` historically attracted a `scrollback_lines` key.
-                // The terminal foundation has no configurable retention cap yet,
-                // so the table is rejected instead of parsed-and-ignored.
-                _ => return Err(ConfigError::UnknownKey(clip(key))),
+                // `[[agents]]` is an array of tables, not a table, so it is
+                // matched before the table-like conversion below.
+                "agents" => parse_agents(item, &mut config.agents)?,
+                _ => {
+                    let table = item
+                        .as_table_like()
+                        .ok_or_else(|| ConfigError::WrongType { key: clip(key) })?;
+                    match key {
+                        "font" => parse_font(table, &mut config.font)?,
+                        "keys" => parse_keys(table, &mut config.keys)?,
+                        "theme" => parse_theme(table, &mut config.theme)?,
+                        // `[terminal]` historically attracted a `scrollback_lines` key.
+                        // The terminal foundation has no configurable retention cap yet,
+                        // so the table is rejected instead of parsed-and-ignored.
+                        _ => return Err(ConfigError::UnknownKey(clip(key))),
+                    }
+                }
             }
         }
         Ok(config)
     }
+}
+
+/// Apply the `[[agents]]` array to the configured agent list.
+///
+/// The array spelling is the only accepted form (`agents = [...]` with
+/// inline tables is rejected, not silently reinterpreted), every entry must
+/// carry a string `name` and a string absolute `command`, and the optional
+/// `args` array must hold only strings. Unknown entry keys are rejected like
+/// every other unknown key in this schema.
+fn parse_agents(item: &Item, agents: &mut Vec<AgentConfig>) -> Result<(), ConfigError> {
+    let entries = item
+        .as_array_of_tables()
+        .ok_or_else(|| ConfigError::AgentTableNotAnArray {
+            key: clip("agents"),
+        })?;
+    for entry in entries.iter() {
+        let mut name: Option<String> = None;
+        let mut command: Option<String> = None;
+        let mut args: Vec<String> = Vec::new();
+        for (key, value) in entry.iter() {
+            match key {
+                "name" => name = Some(agent_string_field(key, value)?),
+                "command" => {
+                    let program = agent_string_field(key, value)?;
+                    if !program.starts_with('/') {
+                        return Err(ConfigError::AgentCommandNotAbsolute { key: clip(key) });
+                    }
+                    command = Some(program);
+                }
+                "args" => {
+                    let array = value
+                        .as_array()
+                        .ok_or_else(|| ConfigError::AgentArgsNotAnArray { key: clip(key) })?;
+                    for (index, argument) in array.iter().enumerate() {
+                        let text = argument
+                            .as_str()
+                            .ok_or(ConfigError::AgentArgNotAString { index })?;
+                        if text.len() > MAX_AGENT_FIELD_BYTES {
+                            return Err(ConfigError::OutOfRange { key: clip(key) });
+                        }
+                        args.push(text.to_owned());
+                    }
+                }
+                _ => return Err(ConfigError::UnknownKey(clip(key))),
+            }
+        }
+        let name = name.ok_or_else(|| ConfigError::AgentFieldMissing { key: clip("name") })?;
+        let command = command.ok_or_else(|| ConfigError::AgentFieldMissing {
+            key: clip("command"),
+        })?;
+        agents.push(AgentConfig {
+            name,
+            command,
+            args,
+        });
+    }
+    Ok(())
+}
+
+/// Read one required `[agents]` string field (`name` or `command`), enforcing
+/// the shared type and length rules.
+fn agent_string_field(key: &str, item: &Item) -> Result<String, ConfigError> {
+    let text = item
+        .as_str()
+        .ok_or_else(|| ConfigError::AgentFieldNotAString { key: clip(key) })?;
+    if text.is_empty() || text.len() > MAX_AGENT_FIELD_BYTES {
+        return Err(ConfigError::OutOfRange { key: clip(key) });
+    }
+    Ok(text.to_owned())
 }
 
 fn parse_font(table: &dyn TableLike, font: &mut FontConfig) -> Result<(), ConfigError> {
@@ -909,6 +1076,25 @@ pub enum ConfigError {
         second: String,
         chord: String,
     },
+    /// `agents` is present but is not an array of tables spelled `[[agents]]`.
+    ///
+    /// No file text appears beyond the fixed key name.
+    AgentTableNotAnArray { key: String },
+    /// An `[[agents]]` entry omits a required key (`name` or `command`).
+    AgentFieldMissing { key: String },
+    /// An `[[agents]]` string field holds the wrong TOML type.
+    AgentFieldNotAString { key: String },
+    /// The `args` key of an `[[agents]]` entry is not a TOML array.
+    AgentArgsNotAnArray { key: String },
+    /// One `args` element of an `[[agents]]` entry is not a TOML string.
+    /// `index` is the element's 0-based position.
+    AgentArgNotAString { index: usize },
+    /// The `command` of an `[[agents]]` entry is not an absolute path.
+    ///
+    /// The rejected text never appears: the position is the entry itself,
+    /// and `PATH` lookup is deliberately not performed, so the only accepted
+    /// shape is a leading `/`.
+    AgentCommandNotAbsolute { key: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -965,6 +1151,31 @@ impl fmt::Display for ConfigError {
             } => write!(
                 f,
                 "configuration keys {first} and {second} are both bound to the chord {chord}"
+            ),
+            Self::AgentTableNotAnArray { key } => write!(
+                f,
+                "configuration key {key} must be an array of tables spelled [[agents]]"
+            ),
+            Self::AgentFieldMissing { key } => {
+                write!(f, "an [[agents]] entry is missing required key: {key}")
+            }
+            Self::AgentFieldNotAString { key } => {
+                write!(
+                    f,
+                    "configuration key {key} inside [[agents]] must be a string"
+                )
+            }
+            Self::AgentArgsNotAnArray { key } => write!(
+                f,
+                "configuration key {key} inside [[agents]] must be an array of strings"
+            ),
+            Self::AgentArgNotAString { index } => {
+                write!(f, "args element {index} inside [[agents]] must be a string")
+            }
+            Self::AgentCommandNotAbsolute { key } => write!(
+                f,
+                "configuration key {key} inside [[agents]] must be an absolute path with a \
+                 leading '/'; PATH lookup is deliberately not performed"
             ),
         }
     }
@@ -1861,5 +2072,234 @@ mod tests {
             config.keys().session_create(),
             chord(KeyCode::Char('t'), Modifiers::empty())
         );
+    }
+
+    // ── [[agents]] tests ───────────────────────────────────────────────
+
+    /// With no `[[agents]]` entries the configured list is empty — exactly
+    /// the pre-agents behavior.
+    #[test]
+    fn default_config_has_no_agents() {
+        assert!(AppConfig::default().agents().is_empty());
+        assert!(
+            AppConfig::parse("# nothing\n")
+                .expect("valid")
+                .agents()
+                .is_empty()
+        );
+        // A bare `[[agents]]` header is one empty entry, and an entry without
+        // its required keys is a typed error, not a silently skipped row.
+        assert!(
+            AppConfig::parse("[[agents]]\n")
+                .expect_err("an empty entry lacks required keys")
+                .to_string()
+                .contains("missing required key")
+        );
+    }
+
+    #[test]
+    fn agents_parse_in_file_order_with_name_command_and_args() {
+        let config = AppConfig::parse(
+            "[[agents]]\nname = \"claude\"\ncommand = \"/usr/local/bin/claude\"\n\
+             args = [\"--login\", \"--theme\", \"dark\"]\n\
+             [[agents]]\nname = \"aider\"\ncommand = \"/opt/homebrew/bin/aider\"\n",
+        )
+        .expect("valid agents configuration");
+        let agents = config.agents();
+        assert_eq!(agents.len(), 2, "file order is preserved");
+        assert_eq!(agents[0].name(), "claude");
+        assert_eq!(agents[0].command(), "/usr/local/bin/claude");
+        assert_eq!(
+            agents[0].args(),
+            [
+                "--login".to_owned(),
+                "--theme".to_owned(),
+                "dark".to_owned()
+            ]
+            .as_slice()
+        );
+        assert_eq!(
+            agents[0].argv(),
+            vec![
+                "/usr/local/bin/claude".to_owned(),
+                "--login".to_owned(),
+                "--theme".to_owned(),
+                "dark".to_owned(),
+            ],
+            "argv is the command followed by the configured args"
+        );
+        assert!(agents[1].args().is_empty());
+        assert_eq!(agents[1].argv().len(), 1);
+        // The rest of the configuration is untouched.
+        assert_eq!(config.font(), FontConfig::default());
+        assert_eq!(config.keys(), KeymapConfig::default());
+    }
+
+    /// Shell metacharacters are data, not syntax: an agent field carrying
+    /// `;`, `$(...)`, or a backtick parses fine, because nothing here ever
+    /// hands it to a shell.
+    #[test]
+    fn agent_fields_may_contain_shell_metacharacters_as_literal_data() {
+        let config = AppConfig::parse(
+            "[[agents]]\nname = \"rm -rf; $(evil) `x`\"\n\
+             command = \"/bin/echo\"\nargs = [\"a;rm\", \"$(b)\", \"`c`\"]\n",
+        )
+        .expect("metacharacters are ordinary string content");
+        assert_eq!(config.agents()[0].name(), "rm -rf; $(evil) `x`");
+        assert_eq!(config.agents()[0].args().len(), 3);
+    }
+
+    #[test]
+    fn agent_entries_reject_each_malformed_shape_with_a_typed_error() {
+        let cases = [
+            (
+                "agents = 3\n",
+                ConfigError::AgentTableNotAnArray {
+                    key: "agents".to_owned(),
+                },
+            ),
+            (
+                "[agents]\nname = \"x\"\n",
+                ConfigError::AgentTableNotAnArray {
+                    key: "agents".to_owned(),
+                },
+            ),
+            (
+                "agents = [{ name = \"x\", command = \"/bin/true\" }]\n",
+                ConfigError::AgentTableNotAnArray {
+                    key: "agents".to_owned(),
+                },
+            ),
+            (
+                "[[agents]]\ncommand = \"/bin/true\"\n",
+                ConfigError::AgentFieldMissing {
+                    key: "name".to_owned(),
+                },
+            ),
+            (
+                "[[agents]]\nname = \"x\"\n",
+                ConfigError::AgentFieldMissing {
+                    key: "command".to_owned(),
+                },
+            ),
+            (
+                "[[agents]]\nname = 5\ncommand = \"/bin/true\"\n",
+                ConfigError::AgentFieldNotAString {
+                    key: "name".to_owned(),
+                },
+            ),
+            (
+                "[[agents]]\nname = \"x\"\ncommand = \"/bin/true\"\nargs = \"y\"\n",
+                ConfigError::AgentArgsNotAnArray {
+                    key: "args".to_owned(),
+                },
+            ),
+            (
+                "[[agents]]\nname = \"x\"\ncommand = \"/bin/true\"\nargs = [\"a\", 2]\n",
+                ConfigError::AgentArgNotAString { index: 1 },
+            ),
+            (
+                "[[agents]]\nname = \"x\"\ncommand = \"claude\"\n",
+                ConfigError::AgentCommandNotAbsolute {
+                    key: "command".to_owned(),
+                },
+            ),
+            (
+                "[[agents]]\nname = \"x\"\ncommand = \"/bin/true\"\nextra = 1\n",
+                ConfigError::UnknownKey("extra".to_owned()),
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(AppConfig::parse(text), Err(expected), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn agent_string_fields_are_range_checked_like_every_other_value() {
+        let oversize = "a".repeat(MAX_AGENT_FIELD_BYTES + 1);
+        for hostile in [
+            "[[agents]]\nname = \"\"\ncommand = \"/bin/true\"\n".to_owned(),
+            "[[agents]]\nname = \"x\"\ncommand = \"\"\n".to_owned(),
+            format!("[[agents]]\nname = \"{oversize}\"\ncommand = \"/bin/true\"\n"),
+            format!("[[agents]]\nname = \"x\"\ncommand = \"/{oversize}\"\n"),
+            format!("[[agents]]\nname = \"x\"\ncommand = \"/bin/true\"\nargs = [\"{oversize}\"]\n"),
+        ] {
+            let result = AppConfig::parse(&hostile);
+            assert!(
+                matches!(result, Err(ConfigError::OutOfRange { .. })),
+                "{hostile:.60?}… must be rejected as out of range, got {result:?}"
+            );
+        }
+        // The cap itself is accepted.
+        let at_cap = "a".repeat(MAX_AGENT_FIELD_BYTES);
+        assert!(
+            AppConfig::parse(&format!(
+                "[[agents]]\nname = \"{at_cap}\"\ncommand = \"/bin/true\"\n"
+            ))
+            .is_ok()
+        );
+    }
+
+    /// Agent fields are file values: no error surface may echo them, and the
+    /// configuration's own Debug is shape-only (issue #146).
+    #[test]
+    fn agent_values_never_reach_errors_or_config_debug() {
+        const SENTINEL: &str = "NOREN-AGENT-VALUE-hunter2";
+        let cases = [
+            // Relative command: the typed refusal names the key, not the text.
+            format!("[[agents]]\nname = \"x\"\ncommand = \"{SENTINEL}\"\n"),
+            // Wrong-typed fields name the key only.
+            format!("[[agents]]\nname = \"{SENTINEL}\"\ncommand = 5\n"),
+            format!("[[agents]]\nname = 5\ncommand = \"/{SENTINEL}\"\n"),
+            format!(
+                "[[agents]]\nname = \"x\"\ncommand = \"/bin/true\"\nargs = [\"{SENTINEL}\", 1]\n"
+            ),
+        ];
+        for text in cases {
+            let error = AppConfig::parse(&text).expect_err("every sentinel fixture fails");
+            let display = error.to_string();
+            assert!(
+                !display.contains(SENTINEL),
+                "Display must not echo agent values: {display}"
+            );
+            let debug = format!("{error:?}");
+            assert!(
+                !debug.contains(SENTINEL),
+                "Debug must not echo agent values: {debug}"
+            );
+        }
+        // A VALID configuration never prints its fields through Debug either.
+        let config = AppConfig::parse(&format!(
+            "[[agents]]\nname = \"{SENTINEL}\"\ncommand = \"/bin/{SENTINEL}\"\nargs = [\"{SENTINEL}\"]\n"
+        ))
+        .expect("valid");
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "AgentConfig Debug leaked file text: {rendered}"
+        );
+    }
+
+    /// The config-layer per-field cap and the policy-layer per-element cap
+    /// are the same number: a configuration the schema accepted can never be
+    /// refused by [`noren_pty::AgentLaunchPolicy`], while the policy still
+    /// enforces the bound against callers that skipped this schema. Diverging
+    /// the constants would create a silent dead range in one direction and a
+    /// launch-time surprise in the other, so the pin is a test.
+    #[test]
+    fn agent_field_cap_matches_the_launch_policy_element_cap() {
+        assert_eq!(
+            MAX_AGENT_FIELD_BYTES,
+            noren_pty::MAX_AGENT_ARGV_ELEMENT_BYTES,
+            "the config and policy layers must enforce the same argv element cap"
+        );
+        // The caps compose, not just match: the largest schema-accepted
+        // command and arg construct a valid policy. The command's cap
+        // includes its leading `/`.
+        let command = format!("/{}", "a".repeat(MAX_AGENT_FIELD_BYTES - 1));
+        let arg = "a".repeat(MAX_AGENT_FIELD_BYTES);
+        let policy = noren_pty::AgentLaunchPolicy::new(&command, &[arg])
+            .expect("a schema-accepted element always fits the policy");
+        assert_eq!(policy.args().len(), 1);
     }
 }

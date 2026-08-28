@@ -1,10 +1,19 @@
 //! Noren-owned process and PTY boundary for the macOS local-shell PoC.
 //!
 //! The public API deliberately exposes no `portable-pty` types. A session
-//! launches either the fixed `/bin/zsh` shell or the fixed system SSH client
-//! (`/usr/bin/ssh`) — in both cases without caller-controlled arguments or
-//! `-c`, moves blocking I/O off the UI thread, bounds every queue and payload,
-//! and owns child termination and reaping in one supervisor thread.
+//! launches the fixed `/bin/zsh` shell, the fixed system SSH client
+//! (`/usr/bin/ssh`), or a configured agent command validated by
+//! [`AgentLaunchPolicy`] — in every case without caller-controlled shell
+//! interpretation or `-c`, moves blocking I/O off the UI thread, bounds
+//! every queue and payload, and owns child termination and reaping in one
+//! supervisor thread.
+//!
+//! The agent launch path is an argv vector, never a shell: the configured
+//! program becomes `argv[0]`, each configured argument becomes exactly one
+//! argv word, and the program must be an absolute path so no `PATH` lookup
+//! can substitute a different binary. A value containing `;`, `$(...)`, or
+//! a backtick is literal data to the agent program, because no shell ever
+//! interprets it.
 //!
 //! The SSH launch path drives the system `ssh` binary only. Noren never
 //! reimplements the SSH protocol and never passes a credential, key, or
@@ -37,6 +46,15 @@ pub const REPLY_BYTES_PER_MESSAGE: usize = 4 * 1024;
 pub const REPLY_BYTES_PER_SECOND: usize = 64 * 1024;
 /// Total orderly-shutdown deadline.
 pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
+/// Maximum accepted bytes for one [`AgentLaunchPolicy`] argv element —
+/// the program or any single argument.
+///
+/// The policy is the boundary, not its callers: this is the same
+/// 1024-byte per-field cap the configuration schema enforces
+/// (`noren_app::config::MAX_AGENT_FIELD_BYTES`; a pin test holds the two
+/// equal), so a config-accepted command can never be refused here while
+/// a direct policy caller gets the same typed rejection.
+pub const MAX_AGENT_ARGV_ELEMENT_BYTES: usize = 1024;
 
 const ZSH_PROGRAM: &str = "/bin/zsh";
 /// Fixed system SSH client. An absolute path deliberately bypasses `PATH`
@@ -52,6 +70,10 @@ const TERM_PROGRAM_VALUE: &str = "Noren-PoC";
 const SUPERVISOR_POLL: Duration = Duration::from_millis(10);
 const READER_JOIN_BUDGET: Duration = Duration::from_millis(1_750);
 const LIFECYCLE_SEND_BUDGET: Duration = Duration::from_millis(100);
+/// Maximum wait for the reader thread to report itself armed before the
+/// child is forked. The report is a channel send executed as the reader's
+/// first statement, so only total thread-startup failure can exceed it.
+const READER_ARMED_BUDGET: Duration = Duration::from_secs(5);
 
 /// Validated, non-zero terminal grid dimensions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -488,6 +510,117 @@ fn build_ssh_command(policy: &SshLaunchPolicy) -> CommandBuilder {
     command
 }
 
+/// Validated argv launch policy for a configured agent command.
+///
+/// This is the third launch shape (after the fixed zsh and ssh policies):
+/// the program comes from the user's own configuration instead of a
+/// compile-time constant, so the validation that the fixed policies got for
+/// free is explicit here:
+///
+/// - the command must be non-empty ([`PtyError::CommandEmpty`]) and
+///   absolute with a leading `/` ([`PtyError::CommandNotAbsolute`]); no
+///   `PATH` lookup is performed, so a writable `PATH` entry cannot
+///   substitute a different binary;
+/// - each argv element — the program and every argument — is bounded to
+///   [`MAX_AGENT_ARGV_ELEMENT_BYTES`] ([`PtyError::CommandTooLarge`]), so
+///   the boundary does not depend on its caller's own validation to keep
+///   argv memory sane;
+/// - the launch is an **argv vector, never a shell invocation**: there is no
+///   `sh -c` and no `-c` anywhere in the build, so a configured value
+///   containing `;`, `$(...)`, or a backtick reaches the agent program as
+///   literal data. Shell metacharacters cannot inject because no shell ever
+///   interprets them.
+///
+/// The child runs in the inherited `HOME` (as cwd and `HOME`) like a local
+/// session, with the same fixed `TERM`/`TERM_PROGRAM` surgery and
+/// `COLUMNS`/`LINES` removal.
+///
+/// [`fmt::Debug`] is shape-only: a program path can embed a username or a
+/// private directory name, so neither the program nor any argument is
+/// printed (issue #146 discipline).
+#[derive(Clone, PartialEq, Eq)]
+pub struct AgentLaunchPolicy {
+    program: String,
+    args: Vec<String>,
+}
+
+impl AgentLaunchPolicy {
+    /// Validate `program` and `args` as a shell-free argv vector.
+    ///
+    /// `program` must be non-empty and absolute; `args` are taken verbatim
+    /// (each element is exactly one argv word; no quoting, splitting, or
+    /// expansion is ever applied). Every element — `program` included —
+    /// must fit [`MAX_AGENT_ARGV_ELEMENT_BYTES`] bytes.
+    pub fn new(program: &str, args: &[String]) -> Result<Self, PtyError> {
+        if program.is_empty() {
+            return Err(PtyError::CommandEmpty);
+        }
+        if !program.starts_with('/') {
+            return Err(PtyError::CommandNotAbsolute);
+        }
+        if program.len() > MAX_AGENT_ARGV_ELEMENT_BYTES {
+            return Err(PtyError::CommandTooLarge);
+        }
+        if args
+            .iter()
+            .any(|argument| argument.len() > MAX_AGENT_ARGV_ELEMENT_BYTES)
+        {
+            return Err(PtyError::CommandTooLarge);
+        }
+        Ok(Self {
+            program: program.to_owned(),
+            args: args.to_vec(),
+        })
+    }
+
+    /// The validated program; `argv[0]` of the launch.
+    ///
+    /// This accessor exists to build the child argv, not for display: the
+    /// [`fmt::Debug`] implementation is redacted so a private path can never
+    /// reach a log through a debug print.
+    #[must_use]
+    pub fn program(&self) -> &str {
+        &self.program
+    }
+
+    /// The validated argv words after the program.
+    #[must_use]
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+}
+
+impl fmt::Debug for AgentLaunchPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AgentLaunchPolicy")
+            .field("argv", &(self.args.len() + 1))
+            .finish()
+    }
+}
+
+/// Build the agent command from a validated policy. Security invariants,
+/// pinned by tests:
+///
+/// - argv is exactly `[program, args...]` as supplied — no shell, no `-c`,
+///   no extra words — so shell metacharacters in any configured value are
+///   literal data to the agent program;
+/// - the working directory and `HOME` are the inherited home (the same
+///   treatment a local session gets), and the fixed `TERM`/`TERM_PROGRAM`
+///   overrides plus `COLUMNS`/`LINES` removal apply like every policy.
+fn build_agent_command(policy: &AgentLaunchPolicy, home: &ZshLaunchPolicy) -> CommandBuilder {
+    let mut command = CommandBuilder::new(policy.program());
+    command.cwd(&home.home);
+    command.env("HOME", &home.home);
+    for argument in policy.args() {
+        command.arg(argument);
+    }
+    command.env("TERM", TERM_VALUE);
+    command.env("TERM_PROGRAM", TERM_PROGRAM_VALUE);
+    command.env_remove("COLUMNS");
+    command.env_remove("LINES");
+    command
+}
+
 /// PTY operations named by payload-free errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PtyOperation {
@@ -522,6 +655,15 @@ pub enum PtyError {
     SessionClosing,
     ReaderJoinTimeout,
     SupervisorJoinTimeout,
+    /// An [`AgentLaunchPolicy`](crate::AgentLaunchPolicy) program was empty.
+    CommandEmpty,
+    /// An [`AgentLaunchPolicy`](crate::AgentLaunchPolicy) program was not an
+    /// absolute path; `PATH` lookup is deliberately not performed.
+    CommandNotAbsolute,
+    /// An [`AgentLaunchPolicy`](crate::AgentLaunchPolicy) argv element — the
+    /// program or one argument — exceeded
+    /// [`MAX_AGENT_ARGV_ELEMENT_BYTES`](crate::MAX_AGENT_ARGV_ELEMENT_BYTES).
+    CommandTooLarge,
     Backend {
         operation: PtyOperation,
     },
@@ -560,6 +702,13 @@ impl fmt::Display for PtyError {
             Self::ReaderJoinTimeout => f.write_str("PTY reader did not stop before the deadline"),
             Self::SupervisorJoinTimeout => {
                 f.write_str("PTY supervisor did not stop before the deadline")
+            }
+            Self::CommandEmpty => f.write_str("agent command must not be empty"),
+            Self::CommandNotAbsolute => {
+                f.write_str("agent command must be an absolute path; PATH lookup is not performed")
+            }
+            Self::CommandTooLarge => {
+                f.write_str("agent command argv element exceeds its byte limit")
             }
             Self::Backend { operation } => {
                 write!(f, "PTY backend operation {operation:?} failed")
@@ -643,6 +792,22 @@ impl PtySession {
     /// left to ssh's own agent and configuration resolution.
     pub fn spawn_ssh(policy: SshLaunchPolicy, size: PtySize) -> Result<Self, PtyError> {
         Self::spawn_session(build_ssh_command(&policy), size)
+    }
+
+    /// Spawn a configured agent command at the supplied initial non-zero
+    /// size, as a shell-free argv vector (see [`build_agent_command`]).
+    ///
+    /// argv is exactly `[program, args...]` from the validated policy — no
+    /// `sh -c`, so metacharacters in configured values are literal data. A
+    /// missing or non-executable program surfaces as the spawn error from
+    /// the PTY backend ([`PtyError::Backend`] with
+    /// [`PtyOperation::SpawnChild`]); the caller is expected to make that a
+    /// visible failure, never a silent no-op. The child runs in the
+    /// inherited `HOME` with the same environment surgery as a local
+    /// session.
+    pub fn spawn_agent(policy: AgentLaunchPolicy, size: PtySize) -> Result<Self, PtyError> {
+        let home = ZshLaunchPolicy::from_environment()?;
+        Self::spawn_session(build_agent_command(&policy, &home), size)
     }
 
     /// Spawn `/bin/zsh` with `home` as the child's `HOME` and working
@@ -1008,6 +1173,21 @@ type PtyParts = (
     Receiver<()>,
 );
 
+/// Wait for the reader's armed report within `budget`.
+///
+/// Any failure — the report not arriving in time ([`RecvTimeoutError::Timeout`])
+/// or the reader vanishing before reporting ([`RecvTimeoutError::Disconnected`])
+/// — is the same typed spawn error, because the arming rendezvous is part of
+/// the spawn contract: the child is only forked after this succeeds.
+fn wait_for_reader_armed(report: Receiver<()>, budget: Duration) -> Result<(), PtyError> {
+    match report.recv_timeout(budget) {
+        Ok(()) => Ok(()),
+        Err(_) => Err(PtyError::Backend {
+            operation: PtyOperation::SpawnThread,
+        }),
+    }
+}
+
 fn setup_pty(
     command: CommandBuilder,
     size: PtySize,
@@ -1028,27 +1208,36 @@ fn setup_pty(
     let writer = pair.master.take_writer().map_err(|_| PtyError::Backend {
         operation: PtyOperation::TakeWriter,
     })?;
-    let mut child = pair
+
+    // The reader must be parked in `read` BEFORE the child is forked.
+    // macOS discards any unread slave-to-master output at the moment the
+    // last slave-side descriptor closes: if a short-lived child writes and
+    // exits before the reader's first `read` is pending, that output is
+    // flushed and only EOF is observed (established with a raw openpty
+    // probe: a first read starting after the child was reaped lost the
+    // marker in 200/200 rounds). The rendezvous below waits for the
+    // reader's armed report, so the child's writes always land in a
+    // pending read and the flush at child exit can no longer destroy
+    // undelivered output. A failure to arm is a typed spawn error; the
+    // master and writer drop here, which unblocks and ends the reader.
+    let (reader_done_tx, reader_done_rx) = mpsc::sync_channel(1);
+    let (armed_tx, armed_rx) = mpsc::sync_channel(1);
+    let reader_events = event_tx.clone();
+    let reader_thread = thread::Builder::new()
+        .name("noren-pty-reader".to_owned())
+        .spawn(move || reader_main(reader, reader_events, reader_done_tx, armed_tx, closing))
+        .map_err(|error| PtyError::io(PtyOperation::SpawnThread, &error))?;
+    wait_for_reader_armed(armed_rx, READER_ARMED_BUDGET)?;
+
+    let child = pair
         .slave
         .spawn_command(command)
         .map_err(|_| PtyError::Backend {
             operation: PtyOperation::SpawnChild,
         })?;
+    // Not the last slave-side descriptor: the child holds its stdio, so
+    // this close cannot flush anything the parked reader has not read.
     drop(pair.slave);
-
-    let (reader_done_tx, reader_done_rx) = mpsc::sync_channel(1);
-    let reader_events = event_tx.clone();
-    let reader_thread = match thread::Builder::new()
-        .name("noren-pty-reader".to_owned())
-        .spawn(move || reader_main(reader, reader_events, reader_done_tx, closing))
-    {
-        Ok(thread) => thread,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(PtyError::io(PtyOperation::SpawnThread, &error));
-        }
-    };
 
     Ok((pair.master, writer, child, reader_thread, reader_done_rx))
 }
@@ -1067,8 +1256,13 @@ fn reader_main(
     mut reader: Box<dyn Read + Send>,
     event_tx: SyncSender<PtyEvent>,
     done_tx: SyncSender<()>,
+    armed_tx: SyncSender<()>,
     closing: Arc<AtomicBool>,
 ) {
+    // Armed report: the reader is scheduled and entering its first `read`.
+    // setup_pty waits for this before forking the child, so a pending read
+    // always exists by the time the child can write (see setup_pty).
+    let _ = armed_tx.send(());
     let mut buffer = vec![0_u8; READ_CHUNK_BYTES];
     loop {
         match reader.read(&mut buffer) {
@@ -1237,11 +1431,20 @@ mod tests {
     ) {
         let start = Instant::now();
         while Instant::now() < deadline {
-            match session.try_recv().expect("receive PTY event") {
-                Some(PtyEvent::Output(bytes)) => output.extend(bytes),
-                Some(PtyEvent::Eof | PtyEvent::Exited { .. }) => *lifecycle = true,
-                Some(PtyEvent::Error(error)) => panic!("unexpected typed PTY error: {error}"),
-                None => thread::sleep(Duration::from_millis(1)),
+            match session.try_recv() {
+                Ok(Some(PtyEvent::Output(bytes))) => output.extend(bytes),
+                Ok(Some(PtyEvent::Eof | PtyEvent::Exited { .. })) => *lifecycle = true,
+                Ok(Some(PtyEvent::Error(error))) => panic!("unexpected typed PTY error: {error}"),
+                Ok(None) => thread::sleep(Duration::from_millis(1)),
+                // A drained-and-disconnected channel after exit evidence is
+                // end-of-stream, not an error: both producer threads finish
+                // as a normal consequence of the child exiting, and the
+                // disconnect lands in the window before `shutdown` sets the
+                // session's finished flag. A disconnect with no exit
+                // evidence yet means the session ended without reporting
+                // its child's fate — a real defect that must fail loudly.
+                Err(PtyError::ChannelDisconnected) if *lifecycle => return,
+                Err(error) => panic!("PTY channel failed before any exit evidence: {error}"),
             }
             if done(output, *lifecycle) {
                 return;
@@ -1601,6 +1804,214 @@ mod tests {
         );
         session.shutdown().expect("bounded shutdown after ssh exit");
         session.shutdown().expect("shutdown remains idempotent");
+    }
+
+    #[test]
+    fn agent_launch_policy_validates_and_redacts_its_debug() {
+        assert_eq!(AgentLaunchPolicy::new("", &[]), Err(PtyError::CommandEmpty));
+        assert_eq!(
+            AgentLaunchPolicy::new("claude", &[]),
+            Err(PtyError::CommandNotAbsolute)
+        );
+
+        // The policy's own Debug prints shape only: a program path can embed
+        // a private directory, and an argument can carry anything.
+        const SECRET: &str = "NOREN-AGENT-hunter2";
+        let policy = AgentLaunchPolicy::new(
+            &format!("/opt/{SECRET}/agent"),
+            &[format!("--token={SECRET}"), format!("{SECRET};rm")],
+        )
+        .expect("absolute program with metacharacter args is valid data");
+        let rendered = format!("{policy:?}");
+        assert!(
+            !rendered.contains(SECRET),
+            "AgentLaunchPolicy Debug leaked argv text: {rendered}"
+        );
+        assert!(
+            rendered.contains("argv: 3"),
+            "the shape-only Debug names the argv length: {rendered}"
+        );
+        // Accessors expose the real values for argv construction.
+        assert_eq!(policy.program(), format!("/opt/{SECRET}/agent"));
+        assert_eq!(policy.args().len(), 2);
+    }
+
+    /// The policy is the boundary: no argv element may exceed
+    /// [`MAX_AGENT_ARGV_ELEMENT_BYTES`], whatever its caller already
+    /// checked. The cap itself is accepted, on every element kind.
+    #[test]
+    fn agent_launch_policy_bounds_each_argv_element() {
+        let at_cap = format!("/{}", "a".repeat(MAX_AGENT_ARGV_ELEMENT_BYTES - 1));
+        let over_cap = format!("/{}", "a".repeat(MAX_AGENT_ARGV_ELEMENT_BYTES));
+        // The cap is accepted, for the program and an argument alike.
+        assert!(
+            AgentLaunchPolicy::new(&at_cap, &[at_cap.clone()]).is_ok(),
+            "an element of exactly the cap is accepted"
+        );
+        assert_eq!(
+            AgentLaunchPolicy::new(&over_cap, &[]),
+            Err(PtyError::CommandTooLarge),
+            "an over-cap program is refused by the policy itself"
+        );
+        assert_eq!(
+            AgentLaunchPolicy::new("/bin/true", &[at_cap, over_cap]),
+            Err(PtyError::CommandTooLarge),
+            "one over-cap argument refuses the whole vector"
+        );
+        // The refusal is byte-length, not char-count: a multi-byte string
+        // under the char cap but over the byte cap is still refused.
+        let wide = "é".repeat(MAX_AGENT_ARGV_ELEMENT_BYTES / 2 + 1);
+        assert!(wide.chars().count() <= MAX_AGENT_ARGV_ELEMENT_BYTES);
+        assert_eq!(
+            AgentLaunchPolicy::new("/bin/true", &[wide]),
+            Err(PtyError::CommandTooLarge)
+        );
+    }
+
+    /// The agent command is the configured argv VERBATIM: no shell, no `-c`,
+    /// no word splitting or re-quoting. Metacharacters survive as literal
+    /// argv words, which is exactly why they cannot inject.
+    #[test]
+    fn agent_command_argv_is_exactly_the_configured_vector() {
+        let home = temp_directory();
+        let policy = validate_home(Some(home.clone().into_os_string())).expect("valid home");
+        let agent = AgentLaunchPolicy::new(
+            "/usr/local/bin/agent-cli",
+            &[
+                "--login".to_owned(),
+                "; rm -rf /".to_owned(),
+                "$(whoami)".to_owned(),
+                "`id`".to_owned(),
+            ],
+        )
+        .expect("validated policy");
+        let command = build_agent_command(&agent, &policy);
+        let argv: Vec<OsString> = command.get_argv().to_vec();
+        assert_eq!(
+            argv,
+            vec![
+                OsString::from("/usr/local/bin/agent-cli"),
+                OsString::from("--login"),
+                OsString::from("; rm -rf /"),
+                OsString::from("$(whoami)"),
+                OsString::from("`id`"),
+            ],
+            "argv must be the configured vector with no interpretation"
+        );
+        assert_eq!(argv.len(), 5, "no shell word was added or split");
+        // The child's environment is the local-session shape: cwd/HOME are
+        // the home, TERM is fixed, COLUMNS/LINES are removed.
+        assert_eq!(
+            command.get_cwd().map(OsString::as_os_str),
+            Some(home.as_os_str())
+        );
+        assert_eq!(command.get_env("HOME"), Some(home.as_os_str()));
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new(TERM_VALUE))
+        );
+        assert_eq!(command.get_env("COLUMNS"), None);
+        assert_eq!(command.get_env("LINES"), None);
+        fs::remove_dir(home).expect("remove test directory");
+    }
+
+    /// A real configured agent command actually runs: /bin/echo's own
+    /// output, read back through the PTY, is the evidence the child started
+    /// — never an inference from the code path. Its clean exit code 0 is
+    /// observed through the normal reaping path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn spawn_agent_runs_the_configured_command_to_a_verified_exit() {
+        let marker = format!("NOREN_AGENT_ECHO_{}", std::process::id());
+        let policy = AgentLaunchPolicy::new("/bin/echo", &[marker.clone()])
+            .expect("absolute /bin/echo with one literal argument");
+        let size = PtySize::from_raw(24, 80).expect("valid initial size");
+        let mut session =
+            PtySession::spawn_agent(policy, size).expect("spawn the configured agent command");
+
+        let mut output = Vec::new();
+        let mut lifecycle = false;
+        poll_events(
+            &session,
+            Instant::now() + Duration::from_secs(10),
+            &mut output,
+            &mut lifecycle,
+            |bytes, done| done && bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+        );
+        assert!(
+            output.windows(marker.len()).any(|w| w == marker.as_bytes()),
+            "the child's own output must flow through the PTY: {}",
+            String::from_utf8_lossy(&output)
+        );
+        session
+            .shutdown()
+            .expect("bounded shutdown after agent exit");
+        session.shutdown().expect("shutdown remains idempotent");
+    }
+
+    /// A command that does not exist is a typed spawn failure at the seam,
+    /// not a hang and not a silently created session.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn spawn_agent_with_a_missing_program_fails_typed() {
+        let missing = format!("/noren-definitely-missing-agent-{}", std::process::id());
+        let policy =
+            AgentLaunchPolicy::new(&missing, &[]).expect("absolute but nonexistent program");
+        let size = PtySize::from_raw(24, 80).expect("valid initial size");
+        let result = PtySession::spawn_agent(policy, size);
+        assert!(
+            matches!(
+                result,
+                Err(PtyError::Backend {
+                    operation: PtyOperation::SpawnChild
+                })
+            ),
+            "a missing program must fail the spawn, got {result:?}"
+        );
+    }
+
+    /// The arming rendezvous failure is the typed
+    /// `Backend { SpawnThread }` error. A reader that never reports armed
+    /// within the budget is the failure `setup_pty` guards against before
+    /// forking the child; the branch is unreachable through the public API
+    /// in a bounded test (production's budget is five seconds and the armed
+    /// send is the reader's first statement, so only scheduler starvation
+    /// exercises it), so the wait itself is the unit under test: a live
+    /// channel that never arms, with a zero budget, is deterministic.
+    #[test]
+    fn reader_arming_timeout_is_the_typed_spawn_thread_error() {
+        let (armed_tx, armed_rx) = mpsc::sync_channel(1);
+        // Timeout shape: the sender is alive but never reports. The zero
+        // budget makes the deadline immediate; no send can race it because
+        // nothing in this test sends. The sender binding is deliberately
+        // held (not dropped) to the end of the scope: dropping it would
+        // turn this into the Disconnected case below.
+        let _held_sender = armed_tx;
+        assert_eq!(
+            wait_for_reader_armed(armed_rx, Duration::ZERO),
+            Err(PtyError::Backend {
+                operation: PtyOperation::SpawnThread
+            })
+        );
+        // Disconnected shape: a reader that dies before reporting arms the
+        // same typed refusal.
+        let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
+        drop(dropped_tx);
+        assert_eq!(
+            wait_for_reader_armed(dropped_rx, Duration::ZERO),
+            Err(PtyError::Backend {
+                operation: PtyOperation::SpawnThread
+            })
+        );
+    }
+
+    /// The armed report arriving in time is success — the shape every real
+    /// spawn takes.
+    #[test]
+    fn reader_arming_success_is_ok() {
+        let (armed_tx, armed_rx) = mpsc::sync_channel(1);
+        armed_tx.send(()).expect("report armed");
+        assert_eq!(wait_for_reader_armed(armed_rx, READER_ARMED_BUDGET), Ok(()));
     }
 
     #[test]
