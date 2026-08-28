@@ -14,6 +14,9 @@ noren-terminal.workspace = true
 toml_edit.workspace = true
 winit.workspace = true
 wgpu.workspace = true
+# Not a real dependency: the bench harness, optional for the reasons
+# recorded in `crates/noren-terminal/Cargo.toml`.
+criterion = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # `OpenOptionsExt` accepts custom flags but std does not expose their portable
@@ -22,10 +25,11 @@ libc.workspace = true
 
 [features]
 test-support = []
-# Empty by design: a compile gate for the `benches/` targets so `cargo
-# test --workspace` (and CI) never builds the bench harness. Run with
-# `cargo bench -p noren-app --features bench-support`.
-bench-support = []
+# Compile gate for the `benches/` targets and their harness; see the
+# matching comment in `crates/noren-terminal/Cargo.toml` for why the
+# harness is an optional normal dependency rather than a dev-dependency.
+# Run with `cargo bench -p noren-app --features bench-support`.
+bench-support = ["dep:criterion"]
 
 [dev-dependencies]
 # Self-dev-dependency so integration tests (separate crates) can reach the
@@ -39,7 +43,6 @@ noren-app = { path = ".", features = ["test-support"] }
 # TERM_PROGRAM from `noren_pty`'s real `LaunchMetadata` so it cannot drift
 # from the production environment policy.
 portable-pty.workspace = true
-criterion.workspace = true
 
 [[bench]]
 name = "ssh_config"

@@ -34,9 +34,24 @@ Policy, in one line: **benchmarks report; they never gate.**
 ## Running
 
 The harness is `criterion` 0.8.2 (pinned `=`, `cargo_bench_support` only).
-Bench targets are behind the empty `bench-support` feature so that a normal
-`cargo test --workspace` never compiles the harness (verified: identical
-cold-build wall clock before/after adding it).
+It is an **optional dependency** of the two benched crates, activated only
+by their `bench-support` feature; with the feature off (the default),
+`cargo test --workspace` cannot compile it at all.
+
+That optional-dependency placement is load-bearing, and this file once
+claimed it wrongly: `required-features` on the bench *targets* filters
+targets, not the dependency graph, so an earlier revision that kept
+criterion as a plain dev-dependency compiled it on every `cargo test` —
+a measured **+3.8 s** cold-build cost (22.5 s vs 18.7 s,
+`cargo clean` then `cargo test --workspace --no-run` on the reference
+M4), with criterion artifacts present in `target/debug`, despite the
+docs asserting an "identical cold-build wall clock" that had not been
+measured that way. After the move, the same measurement reads
+18.7/19.8/20.2 s without the suite vs 19.7/20.6/20.6 s with it —
+overlapping within the ~1 s run-to-run spread of this method, and zero
+criterion artifacts under `target/debug`. Warm `cargo test` runs are
+unaffected either way; the point of the placement is that the claim and
+the mechanism agree.
 
 ```sh
 # everything (~2 min on the reference M4)
