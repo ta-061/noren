@@ -193,8 +193,19 @@ because it blocks an entire language of user, but the items above it block
 
 ## 7. Issue mapping
 
-Already filed: #196 (sidebar clipping → rank 3), #191 (palette hint → rank 1,
-hint half), #192 (glyph size → rank 7), #190/#189/#188/#185 (related, low).
-Filed from this plan: cursor (rank 2), actionable empty state (rank 1, recovery
-half), selection highlight (rank 4), scrollback navigation/orientation
-(rank 6), IME input (rank 5) — numbers recorded in the plan's commit.
+| Issue | Covers | Rank |
+| --- | --- | --- |
+| #191 | Palette hint (persistent affordance half of rank 1) | 1 |
+| #201 | Actionable empty state (recovery half of rank 1) | 1 |
+| #200 | Terminal cursor | 2 |
+| #196 | Sidebar clipping (layout half of rank 3) | 3 |
+| #202 | Selection highlight | 4 |
+| #204 | IME input | 5 |
+| #203 | Scrollback navigation + orientation | 6 |
+| #192 | Glyph size / bitmap legibility | 7 |
+
+Not yet filed (no defect to file against): user-defined palettes (rank 8),
+semantic styling + Zellij handoff (rank 9), sidebar width configurability
+(the Q2 half of rank 3 — belongs in #196's fix), shell launch policy (M4,
+needs an owner decision, not an issue). Related and already tracked low:
+#190, #189, #188, #185.
