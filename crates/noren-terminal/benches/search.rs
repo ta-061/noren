@@ -14,8 +14,6 @@
 //!
 //! Run with: `cargo bench -p noren-terminal --features bench-support search`.
 
-use std::sync::OnceLock;
-
 use criterion::{Criterion, criterion_group, criterion_main};
 use noren_terminal::{CaseSensitivity, Search, TerminalSnapshot, TerminalState};
 
@@ -56,12 +54,11 @@ fn build_snapshot(hit_every: Option<usize>) -> TerminalSnapshot {
 fn bench_search(c: &mut Criterion) {
     let mut group = c.benchmark_group("search");
 
-    let near_end = OnceLock::new();
-    let near_end = near_end.get_or_init(|| build_snapshot(None));
-    let spread = OnceLock::new();
-    let spread = spread.get_or_init(|| build_snapshot(Some(500)));
-    let miss_corpus = OnceLock::new();
-    let miss_corpus = miss_corpus.get_or_init(|| {
+    // Built once per process, before any timing: only the search itself is
+    // measured.
+    let near_end = build_snapshot(None);
+    let spread = build_snapshot(Some(500));
+    let miss_corpus = {
         // Same volume, needle never present.
         let mut terminal = TerminalState::new(ROWS, COLS).expect("valid grid");
         for seed in 0..LINE_COUNT {
@@ -69,12 +66,12 @@ fn bench_search(c: &mut Criterion) {
             terminal.feed_bytes(b"\r\n");
         }
         terminal.snapshot()
-    });
+    };
 
     group.bench_function("first_hit_near_end", |b| {
         b.iter(|| {
             std::hint::black_box(
-                Search::new(near_end, NEEDLE, CaseSensitivity::InsensitiveAscii).first(),
+                Search::new(&near_end, NEEDLE, CaseSensitivity::InsensitiveAscii).first(),
             )
         })
     });
@@ -82,7 +79,7 @@ fn bench_search(c: &mut Criterion) {
     group.bench_function("all_hits_spread", |b| {
         b.iter(|| {
             std::hint::black_box(
-                Search::new(spread, NEEDLE, CaseSensitivity::InsensitiveAscii).all(),
+                Search::new(&spread, NEEDLE, CaseSensitivity::InsensitiveAscii).all(),
             )
         })
     });
@@ -90,7 +87,7 @@ fn bench_search(c: &mut Criterion) {
     group.bench_function("count_no_hits", |b| {
         b.iter(|| {
             std::hint::black_box(
-                Search::new(miss_corpus, NEEDLE, CaseSensitivity::InsensitiveAscii).count(),
+                Search::new(&miss_corpus, NEEDLE, CaseSensitivity::InsensitiveAscii).count(),
             )
         })
     });

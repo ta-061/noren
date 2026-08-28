@@ -38,8 +38,6 @@
 #[path = "../src/renderer.rs"]
 mod renderer_source;
 
-use std::sync::OnceLock;
-
 use criterion::{Criterion, criterion_group, criterion_main};
 use noren_app::GridGeometry;
 use noren_app::theme::DARK;
@@ -122,15 +120,15 @@ fn full_scrollback_terminal() -> TerminalState {
 fn bench_renderer_frame(c: &mut Criterion) {
     let mut group = c.benchmark_group("renderer_frame");
 
-    let dense = OnceLock::new();
-    let dense = dense.get_or_init(|| (dense_terminal(), sidebar_lines(), STATUS.to_owned()));
-    let idle = OnceLock::new();
-    let idle = idle.get_or_init(|| (idle_terminal(), sidebar_lines(), STATUS.to_owned()));
+    // Built once per process, before any timing: only frame prep and the
+    // snapshot itself are measured.
+    let dense = (dense_terminal(), sidebar_lines(), STATUS.to_owned());
+    let idle = (idle_terminal(), sidebar_lines(), STATUS.to_owned());
     let cell_metrics = metrics();
     let (width, height) = window_size(cell_metrics);
 
     group.bench_function("dense_full_sidebar", |b| {
-        let (terminal, sidebar, status) = dense;
+        let (terminal, sidebar, status) = &dense;
         let snapshot = terminal.snapshot();
         b.iter(|| {
             let target = Target::new(&DARK, width, height, cell_metrics);
@@ -145,7 +143,7 @@ fn bench_renderer_frame(c: &mut Criterion) {
     });
 
     group.bench_function("idle_prompt_sidebar", |b| {
-        let (terminal, sidebar, status) = idle;
+        let (terminal, sidebar, status) = &idle;
         let snapshot = terminal.snapshot();
         b.iter(|| {
             let target = Target::new(&DARK, width, height, cell_metrics);
@@ -164,10 +162,8 @@ fn bench_renderer_frame(c: &mut Criterion) {
 fn bench_snapshot(c: &mut Criterion) {
     let mut group = c.benchmark_group("snapshot");
 
-    let empty = OnceLock::new();
-    let empty = empty.get_or_init(idle_terminal);
-    let full = OnceLock::new();
-    let full = full.get_or_init(full_scrollback_terminal);
+    let empty = idle_terminal();
+    let full = full_scrollback_terminal();
 
     group.bench_function("empty_scrollback_60x160", |b| {
         b.iter(|| std::hint::black_box(empty.snapshot()))
