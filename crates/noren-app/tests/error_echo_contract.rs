@@ -57,7 +57,7 @@ enum ValueEcho {
 
 /// Pinned variant count of [`ConfigError`]; a new variant must extend both
 /// the classifier and the sample table.
-const CONFIG_ERROR_VARIANTS: usize = 22;
+const CONFIG_ERROR_VARIANTS: usize = 26;
 /// Pinned variant count of [`SessionPersistenceError`].
 const SESSION_ERROR_VARIANTS: usize = 14;
 /// Pinned variant count of [`ChordParseError`].
@@ -119,6 +119,13 @@ fn classify_config(error: &ConfigError) -> ValueEcho {
         ConfigError::AgentArgsNotAnArray { .. } => ValueEcho::Never,
         ConfigError::AgentArgNotAString { .. } => ValueEcho::Never,
         ConfigError::AgentCommandNotAbsolute { .. } => ValueEcho::Never,
+        // `[[projects]]` variants carry only key names; the name and root
+        // values never appear (a project root can embed a username or a
+        // private directory name).
+        ConfigError::ProjectTableNotAnArray { .. } => ValueEcho::Never,
+        ConfigError::ProjectFieldMissing { .. } => ValueEcho::Never,
+        ConfigError::ProjectFieldNotAString { .. } => ValueEcho::Never,
+        ConfigError::ProjectRootNotAbsolute { .. } => ValueEcho::Never,
     }
 }
 
@@ -303,6 +310,22 @@ fn config_samples() -> Vec<(ConfigError, ValueEcho)> {
         ),
         (
             ConfigError::AgentCommandNotAbsolute { key: key() },
+            ValueEcho::Never,
+        ),
+        (
+            ConfigError::ProjectTableNotAnArray { key: key() },
+            ValueEcho::Never,
+        ),
+        (
+            ConfigError::ProjectFieldMissing { key: key() },
+            ValueEcho::Never,
+        ),
+        (
+            ConfigError::ProjectFieldNotAString { key: key() },
+            ValueEcho::Never,
+        ),
+        (
+            ConfigError::ProjectRootNotAbsolute { key: key() },
             ValueEcho::Never,
         ),
     ]
@@ -630,6 +653,11 @@ fn config_values_outside_keys_never_reach_display_or_debug() {
         format!("[[agents]]\nname = \"x\"\ncommand = \"{SENTINEL}\"\n"),
         format!("[[agents]]\nname = \"{SENTINEL}\"\ncommand = 5\n"),
         format!("[[agents]]\nname = \"x\"\ncommand = \"/bin/true\"\nargs = [\"{SENTINEL}\", 1]\n"),
+        // `[[projects]]` values: a root can embed a private path, so its
+        // rejections name the key, never the text.
+        format!("[[projects]]\nname = \"x\"\nroot = \"{SENTINEL}\"\n"),
+        format!("[[projects]]\nname = \"{SENTINEL}\"\nroot = 5\n"),
+        format!("[[projects]]\nname = \"x\"\nroot = \"~/{SENTINEL}\"\n"),
     ];
     for text in cases {
         let error = AppConfig::parse(&text).expect_err("every sentinel fixture must fail");
