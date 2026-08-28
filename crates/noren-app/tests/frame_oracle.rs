@@ -839,10 +839,13 @@ fn no_background_keeps_the_existing_pixel_exact_appearance() {
 #[test]
 fn a_dark_coloured_cell_is_still_seen_as_lit() {
     // This is the case the old brightness gate got wrong: ANSI black is a
-    // legitimate foreground whose channels are all far below the old `< 48`
-    // threshold, so a threshold-based oracle would call the cell blank and
-    // agree with a renderer that dropped it. `is_background` now compares to
-    // the clear colour, so the cell reads as lit and the colour is checked.
+    // legitimate foreground whose channels sat far below the old `< 48`
+    // threshold (until issue #168 lifted black to grey 121 for AA), so a
+    // threshold-based oracle would call the cell blank and agree with a
+    // renderer that dropped it. `is_background` compares to the clear
+    // colour, so the cell reads as lit and the colour is checked — against
+    // the fixed palette value, pinned here as a literal so the issue-168
+    // fix is visible at the pixel level too.
     let Some(renderer) = renderer_or_skip("a_dark_coloured_cell_is_still_seen_as_lit") else {
         return;
     };
@@ -859,8 +862,13 @@ fn a_dark_coloured_cell_is_still_seen_as_lit() {
         "SGR 30 should draw palette black {:?}, drew {drawn:?}",
         DARK.ansi()[0]
     );
-    // The old gate would have mistaken this for background; the new one must not.
-    assert!(drawn.iter().all(|channel| *channel < 48));
+    // The issue-168 value: the smallest achromatic grey clearing WCAG AA
+    // (4.53:1) on the dark background — no longer below any brightness gate.
+    assert_eq!(
+        drawn,
+        [121, 121, 121],
+        "palette black must draw the AA-fixed grey 121, not the pre-168 near-zero"
+    );
 }
 
 #[test]

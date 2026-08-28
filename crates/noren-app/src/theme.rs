@@ -43,20 +43,36 @@
 //!   pure white and pure black; a program selecting index 16 has asked for
 //!   that device colour.
 //!
-//! # The dark-palette finding
+//! # The dark-palette fix (issue #168)
 //!
-//! The existing default (`dark`) **fails** the 4.5:1 floor for five of its
-//! sixteen ANSI entries on its own background — ANSI black at 1.06:1, blue
-//! at 2.10:1, red at 3.38:1, bright blue at 4.16:1, and magenta at
-//! 4.21:1. This is reported, not fixed here: the dark values are the xterm
-//! defaults the app shipped with since colour landed (issues #107/#112),
-//! and changing them would change today's rendered pixels, which the
-//! defaults-preservation contract of this slice forbids
-//! ([`tests/frame_oracle.rs`] proves byte-identity). The measured minimum
-//! is pinned by test so any change — fix or regression — is a deliberate,
-//! visible decision. `high-contrast` is the theme users who need AA on
-//! every slot can select today: its minimum is ≥ 7:1 (WCAG AAA for normal
-//! text), strictly exceeding both other themes.
+//! The shipped default (`dark`) used to **fail** the 4.5:1 floor for five of
+//! its sixteen ANSI entries on its own background — ANSI black at 1.06:1,
+//! blue at 2.10:1, red at 3.38:1, bright blue at 4.16:1, and magenta at
+//! 4.21:1 — leaving `\x1b[30m` text effectively invisible on the near-black
+//! ground. Issue #168 resolved the product decision PR #167 had deliberately
+//! deferred: a terminal's default that hides text is a defect, not a
+//! preference, and a preview must not ship one. The five failing entries were
+//! each moved the **minimum distance** that clears 4.5:1 (the smallest u8
+//! value per entry whose ratio reaches the floor), preserving slot
+//! semantics — red stays a pure red ramp value, magenta stays symmetric
+//! R=B, bright blue keeps its R=G lavender balance, black stays achromatic,
+//! and blue keeps red at zero with blue dominant:
+//!
+//! | slot | before | ratio | after | ratio |
+//! | --- | --- | --- | --- | --- |
+//! | black | `[0,0,0]` | 1.06:1 | `[121,121,121]` | 4.53:1 |
+//! | red | `[205,0,0]` | 3.38:1 | `[243,0,0]` | 4.52:1 |
+//! | blue | `[0,0,238]` | 2.10:1 | `[0,113,255]` | 4.52:1 |
+//! | magenta | `[205,0,205]` | 4.21:1 | `[213,0,213]` | 4.50:1 |
+//! | bright blue | `[92,92,255]` | 4.16:1 | `[100,100,255]` | 4.52:1 |
+//!
+//! The theme's measured minimum is now 4.50:1 (magenta, the tightest of the
+//! five minimum moves), pinned by test. One visible consequence is
+//! documented rather than hidden: ANSI black and bright black now sit close
+//! together (`[121,121,121]` vs `[127,127,127]`) because any achromatic
+//! entry clearing 4.5:1 on this background must be at least grey 121 —
+//! bright black itself was already 127. `light` (5.07:1) and `high-contrast`
+//! (7.84:1) are untouched by the fix.
 
 use std::fmt;
 
@@ -89,7 +105,8 @@ const ANSI_SLOT_NAMES: [&str; 16] = [
 /// renders exactly as it did before themes existed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ThemeName {
-    /// Today's palette: xterm ANSI defaults on the near-black background.
+    /// The default palette: xterm ANSI values on the near-black background,
+    /// with the five AA-failing entries minimally brightened (issue #168).
     #[default]
     Dark,
     /// A light background with darkened ANSI entries.
@@ -146,28 +163,31 @@ impl fmt::Display for ThemeName {
     }
 }
 
-/// The sixteen ANSI colours of the dark theme: the xterm defaults, unchanged
-/// since issue #107 wired colour into the renderer.
+/// The sixteen ANSI colours of the dark theme: the xterm defaults the app
+/// shipped since issue #107, with the five entries that failed WCAG AA on
+/// the dark background brightened the minimum distance to clear 4.5:1
+/// (issue #168; see the module docs for the before/after measurements).
 ///
-/// Byte-identity with the pre-theme renderer is load-bearing (see the module
-/// docs); these values are pinned by test.
+/// The foreground/background floats and the shared cube tail below are still
+/// byte-identical to the pre-theme renderer; only these five entries moved,
+/// deliberately. The values are pinned by test.
 const DARK_ANSI: [[u8; 3]; 16] = [
-    [0, 0, 0],
-    [205, 0, 0],
-    [0, 205, 0],
-    [205, 205, 0],
-    [0, 0, 238],
-    [205, 0, 205],
-    [0, 205, 205],
-    [229, 229, 229],
-    [127, 127, 127],
-    [255, 0, 0],
-    [0, 255, 0],
-    [255, 255, 0],
-    [92, 92, 255],
-    [255, 0, 255],
-    [0, 255, 255],
-    [255, 255, 255],
+    [121, 121, 121], // 0 black (was [0,0,0], 1.06:1 — issue #168)
+    [243, 0, 0],     // 1 red (was [205,0,0], 3.38:1 — issue #168)
+    [0, 205, 0],     // 2 green
+    [205, 205, 0],   // 3 yellow
+    [0, 113, 255],   // 4 blue (was [0,0,238], 2.10:1 — issue #168)
+    [213, 0, 213],   // 5 magenta (was [205,0,205], 4.21:1 — issue #168)
+    [0, 205, 205],   // 6 cyan
+    [229, 229, 229], // 7 white
+    [127, 127, 127], // 8 bright black
+    [255, 0, 0],     // 9 bright red
+    [0, 255, 0],     // 10 bright green
+    [255, 255, 0],   // 11 bright yellow
+    [100, 100, 255], // 12 bright blue (was [92,92,255], 4.16:1 — #168)
+    [255, 0, 255],   // 13 bright magenta
+    [0, 255, 255],   // 14 bright cyan
+    [255, 255, 255], // 15 bright white
 ];
 
 /// The dark theme's default foreground, as the exact floats the fragment
@@ -288,7 +308,8 @@ pub struct Theme {
     background: [f32; 3],
 }
 
-/// The built-in `dark` theme: exactly the pre-theme renderer's colours.
+/// The built-in `dark` theme: the pre-theme renderer's colours, except the
+/// five ANSI entries minimally brightened to clear WCAG AA (issue #168).
 pub const DARK: Theme = Theme {
     ansi: DARK_ANSI,
     palette256: &DARK_PALETTE,
