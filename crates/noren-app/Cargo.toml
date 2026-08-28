@@ -46,5 +46,10 @@ name = "ssh_config"
 harness = false
 required-features = ["bench-support"]
 
+[[bench]]
+name = "renderer_frame"
+harness = false
+required-features = ["bench-support"]
+
 [lints]
 workspace = true
