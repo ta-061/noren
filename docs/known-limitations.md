@@ -199,10 +199,13 @@ Each item states what you would actually see if you ran the build.
   The PTY launches `/bin/zsh` with a fixed policy and no caller-controlled
   arguments (`ZSH_PROGRAM` in `crates/noren-pty/src/lib.rs`). Linux support is roadmap intent
   (Milestone 6), not current capability.
-- **Project and agent sessions are not launched.** `SessionKind` models
+- **Worktree, project, and agent sessions launch; the SSH kind does not go
+  through the spawn gate.** `SessionKind` models
   `Local`, `Project`, `Worktree`, `Ssh`, and `Agent`, and `EntryKind` in
   `sidebar.rs` can describe project, worktree, SSH-connection, and agent rows —
-  `Local`, `Worktree`, and `Ssh` have launch paths. The running binary reads bounded
+  `Local`, `Project`, `Worktree`, and `Agent` have launch paths (an SSH
+  launch runs the system client through its own connection path). The
+  running binary reads bounded
   OpenSSH configuration facts and displays configured targets as
   `SidebarEntry::SshConnection` rows. Clicking one validates the alias as an
   `SshDestination` (raw `%h`/`%p`/`%r` tokens are refused with a typed error
@@ -227,15 +230,21 @@ Each item states what you would actually see if you ran the build.
   `(missing)` marker
   and refused on selection — no panic, no child. Worktree sessions persist
   and restore through `sessions.toml` exactly like local ones.
-  Project and agent kinds remain modelled, while agent entries remain
-  reserved fixtures and no agent is launched. In practice: startup owns exactly
-  one local `zsh`, the palette's "New Session" spawns another real local `zsh`,
-  and every local row can take the live view; a restored row cannot (its shell
-  died with the previous launch). Selecting an SSH host row now launches the
-  system `ssh` client in the terminal's PTY (see the SSH section); selecting a
-  worktree row starts a shell in that worktree. A project row or an agent
-  still cannot be opened from the workspace. Milestones 4
-  and 5 own the remaining work.
+  `[[projects]]` configuration entries appear as `EntryKind::Project` rows
+  (at most 24, capped like every other list; the fixed `PRJ-` state prefix
+  distinguishes them from prefix-less worktree rows), and selecting one
+  whose root still exists starts a real `SessionKind::Project` session — the
+  same directory-rooted launch shape as a worktree, with the child's own
+  `pwd` proof; a configured-but-gone root is refused visibly like a deleted
+  worktree. `[[agents]]` entries launch their configured, shell-free argv in
+  a PTY (PR #169). Project and agent sessions persist and restore through
+  `sessions.toml` exactly like every other kind. In practice: startup owns
+  exactly one local `zsh`, the palette's "New Session" spawns another real
+  local `zsh`, and every local row can take the live view; a restored row
+  cannot (its shell died with the previous launch). Selecting an SSH host
+  row launches the system `ssh` client in the terminal's PTY (see the SSH
+  section); selecting a worktree, project, or agent row starts a real
+  session rooted at that row's identity.
 - **The SSH list is not OpenSSH-equivalent discovery.** A readable config can
   legitimately name destinations that do not appear: wildcard or negated
   patterns are matching policy rather than concrete aliases, `Match` and token

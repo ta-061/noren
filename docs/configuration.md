@@ -177,6 +177,48 @@ offending key. The `agents` table must be spelled as an array of tables
 (`[[agents]]`); `agents = [...]` with inline tables is rejected. Error
 messages never echo the field values.
 
+### `[[projects]]`
+
+Configured project entries: each `[[projects]]` table names one project
+with a display `name` and the absolute `root` directory a session starts in
+when the row is selected. Entries appear in file order, between the session
+rows and the worktree rows, capped at 24 rows (the omitted count is reported
+on the status row, exactly like the other bounded lists).
+
+Projects are **configured, not discovered**. A git worktree has an
+authoritative machine-readable source (`git worktree list --porcelain`), so
+worktrees are discovered; a project has no such source — any directory can
+be one — and scanning a directory tree for `.git` folders would be slow,
+unbounded, and would guess at the user's intent. A `[[projects]]` entry is
+the user telling Noren what counts.
+
+| Key | Type | Required | Accepted range | Meaning |
+| --- | --- | --- | --- | --- |
+| `name` | string | yes | 1..=1024 bytes | Display name on the sidebar row. |
+| `root` | string | yes | 1..=1024 bytes, absolute path | Directory the session's shell starts in when the row is selected. |
+
+The `root` must be an absolute path with a leading `/`: neither `~`
+expansion nor resolution against the launch directory is performed, so the
+configured text and the directory the session starts in can never silently
+diverge. Existence is deliberately not checked at load time — a configured
+root whose directory is gone is a runtime fact, refused visibly when the
+row is selected (exactly like a registered-but-deleted worktree), not a
+load-time guess.
+
+A project row is visually distinguishable from a worktree row: it carries
+the fixed eight-character state prefix (`PRJ-OFF` idle, `PRJ-ERR` after a
+refused launch) like the SSH and agent rows, while a worktree row shows its
+checkout's final path component and branch.
+
+Rejections follow the same hard-error discipline: an entry missing `name`
+or `root`, a wrong-typed field, a relative or tilde-relative `root`, an
+empty or oversized field, or an unknown key inside an entry is an error
+naming the offending key. The table must be spelled as an array of tables
+(`[[projects]]`); `projects = [...]` with inline tables is rejected. Error
+messages never echo the field values — a root can embed a username or a
+private directory name, so neither `Debug` output nor any error `Display`
+prints it.
+
 ### Rejected keys, by design
 
 - **`[terminal]` / `scrollback_lines`.** Scrollback retention is enforced
@@ -201,6 +243,14 @@ session_create = "ctrl+shift+t"
 
 [theme]
 name = "light"
+
+[[projects]]
+name = "noren"
+root = "/Users/dev/noren"
+
+[[projects]]
+name = "zellij"
+root = "/Users/dev/tooling/zellij"
 
 [[agents]]
 name = "claude"
@@ -231,12 +281,14 @@ command = "/opt/homebrew/bin/aider"
 
 - **No shell selection.** The threat model (TM-01) fixes the shell spawn at
   `/bin/zsh` with structured argv and accepts no configured additions, so
-  there is no shell key and none may be added. The `[[agents]]` `command` is
-  a different, explicit surface: a program the user asks Noren to launch,
-  executed as a shell-free argv vector with an absolute path (see the
-  `[[agents]]` section above).
-- **No credentials.** No key names a credential, key, or sensitive path; the
-  schema exposes no path keys at all.
+  there is no shell key and none may be added. The `[[agents]]` `command`
+  and the `[[projects]]` `root` are different, explicit surfaces: a program
+  the user asks Noren to launch and a directory the user asks Noren to open,
+  validated (absolute, bounded) and never echoed in errors or `Debug`
+  output.
+- **No credentials.** No key names a credential, key, or other sensitive
+  value; the only path-shaped keys are the agent `command` and the project
+  `root` described above.
 - **No raised ceilings.** `MAX_SCROLLBACK_LINES` and `MAX_SCREEN_CELLS` stay
   hard caps. Configuration has no key that touches the scrollback ceiling
   (the rejected `[terminal]` table), and every grid derived from cell sizes

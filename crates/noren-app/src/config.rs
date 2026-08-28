@@ -46,15 +46,30 @@
 //! deliberately not performed, so a writable `PATH` entry cannot substitute a
 //! different binary.
 //!
+//! The `[[projects]]` array configures project sidebar entries: a display
+//! `name` and the absolute `root` directory a session starts in when the row
+//! is selected. Projects are configured, not discovered, because a project
+//! has no authoritative machine-readable source (unlike a worktree, whose
+//! source of truth is `git worktree list --porcelain`): scanning a directory
+//! tree for `.git` folders would be slow, unbounded, and would guess at the
+//! user's intent. The same discipline applies — unknown keys are rejected,
+//! every value is type- and range-checked, the root must be an absolute path
+//! (leading `/`; neither `~` expansion nor relative resolution against the
+//! launch directory is performed, so the configured text and the launched
+//! directory can never silently diverge), and the root text is never echoed
+//! in any error message or `Debug` output.
+//!
 //! # Privacy
 //!
 //! Configuration carries no secrets: no supported key names a credential,
-//! key, or other sensitive path, and the schema deliberately exposes no path
-//! keys at all. The shell program is **not** configurable: the threat model
-//! (TM-01) fixes the spawn at `/bin/zsh` with no configured additions. An
-//! agent `command` is a different surface: it names a program the user
-//! explicitly asked Noren to launch, and it is validated (absolute, bounded,
-//! shell-free argv) rather than forbidden.
+//! key, or other sensitive value. The shell program is **not** configurable:
+//! the threat model (TM-01) fixes the spawn at `/bin/zsh` with no configured
+//! additions. The two path-shaped surfaces — an agent `command` and a project
+//! `root` — are different in kind from a credential: each names a program or
+//! directory the user explicitly asked Noren to launch or open, and each is
+//! validated (absolute, bounded) rather than forbidden. A path can still
+//! embed a username or a private directory name, so neither surface is ever
+//! echoed through an error `Display` or a `Debug` rendering (issue #146).
 
 use crate::passthrough::{
     CLAIM_ID_PALETTE, Chord, ChordError, ChordSeq, KeyCode, Modifiers, PassthroughAction,
@@ -108,6 +123,17 @@ const MAX_ERROR_DETAIL_CHARS: usize = 120;
 /// policy re-enforces the same cap at its own layer — and a pin test
 /// below holds the two constants equal so the layers can never diverge.
 pub const MAX_AGENT_FIELD_BYTES: usize = 1024;
+
+/// Maximum accepted bytes for one `[[projects]]` string field (`name` or
+/// `root`).
+///
+/// Policy, like [`MAX_AGENT_FIELD_BYTES`] and [`MAX_CELL_EDGE`]: keeps a
+/// single field from monopolizing the bounded 64 KiB read, and gives the
+/// sidebar label arithmetic the same reasonable worst case as an agent name.
+/// Longer values are [`ConfigError::OutOfRange`] errors, never truncated.
+/// A pin test below holds this equal to [`MAX_AGENT_FIELD_BYTES`] so the
+/// two array-of-tables sections cannot drift apart.
+pub const MAX_PROJECT_FIELD_BYTES: usize = 1024;
 
 /// Font geometry settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,6 +321,51 @@ impl AgentConfig {
     }
 }
 
+/// One configured project: a display name plus the absolute root directory a
+/// session starts in when the project's sidebar row is selected.
+///
+/// The root is a directory path the user explicitly asked Noren to open, so
+/// it is validated (absolute, bounded) rather than forbidden — the same
+/// reasoning that admits an agent `command`. It is never checked for
+/// existence at load time: a configured-but-missing directory is a runtime
+/// fact, refused visibly when the row is selected (exactly like a
+/// registered-but-deleted worktree), not a load-time guess.
+///
+/// # Debug discipline
+///
+/// [`fmt::Debug`] is shape-only (issue #146): the name is user-authored file
+/// text, and a root can embed a username or a private directory name, so
+/// neither is printed. Use the accessors for real values.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProjectConfig {
+    name: String,
+    root: String,
+}
+
+impl fmt::Debug for ProjectConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProjectConfig")
+            .field("name_chars", &self.name.chars().count())
+            .field("root_chars", &self.root.chars().count())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProjectConfig {
+    /// The display name shown on the project's sidebar row.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The absolute root directory, as the configuration spelled it. The
+    /// launch layer validates it (absolute, existing directory) again.
+    #[must_use]
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+}
+
 /// Validated application configuration.
 ///
 /// [`AppConfig::default`] is byte-for-byte the behavior the app had before
@@ -305,6 +376,7 @@ pub struct AppConfig {
     keys: KeymapConfig,
     theme: ThemeConfig,
     agents: Vec<AgentConfig>,
+    projects: Vec<ProjectConfig>,
 }
 
 impl AppConfig {
@@ -330,6 +402,12 @@ impl AppConfig {
     #[must_use]
     pub fn agents(&self) -> &[AgentConfig] {
         &self.agents
+    }
+
+    /// Configured projects, in file order. Empty when `[projects]` is absent.
+    #[must_use]
+    pub fn projects(&self) -> &[ProjectConfig] {
+        &self.projects
     }
 
     /// Load configuration from the standard path or the [`CONFIG_ENV_VAR`]
@@ -377,9 +455,11 @@ impl AppConfig {
         let mut config = Self::default();
         for (key, item) in document.as_table().iter() {
             match key {
-                // `[[agents]]` is an array of tables, not a table, so it is
-                // matched before the table-like conversion below.
+                // `[[agents]]` and `[[projects]]` are arrays of tables, not
+                // tables, so they are matched before the table-like
+                // conversion below.
                 "agents" => parse_agents(item, &mut config.agents)?,
+                "projects" => parse_projects(item, &mut config.projects)?,
                 _ => {
                     let table = item
                         .as_table_like()
@@ -464,6 +544,56 @@ fn agent_string_field(key: &str, item: &Item) -> Result<String, ConfigError> {
         .as_str()
         .ok_or_else(|| ConfigError::AgentFieldNotAString { key: clip(key) })?;
     if text.is_empty() || text.len() > MAX_AGENT_FIELD_BYTES {
+        return Err(ConfigError::OutOfRange { key: clip(key) });
+    }
+    Ok(text.to_owned())
+}
+
+/// Apply the `[[projects]]` array to the configured project list.
+///
+/// The array spelling is the only accepted form (`projects = [...]` with
+/// inline tables is rejected, not silently reinterpreted), every entry must
+/// carry a string `name` and a string absolute `root`, and unknown entry keys
+/// are rejected like every other unknown key in this schema. The root must
+/// start with `/`: neither `~` expansion nor resolution against the launch
+/// directory is performed, so the configured text and the directory the
+/// session starts in can never silently diverge.
+fn parse_projects(item: &Item, projects: &mut Vec<ProjectConfig>) -> Result<(), ConfigError> {
+    let entries = item
+        .as_array_of_tables()
+        .ok_or_else(|| ConfigError::ProjectTableNotAnArray {
+            key: clip("projects"),
+        })?;
+    for entry in entries.iter() {
+        let mut name: Option<String> = None;
+        let mut root: Option<String> = None;
+        for (key, value) in entry.iter() {
+            match key {
+                "name" => name = Some(project_string_field(key, value)?),
+                "root" => {
+                    let root_text = project_string_field(key, value)?;
+                    if !root_text.starts_with('/') {
+                        return Err(ConfigError::ProjectRootNotAbsolute { key: clip(key) });
+                    }
+                    root = Some(root_text);
+                }
+                _ => return Err(ConfigError::UnknownKey(clip(key))),
+            }
+        }
+        let name = name.ok_or_else(|| ConfigError::ProjectFieldMissing { key: clip("name") })?;
+        let root = root.ok_or_else(|| ConfigError::ProjectFieldMissing { key: clip("root") })?;
+        projects.push(ProjectConfig { name, root });
+    }
+    Ok(())
+}
+
+/// Read one required `[[projects]]` string field (`name` or `root`),
+/// enforcing the shared type and length rules.
+fn project_string_field(key: &str, item: &Item) -> Result<String, ConfigError> {
+    let text = item
+        .as_str()
+        .ok_or_else(|| ConfigError::ProjectFieldNotAString { key: clip(key) })?;
+    if text.is_empty() || text.len() > MAX_PROJECT_FIELD_BYTES {
         return Err(ConfigError::OutOfRange { key: clip(key) });
     }
     Ok(text.to_owned())
@@ -1095,6 +1225,23 @@ pub enum ConfigError {
     /// and `PATH` lookup is deliberately not performed, so the only accepted
     /// shape is a leading `/`.
     AgentCommandNotAbsolute { key: String },
+    /// `projects` is present but is not an array of tables spelled
+    /// `[[projects]]`.
+    ///
+    /// No file text appears beyond the fixed key name.
+    ProjectTableNotAnArray { key: String },
+    /// A `[[projects]]` entry omits a required key (`name` or `root`).
+    ProjectFieldMissing { key: String },
+    /// A `[[projects]]` string field holds the wrong TOML type.
+    ProjectFieldNotAString { key: String },
+    /// The `root` of a `[[projects]]` entry is not an absolute path.
+    ///
+    /// The rejected text never appears: neither `~` expansion nor resolution
+    /// against the launch directory is performed, so the only accepted shape
+    /// is a leading `/`. A root can embed a username or a private directory
+    /// name, so echoing it would leak exactly what this schema keeps out of
+    /// diagnostics.
+    ProjectRootNotAbsolute { key: String },
 }
 
 impl fmt::Display for ConfigError {
@@ -1176,6 +1323,25 @@ impl fmt::Display for ConfigError {
                 f,
                 "configuration key {key} inside [[agents]] must be an absolute path with a \
                  leading '/'; PATH lookup is deliberately not performed"
+            ),
+            Self::ProjectTableNotAnArray { key } => write!(
+                f,
+                "configuration key {key} must be an array of tables spelled [[projects]]"
+            ),
+            Self::ProjectFieldMissing { key } => {
+                write!(f, "a [[projects]] entry is missing required key: {key}")
+            }
+            Self::ProjectFieldNotAString { key } => {
+                write!(
+                    f,
+                    "configuration key {key} inside [[projects]] must be a string"
+                )
+            }
+            Self::ProjectRootNotAbsolute { key } => write!(
+                f,
+                "configuration key {key} inside [[projects]] must be an absolute path with a \
+                 leading '/'; neither '~' expansion nor resolution against the launch \
+                 directory is performed"
             ),
         }
     }
@@ -2301,5 +2467,191 @@ mod tests {
         let policy = noren_pty::AgentLaunchPolicy::new(&command, &[arg])
             .expect("a schema-accepted element always fits the policy");
         assert_eq!(policy.args().len(), 1);
+    }
+
+    // ── [[projects]] tests ─────────────────────────────────────────────
+
+    /// With no `[[projects]]` entries the configured list is empty — exactly
+    /// the pre-projects behavior.
+    #[test]
+    fn default_config_has_no_projects() {
+        assert!(AppConfig::default().projects().is_empty());
+        assert!(
+            AppConfig::parse("# nothing\n")
+                .expect("valid")
+                .projects()
+                .is_empty()
+        );
+        // A bare `[[projects]]` header is one empty entry, and an entry
+        // without its required keys is a typed error, not a skipped row.
+        assert!(
+            AppConfig::parse("[[projects]]\n")
+                .expect_err("an empty entry lacks required keys")
+                .to_string()
+                .contains("missing required key")
+        );
+    }
+
+    #[test]
+    fn projects_parse_in_file_order_with_name_and_root() {
+        let config = AppConfig::parse(
+            "[[projects]]\nname = \"noren\"\nroot = \"/Users/dev/noren\"\n\
+             [[projects]]\nname = \"zellij\"\nroot = \"/Users/dev/tooling/zellij\"\n",
+        )
+        .expect("valid projects configuration");
+        let projects = config.projects();
+        assert_eq!(projects.len(), 2, "file order is preserved");
+        assert_eq!(projects[0].name(), "noren");
+        assert_eq!(projects[0].root(), "/Users/dev/noren");
+        assert_eq!(projects[1].name(), "zellij");
+        assert_eq!(projects[1].root(), "/Users/dev/tooling/zellij");
+        // The rest of the configuration is untouched.
+        assert_eq!(config.font(), FontConfig::default());
+        assert_eq!(config.keys(), KeymapConfig::default());
+        // Projects compose with agents in one file.
+        let combined = AppConfig::parse(
+            "[[agents]]\nname = \"a\"\ncommand = \"/bin/true\"\n\
+             [[projects]]\nname = \"p\"\nroot = \"/srv/p\"\n",
+        )
+        .expect("both arrays are valid together");
+        assert_eq!(combined.agents().len(), 1);
+        assert_eq!(combined.projects().len(), 1);
+    }
+
+    #[test]
+    fn project_entries_reject_each_malformed_shape_with_a_typed_error() {
+        let cases = [
+            (
+                "projects = 3\n",
+                ConfigError::ProjectTableNotAnArray {
+                    key: "projects".to_owned(),
+                },
+            ),
+            (
+                "[projects]\nname = \"x\"\n",
+                ConfigError::ProjectTableNotAnArray {
+                    key: "projects".to_owned(),
+                },
+            ),
+            (
+                "projects = [{ name = \"x\", root = \"/srv/x\" }]\n",
+                ConfigError::ProjectTableNotAnArray {
+                    key: "projects".to_owned(),
+                },
+            ),
+            (
+                "[[projects]]\nroot = \"/srv/x\"\n",
+                ConfigError::ProjectFieldMissing {
+                    key: "name".to_owned(),
+                },
+            ),
+            (
+                "[[projects]]\nname = \"x\"\n",
+                ConfigError::ProjectFieldMissing {
+                    key: "root".to_owned(),
+                },
+            ),
+            (
+                "[[projects]]\nname = 5\nroot = \"/srv/x\"\n",
+                ConfigError::ProjectFieldNotAString {
+                    key: "name".to_owned(),
+                },
+            ),
+            (
+                "[[projects]]\nname = \"x\"\nroot = \"srv/x\"\n",
+                ConfigError::ProjectRootNotAbsolute {
+                    key: "root".to_owned(),
+                },
+            ),
+            (
+                "[[projects]]\nname = \"x\"\nroot = \"~/dev/x\"\n",
+                ConfigError::ProjectRootNotAbsolute {
+                    key: "root".to_owned(),
+                },
+            ),
+            (
+                "[[projects]]\nname = \"x\"\nroot = \"/srv/x\"\nextra = 1\n",
+                ConfigError::UnknownKey("extra".to_owned()),
+            ),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(AppConfig::parse(text), Err(expected), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn project_string_fields_are_range_checked_like_every_other_value() {
+        let oversize = "a".repeat(MAX_PROJECT_FIELD_BYTES + 1);
+        for hostile in [
+            "[[projects]]\nname = \"\"\nroot = \"/srv/x\"\n".to_owned(),
+            "[[projects]]\nname = \"x\"\nroot = \"\"\n".to_owned(),
+            format!("[[projects]]\nname = \"{oversize}\"\nroot = \"/srv/x\"\n"),
+            format!("[[projects]]\nname = \"x\"\nroot = \"/{oversize}\"\n"),
+        ] {
+            let result = AppConfig::parse(&hostile);
+            assert!(
+                matches!(result, Err(ConfigError::OutOfRange { .. })),
+                "{hostile:.60?}… must be rejected as out of range, got {result:?}"
+            );
+        }
+        // The cap itself is accepted; a root's cap includes its leading `/`,
+        // like an agent command's.
+        let at_cap = "a".repeat(MAX_PROJECT_FIELD_BYTES);
+        let root_at_cap = "a".repeat(MAX_PROJECT_FIELD_BYTES - 1);
+        assert!(
+            AppConfig::parse(&format!(
+                "[[projects]]\nname = \"{at_cap}\"\nroot = \"/{root_at_cap}\"\n"
+            ))
+            .is_ok()
+        );
+    }
+
+    /// Project fields are file values: no error surface may echo them, and
+    /// the configuration's own Debug is shape-only (issue #146).
+    #[test]
+    fn project_values_never_reach_errors_or_config_debug() {
+        const SENTINEL: &str = "NOREN-PROJECT-VALUE-hunter2";
+        let cases = [
+            // Relative root: the typed refusal names the key, not the text.
+            format!("[[projects]]\nname = \"x\"\nroot = \"{SENTINEL}\"\n"),
+            // Tilde root: still not absolute, still key-only.
+            format!("[[projects]]\nname = \"x\"\nroot = \"~/{SENTINEL}\"\n"),
+            // Wrong-typed fields name the key only.
+            format!("[[projects]]\nname = \"{SENTINEL}\"\nroot = 5\n"),
+            format!("[[projects]]\nname = 5\nroot = \"/{SENTINEL}\"\n"),
+        ];
+        for text in cases {
+            let error = AppConfig::parse(&text).expect_err("every sentinel fixture fails");
+            let display = error.to_string();
+            assert!(
+                !display.contains(SENTINEL),
+                "Display must not echo project values: {display}"
+            );
+            let debug = format!("{error:?}");
+            assert!(
+                !debug.contains(SENTINEL),
+                "Debug must not echo project values: {debug}"
+            );
+        }
+        // A VALID configuration never prints its fields through Debug either.
+        let config = AppConfig::parse(&format!(
+            "[[projects]]\nname = \"{SENTINEL}\"\nroot = \"/Users/{SENTINEL}/p\"\n"
+        ))
+        .expect("valid");
+        let rendered = format!("{config:?}");
+        assert!(
+            !rendered.contains(SENTINEL),
+            "ProjectConfig Debug leaked file text: {rendered}"
+        );
+    }
+
+    /// The two array-of-tables field caps are one policy: a project field can
+    /// never outgrow the bound an agent field is held to, and vice versa.
+    #[test]
+    fn project_field_cap_matches_the_agent_field_cap() {
+        assert_eq!(
+            MAX_PROJECT_FIELD_BYTES, MAX_AGENT_FIELD_BYTES,
+            "the [[projects]] and [[agents]] field caps must not drift apart"
+        );
     }
 }

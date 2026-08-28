@@ -1979,6 +1979,7 @@ fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_
             app.status,
             app.ssh_selection_status.as_deref(),
             app.worktree_diagnostic.as_deref(),
+            app.project_diagnostic.as_deref(),
             app.agent_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
@@ -2012,6 +2013,7 @@ fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_
         app.status,
         app.ssh_selection_status.as_deref(),
         app.worktree_diagnostic.as_deref(),
+        app.project_diagnostic.as_deref(),
         app.agent_diagnostic.as_deref(),
         app.ssh_diagnostic.as_deref(),
     );
@@ -2098,6 +2100,7 @@ fn post_startup_ssh_diagnostic_status_row_agrees_with_hit_testing_and_yields_to_
             app.status,
             app.ssh_selection_status.as_deref(),
             app.worktree_diagnostic.as_deref(),
+            app.project_diagnostic.as_deref(),
             app.agent_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
@@ -2168,6 +2171,7 @@ fn selecting_an_ssh_row_keeps_a_pending_choice_and_never_a_registry_connection()
             app.status,
             app.ssh_selection_status.as_deref(),
             app.worktree_diagnostic.as_deref(),
+            app.project_diagnostic.as_deref(),
             app.agent_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
@@ -5045,15 +5049,17 @@ fn worktree_session_paths(app: &NorenApp) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Row order is FIXED — sessions first, then discovered worktree facts, then
-/// configured SSH hosts, then configured agents — and the click-path offset
-/// arithmetic silently depends on it, so the rendered order is pinned here
-/// with all four kinds present at once, including each kind's internal order
-/// (registry order, git listing order, config order). Agent-kind sessions
-/// render as ordinary session rows; a configured agent row (`EntryKind::Agent`)
-/// appears only for `[[agents]]` configuration entries.
+/// Row order is FIXED — sessions first, then configured project facts, then
+/// discovered worktree facts, then configured SSH hosts, then configured
+/// agents — and the click-path offset arithmetic silently depends on it, so
+/// the rendered order is pinned here with all five kinds present at once,
+/// including each kind's internal order (registry order, configuration
+/// order, git listing order). Agent-kind sessions render as ordinary
+/// session rows; a configured agent row (`EntryKind::Agent`) appears only
+/// for `[[agents]]` configuration entries, and a configured project row
+/// (`EntryKind::Project`) only for `[[projects]]` entries.
 #[test]
-fn sidebar_rows_render_sessions_then_worktrees_then_ssh_hosts_then_agents() {
+fn sidebar_rows_render_sessions_then_projects_worktrees_ssh_hosts_agents() {
     let fixture = SshConfigFixture::new();
     fixture.write_new(b"Host zulu\nHost alpha\n");
     let records = git_worktree::parse_worktree_porcelain(
@@ -5062,11 +5068,13 @@ fn sidebar_rows_render_sessions_then_worktrees_then_ssh_hosts_then_agents() {
          \nworktree /srv/mix-b\ndetached\n",
     )
     .expect("synthetic porcelain parses");
-    let config = AppConfig::parse(
-        "[[agents]]\nname = \"m-one\"\ncommand = \"/bin/true\"\n\
+    let project_roots = project_directories(2);
+    let config = AppConfig::parse(&format!(
+        "{}\n[[agents]]\nname = \"m-one\"\ncommand = \"/bin/true\"\n\
          [[agents]]\nname = \"m-two\"\ncommand = \"/bin/true\"\n",
-    )
-    .expect("valid agents configuration");
+        projects_toml(&project_roots),
+    ))
+    .expect("valid projects and agents configuration");
 
     let mut app = NorenApp::new(config);
     app.workspace
@@ -5085,6 +5093,8 @@ fn sidebar_rows_render_sessions_then_worktrees_then_ssh_hosts_then_agents() {
         vec![
             EntryKind::Session,
             EntryKind::Session,
+            EntryKind::Project,
+            EntryKind::Project,
             EntryKind::Worktree,
             EntryKind::Worktree,
             EntryKind::Worktree,
@@ -5093,11 +5103,21 @@ fn sidebar_rows_render_sessions_then_worktrees_then_ssh_hosts_then_agents() {
             EntryKind::Agent,
             EntryKind::Agent,
         ],
-        "the fixed order is sessions, worktrees, SSH hosts, then agents"
+        "the fixed order is sessions, projects, worktrees, SSH hosts, agents"
     );
+    // Project rows keep the configuration's declaration order and carry the
+    // fixed state prefix and detail, never the root path.
+    assert_eq!(
+        rows[2..4]
+            .iter()
+            .map(|row| row.label().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["PRJ-OFF pr-00", "PRJ-OFF pr-01"]
+    );
+    assert_eq!(rows[2].detail(), Some("not running"));
     // Worktree rows keep git's listing order (main first).
     assert_eq!(
-        rows[2..5]
+        rows[4..7]
             .iter()
             .map(|row| row.label().to_owned())
             .collect::<Vec<_>>(),
@@ -5105,7 +5125,7 @@ fn sidebar_rows_render_sessions_then_worktrees_then_ssh_hosts_then_agents() {
     );
     // SSH rows keep the config's declaration order.
     assert_eq!(
-        rows[5..7]
+        rows[7..9]
             .iter()
             .map(|row| row.label().to_owned())
             .collect::<Vec<_>>(),
@@ -5114,35 +5134,63 @@ fn sidebar_rows_render_sessions_then_worktrees_then_ssh_hosts_then_agents() {
     // Agent rows keep the configuration's declaration order (short names:
     // the label target budget is six characters, like an SSH target's).
     assert_eq!(
-        rows[7..9]
+        rows[9..11]
             .iter()
             .map(|row| row.label().to_owned())
             .collect::<Vec<_>>(),
         vec!["AGT-OFF m-one", "AGT-OFF m-two"]
     );
-    assert_eq!(rows[7].detail(), Some("not running"));
+    assert_eq!(rows[9].detail(), Some("not running"));
     assert!(
         app.agent_diagnostic.is_none(),
         "an in-cap agent list adds no notice"
     );
+    assert!(
+        app.project_diagnostic.is_none(),
+        "an in-cap project list adds no notice"
+    );
+    for root in &project_roots {
+        let _ = std::fs::remove_dir(root);
+    }
+}
+
+/// The roots of every registry session launched from a project row, in
+/// registry order — the observable identity of WHICH project row a click
+/// selected. (A model-only Project-kind session created directly by a test
+/// also appears here, exactly as the registry records it.)
+fn project_session_roots(app: &NorenApp) -> Vec<PathBuf> {
+    app.workspace
+        .registry()
+        .sessions()
+        .iter()
+        .filter_map(|descriptor| match descriptor.kind() {
+            SessionKind::Project { root } => Some(root.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Clicking each row kind in a mixed sidebar must select the row the user
 /// actually clicked — the default sidebar shape of this repository, which
-/// holds sessions, worktrees, SSH hosts, and configured agents at once. The
-/// boundaries are asserted explicitly: the last worktree row, the first SSH
-/// row, the last SSH row, the first and last agent rows, and the row
-/// immediately after the last agent row (a dead click that must select
-/// nothing, not wrap).
+/// holds sessions, configured projects, worktrees, SSH hosts, and configured
+/// agents at once. The boundaries are asserted explicitly: the first and
+/// last project rows, the last worktree row, the first SSH row, the last SSH
+/// row, the first and last agent rows, and the row immediately after the
+/// last agent row (a dead click that must select nothing, not wrap).
 ///
 /// Mutation checks:
-/// - dropping `+ worktree_rows` from `select_ssh_sidebar_row` makes the
+/// - dropping `+ self.projects.len()` (the project offset) from
+///   `worktree_sidebar_row` makes a worktree click resolve to a PROJECT row
+///   or dead-click instead of the worktree the user pointed at;
+/// - dropping `+ project_rows` from `select_ssh_sidebar_row` makes the
 ///   first-SSH-row click resolve to a DIFFERENT host (the host list here is
 ///   longer than the worktree list, so the misresolved index lands on a
 ///   real host, not a dead click);
-/// - dropping `+ self.ssh_hosts.len()` from `agent_sidebar_row` (the agent
+/// - dropping `+ self.projects.len()` from `agent_sidebar_row` (the agent
 ///   block's offset arithmetic) makes the first-agent-row click a dead
-///   click or an SSH connect instead of an agent launch;
+///   click, a project launch, or an SSH connect instead of an agent launch;
+/// - dropping the session-row offset from `project_sidebar_row` resolves a
+///   session click to a project row and launches instead of selecting;
 /// - dropping the session-row offset from `worktree_sidebar_row` resolves a
 ///   worktree click to another worktree's row;
 /// - dropping the session bound from `local_sidebar_session` makes
@@ -5157,17 +5205,22 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
     let worktree_paths = mixed_worktree_directories(3);
     let records = git_worktree::parse_worktree_porcelain(&synthetic_porcelain(&worktree_paths))
         .expect("synthetic porcelain parses");
+    // Two configured projects whose launches are real; their observable
+    // identity is the launched session's root directory.
+    let project_paths = project_directories(2);
     // Two configured agents whose launches are real, cheap, and immediate.
     let config = AppConfig::parse(&format!(
-        "[[agents]]\nname = \"mix-agent-one\"\ncommand = \"/bin/echo\"\nargs = [\"{}\"]\n\
+        "{}[[agents]]\nname = \"mix-agent-one\"\ncommand = \"/bin/echo\"\nargs = [\"{}\"]\n\
          [[agents]]\nname = \"mix-agent-two\"\ncommand = \"/bin/echo\"\nargs = [\"{}\"]\n",
-        "MIX-AGENT-ONE", "MIX-AGENT-TWO"
+        projects_toml(&project_paths),
+        "MIX-AGENT-ONE",
+        "MIX-AGENT-TWO"
     ))
-    .expect("valid agents configuration");
+    .expect("valid projects and agents configuration");
 
     // The deterministic seam keeps SSH row clicks from spawning any process;
-    // worktree and agent row clicks really launch (that is their observable
-    // identity).
+    // project, worktree, and agent row clicks really launch (that is their
+    // observable identity).
     let mut app = app_with_deterministic_ssh_seam_and_config(config);
     app.workspace
         .load_worktrees(WorktreeDiscovery::from_records(records));
@@ -5179,12 +5232,13 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
         }),
     ];
 
-    // Layout: rows 0-1 sessions, rows 2-4 worktrees, rows 5-9 SSH hosts,
-    // rows 10-11 configured agents.
+    // Layout: rows 0-1 sessions, rows 2-3 configured projects, rows 4-6
+    // worktrees, rows 7-11 SSH hosts, rows 12-13 configured agents.
     assert_eq!(
         app.workspace.sidebar().rows().len(),
-        12,
-        "two session rows, three worktree rows, five SSH rows, two agent rows"
+        14,
+        "two session rows, two project rows, three worktree rows, five SSH \
+         rows, two agent rows"
     );
 
     // Session rows select their own session, first and last alike.
@@ -5193,32 +5247,59 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
     assert!(click_sidebar_row(&mut app, 1), "the last session row");
     assert_eq!(app.workspace.registry().selected(), Some(sessions[1]));
 
-    // First SSH row (row 5): selects the FIRST host, and never moves the
-    // registry selection.
-    assert!(click_sidebar_row(&mut app, 5), "the first SSH row");
+    // First project row (row 2): launches a session rooted at the FIRST
+    // configured root — the created session's Project root is the observable
+    // identity of WHICH row the click resolved to. (The second session row
+    // is itself a model-only Project-kind row at /srv/noren, so it leads the
+    // recorded roots.)
+    assert!(click_sidebar_row(&mut app, 2), "the first project row");
+    assert_eq!(
+        project_session_roots(&app),
+        vec![PathBuf::from("/srv/noren"), project_paths[0].clone()],
+        "the click launches the project the user pointed at"
+    );
+
+    // Each launch adds a session row, shifting the rows below: with three
+    // sessions the project block occupies rows 3-4. Last project row (4):
+    // launches the SECOND configured root.
+    assert!(click_sidebar_row(&mut app, 4), "the last project row");
+    assert_eq!(
+        project_session_roots(&app),
+        vec![
+            PathBuf::from("/srv/noren"),
+            project_paths[0].clone(),
+            project_paths[1].clone(),
+        ],
+        "the last project row launches the second project, not the first again"
+    );
+
+    // With four sessions the layout is sessions 0-3, projects 4-5, worktrees
+    // 6-8, SSH 9-13, agents 14-15. First SSH row (9): selects the FIRST
+    // host, and never moves the registry selection (still the last launched
+    // project's own session).
+    let selected_before_ssh = app.workspace.registry().selected();
+    assert!(click_sidebar_row(&mut app, 9), "the first SSH row");
     assert_eq!(app.workspace.selected_ssh_target(), Some("alpha"));
     assert_eq!(
         app.workspace.registry().selected(),
-        Some(sessions[1]),
+        selected_before_ssh,
         "an SSH row click never selects a registry session"
     );
-    // Last SSH row (row 9): selects the LAST host.
-    assert!(click_sidebar_row(&mut app, 9), "the last SSH row");
+    // Last SSH row (13): selects the LAST host.
+    assert!(click_sidebar_row(&mut app, 13), "the last SSH row");
     assert_eq!(app.workspace.selected_ssh_target(), Some("echo"));
 
-    // First agent row (row 10): launches the FIRST configured agent — the
-    // created session's Agent name is the observable identity of WHICH row
-    // the click resolved to.
-    assert!(click_sidebar_row(&mut app, 10), "the first agent row");
+    // First agent row (14): launches the FIRST configured agent.
+    assert!(click_sidebar_row(&mut app, 14), "the first agent row");
     assert_eq!(
         agent_session_names(&app),
         vec!["mix-agent-one".to_owned()],
         "the click launches the agent the user pointed at"
     );
 
-    // Each launch adds a session row, shifting the rows below: with three
-    // sessions the agent block occupies rows 11-12. Last agent row.
-    assert!(click_sidebar_row(&mut app, 12), "the last agent row");
+    // Each launch adds a session row, shifting the rows below: with five
+    // sessions the agent block occupies rows 15-16. Last agent row.
+    assert!(click_sidebar_row(&mut app, 16), "the last agent row");
     assert_eq!(
         agent_session_names(&app),
         vec!["mix-agent-one".to_owned(), "mix-agent-two".to_owned()],
@@ -5229,16 +5310,17 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
         "the two agent clicks resolved to two DIFFERENT agents"
     );
 
-    // Row 14 — immediately after the last agent row (with four sessions the
-    // layout is sessions 0-3, worktrees 4-6, SSH 7-11, agents 12-13) —
-    // selects nothing: not a session, not a host, not an agent, no
-    // wrap-around, and no state changes at all. (The agent launches already
-    // cleared the pending SSH choice by selecting their own sessions, so
-    // the invariant here is that a dead click changes NOTHING.)
+    // Row 18 — immediately after the last agent row (with six sessions the
+    // layout is sessions 0-5, projects 6-7, worktrees 8-10, SSH 11-15,
+    // agents 16-17) — selects nothing: not a session, not a project, not a
+    // host, not an agent, no wrap-around, and no state changes at all. (The
+    // launches already cleared the pending SSH choice by selecting their own
+    // sessions, so the invariant here is that a dead click changes NOTHING.)
     let registry_len = app.workspace.registry().len();
     let selected = app.workspace.registry().selected();
+    let project_roots = project_session_roots(&app);
     assert!(
-        !click_sidebar_row(&mut app, 14),
+        !click_sidebar_row(&mut app, 18),
         "the row after the last agent row is a dead click"
     );
     assert_eq!(
@@ -5251,28 +5333,33 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
         registry_len,
         "a dead click must not create a session"
     );
+    assert_eq!(
+        project_session_roots(&app),
+        project_roots,
+        "a dead click must not launch a project"
+    );
 
-    // Last worktree row (row 6 with four sessions): launches a session
+    // Last worktree row (row 10 with six sessions): launches a session
     // rooted at the THIRD worktree — the row the user clicked, not the one
     // an offset error would resolve to.
-    assert!(click_sidebar_row(&mut app, 6), "the last worktree row");
+    assert!(click_sidebar_row(&mut app, 10), "the last worktree row");
     assert_eq!(
         worktree_session_paths(&app),
         vec![worktree_paths[2].clone()],
         "the click launches the worktree the user pointed at"
     );
 
-    // With five sessions the worktree block occupies rows 5-7. First
+    // With seven sessions the worktree block occupies rows 9-11. First
     // worktree row.
-    assert!(click_sidebar_row(&mut app, 5), "the first worktree row");
+    assert!(click_sidebar_row(&mut app, 9), "the first worktree row");
     assert_eq!(
         worktree_session_paths(&app),
         vec![worktree_paths[2].clone(), worktree_paths[0].clone()]
     );
 
-    // With six sessions the worktree block occupies rows 6-8; the middle
-    // worktree is row 7.
-    assert!(click_sidebar_row(&mut app, 7), "a middle worktree row");
+    // With eight sessions the worktree block occupies rows 10-12; the middle
+    // worktree is row 11.
+    assert!(click_sidebar_row(&mut app, 11), "a middle worktree row");
     assert_eq!(
         worktree_session_paths(&app),
         vec![
@@ -5282,26 +5369,42 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
         ]
     );
 
-    // After the launches the accumulated counts changed (seven sessions),
-    // so the SSH and agent boundaries are re-asserted at their new offsets:
-    // sessions 0-6, worktrees 7-9, SSH 10-14, agents 15-16.
+    // After the launches the accumulated counts changed (nine sessions), so
+    // the project, SSH, and agent boundaries are re-asserted at their new
+    // offsets: sessions 0-8, projects 9-10, worktrees 11-13, SSH 14-18,
+    // agents 19-20.
     assert_eq!(
         app.workspace.sidebar().rows().len(),
-        17,
-        "seven session rows, three worktree rows, five SSH rows, two agent rows"
+        21,
+        "nine session rows, two project rows, three worktree rows, five SSH \
+         rows, two agent rows"
     );
-    assert!(click_sidebar_row(&mut app, 10), "the first SSH row again");
+    assert!(
+        click_sidebar_row(&mut app, 9),
+        "the first project row again"
+    );
+    assert_eq!(
+        project_session_roots(&app).last(),
+        Some(&project_paths[0]),
+        "the project offset must track the grown session block"
+    );
+    // That launch grew the session block again (ten sessions): sessions
+    // 0-9, projects 10-11, worktrees 12-14, SSH 15-19, agents 20-21.
+    assert!(click_sidebar_row(&mut app, 15), "the first SSH row again");
     assert_eq!(
         app.workspace.selected_ssh_target(),
         Some("alpha"),
         "the SSH offset must track the grown session block"
     );
     assert!(
-        !click_sidebar_row(&mut app, 17),
+        !click_sidebar_row(&mut app, 22),
         "the row after the last agent row stays dead after the shifts"
     );
 
     for path in &worktree_paths {
+        let _ = std::fs::remove_dir(path);
+    }
+    for path in &project_paths {
         let _ = std::fs::remove_dir(path);
     }
 }
@@ -5414,6 +5517,7 @@ fn many_configured_agents_are_capped_and_the_omitted_count_is_reported() {
             app.status,
             app.ssh_selection_status.as_deref(),
             app.worktree_diagnostic.as_deref(),
+            app.project_diagnostic.as_deref(),
             app.agent_diagnostic.as_deref(),
             app.ssh_diagnostic.as_deref(),
         ),
@@ -5719,4 +5823,443 @@ fn agent_commands_never_reach_debug_status_or_state_surfaces() {
         "the agent NAME is the persisted identity, like a worktree path: {text}"
     );
     cleanup_state_file(&path);
+}
+
+// ── Configured projects ([[projects]]) ──────────────────────────────────
+
+/// The `[[projects]]` TOML body for one entry per root. The roots are
+/// canonicalized before they are written, so the configured text, the
+/// session's launch shape, and the child's own `pwd` answer all name the
+/// same directory (`std::env::temp_dir` on macOS is a symlink whose
+/// canonical form is what a shell reports).
+fn projects_toml(roots: &[PathBuf]) -> String {
+    let mut text = String::new();
+    for (index, root) in roots.iter().enumerate() {
+        let canonical = std::fs::canonicalize(root).expect("canonicalize project root");
+        text.push_str(&format!(
+            "[[projects]]\nname = \"pr-{index:02}\"\nroot = \"{}\"\n",
+            canonical.display()
+        ));
+    }
+    text
+}
+
+/// A synthetic `[[projects]]` configuration with one entry per root, each
+/// with a real temp directory so a row click can launch into it.
+fn many_projects_config(roots: &[PathBuf]) -> AppConfig {
+    AppConfig::parse(&projects_toml(roots)).expect("synthetic projects configuration parses")
+}
+
+/// Real directories for configured projects: a project row click launches a
+/// session rooted at the configured directory, so the directory must exist
+/// for the launch to succeed. The returned paths are canonical, so a
+/// launched session's root and the fixture path compare equal
+/// (`std::env::temp_dir` on macOS is a symlink whose canonical form is what
+/// a shell reports).
+fn project_directories(count: usize) -> Vec<PathBuf> {
+    (0..count)
+        .map(|index| {
+            let path = std::env::temp_dir().join(format!(
+                "noren-app-project-{}-{}-{index}",
+                std::process::id(),
+                WT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).expect("create project directory fixture");
+            std::fs::canonicalize(&path).expect("canonicalize project directory fixture")
+        })
+        .collect()
+}
+
+/// Configured projects appear as `EntryKind::Project` rows in configuration
+/// order with bounded labels — and are distinguishable at a glance from
+/// worktree rows shown beside them: a project row carries the fixed
+/// `PRJ-OFF` state prefix and a fixed state detail, while a worktree row
+/// shows its checkout's final path component and its branch. The row kinds
+/// are distinct discriminants, so they can never collide.
+#[test]
+fn configured_projects_appear_as_rows_distinguishable_from_worktrees() {
+    let roots = project_directories(2);
+    let config = many_projects_config(&roots);
+    let mut app = NorenApp::new(config);
+    // Worktree facts beside the project rows (pure parsing; no git child).
+    let records = git_worktree::parse_worktree_porcelain(
+        "worktree /srv/pr-main\nbranch refs/heads/pr-main\n\
+         \nworktree /srv/pr-linked\nbranch refs/heads/pr-linked\n",
+    )
+    .expect("synthetic porcelain parses");
+    app.workspace
+        .load_worktrees(WorktreeDiscovery::from_records(records));
+
+    let rows = app.workspace.sidebar().rows();
+    let kinds: Vec<EntryKind> = rows.iter().map(|row| row.kind()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            EntryKind::Project,
+            EntryKind::Project,
+            EntryKind::Worktree,
+            EntryKind::Worktree,
+        ],
+        "project rows render before worktree rows, kinds never colliding"
+    );
+    // Configuration order is preserved; the label is the shared
+    // state-prefix + name shape; the detail is a fixed state, never the
+    // configured root path.
+    assert_eq!(rows[0].label(), "PRJ-OFF pr-00");
+    assert_eq!(rows[0].detail(), Some("not running"));
+    assert_eq!(rows[1].label(), "PRJ-OFF pr-01");
+    // A worktree row beside them has no state prefix and a branch detail:
+    // the two kinds of directory-rooted rows are visually distinct. (The
+    // synthetic worktree directories do not exist, so the detail carries the
+    // honest missing-directory marker.)
+    assert_eq!(rows[2].label(), "pr-main");
+    assert_eq!(rows[2].detail(), Some("pr-main (missing)"));
+    assert_ne!(rows[0].kind(), rows[2].kind());
+    assert!(
+        !rows[2].label().starts_with("PRJ-"),
+        "a worktree row never carries the project state prefix"
+    );
+    for root in &roots {
+        let _ = std::fs::remove_dir(root);
+    }
+}
+
+/// An overlong project name is truncated with the shared ASCII marker
+/// inside the label budget, exactly like an agent name or an SSH target.
+#[test]
+fn configured_project_labels_are_bounded_like_agent_labels() {
+    let roots = project_directories(1);
+    let config = AppConfig::parse(&format!(
+        "[[projects]]\nname = \"a-very-long-project-name-that-exceeds-the-budget\"\nroot = \"{}\"\n",
+        roots[0].display()
+    ))
+    .expect("valid configuration");
+    let app = NorenApp::new(config);
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].label(), "PRJ-OFF a-v...");
+    let _ = std::fs::remove_dir(&roots[0]);
+}
+
+/// More configured projects than the sidebar cap keep the first rows in
+/// configuration order and report the cap and the omitted count on the
+/// status row, exactly like the bounded agent, SSH host, and worktree lists.
+#[test]
+fn many_configured_projects_are_capped_and_the_omitted_count_is_reported() {
+    let cap = MAX_PROJECT_SIDEBAR_ROWS;
+    let roots = project_directories(cap + 2);
+    let config = many_projects_config(&roots);
+    let mut app = NorenApp::new(config);
+
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(
+        rows.len(),
+        cap,
+        "the sidebar keeps exactly the capped row count"
+    );
+    assert_eq!(rows[0].label(), "PRJ-OFF pr-00");
+    assert_eq!(
+        rows[cap - 1].label(),
+        format!("PRJ-OFF pr-{:02}", cap - 1),
+        "the retained block is the FIRST {cap} in configuration order"
+    );
+    assert_eq!(
+        app.workspace.projects_omitted, 2,
+        "beyond-cap projects are counted, not silently dropped"
+    );
+    let notice = app
+        .project_diagnostic
+        .as_deref()
+        .expect("the cap is reported on the status row");
+    assert!(
+        notice.contains("showing first 24") && notice.contains("2 omitted"),
+        "the notice names the cap and the omitted count: {notice}"
+    );
+    // The notice owns the status row whenever no runtime status shows.
+    app.show_status = false;
+    assert_eq!(app.status_row(), StatusRowSource::ProjectDiagnostic);
+    for root in &roots {
+        let _ = std::fs::remove_dir(root);
+    }
+}
+
+/// Selecting a project row must START a session whose working directory IS
+/// the configured root — verified by reading the child's own `pwd` answer
+/// back through the terminal, never by inferring it from the code path.
+///
+/// Mutation checks: making the click add a model row without spawning (no
+/// PTY, no `Running` observation), or starting the child anywhere other
+/// than the configured root, fails the assertions below.
+#[cfg(target_os = "macos")]
+#[test]
+fn selecting_a_project_row_starts_a_session_in_that_directory() {
+    let roots = project_directories(1);
+    let config = many_projects_config(&roots);
+    let home = AppTestHome::new();
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..NorenApp::new(config)
+    };
+
+    assert!(
+        click_sidebar_row(&mut app, 0),
+        "the project row is consumed"
+    );
+
+    // The launch created a real Project-kind session that owns the live
+    // surface and is observed Running, carrying the configured root (the
+    // configuration wrote the canonical form, so every surface agrees).
+    let canonical = std::fs::canonicalize(&roots[0]).expect("canonicalize the project root");
+    let ids = registry_ids(&app);
+    assert_eq!(ids.len(), 1, "one registry session from the project row");
+    let id = ids[0];
+    assert_eq!(
+        app.workspace.registry().get(id).map(|d| d.kind().clone()),
+        Some(SessionKind::Project {
+            root: canonical.clone()
+        }),
+        "the session's launch shape carries the configured project root"
+    );
+    assert_eq!(session_status(&app, id), SessionStatus::Running);
+    assert_eq!(app.active_session, Some(id));
+    assert!(app.pty.is_some(), "the project session owns a real PTY");
+
+    // Read the child's ACTUAL working directory back: wait for the shell,
+    // ask it, and search the terminal text for its own answer. The path the
+    // session claims and the directory the child reports must agree. The
+    // grid wraps long lines across rows, so the comparison strips the row
+    // separators a wrap inserts — a wrapped path must still match whole.
+    wait_for_shell_output(&mut app);
+    app.send_input(b"pwd\n");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.drain_pty();
+        let answered = app.terminal.as_ref().is_some_and(|terminal| {
+            let unwrapped = terminal_text(terminal).replace(['\r', '\n'], "");
+            unwrapped.contains(canonical.display().to_string().as_str())
+        });
+        if answered {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child's own pwd never reported the project root\n\
+             expected: the terminal text to contain the project root {}\n\
+             received: terminal said: {}",
+            canonical.display(),
+            app.terminal.as_ref().map(terminal_text).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = std::fs::remove_dir(&roots[0]);
+}
+
+/// A configured root whose directory no longer exists is refused before any
+/// session or child exists — a visible failure on the row and the status
+/// row, exactly like a registered-but-deleted worktree. Never a hang, never
+/// a session row, never a silent no-op.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_project_row_with_a_missing_directory_is_a_visible_failure_never_a_session() {
+    let missing_root =
+        std::env::temp_dir().join(format!("noren-missing-project-{}", std::process::id()));
+    let config = AppConfig::parse(&format!(
+        "[[projects]]\nname = \"ghost\"\nroot = \"{}\"\n",
+        missing_root.display()
+    ))
+    .expect("valid configuration");
+    let mut app = NorenApp::new(config);
+
+    // The click returns promptly (a hang fails the test runner's deadline);
+    // nothing was spawned and no session exists.
+    assert!(
+        click_sidebar_row(&mut app, 0),
+        "the project row is consumed even when the launch is refused"
+    );
+
+    // The refusal is first-class on every surface a user can see.
+    assert_eq!(app.status, "Noren project directory missing");
+    assert!(app.show_status, "the refusal must be visible");
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(rows[0].kind(), EntryKind::Project);
+    assert_eq!(rows[0].label(), "PRJ-ERR ghost");
+    assert_eq!(rows[0].detail(), Some("launch failed"));
+    assert!(
+        app.workspace.registry().is_empty(),
+        "a refused launch must not create a session row"
+    );
+    assert!(
+        app.pty.is_none(),
+        "a refused launch must leave no PTY behind"
+    );
+}
+
+/// A project root (and name) can embed a username or a private directory
+/// name. Every debug and status surface the configured-project flow can
+/// reach must stay free of the root. The persisted sessions.toml file
+/// deliberately DOES carry the root of a launched session — it is the
+/// user's own private state and exactly what restoration needs, the same
+/// class as a worktree path; the redaction discipline governs Debug and
+/// error output, not the state file.
+#[cfg(target_os = "macos")]
+#[test]
+fn project_paths_never_reach_debug_or_status_surfaces() {
+    let secret = format!("NOREN-PRJ-hunter2-{}", std::process::id());
+    let root = std::env::temp_dir().join(format!("{secret}/proj"));
+    std::fs::create_dir_all(&root).expect("create secret-shaped project root");
+    let config = AppConfig::parse(&format!(
+        "[[projects]]\nname = \"{secret}\"\nroot = \"{}\"\n",
+        root.display()
+    ))
+    .expect("valid configuration");
+
+    let home = AppTestHome::new();
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..NorenApp::new(config)
+    };
+
+    // The workspace (configured projects, sidebar view) never prints it.
+    assert!(
+        !format!("{:?}", app.workspace).contains(&secret),
+        "workspace debug leaked the project root"
+    );
+
+    // A launch selects the session and persists the structural change; the
+    // app-level debug surface still never prints it.
+    assert!(
+        click_sidebar_row(&mut app, 0),
+        "the project row is consumed"
+    );
+    assert!(
+        !format!("{:?}", app.workspace).contains(&secret),
+        "workspace debug leaked the project root after the launch"
+    );
+    // A registry session of this shape (the state a launch or a restore
+    // leaves behind) never prints it through the descriptor either.
+    let ids = registry_ids(&app);
+    let rendered = format!("{:?}", app.workspace.registry().get(ids[0]));
+    assert!(
+        !rendered.contains(&secret),
+        "descriptor debug leaked the project root: {rendered}"
+    );
+    assert!(
+        rendered.contains("Project"),
+        "not vacuous — the descriptor still names its shape: {rendered}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Quitting with a project session beside a local, a worktree, and an agent
+/// session persists ALL FOUR creatable kinds through the real sessions.toml
+/// path — quit does not erase them — and the next launch restores every kind
+/// intact. (The fifth kind, SSH, never enters the registry by design; its
+/// round-trip is covered by the persistence suite's five-kind test,
+/// `round_trip_preserves_every_entry_kind_and_the_selection`.) This is also
+/// the direct guard that the project launch path did not reintroduce the
+/// historic quit-path erase: teardown must save exactly the sessions it had.
+#[cfg(target_os = "macos")]
+#[test]
+fn quitting_persists_project_sessions_beside_every_creatable_kind() {
+    let project_paths = project_directories(1);
+    let worktree_paths = mixed_worktree_directories(1);
+    let worktree_records =
+        git_worktree::parse_worktree_porcelain(&synthetic_porcelain(&worktree_paths))
+            .expect("synthetic porcelain parses");
+    let config = AppConfig::parse(&format!(
+        "{}[[agents]]\nname = \"persist-agent\"\ncommand = \"/bin/echo\"\nargs = [\"NOREN-PERSIST\"]\n",
+        projects_toml(&project_paths)
+    ))
+    .expect("valid projects and agents configuration");
+    let path = temp_state_path();
+    let home = AppTestHome::new();
+    let mut app = NorenApp {
+        test_pty_home: Some(home.0.clone()),
+        ..app_with_deterministic_ssh_seam_and_config(config)
+    };
+    app.workspace.state_path = Some(path.clone());
+    app.workspace
+        .load_worktrees(WorktreeDiscovery::from_records(worktree_records));
+
+    // One local session (palette), then the project row (row 1), the
+    // worktree row (row 3 after the project launch), and the agent row
+    // (row 5 after the worktree launch).
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    assert!(click_sidebar_row(&mut app, 1), "the project row launches");
+    assert!(click_sidebar_row(&mut app, 3), "the worktree row launches");
+    assert!(click_sidebar_row(&mut app, 5), "the agent row launches");
+    let ids = registry_ids(&app);
+    assert_eq!(ids.len(), 4);
+    for id in &ids {
+        assert_eq!(session_status(&app, *id), SessionStatus::Running);
+    }
+
+    app.teardown();
+
+    let text = std::fs::read_to_string(&path).expect("state saved on quit");
+    assert_eq!(
+        text.matches("kind = \"local\"").count(),
+        1,
+        "the local session still persists: {text}"
+    );
+    assert_eq!(
+        text.matches("kind = \"project\"").count(),
+        1,
+        "the project session persists with its kind: {text}"
+    );
+    assert!(
+        text.contains(&format!("root = \"{}\"", project_paths[0].display())),
+        "the project entry carries its root for restoration: {text}"
+    );
+    assert_eq!(
+        text.matches("kind = \"worktree\"").count(),
+        1,
+        "the worktree session persists with its kind: {text}"
+    );
+    assert_eq!(
+        text.matches("kind = \"agent\"").count(),
+        1,
+        "the agent session persists with its kind: {text}"
+    );
+
+    // The next launch restores all four rows as Restored with intact kinds —
+    // the project root survives the round-trip byte for byte.
+    let relaunched = sidebar_after_relaunch(&path);
+    assert_eq!(relaunched.registry().len(), 4);
+    let kinds: Vec<SessionKind> = relaunched
+        .registry()
+        .sessions()
+        .iter()
+        .map(|descriptor| descriptor.kind().clone())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            SessionKind::Local,
+            SessionKind::Project {
+                root: project_paths[0].clone()
+            },
+            SessionKind::Worktree {
+                path: worktree_paths[0].clone()
+            },
+            SessionKind::Agent {
+                name: "persist-agent".to_owned()
+            },
+        ]
+    );
+    for descriptor in relaunched.registry().sessions() {
+        assert_eq!(
+            descriptor.status(),
+            &SessionStatus::Restored,
+            "a relaunched row must be Restored, never a phantom Running"
+        );
+    }
+    cleanup_state_file(&path);
+    for path in &worktree_paths {
+        let _ = std::fs::remove_dir(path);
+    }
+    for path in &project_paths {
+        let _ = std::fs::remove_dir(path);
+    }
 }
