@@ -12,7 +12,11 @@ Only evidence-backed work is marked complete.
 | 4 — SSH and remote | OpenSSH configuration, connections, reconnect, remote panes, daemon decision/PoC and recovery | In progress — bounded, explicitly partial literal-alias discovery landed, and selecting an alias launches the fixed system `ssh` client in the terminal's PTY (PR #138); reconnect, remote panes, the daemon decision/PoC, and recovery are not started |
 | 5 — Agent experience | Launchers, verified adapters, trustworthy state, notifications and jump-to-source | In progress — the first launcher slice landed: `[[agents]]` configuration rows launch a configured, shell-free argv command in a real PTY (`AgentLaunchPolicy` requires an absolute program path, no shell, no `PATH` lookup; a missing or non-executable command is a visible per-row and status-row failure; agent sessions persist through `sessions.toml`). Verified adapters, trustworthy state, notifications, and jump-to-source are not started |
 | 6 — Themes and accessibility | Light/dark/high-contrast palettes, contrast checks, IME/CJK/HiDPI and keyboard/accessibility work | In progress — the foundation slice landed: `[theme]` selects built-in `dark`/`light`/`high-contrast` palettes with measured, test-pinned WCAG contrast floors (`theme.rs`, `crates/noren-app/tests/theme.rs`; the default `dark` palette still fails AA on five slots, pinned deliberately as issue #168), and CJK display width is verified end to end through real pixels (`crates/noren-app/tests/frame_oracle.rs`). IME input is still discarded, and HiDPI, keyboard accessibility, custom palettes, and colour-vision-friendly work remain not started |
-| 7 — Quality | Unit/integration/compatibility/fault/security/visual tests, fuzzing, soak tests and benchmarks | In progress — the benchmark slice landed (PR #171): a criterion suite over the paths with a defect history (`feed_bytes`, `ssh_config_parse` incl. the #137 shape, renderer frame prep, per-frame `snapshot`, `search`) behind a `bench-support` feature gate with a recorded reference-machine baseline and a report-never-gate policy ([docs/testing/benchmarks.md](docs/testing/benchmarks.md)); its first finding (46.3 ms per-frame `snapshot` at full scrollback, filed as #172) has since been remediated — `TerminalSnapshot::from_state` shares scrollback rows instead of deep-copying them. A seeded soak harness (`crates/noren-terminal/tests/soak_feed_bytes.rs`) and a hand-rolled, dependency-free fuzz harness with a decoded-content oracle (`crates/noren-terminal/tests/fuzz_feed_bytes.rs`) landed; the fuzz campaign's first finding — SD/SU/DL strand the cursor on a wide-character continuation cell — is open as #176. Visual suites remain not started |
+| 7 — Quality | Unit/integration/compatibility/fault/security/visual tests, fuzzing, soak tests and benchmarks | In progress — the benchmark slice landed (PR #171): a criterion suite over the paths with a defect history (`feed_bytes`, `ssh_config_parse` incl. the #137 shape, renderer frame prep, per-frame `snapshot`, `search`) behind a `bench-support` feature gate with a recorded reference-machine baseline and a report-never-gate policy ([docs/testing/benchmarks.md](docs/testing/benchmarks.md)); its first finding (46.3 ms per-frame `snapshot` at full scrollback, filed as #172) has since been remediated — `TerminalSnapshot::from_state` shares scrollback rows instead of deep-copying them. A seeded soak harness (`crates/noren-terminal/tests/soak_feed_bytes.rs`) and a hand-rolled, dependency-free fuzz harness with a decoded-content oracle (`crates/noren-terminal/tests/fuzz_feed_bytes.rs`) landed; the fuzz campaign's first finding — SD/SU/DL stranding the cursor
+on a wide-character continuation cell — is remediated at this tree: those
+operations now end in the same shared `snap_cursor_to_lead` re-snap as
+LF/IND/NEL/RI, pinned one per operation in
+`crates/noren-terminal/tests/unicode_width.rs`. Visual suites remain not started |
 | 8 — Public Preview | Honest docs/site, binaries, checksums, release review, known limitations and `0.1.0-preview` | Not started; scope decided by [D-M8-001](docs/coordination/decisions/D-M8-001-preview-scope.md) |
 
 A renderer-independent terminal state core is merged as PR
@@ -231,7 +235,14 @@ against it:
   the **correct** two-column width, pinned through real pixels by
   `cjk_text_occupies_two_cells_per_character_and_fails_visibly_not_corruptingly`
   and its wide-character and combining-mark neighbours in
-  `crates/noren-app/tests/frame_oracle.rs`, but with no glyphs. Rendering
+  `crates/noren-app/tests/frame_oracle.rs`, but with no glyphs. The
+  layout side of the CJK path, by contrast, holds end to end at this
+  tree: every row-shifting operation — LF, IND, NEL, RI, and the
+  fuzz-found SU, SD, DL — ends in the shared `snap_cursor_to_lead`
+  re-snap (`crates/noren-terminal/src/state.rs`), with one pin per
+  operation in `crates/noren-terminal/tests/unicode_width.rs`, so the
+  cursor is never stranded on a continuation cell. The blocker is
+  glyphs, not layout. Rendering
   real CJK needs a real font stack, which is deliberately not claimed.
   Seven glyph pairs remain visually identical by an allowlisted collision
   set (pinned by
@@ -254,13 +265,6 @@ against it:
   sidebar's own). Selection is tracked and copies correctly but is never
   highlighted. A terminal in which a stranger cannot see the cursor, cannot
   scroll back, and cannot see their selection is not preview-ready.
-- **An open correctness defect sits on the CJK layout path.** `CSI T` (SD),
-  `CSI S` (SU), and `CSI M` (DL) shift rows without re-snapping the cursor
-  to a wide character's lead cell, so the cursor can be stranded on a
-  continuation cell — the very contract the frame oracle pins. Found by the
-  parser fuzz harness (`crates/noren-terminal/tests/fuzz_feed_bytes.rs`),
-  reported as issue #176, and deliberately not yet fixed. It is reachable
-  by any pager or TUI that scrolls a region while CJK text is on screen.
 - **The FR-005 rendered-frame oracle exists and runs, and its boundary is
   the honesty requirement.** It drives the real `wgpu` pipeline offscreen
   (`crates/noren-app/src/renderer_capture.rs`,
