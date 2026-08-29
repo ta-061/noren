@@ -1,4 +1,4 @@
-//! DEC private mouse tracking (1000/1002/1003) and encoding (1005/1006/1015)
+//! DEC private mouse tracking (9/1000/1002/1003) and encoding (1005/1006/1015)
 //! mode tracking in terminal state.
 //!
 //! The terminal holds the mode state only; generating mouse reports stays in
@@ -13,12 +13,25 @@ use noren_terminal::TerminalState;
 fn mouse_modes_default_to_disabled() {
     let state = TerminalState::new(2, 4).expect("valid terminal");
     let modes = state.modes();
+    assert!(!modes.is_mouse_x10_tracking_enabled());
     assert!(!modes.is_mouse_normal_tracking_enabled());
     assert!(!modes.is_mouse_button_event_tracking_enabled());
     assert!(!modes.is_mouse_any_event_tracking_enabled());
     assert!(!modes.is_mouse_utf8_encoding_enabled());
     assert!(!modes.is_mouse_sgr_encoding_enabled());
     assert!(!modes.is_mouse_urxvt_encoding_enabled());
+}
+
+#[test]
+fn x10_mouse_tracking_mode_9_toggles_with_decset_and_decrst() {
+    let mut state = TerminalState::new(2, 4).expect("valid terminal");
+
+    state.feed_bytes(b"\x1b[?9h");
+    assert!(state.modes().is_mouse_x10_tracking_enabled());
+    assert!(!state.modes().is_mouse_normal_tracking_enabled());
+
+    state.feed_bytes(b"\x1b[?9l");
+    assert!(!state.modes().is_mouse_x10_tracking_enabled());
 }
 
 #[test]
