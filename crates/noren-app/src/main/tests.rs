@@ -1261,6 +1261,306 @@ fn palette_text_lines_show_selection_marker() {
     );
 }
 
+// ── Scrollback viewport input and ownership ──────────────────────────
+
+fn history_terminal(rows: u16, cols: u16) -> TerminalState {
+    let mut terminal = TerminalState::new(rows, cols).expect("valid history terminal");
+    terminal.feed_bytes(b"A\r\nB\r\nC\r\nD\r\nE\r\nF");
+    assert!(terminal.scrollback_len() >= 3, "fixture retains history");
+    terminal
+}
+
+#[test]
+fn default_and_configured_scrollback_chords_drive_the_live_offset() {
+    let mut app = NorenApp {
+        terminal: Some(history_terminal(3, 4)),
+        ..Default::default()
+    };
+    let page_up = gate_chord(GateKeyCode::PageUp, GateModifiers::empty().shift());
+    let page_down = gate_chord(GateKeyCode::PageDown, GateModifiers::empty().shift());
+
+    assert!(app.handle_scrollback_chord(page_up));
+    assert_eq!(app.scroll_offset, 3, "one page is the three-row viewport");
+    assert!(app.handle_scrollback_chord(page_down));
+    assert_eq!(app.scroll_offset, 0, "page down reaches the live tail");
+
+    let config =
+        AppConfig::parse("[keys]\nscroll_page_up = \"ctrl+u\"\nscroll_page_down = \"ctrl+j\"\n")
+            .expect("valid scrollback rebinds");
+    let mut rebound = NorenApp {
+        terminal: Some(history_terminal(3, 4)),
+        ..NorenApp::new(config)
+    };
+    assert!(
+        !rebound.handle_scrollback_chord(page_up),
+        "the compiled default is released after rebinding"
+    );
+    assert!(rebound.handle_scrollback_chord(gate_chord(
+        GateKeyCode::Char('u'),
+        GateModifiers::empty().ctrl(),
+    )));
+    assert_eq!(rebound.scroll_offset, 3);
+    assert!(rebound.handle_scrollback_chord(gate_chord(
+        GateKeyCode::Char('j'),
+        GateModifiers::empty().ctrl(),
+    )));
+    assert_eq!(rebound.scroll_offset, 0);
+}
+
+#[test]
+fn scrolling_past_both_ends_clamps_without_blank_offsets() {
+    let terminal = history_terminal(3, 4);
+    let history_len = terminal.scrollback_len();
+    let mut app = NorenApp {
+        terminal: Some(terminal),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        app.scroll_view(ScrollDirection::Older, usize::MAX),
+        (0, history_len)
+    );
+    assert_eq!(
+        app.scroll_view(ScrollDirection::Older, 1),
+        (history_len, history_len)
+    );
+    assert_eq!(
+        app.scroll_view(ScrollDirection::Newer, usize::MAX),
+        (history_len, 0)
+    );
+    assert_eq!(app.scroll_view(ScrollDirection::Newer, 1), (0, 0));
+}
+
+#[test]
+fn new_output_follows_at_zero_but_preserves_a_deliberate_history_view() {
+    let mut terminal = TerminalState::new(2, 4).expect("valid terminal");
+    terminal.feed_bytes(b"A\r\nB\r\nC");
+    let mut app = NorenApp {
+        terminal: Some(terminal),
+        ..Default::default()
+    };
+    app.scroll_view(ScrollDirection::Older, 1);
+    assert_eq!(app.scroll_offset, 1);
+
+    app.apply_pty_output(b"\r\nD");
+    assert_eq!(
+        app.scroll_offset, 1,
+        "ordinary output must not yank a deliberate history view to latest"
+    );
+
+    app.scroll_view(ScrollDirection::Newer, 1);
+    assert_eq!(app.scroll_offset, 0);
+    app.apply_pty_output(b"\r\nE");
+    assert_eq!(
+        app.scroll_offset, 0,
+        "offset zero remains the automatic live tail"
+    );
+}
+
+#[test]
+fn alternate_screen_resets_history_and_forwards_scrollback_chords() {
+    let mut app = NorenApp {
+        terminal: Some(history_terminal(3, 6)),
+        ..Default::default()
+    };
+    app.scroll_view(ScrollDirection::Older, 2);
+    assert_eq!(app.scroll_offset, 2);
+
+    app.apply_pty_output(b"\x1b[?1049hALT");
+    assert_eq!(
+        app.scroll_offset, 0,
+        "alternate screen rejoins live content"
+    );
+    assert!(
+        !app.handle_scrollback_chord(gate_chord(
+            GateKeyCode::PageUp,
+            GateModifiers::empty().shift(),
+        )),
+        "alternate-screen application receives Shift+PageUp unchanged"
+    );
+    app.apply_pty_output(b"\x1b[?1049l");
+    assert_eq!(app.scroll_offset, 0, "primary screen resumes at latest");
+}
+
+#[test]
+fn resize_while_scrolled_preserves_offset_and_wide_history_cells() {
+    let mut terminal = TerminalState::new(2, 6).expect("valid terminal");
+    terminal.feed_bytes("日A\r\n語B\r\n界C".as_bytes());
+    assert_eq!(terminal.scrollback_len(), 1);
+    let mut app = NorenApp {
+        terminal: Some(terminal),
+        ..Default::default()
+    };
+    app.scroll_offset = 1;
+
+    let grid = app
+        .geometry
+        .update(Resize::new(200, 80))
+        .expect("resize changes the window grid");
+    app.pending_grid = Some(grid);
+    app.apply_pending_resize();
+
+    assert_eq!(app.scroll_offset, 1, "valid history offset survives resize");
+    let snapshot = app.terminal.as_ref().expect("terminal retained").snapshot();
+    let oldest = snapshot.scrollback().first().expect("history row retained");
+    assert_eq!(oldest[0].text(), "日");
+    assert_eq!(oldest[0].width(), 2);
+    assert!(oldest[1].is_continuation());
+    assert_eq!(oldest[2].text(), "A");
+}
+
+#[test]
+fn wheel_is_local_without_mouse_mode_and_forwarded_with_mouse_mode() {
+    let mut app = NorenApp {
+        terminal: Some(history_terminal(3, 6)),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        app.route_terminal_wheel(MouseScrollDelta::LineDelta(0.0, 2.0), Some((1, 1))),
+        TerminalWheelRoute::ConsumedLocally {
+            before: 0,
+            after: 2,
+        }
+    );
+    assert_eq!(
+        app.scroll_offset, 2,
+        "unclaimed wheel scrolls Noren history"
+    );
+
+    app.apply_pty_output(b"\x1b[?1000;1006h");
+    assert_eq!(
+        app.scroll_offset, 0,
+        "an application claiming the mouse rejoins its live surface"
+    );
+    app.scroll_offset = 1;
+    app.modifiers = Modifiers::empty().shift();
+    let mapped = app.mouse_cell_in_frame(
+        PhysicalPosition::new(
+            sidebar_pixel_width(app.geometry.cell_width())
+                + f64::from(app.geometry.cell_width())
+                + 1.0,
+            f64::from(app.geometry.cell_height()) + 1.0,
+        ),
+        PhysicalSize::new(
+            (renderer::SIDEBAR_COLS as u32 + 6) * app.geometry.cell_width(),
+            4 * app.geometry.cell_height(),
+        ),
+    );
+    assert_eq!(
+        mapped,
+        Some((1, 1)),
+        "tracked wheel coordinates stay reportable while history is displayed"
+    );
+    let routed = app.route_terminal_wheel(MouseScrollDelta::LineDelta(0.0, 2.0), mapped);
+    assert_eq!(
+        routed,
+        TerminalWheelRoute::ForwardedToApplication(vec![
+            b"\x1b[<68;2;2M".to_vec(),
+            b"\x1b[<68;2;2M".to_vec(),
+        ]),
+        "tracking owns every wheel click, including with Shift held"
+    );
+    assert_eq!(
+        app.scroll_offset, 1,
+        "forwarding must not consume the wheel as local history"
+    );
+    app.apply_pty_output(b"X");
+    assert_eq!(
+        app.scroll_offset, 1,
+        "after the ownership transition, ordinary output preserves deliberate history"
+    );
+}
+
+fn assert_tracking_mode_forwards_wheel(decset: &[u8]) {
+    let mut app = NorenApp {
+        terminal: Some(history_terminal(3, 6)),
+        ..Default::default()
+    };
+    app.apply_pty_output(decset);
+    app.apply_pty_output(b"\x1b[?1006h");
+
+    assert_eq!(
+        app.route_terminal_wheel(MouseScrollDelta::LineDelta(0.0, 1.0), Some((1, 1))),
+        TerminalWheelRoute::ForwardedToApplication(vec![b"\x1b[<64;2;2M".to_vec()]),
+        "an application tracking mode must own the wheel"
+    );
+    assert_eq!(
+        app.scroll_offset, 0,
+        "forwarding must not consume the wheel as local history"
+    );
+}
+
+#[test]
+fn mode_1000_forwards_wheel_instead_of_consuming_scrollback() {
+    assert_tracking_mode_forwards_wheel(b"\x1b[?1000h");
+}
+
+#[test]
+fn mode_1002_forwards_wheel_instead_of_consuming_scrollback() {
+    assert_tracking_mode_forwards_wheel(b"\x1b[?1002h");
+}
+
+#[test]
+fn mode_1003_forwards_wheel_instead_of_consuming_scrollback() {
+    assert_tracking_mode_forwards_wheel(b"\x1b[?1003h");
+}
+
+#[test]
+fn mode_9_forwards_wheel_instead_of_consuming_scrollback() {
+    assert_tracking_mode_forwards_wheel(b"\x1b[?9h");
+}
+
+#[test]
+fn mouse_tracking_enable_then_disable_restores_local_wheel_scrolling() {
+    let mut app = NorenApp {
+        terminal: Some(history_terminal(3, 6)),
+        ..Default::default()
+    };
+    app.apply_pty_output(b"\x1b[?1000;1006h");
+
+    assert!(matches!(
+        app.route_terminal_wheel(MouseScrollDelta::LineDelta(0.0, 1.0), Some((0, 0))),
+        TerminalWheelRoute::ForwardedToApplication(_)
+    ));
+    assert_eq!(app.scroll_offset, 0);
+
+    app.apply_pty_output(b"\x1b[?1000l");
+    assert_eq!(
+        app.route_terminal_wheel(MouseScrollDelta::LineDelta(0.0, 1.0), Some((0, 0))),
+        TerminalWheelRoute::ConsumedLocally {
+            before: 0,
+            after: 1,
+        },
+        "DECRST must return an unclaimed wheel to local scrollback"
+    );
+    assert_eq!(app.scroll_offset, 1);
+}
+
+#[test]
+fn claiming_mouse_while_scrolled_snaps_to_tail_before_forwarding_wheel() {
+    let mut app = NorenApp {
+        terminal: Some(history_terminal(3, 6)),
+        ..Default::default()
+    };
+    app.scroll_view(ScrollDirection::Older, 2);
+    assert_eq!(app.scroll_offset, 2, "fixture starts in history");
+
+    app.apply_pty_output(b"\x1b[?1002h");
+    assert_eq!(
+        app.scroll_offset, 0,
+        "a newly claimed mouse rejoins the application's live surface"
+    );
+    assert!(
+        matches!(
+            app.route_terminal_wheel(MouseScrollDelta::LineDelta(0.0, 1.0), Some((0, 0))),
+            TerminalWheelRoute::ForwardedToApplication(ref reports) if reports.len() == 1
+        ),
+        "the claiming mode must own the next wheel event"
+    );
+    assert_eq!(app.scroll_offset, 0);
+}
+
 // ── Authoritative application mouse modes ───────────────────────────
 
 #[test]
@@ -1328,8 +1628,9 @@ fn app_decrst_mouse_output_disables_encoding() {
 }
 
 #[test]
-fn app_current_mouse_modes_projects_all_six_terminal_flags() {
+fn app_current_mouse_modes_projects_all_seven_terminal_flags() {
     let cases: &[(&[u8], MouseModes)] = &[
+        (b"\x1b[?9h", MouseModes::disabled().with_x10(true)),
         (b"\x1b[?1000h", MouseModes::disabled().with_normal(true)),
         (
             b"\x1b[?1002h",

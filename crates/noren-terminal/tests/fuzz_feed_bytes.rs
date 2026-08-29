@@ -624,6 +624,7 @@ const CORPUS_TMUX: &[&[u8]] = &[
 /// programs still emit (47/1047/1048), DECRQM (`$p`), and device queries.
 /// The 9999/0/65535 entries are unknown modes that must be ignored cleanly.
 const CORPUS_DECSET: &[&[u8]] = &[
+    b"\x1b[?9h\x1b[?9l",
     b"\x1b[?7h\x1b[?7l",
     b"\x1b[?25h\x1b[?25l",
     b"\x1b[?12h\x1b[?12l",
@@ -791,7 +792,7 @@ fn gen_csi_private(rng: &mut Xorshift64) -> Vec<u8> {
         out.extend_from_slice(
             match rng.below(10) {
                 0..=5 => (*rng.pick(&[
-                    1_u16, 7, 12, 25, 47, 1000, 1002, 1003, 1004, 1005, 1006, 1015, 1047, 1048,
+                    1_u16, 7, 9, 12, 25, 47, 1000, 1002, 1003, 1004, 1005, 1006, 1015, 1047, 1048,
                     1049, 2004,
                 ]))
                 .to_string(),

@@ -343,16 +343,19 @@ pub(crate) enum RenderOutcome {
 
 /// Application-owned chrome drawn around terminal cells for one frame.
 ///
-/// The palette affordance travels separately from runtime status text so the
-/// renderer can keep it first in the permanent terminal-side status row. That
-/// ordering is load-bearing: a long diagnostic may be clipped by a narrow
-/// window, but it must never make the command surface undiscoverable.
+/// Viewport orientation and the palette affordance travel separately from
+/// runtime status text so the renderer can keep them first in the permanent
+/// terminal-side status row. That ordering is load-bearing: a long diagnostic
+/// may be clipped by a narrow window, but it must never hide how to leave
+/// history or make the command surface undiscoverable.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct FrameChrome<'a> {
     sidebar: Option<SidebarInput<'a>>,
     status: Option<&'a str>,
     palette_hint: Option<&'a str>,
+    viewport_indicator: Option<&'a str>,
     workspace_notice: Option<&'a [String]>,
+    scroll_offset: usize,
     selection: Option<&'a Selection>,
 }
 
@@ -362,7 +365,9 @@ impl<'a> FrameChrome<'a> {
             sidebar: sidebar.map(SidebarInput::Plain),
             status,
             palette_hint: None,
+            viewport_indicator: None,
             workspace_notice: None,
+            scroll_offset: 0,
             selection: None,
         }
     }
@@ -383,10 +388,31 @@ impl<'a> FrameChrome<'a> {
         self
     }
 
+    /// Add the scrolled-history orientation/recovery copy. It is emitted
+    /// before every other status segment so a narrow frame cannot clip the
+    /// user's route back to the live tail.
+    #[must_use]
+    pub(crate) const fn with_viewport_indicator(mut self, indicator: Option<&'a str>) -> Self {
+        self.viewport_indicator = indicator;
+        self
+    }
+
     /// Add terminal-side application copy shown in place of absent content.
     #[must_use]
     pub(crate) const fn with_workspace_notice(mut self, lines: Option<&'a [String]>) -> Self {
         self.workspace_notice = lines;
+        self
+    }
+
+    /// Select a viewport this many logical rows above the live tail.
+    ///
+    /// The renderer clamps the request to retained primary-screen history and
+    /// ignores it while the alternate screen is active. Keeping that safety at
+    /// the render boundary means a stale application offset can never produce
+    /// a blank frame or leak shell history into vim/less.
+    #[must_use]
+    pub(crate) const fn with_scroll_offset(mut self, offset: usize) -> Self {
+        self.scroll_offset = offset;
         self
     }
 
@@ -398,12 +424,11 @@ impl<'a> FrameChrome<'a> {
     }
 
     fn status_line(self) -> Option<String> {
-        match (self.palette_hint, self.status) {
-            (None, None) => None,
-            (Some(hint), None) => Some(hint.to_owned()),
-            (None, Some(status)) => Some(status.to_owned()),
-            (Some(hint), Some(status)) => Some(format!("{hint} | {status}")),
-        }
+        let parts: Vec<&str> = [self.viewport_indicator, self.palette_hint, self.status]
+            .into_iter()
+            .flatten()
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(" | "))
     }
 }
 
@@ -774,6 +799,7 @@ fn glyph_vertices_with_chrome_budget(
     let sidebar = chrome.sidebar;
     let status = chrome.status_line();
     let workspace_notice = chrome.workspace_notice;
+    let requested_scroll_offset = chrome.scroll_offset;
     let selection = chrome.selection;
     let has_sidebar = sidebar.is_some();
     let col_offset = if has_sidebar { sidebar_columns } else { 0 };
@@ -800,15 +826,31 @@ fn glyph_vertices_with_chrome_budget(
     // column, so the cell index below is the display column for every glyph —
     // the same coordinate model the string path used, now carrying the
     // attributes that path threw away.
+    let effective_scroll_offset = terminal
+        .map(|snapshot| clamped_scroll_offset(snapshot, requested_scroll_offset))
+        .unwrap_or(0);
+    // Selection points address the complete logical grid (retained history
+    // followed by the live screen), while `line_index` addresses this frame's
+    // selected viewport. Translate through the viewport origin so a drag made
+    // above the live tail paints the same absolute cells that `extract` reads.
+    let viewport_logical_start = terminal
+        .map(|snapshot| {
+            snapshot
+                .scrollback()
+                .len()
+                .saturating_sub(effective_scroll_offset)
+        })
+        .unwrap_or(0);
     let mut rows: Vec<&[noren_terminal::Cell]> = terminal
-        .map(|snapshot| snapshot.display_cells().collect())
+        .map(|snapshot| viewport_rows(snapshot, effective_scroll_offset))
         .unwrap_or_default();
     // A visible cursor makes its row content (issues #197/#200): the display
     // model trims trailing blank rows, so without this extension the caret
     // would vanish on a fresh screen — exactly the row typing lands in. A
     // hidden cursor skips the extension, keeping hidden-cursor frames
     // byte-identical to the pre-cursor renderer.
-    if let Some(snapshot) = terminal
+    if effective_scroll_offset == 0
+        && let Some(snapshot) = terminal
         && snapshot.is_cursor_visible()
     {
         let cursor_row = usize::from(snapshot.cursor().row())
@@ -824,7 +866,9 @@ fn glyph_vertices_with_chrome_budget(
     let content_rows = rows.len().max(workspace_notice.map_or(0, <[String]>::len));
     let layout = FrameRowLayout::new(height, metrics, content_rows, status.is_some())
         .expect("non-zero frame height has a row layout");
-    let cursor_plan = terminal.and_then(|snapshot| plan_cursor(snapshot, &layout, terminal_cols));
+    let cursor_plan = (effective_scroll_offset == 0)
+        .then(|| terminal.and_then(|snapshot| plan_cursor(snapshot, &layout, terminal_cols)))
+        .flatten();
     let mut vertices = Vec::new();
 
     // The sidebar is chrome, not terminal content: ordinary text draws in the
@@ -870,8 +914,10 @@ fn glyph_vertices_with_chrome_budget(
                     let visible = &cells[..visible_len];
                     let selected_columns = terminal.and_then(|snapshot| {
                         selection.and_then(|selection| {
-                            selection
-                                .columns_in_line(snapshot, snapshot.scrollback().len() + line_index)
+                            selection.columns_in_line(
+                                snapshot,
+                                viewport_logical_start.saturating_add(line_index),
+                            )
                         })
                     });
                     if let Some(plan) = cursor_plan
@@ -965,6 +1011,45 @@ fn glyph_vertices_with_chrome_budget(
         }
     }
     vertices
+}
+
+/// Clamp a requested primary-screen history offset at the renderer boundary.
+///
+/// An offset addresses rows above the live tail, so the number of retained
+/// scrollback rows is the inclusive upper bound. Alternate-screen content is
+/// intentionally isolated: its effective offset is always zero even if the
+/// application carries a stale primary-screen view request.
+fn clamped_scroll_offset(snapshot: &TerminalSnapshot, requested: usize) -> usize {
+    if snapshot.modes().is_alternate_screen_active() {
+        0
+    } else {
+        requested.min(snapshot.scrollback().len())
+    }
+}
+
+/// Borrow the exact terminal rows selected by one effective scroll offset.
+///
+/// At the live tail this preserves the renderer's established trailing-blank
+/// trimming. Above the tail it selects one full screen-height window from the
+/// logical grid (`scrollback` followed by the visible screen). Each result is
+/// a complete cell slice, so wide-character lead/continuation pairs and cell
+/// attributes cross the viewport seam unchanged.
+fn viewport_rows(snapshot: &TerminalSnapshot, scroll_offset: usize) -> Vec<&[Cell]> {
+    if scroll_offset == 0 {
+        return snapshot.display_cells().collect();
+    }
+
+    let screen_rows = usize::from(snapshot.rows());
+    let logical_rows = snapshot.scrollback().len().saturating_add(screen_rows);
+    let end = logical_rows.saturating_sub(scroll_offset);
+    let start = end.saturating_sub(screen_rows);
+    (start..end)
+        .filter_map(|index| {
+            u32::try_from(index)
+                .ok()
+                .and_then(|index| snapshot.logical_row(index))
+        })
+        .collect()
 }
 
 /// Immutable drawing context shared by every terminal cell in one frame row.
@@ -2076,9 +2161,105 @@ mod tests {
         terminal.snapshot()
     }
 
+    fn row_heads<'a>(rows: &[&'a [Cell]]) -> Vec<&'a str> {
+        rows.iter()
+            .map(|row| row.first().map_or("", Cell::text))
+            .collect()
+    }
+
     /// The PoC default cell metrics for tests that exercise the default path.
     fn poc_metrics() -> CellMetrics {
         GridGeometry::poc().cell_metrics()
+    }
+
+    #[test]
+    fn scrollback_viewport_pins_exact_rows_at_each_offset_and_clamps() {
+        let terminal = snapshot(3, 4, b"\x1b[?25lA\r\nB\r\nC\r\nD\r\nE");
+        assert_eq!(terminal.scrollback_lines(), ["A", "B"], "fixture history");
+        assert_eq!(terminal.lines(), ["C", "D", "E"], "fixture live screen");
+
+        let live = viewport_rows(&terminal, clamped_scroll_offset(&terminal, 0));
+        assert_eq!(row_heads(&live), ["C", "D", "E"]);
+
+        let one_up = viewport_rows(&terminal, clamped_scroll_offset(&terminal, 1));
+        assert_eq!(row_heads(&one_up), ["B", "C", "D"]);
+
+        let oldest = viewport_rows(&terminal, clamped_scroll_offset(&terminal, 2));
+        assert_eq!(row_heads(&oldest), ["A", "B", "C"]);
+
+        let past_oldest = viewport_rows(&terminal, clamped_scroll_offset(&terminal, usize::MAX));
+        assert_eq!(row_heads(&past_oldest), ["A", "B", "C"]);
+    }
+
+    #[test]
+    fn scrollback_viewport_keeps_wide_lead_and_continuation_together() {
+        let terminal = snapshot(2, 5, "\x1b[?25l日A\r\n語B\r\n界C".as_bytes());
+        assert_eq!(
+            terminal.scrollback().len(),
+            1,
+            "fixture has one history row"
+        );
+
+        let rows = viewport_rows(&terminal, clamped_scroll_offset(&terminal, 1));
+        let oldest = rows.first().expect("oldest history row is visible");
+        assert_eq!(oldest[0].text(), "日");
+        assert_eq!(oldest[0].width(), 2);
+        assert!(oldest[1].is_continuation());
+        assert_eq!(oldest[2].text(), "A");
+    }
+
+    #[test]
+    fn alternate_screen_forces_live_view_and_never_borrows_primary_history() {
+        let mut terminal = TerminalState::new(2, 5).expect("valid terminal");
+        terminal.feed_bytes(b"OLD1\r\nOLD2\r\nLIVE");
+        assert_eq!(terminal.scrollback_len(), 1, "primary fixture has history");
+        terminal.feed_bytes(b"\x1b[?1049hALT");
+        let alternate = terminal.snapshot();
+        assert!(alternate.modes().is_alternate_screen_active());
+
+        let effective = clamped_scroll_offset(&alternate, usize::MAX);
+        assert_eq!(effective, 0);
+        let rows = viewport_rows(&alternate, effective);
+        assert_eq!(row_heads(&rows), ["A"]);
+        assert!(
+            rows.iter()
+                .all(|row| row.iter().all(|cell| cell.text() != "O")),
+            "primary scrollback must not leak into the alternate screen"
+        );
+    }
+
+    #[test]
+    fn scrolled_view_suppresses_the_live_cursor_vertices() {
+        let visible = snapshot(2, 4, b"A\r\nB\r\nC");
+        let hidden = snapshot(2, 4, b"A\r\nB\r\nC\x1b[?25l");
+        let metrics = poc_metrics();
+        let target = Target::new(
+            &Theme::default(),
+            u32::from(visible.cols()) * metrics.width(),
+            u32::from(visible.rows()) * metrics.height(),
+            metrics,
+        );
+
+        let live_visible =
+            glyph_vertices_for_chrome(target, Some(&visible), FrameChrome::new(None, None));
+        let live_hidden =
+            glyph_vertices_for_chrome(target, Some(&hidden), FrameChrome::new(None, None));
+        assert_ne!(live_visible, live_hidden, "the live tail draws the caret");
+
+        let history_visible = glyph_vertices_for_chrome(
+            target,
+            Some(&visible),
+            FrameChrome::new(None, None).with_scroll_offset(1),
+        );
+        let history_hidden = glyph_vertices_for_chrome(
+            target,
+            Some(&hidden),
+            FrameChrome::new(None, None).with_scroll_offset(1),
+        );
+        assert_eq!(
+            history_visible, history_hidden,
+            "history frames must not draw the live cursor at a stale position"
+        );
     }
 
     /// Deterministic companion to the GPU frame oracle: configured chrome

@@ -275,6 +275,7 @@ pub struct TerminalModes {
     // Stored hidden-side-out so the derive-Default all-false value means the
     // historical behaviour: a visible cursor. DECTCEM hides it.
     cursor_hidden: bool,
+    mouse_x10_tracking: bool,
     mouse_normal_tracking: bool,
     mouse_button_event_tracking: bool,
     mouse_any_event_tracking: bool,
@@ -322,6 +323,12 @@ impl TerminalModes {
     #[must_use]
     pub const fn is_cursor_visible(self) -> bool {
         !self.cursor_hidden
+    }
+
+    /// Whether DEC private mode 9 (X10 mouse tracking) is enabled.
+    #[must_use]
+    pub const fn is_mouse_x10_tracking_enabled(self) -> bool {
+        self.mouse_x10_tracking
     }
 
     /// Whether DEC private mode 1000 (normal mouse tracking) is enabled.
@@ -1353,6 +1360,9 @@ impl TerminalState {
             }
             (PrivateMode::BracketedPaste, enabled) => {
                 self.modes.bracketed_paste = enabled;
+            }
+            (PrivateMode::MouseTrackingX10, enabled) => {
+                self.modes.mouse_x10_tracking = enabled;
             }
             (PrivateMode::MouseTrackingNormal, enabled) => {
                 self.modes.mouse_normal_tracking = enabled;
