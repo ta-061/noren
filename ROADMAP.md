@@ -302,19 +302,20 @@ against it:
   only feedback. Pasting into a plain `zsh` prompt or `cat` therefore
   does nothing. Sending unbracketed bytes is deliberately not done, so
   a preview must tell users this before they call paste broken.
-- **The view layer remains incomplete beyond cursor, colour, glyphs, and
-  scrollback navigation.** The cursor is rendered, and retained primary-screen
-  history now has a clamped viewport driven by configurable
+- **The view layer remains incomplete beyond cursor, colour, glyphs, visible
+  selection, and scrollback navigation.** The cursor is rendered. Selection
+  paints the exact copied cell span with a theme-owned inverse pair, including
+  partial wrapped rows, both columns of wide characters, and absolute logical
+  rows while the viewport is above the live tail. Retained primary-screen
+  history has a clamped viewport driven by configurable
   Shift+PageUp/Shift+PageDown defaults plus the wheel only when the application
   has not enabled mouse tracking. A `History -N` indicator names the configured
-  route to `Latest`; alternate screens never borrow primary history. Selection
-  is tracked and copies correctly but is never highlighted. Scrollback search
-  is unreachable: the terminal core ships a
-  real snapshot search engine (`crates/noren-terminal/src/search.rs`:
-  `Search`, ranked matches, case sensitivity), but nothing in the app
-  references it — no key or palette command starts a search and no renderer
-  surface draws one. Selection feedback and search therefore remain
-  preview-readiness gaps even though cursor and history navigation now work.
+  route to `Latest`; alternate screens never borrow primary history. Scrollback
+  search is still unreachable: the terminal core ships a real snapshot search
+  engine (`crates/noren-terminal/src/search.rs`: `Search`, ranked matches, case
+  sensitivity), but nothing in the app references it — no key or palette
+  command starts a search and no renderer surface draws one. Search therefore
+  remains the view-layer preview-readiness gap.
 - **The FR-005 rendered-frame oracle exists and runs, and its boundary is
   the honesty requirement.** It drives the real `wgpu` pipeline offscreen
   (`crates/noren-app/src/renderer_capture.rs`,

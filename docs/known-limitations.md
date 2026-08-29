@@ -249,12 +249,14 @@ Each item states what you would actually see if you ran the build.
 - **There is no accessibility surface.** Nothing in the tree integrates with
   assistive technology (no AccessKit, AT-SPI, or AppKit accessibility wiring);
   a screen reader has nothing to work with.
-- **Selection works, but you cannot see it; scrollback search is still
-  unreachable.** Selection is tracked and copy extracts it, yet the renderer
-  does not highlight the selected region — the comment on the `selection`
-  field in `main.rs` says so in the source itself ("The renderer does not
-  highlight it yet"). Retained primary-screen history is now visible through
-  Shift+PageUp/Shift+PageDown (configurable as `scroll_page_up` and
+- **Selection and scrollback are visible; scrollback search is still
+  unreachable.** Selection is tracked, copy extracts it, and the renderer
+  paints the same inclusive cell spans with the active theme's inverse-video
+  selection pair. Wrapped ranges stay partial on their first and last rows, a
+  selected wide character paints its lead and continuation columns together,
+  and selection coordinates remain aligned with visible logical rows while
+  scrolled above the live tail. Retained primary-screen history is navigable
+  through Shift+PageUp/Shift+PageDown (configurable as `scroll_page_up` and
   `scroll_page_down`) and the mouse wheel when no application mouse mode is
   active. A `History -N` status indicator names the configured route back to
   `Latest`; alternate screens remain isolated and an application that enables

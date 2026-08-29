@@ -1187,9 +1187,9 @@ struct NorenApp {
     #[cfg(test)]
     ssh_spawn_force_failure: bool,
     redraw_needed: bool,
-    // User-initiated selection state. The renderer does not highlight it yet;
-    // copy still extracts it. Any PTY output or resize invalidates it because
-    // grid coordinates only address the content they were captured on.
+    // User-initiated selection state. The renderer paints this exact range and
+    // copy extracts the same model. Any PTY output or resize invalidates it
+    // because grid coordinates only address the content they were captured on.
     selection: Option<Selection>,
     drag_origin: Option<GridPoint>,
     drag_mode: SelectionMode,
@@ -2665,9 +2665,18 @@ impl NorenApp {
     }
 
     fn select_entire_grid(&mut self) {
-        if let Some(terminal) = &self.terminal {
-            self.selection = Some(Selection::entire_grid(terminal));
+        if let Some(selection) = self.terminal.as_ref().map(Selection::entire_grid) {
+            self.show_selection(selection);
         }
+    }
+
+    /// Install a user-visible selection and schedule the frame that paints it.
+    ///
+    /// Selection input can arrive while the PTY is idle, so relying on output
+    /// to request a redraw would leave the new range invisible indefinitely.
+    fn show_selection(&mut self, selection: Selection) {
+        self.selection = Some(selection);
+        self.redraw_needed = true;
     }
 
     fn copy_selection(&mut self) {
@@ -2754,8 +2763,12 @@ impl NorenApp {
         let Some(point) = self.grid_point_at(position) else {
             return;
         };
-        if let Some(terminal) = &self.terminal {
-            self.selection = Some(Selection::new(terminal, self.drag_mode, origin, point));
+        if let Some(selection) = self
+            .terminal
+            .as_ref()
+            .map(|terminal| Selection::new(terminal, self.drag_mode, origin, point))
+        {
+            self.show_selection(selection);
         }
     }
 
@@ -2793,7 +2806,8 @@ impl NorenApp {
                 };
                 self.drag_mode = mode;
                 self.drag_origin = Some(point);
-                self.selection = Some(Selection::new(terminal, mode, point, point));
+                let selection = Selection::new(terminal, mode, point, point);
+                self.show_selection(selection);
             }
             ElementState::Released => {
                 self.drag_origin = None;
@@ -3607,7 +3621,8 @@ impl NorenApp {
             .with_viewport_indicator(viewport_indicator.as_deref())
             .with_palette_hint(palette_hint.as_deref())
             .with_workspace_notice(workspace_notice.as_deref())
-            .with_scroll_offset(self.scroll_offset);
+            .with_scroll_offset(self.scroll_offset)
+            .with_selection(self.selection.as_ref());
         let outcome = self
             .renderer
             .as_mut()

@@ -10,6 +10,27 @@ fn grid(rows: u16, cols: u16, bytes: &[u8]) -> TerminalState {
     state
 }
 
+fn text_covered_by_highlight(selection: &Selection, grid: &impl SelectionGrid) -> String {
+    let mut lines = Vec::new();
+    for line in selection.start().line()..=selection.end().line() {
+        let mut text = String::new();
+        if let Some(columns) = selection.columns_in_line(grid, line) {
+            let cells = grid.row_cells(line).expect("highlighted row exists");
+            for column in columns {
+                let cell = &cells[column];
+                if !cell.is_continuation() {
+                    text.push_str(cell.text());
+                }
+            }
+        }
+        lines.push(text);
+    }
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
 #[test]
 fn ascii_extraction_is_byte_exact() {
     let state = grid(3, 12, b"hello world\r\nsecond line");
@@ -107,6 +128,90 @@ fn endpoints_on_a_continuation_round_to_the_whole_character() {
         GridPoint::new(0, 1),
     );
     assert_eq!(collapsed.extract(&state), "你");
+}
+
+#[test]
+fn drawable_columns_cover_both_halves_of_a_wide_character() {
+    // Columns: a=0, 日=1(+2 continuation), b=3. Selecting either half of
+    // 日 normalizes to its lead and exposes both display columns for drawing.
+    let state = grid(1, 6, "a日b".as_bytes());
+    for endpoint in [GridPoint::new(0, 1), GridPoint::new(0, 2)] {
+        let selection = Selection::new(&state, SelectionMode::Char, endpoint, endpoint);
+        assert_eq!(selection.extract(&state), "日");
+        assert_eq!(selection.columns_in_line(&state, 0), Some(1..=2));
+    }
+
+    // An adjacent narrow character does not accidentally inherit the wide
+    // character's continuation column.
+    let narrow = Selection::new(
+        &state,
+        SelectionMode::Char,
+        GridPoint::new(0, 3),
+        GridPoint::new(0, 3),
+    );
+    assert_eq!(narrow.columns_in_line(&state, 0), Some(3..=3));
+}
+
+#[test]
+fn drawable_columns_follow_character_selection_across_wrapped_rows() {
+    // `e` triggers the pending wrap after `abcd`, producing two physical
+    // screen rows. A cross-row selection owns only the tail of the first row
+    // and the head of the second — never either whole row.
+    let state = grid(2, 4, b"abcdef");
+    let selection = Selection::new(
+        &state,
+        SelectionMode::Char,
+        GridPoint::new(0, 2),
+        GridPoint::new(1, 0),
+    );
+    assert_eq!(selection.extract(&state), "cd\ne");
+    assert_eq!(selection.columns_in_line(&state, 0), Some(2..=3));
+    assert_eq!(selection.columns_in_line(&state, 1), Some(0..=0));
+    assert_eq!(selection.columns_in_line(&state, 2), None);
+}
+
+#[test]
+fn drawable_columns_match_extract_after_trailing_blank_trimming() {
+    let short_row = grid(1, 10, b"ab");
+    let dragged_past_text = Selection::new(
+        &short_row,
+        SelectionMode::Char,
+        GridPoint::new(0, 0),
+        GridPoint::new(0, 9),
+    );
+    assert_eq!(dragged_past_text.extract(&short_row), "ab");
+    assert_eq!(
+        text_covered_by_highlight(&dragged_past_text, &short_row),
+        dragged_past_text.extract(&short_row)
+    );
+    assert_eq!(
+        dragged_past_text.columns_in_line(&short_row, 0),
+        Some(0..=1)
+    );
+
+    let three_rows = grid(3, 10, b"hello\r\nworld");
+    let entire_grid = Selection::entire_grid(&three_rows);
+    assert_eq!(entire_grid.extract(&three_rows), "hello\nworld");
+    assert_eq!(
+        text_covered_by_highlight(&entire_grid, &three_rows),
+        entire_grid.extract(&three_rows)
+    );
+    assert_eq!(entire_grid.columns_in_line(&three_rows, 0), Some(0..=4));
+    assert_eq!(entire_grid.columns_in_line(&three_rows, 1), Some(0..=4));
+    assert_eq!(entire_grid.columns_in_line(&three_rows, 2), None);
+
+    let only_blanks = Selection::new(
+        &short_row,
+        SelectionMode::Char,
+        GridPoint::new(0, 4),
+        GridPoint::new(0, 7),
+    );
+    assert_eq!(only_blanks.extract(&short_row), "");
+    assert_eq!(
+        text_covered_by_highlight(&only_blanks, &short_row),
+        only_blanks.extract(&short_row)
+    );
+    assert_eq!(only_blanks.columns_in_line(&short_row, 0), None);
 }
 
 #[test]
@@ -251,6 +356,7 @@ fn resize_expires_a_selection() {
     assert!(!selection.is_valid(&state));
     // Expired selections yield empty text, never stale or wrong text.
     assert_eq!(selection.extract(&state), "");
+    assert_eq!(selection.columns_in_line(&state, 0), None);
 }
 
 #[test]
