@@ -549,6 +549,43 @@ impl KeyEncoder {
         Ok(Self::alt_prefixed(alt, bytes))
     }
 
+    /// Encode text committed by an input method through the typed-input byte
+    /// contract.
+    ///
+    /// An IME commit is already composed text, so it has no live keyboard
+    /// modifiers. Printable scalars therefore take the same UTF-8 path as an
+    /// ordinary unmodified character. Newline and carriage return take the
+    /// ordinary Enter path (`CR`), while C0 controls take their equivalent
+    /// named-key or Ctrl-key path. The remaining Unicode control scalars have
+    /// no keyboard-key equivalent and retain their UTF-8 representation.
+    ///
+    /// Unlike one physical-key event, a commit can contain multiple scalars.
+    /// This method preserves all of them in order and cannot reject a
+    /// non-empty commit. An empty commit encodes to no bytes.
+    #[must_use]
+    pub fn encode_committed_text(text: &str, mode: InputMode) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(text.len());
+        for character in text.chars() {
+            let Some(input) = committed_text_input(character) else {
+                let mut buffer = [0_u8; 4];
+                bytes.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+                continue;
+            };
+            match Self::encode_with(input, mode) {
+                Ok(encoded) => bytes.extend_from_slice(&encoded),
+                // Every input constructed by `committed_text_input` is part
+                // of the encoder's supported typed-input vocabulary. Keep a
+                // lossless fallback in case that vocabulary is tightened in
+                // the future: a committed scalar must never disappear.
+                Err(_) => {
+                    let mut buffer = [0_u8; 4];
+                    bytes.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+                }
+            }
+        }
+        bytes
+    }
+
     /// Prepend the `ESC` byte that Alt adds in front of a key's base bytes.
     fn alt_prefixed(alt: bool, mut bytes: Vec<u8>) -> Vec<u8> {
         if alt {
@@ -585,6 +622,30 @@ impl KeyEncoder {
         }
         Ok(input::keypad_bytes(input.key(), mode.keypad()).to_vec())
     }
+}
+
+/// Map one committed scalar to the keyboard input that would produce the same
+/// terminal input. C1 and other Unicode controls return `None`: they have no
+/// ordinary key equivalent and are retained as UTF-8 by the caller.
+fn committed_text_input(character: char) -> Option<KeyInput> {
+    let (key, modifiers) = match character {
+        '\n' | '\r' => (Key::Enter, Modifiers::empty()),
+        '\t' => (Key::Tab, Modifiers::empty()),
+        '\u{1b}' => (Key::Escape, Modifiers::empty()),
+        '\u{7f}' => (Key::Backspace, Modifiers::empty()),
+        '\0' => (Key::Character('@'), Modifiers::empty().ctrl()),
+        '\u{1}'..='\u{1a}' => {
+            let letter = char::from_u32(u32::from('a') + u32::from(character) - 1)?;
+            (Key::Character(letter), Modifiers::empty().ctrl())
+        }
+        '\u{1c}' => (Key::Character('\\'), Modifiers::empty().ctrl()),
+        '\u{1d}' => (Key::Character(']'), Modifiers::empty().ctrl()),
+        '\u{1e}' => (Key::Character('^'), Modifiers::empty().ctrl()),
+        '\u{1f}' => (Key::Character('_'), Modifiers::empty().ctrl()),
+        control if control.is_control() => return None,
+        printable => (Key::Character(printable), Modifiers::empty()),
+    };
+    Some(KeyInput::new(key, KeyPhase::Pressed, modifiers))
 }
 
 /// Encode a navigation-class key carrying the xterm modifier parameter.
@@ -876,6 +937,20 @@ mod tests {
                 Ok(vec![byte])
             );
         }
+    }
+
+    #[test]
+    fn committed_text_uses_typed_input_encoding_without_losing_scalars() {
+        let text = "日本語é\n\u{3}\u{80}";
+        assert_eq!(
+            KeyEncoder::encode_committed_text(text, InputMode::normal()),
+            ["日本語é".as_bytes(), b"\r", b"\x03", "\u{80}".as_bytes(),].concat()
+        );
+    }
+
+    #[test]
+    fn empty_committed_text_encodes_to_no_input() {
+        assert!(KeyEncoder::encode_committed_text("", InputMode::normal()).is_empty());
     }
 
     #[test]
