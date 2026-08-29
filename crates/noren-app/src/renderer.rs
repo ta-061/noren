@@ -45,6 +45,8 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use noren_app::cursor::CursorShape;
+use noren_app::sidebar::EntryKind;
+use noren_app::sidebar_text::{DEFAULT_SIDEBAR_COLUMNS, SidebarTextRow, lifecycle_marker_color};
 use noren_app::theme::{Theme, contrast_ratio};
 use noren_app::{CellMetrics, MAX_RENDER_COLS, MAX_RENDER_ROWS};
 use noren_terminal::{Cell, CellAttributes, Color, Selection, TerminalSnapshot};
@@ -74,7 +76,7 @@ const MAX_VERTICES: usize = (MAX_RENDER_ROWS as usize)
 /// Exposed as `pub(crate)` so `main.rs` can subtract it from the PTY/terminal
 /// grid, and so the frame oracle (`renderer_capture.rs`) can render sidebar
 /// content through the same pipeline.
-pub(crate) const SIDEBAR_COLS: usize = 16;
+pub(crate) const SIDEBAR_COLS: usize = DEFAULT_SIDEBAR_COLUMNS;
 
 /// What owns one row in a rendered terminal frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -273,6 +275,24 @@ pub(crate) fn resolve_background(theme: &Theme, attributes: &CellAttributes) -> 
     }
 }
 
+/// Theme-owned colour reinforcing one lifecycle marker's collision-checked
+/// shape. Non-marker sidebar text keeps the default foreground.
+fn sidebar_glyph_color(
+    theme: &Theme,
+    character: char,
+    column: usize,
+    sidebar_columns: usize,
+    row_kind: Option<EntryKind>,
+) -> [f32; 3] {
+    if row_kind == Some(EntryKind::Session)
+        && column + 1 == sidebar_columns
+        && let Some(color) = lifecycle_marker_color(character)
+    {
+        return resolve_color(theme, Color::Ansi(color), theme.foreground());
+    }
+    theme.foreground()
+}
+
 /// Clear colour used by the glyph pipeline's load op.
 ///
 /// Exposed as `pub(crate)` so the offscreen frame-oracle
@@ -329,7 +349,7 @@ pub(crate) enum RenderOutcome {
 /// window, but it must never make the command surface undiscoverable.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct FrameChrome<'a> {
-    sidebar: Option<&'a [String]>,
+    sidebar: Option<SidebarInput<'a>>,
     status: Option<&'a str>,
     palette_hint: Option<&'a str>,
     workspace_notice: Option<&'a [String]>,
@@ -337,14 +357,24 @@ pub(crate) struct FrameChrome<'a> {
 }
 
 impl<'a> FrameChrome<'a> {
-    pub(crate) const fn new(sidebar: Option<&'a [String]>, status: Option<&'a str>) -> Self {
+    pub(crate) fn new(sidebar: Option<&'a [String]>, status: Option<&'a str>) -> Self {
         Self {
-            sidebar,
+            sidebar: sidebar.map(SidebarInput::Plain),
             status,
             palette_hint: None,
             workspace_notice: None,
             selection: None,
         }
+    }
+
+    /// Retain sidebar row kinds through the production chrome path.
+    ///
+    /// Lifecycle colour is semantic reinforcement for session rows only, so
+    /// rendering must not flatten these rows to strings before colour choice.
+    #[must_use]
+    pub(crate) fn with_sidebar_rows(mut self, rows: Option<&'a [SidebarTextRow]>) -> Self {
+        self.sidebar = rows.map(SidebarInput::Typed);
+        self
     }
 
     #[must_use]
@@ -387,6 +417,7 @@ pub(crate) struct Renderer {
     vertex_capacity: u64,
     device_lost: Arc<AtomicBool>,
     metrics: CellMetrics,
+    sidebar_columns: usize,
     theme: Theme,
     cursor: CursorStyle,
 }
@@ -395,6 +426,7 @@ impl Renderer {
     pub(crate) fn new(
         window: Arc<Window>,
         metrics: CellMetrics,
+        sidebar_columns: usize,
         theme: Theme,
         cursor: CursorStyle,
     ) -> Result<Self, RendererError> {
@@ -487,6 +519,7 @@ impl Renderer {
             vertex_capacity,
             device_lost,
             metrics,
+            sidebar_columns,
             cursor,
             theme,
         })
@@ -522,6 +555,7 @@ impl Renderer {
             self.config.height,
             self.metrics,
         )
+        .with_sidebar_columns(self.sidebar_columns)
         .with_cursor_style(self.cursor);
         let vertices = glyph_vertices_for_chrome(target, terminal, chrome);
         let bytes = vertex_bytes(&vertices);
@@ -615,14 +649,12 @@ fn block_on<F: Future>(future: F) -> F::Output {
 /// Exposed as `pub(crate)` for the offscreen frame-oracle (see
 /// `renderer_capture.rs`); no behaviour change.
 ///
-/// When `sidebar` is `Some`, the first [`SIDEBAR_COLS`] columns are reserved
-/// for the sidebar text and the terminal is drawn starting at column
-/// `SIDEBAR_COLS`. When `sidebar` is `None`, the terminal occupies the full
-/// width starting at column 0 (preserving the pre-sidebar behaviour the frame
-/// oracle's existing tests rely on). Every colour decision — palette
-/// resolution, the sidebar/status default foreground, the clear colour the
-/// caller loads — reads from the target's theme, which is how a configured
-/// theme changes what is drawn.
+/// When `sidebar` is `Some`, the target's configured sidebar columns are
+/// reserved for sidebar text and the terminal starts immediately after them.
+/// [`Target::new`] defaults to the shipped [`SIDEBAR_COLS`] for existing
+/// callers; production replaces it with validated configuration. When
+/// `sidebar` is `None`, the terminal occupies the full width starting at
+/// column 0. Every colour decision reads from the target's theme.
 // Re-included directly by the frame oracle and benchmark. The live binary
 // uses the richer `glyph_vertices_for_chrome` seam below, so this compatibility
 // entry point is intentionally dead only in that one compilation target.
@@ -633,7 +665,33 @@ pub(crate) fn glyph_vertices_for(
     sidebar: Option<&[String]>,
     status: Option<&str>,
 ) -> Vec<Vertex> {
-    glyph_vertices_with_budget(target, terminal, sidebar, status, MAX_VERTICES)
+    glyph_vertices_with_chrome_budget(
+        target,
+        terminal,
+        FrameChrome::new(sidebar, status),
+        MAX_VERTICES,
+    )
+}
+
+/// Production vertex path for sidebar text that retains its domain row kind.
+///
+/// Lifecycle colour is semantic reinforcement for session rows only; the
+/// text-only [`glyph_vertices_for`] seam deliberately supplies no row kind.
+// Re-included by the frame oracle, while the live binary supplies the same
+// typed rows through `FrameChrome::with_sidebar_rows`.
+#[allow(dead_code)]
+pub(crate) fn glyph_vertices_for_sidebar_rows(
+    target: Target,
+    terminal: Option<&TerminalSnapshot>,
+    sidebar: Option<&[SidebarTextRow]>,
+    status: Option<&str>,
+) -> Vec<Vertex> {
+    glyph_vertices_with_chrome_budget(
+        target,
+        terminal,
+        FrameChrome::new(None, status).with_sidebar_rows(sidebar),
+        MAX_VERTICES,
+    )
 }
 
 /// Emit a frame through the live application's complete chrome path.
@@ -671,14 +729,42 @@ fn glyph_vertices_with_budget(
     )
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+enum SidebarInput<'a> {
+    Plain(&'a [String]),
+    Typed(&'a [SidebarTextRow]),
+}
+
+impl<'a> SidebarInput<'a> {
+    fn len(self) -> usize {
+        match self {
+            Self::Plain(lines) => lines.len(),
+            Self::Typed(rows) => rows.len(),
+        }
+    }
+
+    fn row(self, index: usize) -> (&'a str, Option<EntryKind>) {
+        match self {
+            Self::Plain(lines) => (&lines[index], None),
+            Self::Typed(rows) => (rows[index].text(), rows[index].kind()),
+        }
+    }
+}
+
 fn glyph_vertices_with_chrome_budget(
     target: Target,
     terminal: Option<&TerminalSnapshot>,
     chrome: FrameChrome<'_>,
     vertex_budget: usize,
 ) -> Vec<Vertex> {
-    let (width, height, metrics, theme) =
-        (target.width, target.height, target.metrics, target.theme);
+    let (width, height, metrics, theme, sidebar_columns) = (
+        target.width,
+        target.height,
+        target.metrics,
+        target.theme,
+        target.sidebar_columns,
+    );
     if width == 0 || height == 0 {
         return Vec::new();
     }
@@ -690,10 +776,10 @@ fn glyph_vertices_with_chrome_budget(
     let workspace_notice = chrome.workspace_notice;
     let selection = chrome.selection;
     let has_sidebar = sidebar.is_some();
-    let col_offset = if has_sidebar { SIDEBAR_COLS } else { 0 };
+    let col_offset = if has_sidebar { sidebar_columns } else { 0 };
     // Reserve the sidebar, then clamp the terminal to the renderer's drawable
-    // budget (`MAX_RENDER_COLS - SIDEBAR_COLS`), floored at one. This is the
-    // same formula `main::terminal_cols` applies — kept independent rather than
+    // budget (`MAX_RENDER_COLS - sidebar_columns`), floored at one. This is the
+    // same formula `main::terminal_cols_at_width` applies — kept independent rather than
     // shared so the sidebar geometry test can still pin that the two sites
     // agree (a single shared function would make their agreement structural and
     // the sidebar subtraction itself un-testable). The sidebar lives *inside*
@@ -701,9 +787,9 @@ fn glyph_vertices_with_chrome_budget(
     // than the renderer can draw beside it.
     let terminal_cols = if has_sidebar {
         let budget = usize::from(MAX_RENDER_COLS)
-            .saturating_sub(SIDEBAR_COLS)
+            .saturating_sub(sidebar_columns)
             .max(1);
-        window_cols.saturating_sub(SIDEBAR_COLS).clamp(1, budget)
+        window_cols.saturating_sub(sidebar_columns).clamp(1, budget)
     } else {
         // No sidebar (offscreen oracle's pre-sidebar mode): the terminal fills
         // the window, clamped to the renderer's column ceiling.
@@ -741,22 +827,21 @@ fn glyph_vertices_with_chrome_budget(
     let cursor_plan = terminal.and_then(|snapshot| plan_cursor(snapshot, &layout, terminal_cols));
     let mut vertices = Vec::new();
 
-    // The sidebar is chrome, not terminal content: it carries no cell
-    // attributes, so it draws in the theme's default foreground. Unlike
+    // The sidebar is chrome, not terminal content: ordinary text draws in the
+    // theme's default foreground, while the reserved final-cell lifecycle
+    // marker receives a theme-owned semantic colour as reinforcement. Unlike
     // terminal and status rows, sidebar rows are interactive chrome and are
     // only drawn when the whole cell is visible; sidebar hit testing uses
     // this same count.
     if let Some(lines) = sidebar {
-        for (row, line) in lines
-            .iter()
-            .take(fully_drawable_rows(height, metrics))
-            .enumerate()
-        {
-            for (col, character) in line.chars().take(SIDEBAR_COLS).enumerate() {
+        let visible_rows = lines.len().min(fully_drawable_rows(height, metrics));
+        for row in 0..visible_rows {
+            let (line, row_kind) = lines.row(row);
+            for (col, character) in line.chars().take(sidebar_columns).enumerate() {
                 push_glyph(
                     &mut vertices,
                     character,
-                    theme.foreground(),
+                    sidebar_glyph_color(&theme, character, col, sidebar_columns, row_kind),
                     col,
                     row,
                     target,
@@ -1260,7 +1345,7 @@ fn push_cursor_hollow(
 /// The draw surface a frame is laid out against: the selected theme plus the
 /// pixel dimensions and cell size the grid is drawn at.
 ///
-/// These four travel together through every emit call and are constant for a
+/// These frame properties travel together through every emit call and are constant for a
 /// frame, so passing them as one value keeps the glyph/rect helpers to a
 /// readable arity; bundling the theme here is also what keeps the public
 /// vertex and capture seams under the argument-count lint without scattering
@@ -1271,6 +1356,7 @@ pub(crate) struct Target {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) metrics: CellMetrics,
+    pub(crate) sidebar_columns: usize,
     pub(crate) cursor: CursorStyle,
 }
 
@@ -1282,8 +1368,15 @@ impl Target {
             width,
             height,
             metrics,
+            sidebar_columns: SIDEBAR_COLS,
             cursor: CursorStyle::theme_default(theme),
         }
+    }
+
+    /// Replace the shipped sidebar width with validated configuration.
+    pub(crate) fn with_sidebar_columns(mut self, columns: usize) -> Self {
+        self.sidebar_columns = columns;
+        self
     }
 
     /// Replace the cursor drawing style (a `[cursor]` configuration
@@ -1493,6 +1586,10 @@ pub(crate) fn vertex_bytes(vertices: &[Vertex]) -> Vec<u8> {
 
 const QUESTION_MARK_GLYPH: [u8; 7] = [14, 17, 1, 2, 4, 0, 4];
 const UNICODE_REPLACEMENT_GLYPH: [u8; 7] = [4, 10, 17, 21, 17, 10, 4];
+const STARTING_MARKER_GLYPH: [u8; 7] = [31, 27, 14, 4, 14, 27, 31];
+const RUNNING_MARKER_GLYPH: [u8; 7] = [8, 12, 14, 15, 14, 12, 8];
+const EXITED_MARKER_GLYPH: [u8; 7] = [0, 14, 14, 14, 14, 14, 0];
+const FAILED_MARKER_GLYPH: [u8; 7] = [17, 10, 4, 14, 4, 10, 17];
 
 /// Add one visible diacritic row to an ASCII base glyph.
 ///
@@ -1841,6 +1938,10 @@ fn box_drawing_rows(character: char) -> Option<[u8; 7]> {
 #[rustfmt::skip]
 fn glyph_rows(character: char) -> [u8; 7] {
     match character {
+        '⌛' => STARTING_MARKER_GLYPH,
+        '▶' => RUNNING_MARKER_GLYPH,
+        '■' => EXITED_MARKER_GLYPH,
+        '✕' => FAILED_MARKER_GLYPH,
         ' ' => [0, 0, 0, 0, 0, 0, 0],
         'A' => [14, 17, 17, 31, 17, 17, 17],
         'B' => [30, 17, 17, 30, 17, 17, 30],
@@ -2131,6 +2232,47 @@ mod tests {
         assert!(
             color_contrast(foreground, background) >= CURSOR_MIN_CONTRAST,
             "the inverted glyph/block pair must remain readable"
+        );
+    }
+
+    /// Non-GPU guard for the cursor-only frame cases. The rendered-frame
+    /// oracle exercises the same behavior through readback when Metal exists;
+    /// this pins production vertex emission on headless runners too.
+    #[test]
+    fn fresh_screen_cursor_survives_and_dectcem_hides_then_restores_it() {
+        let metrics = poc_metrics();
+        let render = |bytes: &[u8]| {
+            let terminal = snapshot(2, 4, bytes);
+            frame_vertices(
+                Some(&terminal),
+                None,
+                None,
+                4 * metrics.width(),
+                2 * metrics.height(),
+                metrics,
+            )
+        };
+
+        let shown = render(b"");
+        let hidden = render(b"\x1b[?25l");
+        let restored = render(b"\x1b[?25l\x1b[?25h");
+
+        assert_eq!(
+            shown.len(),
+            VERTICES_PER_RECT,
+            "a fresh screen must emit exactly one solid cursor block"
+        );
+        assert!(
+            shown.iter().all(|vertex| vertex.color == DARK.foreground()),
+            "the default blank-cell cursor must use inverse foreground ink"
+        );
+        assert!(
+            hidden.is_empty(),
+            "DECTCEM hide must remove the cursor from an otherwise blank frame"
+        );
+        assert_eq!(
+            restored, shown,
+            "DECTCEM show must restore the fresh-screen cursor vertices"
         );
     }
 
@@ -2576,6 +2718,99 @@ mod tests {
         }
 
         assert_eq!(seen.len(), 95, "printable ASCII must contain 95 glyphs");
+    }
+
+    #[test]
+    fn lifecycle_markers_collide_with_none_of_320_existing_sidebar_glyphs() {
+        use noren_app::sidebar_text::LIFECYCLE_MARKERS;
+
+        // The sidebar can receive every renderer-covered text glyph through a
+        // configured or discovered label: 95 printable ASCII, 96 Latin-1
+        // Supplement, and 128 Box Drawing characters. Unsupported Unicode
+        // adds one replacement glyph. Check marker shapes against all 320
+        // inputs, not only against the three pre-existing chrome markers.
+        let mut existing: Vec<char> = (0x20_u8..=0x7e).map(char::from).collect();
+        existing.extend((0x00a0..=0x00ff).filter_map(char::from_u32));
+        existing.extend((0x2500..=0x257f).filter_map(char::from_u32));
+        existing.push('\u{fffd}');
+        assert_eq!(existing.len(), 320);
+
+        for (index, marker) in LIFECYCLE_MARKERS.into_iter().enumerate() {
+            let marker_rows = glyph_rows(marker);
+            for existing_glyph in &existing {
+                assert_ne!(
+                    marker_rows,
+                    glyph_rows(*existing_glyph),
+                    "lifecycle marker {marker:?} collides with existing sidebar glyph \
+                     {existing_glyph:?}"
+                );
+            }
+            for other in &LIFECYCLE_MARKERS[index + 1..] {
+                assert_ne!(
+                    marker_rows,
+                    glyph_rows(*other),
+                    "lifecycle markers {marker:?} and {other:?} collide"
+                );
+            }
+        }
+
+        // Pin the margin for EVERY marker, not just the starting one. The
+        // narrower single-marker form let a future edit to any of the other
+        // three shrink its margin unnoticed. The comparison set is the full
+        // sidebar glyph inventory plus the other markers, so the assertion
+        // covers the marker-vs-marker minimum as well.
+        let bit_distance = |first: [u8; 7], second: [u8; 7]| -> u32 {
+            first
+                .iter()
+                .zip(second)
+                .map(|(a, b)| (a ^ b).count_ones())
+                .sum()
+        };
+        let (global_minimum, worst_pair) = LIFECYCLE_MARKERS
+            .iter()
+            .enumerate()
+            .flat_map(|(index, marker)| {
+                let marker_rows = glyph_rows(*marker);
+                existing
+                    .iter()
+                    .copied()
+                    .chain(LIFECYCLE_MARKERS[index + 1..].iter().copied())
+                    .map(move |other| {
+                        (
+                            bit_distance(marker_rows, glyph_rows(other)),
+                            (*marker, other),
+                        )
+                    })
+            })
+            .min()
+            .expect("the full 320-glyph comparison set is non-empty");
+        // `▶` vs `■` is the true global minimum: 5 of 7 rows differ, which
+        // reads as an unmistakable triangle against a filled square. This
+        // pins that margin so a redesign of any marker cannot silently
+        // erode it.
+        assert_eq!(
+            global_minimum, 5,
+            "closest marker pair {worst_pair:?} is only {global_minimum} bits apart"
+        );
+    }
+
+    #[test]
+    fn lifecycle_marker_colors_clear_aa_on_every_shipped_sidebar_background() {
+        use noren_app::sidebar_text::LIFECYCLE_MARKERS;
+        use noren_app::theme::{DARK, HIGH_CONTRAST, LIGHT};
+
+        for theme in [DARK, LIGHT, HIGH_CONTRAST] {
+            for marker in LIFECYCLE_MARKERS {
+                let ansi = lifecycle_marker_color(marker).expect("known lifecycle marker");
+                let color = theme.ansi()[usize::from(ansi.palette_index())];
+                let ratio = contrast_ratio(color, theme.background_u8());
+                assert!(
+                    ratio >= 4.5,
+                    "marker {marker:?} has only {ratio:.4}:1 contrast on {:?}",
+                    theme.background_u8()
+                );
+            }
+        }
     }
 
     /// Distinct covered characters may share a bitmap only where a 5×7 grid

@@ -420,6 +420,37 @@ fn configured_cell_sizes_drive_the_app_geometry() {
     assert_eq!((grid.rows(), grid.cols()), (15, 45));
 }
 
+#[test]
+fn configured_sidebar_columns_reach_app_terminal_pty_and_text() {
+    let config = AppConfig::parse("[sidebar]\ncolumns = 24\n").expect("valid configuration");
+    let mut app = NorenApp::new(config);
+    assert_eq!(app.sidebar_columns, 24);
+
+    let grid = app
+        .geometry
+        .update(Resize::new(900, 600))
+        .expect("initial grid");
+    let pty = app
+        .prepare_initial_terminal(grid)
+        .expect("configured grid has a PTY size");
+    assert_eq!((pty.rows(), pty.cols()), (29, 66));
+    let terminal = app.terminal.as_ref().expect("terminal installed");
+    assert_eq!(
+        (terminal.screen().rows(), terminal.screen().cols()),
+        (29, 66)
+    );
+
+    let session = app.workspace.create_session(SessionKind::Local);
+    let lines = visible_sidebar_text_lines_at_width(app.workspace.sidebar(), 0, 1, 24);
+    assert_eq!(lines[0].chars().count(), 24);
+    assert!(lines[0].contains(&session.to_string()));
+    assert_eq!(lines[0].chars().last(), Some('⌛'));
+    assert_eq!(
+        sidebar_pixel_width_at_width(app.geometry.cell_width(), app.sidebar_columns),
+        240.0
+    );
+}
+
 /// The `[theme]` selection reaches the app's renderer input: `NorenApp`
 /// carries exactly the palette the configuration named, and a missing
 /// `[theme]` section carries the dark default. This is the app-level half of
@@ -665,7 +696,7 @@ fn sidebar_text_lines_format_a_real_workspace_sidebar() {
     assert_eq!(lines.len(), 2, "one formatted line per sidebar row");
 
     // The selected row is prefixed with '>' and the unselected with a
-    // space; both carry the real descriptor's label and detail.
+    // space; both carry the real descriptor's label.
     assert!(
         lines[0].starts_with("> "),
         "selected row must be marked with '>': {:?}",
@@ -686,13 +717,11 @@ fn sidebar_text_lines_format_a_real_workspace_sidebar() {
         "unselected row carries the session label: {:?}",
         lines[1]
     );
-    // A freshly created session sits at the Starting status, so the detail
-    // is derived from the real descriptor, not a constant.
-    assert!(
-        lines[0].contains("local · starting"),
-        "detail comes from the real descriptor: {:?}",
-        lines[0]
-    );
+    // A freshly created session sits at Starting, whose reserved final cell
+    // carries the hourglass marker. The full detail remains on the view
+    // model; compact rendering never lets it push state beyond column 16.
+    assert_eq!(lines[0].chars().count(), renderer::SIDEBAR_COLS);
+    assert_eq!(lines[0].chars().last(), Some('⌛'));
 }
 
 // ── Pass-through gate integration tests ──────────────────────────────

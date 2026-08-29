@@ -21,6 +21,7 @@ pub mod session;
 pub mod session_persistence;
 pub mod session_supervisor;
 pub mod sidebar;
+pub mod sidebar_text;
 pub mod ssh_config;
 pub mod theme;
 pub mod ui;

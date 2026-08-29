@@ -5,7 +5,11 @@ mod input_translation;
 mod persistence_state;
 mod renderer;
 
-use frame_geometry::{pixel_row_index, sidebar_pixel_width, terminal_cols, terminal_column_at};
+use frame_geometry::{
+    pixel_row_index, sidebar_pixel_width_at_width, terminal_cols_at_width, terminal_column_at_width,
+};
+#[cfg(test)]
+use frame_geometry::{sidebar_pixel_width, terminal_cols, terminal_column_at};
 #[cfg(test)]
 use input_translation::{
     app_modifiers_from_gate, gate_key_to_app, keypad_key, translate_logical_key,
@@ -16,6 +20,8 @@ use input_translation::{
 };
 use persistence_state::{AttemptOutcome, Observation, PersistenceState, SaveOutcome};
 
+#[cfg(test)]
+use noren_app::sidebar_text::{visible_sidebar_text_lines, visible_sidebar_text_lines_at_width};
 #[cfg(test)]
 use noren_app::{
     Arrow, CellMetrics, FunctionKey, Key, KeyDropReason, KeyInput, KeyPhase, KeypadInput,
@@ -44,6 +50,7 @@ use noren_app::{
         SESSION_STATE_FILE_NAME, SessionPersistenceError, load_snapshot, save_snapshot, snapshot,
     },
     sidebar::{SidebarEntry, SidebarView},
+    sidebar_text::{SidebarTextRow, visible_sidebar_text_rows_at_width},
     ssh_config::{HostDiscoveryKind, SshConfig},
     theme::Theme,
 };
@@ -1123,6 +1130,9 @@ struct NorenApp {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     geometry: GridGeometry,
+    /// Validated `[sidebar] columns`, shared by layout, drawing, formatting,
+    /// and hit testing so configured control cannot create split geometry.
+    sidebar_columns: usize,
     pending_grid: Option<GridSize>,
     terminal: Option<TerminalState>,
     pty: Option<PtySession>,
@@ -1292,6 +1302,7 @@ impl NorenApp {
             window: None,
             renderer: None,
             geometry,
+            sidebar_columns: config.sidebar().columns(),
             pending_grid: None,
             terminal: None,
             pty: None,
@@ -1370,7 +1381,7 @@ impl NorenApp {
     /// Keeping this as the initialization seam prevents the two consumers from
     /// independently reinterpreting the application-owned status row.
     fn prepare_initial_terminal(&mut self, grid: GridSize) -> Option<PtySize> {
-        let runtime = RuntimeGridSize::from_window(grid);
+        let runtime = RuntimeGridSize::from_window(grid, self.sidebar_columns);
         let terminal = runtime.terminal_state()?;
         let pty = runtime.pty_size()?;
         self.terminal = Some(terminal);
@@ -1663,7 +1674,7 @@ impl NorenApp {
         // `update` returns `None` for an unchanged grid; the current grid is
         // then exactly what a new session should use.
         let grid = changed.or_else(|| self.geometry.current())?;
-        let runtime = RuntimeGridSize::from_window(grid);
+        let runtime = RuntimeGridSize::from_window(grid, self.sidebar_columns);
         Some((runtime.terminal_state()?, runtime.pty_size()?))
     }
 
@@ -2247,6 +2258,7 @@ impl NorenApp {
         self.renderer = match Renderer::new(
             Arc::clone(&window),
             self.geometry.cell_metrics(),
+            self.sidebar_columns,
             self.theme,
             self.cursor_style,
         ) {
@@ -2810,7 +2822,8 @@ impl NorenApp {
             || position.y < 0.0
             || position.x >= f64::from(frame_size.width)
             || position.y >= f64::from(frame_size.height)
-            || position.x >= sidebar_pixel_width(self.geometry.cell_width())
+            || position.x
+                >= sidebar_pixel_width_at_width(self.geometry.cell_width(), self.sidebar_columns)
         {
             return None;
         }
@@ -2840,7 +2853,8 @@ impl NorenApp {
             || !position.y.is_finite()
             || position.x < 0.0
             || position.y < 0.0
-            || position.x >= sidebar_pixel_width(self.geometry.cell_width())
+            || position.x
+                >= sidebar_pixel_width_at_width(self.geometry.cell_width(), self.sidebar_columns)
             || position.x >= f64::from(frame_size.width)
             || position.y >= f64::from(frame_size.height)
         {
@@ -2987,9 +3001,9 @@ impl NorenApp {
         let terminal = self.terminal.as_ref()?;
         let cell_width = self.geometry.cell_width();
         let cell_height = self.geometry.cell_height();
-        // The sidebar occupies the leftmost SIDEBAR_COLS cell columns; clicks
+        // The sidebar occupies the configured leftmost cell columns; clicks
         // inside it do not address the terminal grid.
-        if position.x < sidebar_pixel_width(cell_width) {
+        if position.x < sidebar_pixel_width_at_width(cell_width, self.sidebar_columns) {
             return None;
         }
         let content_rows = terminal.screen().display_row_count();
@@ -3009,7 +3023,7 @@ impl NorenApp {
         if line_index >= usize::from(rows) {
             return None;
         }
-        let column = terminal_column_at(position.x, cols, cell_width)?;
+        let column = terminal_column_at_width(position.x, cols, cell_width, self.sidebar_columns)?;
         Some(GridPoint::new(
             terminal.scrollback_len() + line_index,
             column,
@@ -3179,7 +3193,7 @@ impl NorenApp {
         // Resize re-addresses the grid, so captured coordinates expire.
         self.selection = None;
         self.drag_origin = None;
-        let runtime = RuntimeGridSize::from_window(grid);
+        let runtime = RuntimeGridSize::from_window(grid, self.sidebar_columns);
         if let Some(terminal) = &mut self.terminal {
             if runtime.resize_terminal(terminal).is_err() {
                 self.status = "Noren terminal resize failed";
@@ -3353,18 +3367,22 @@ impl NorenApp {
             .ok()
             .and_then(|rows| self.rendered_status_row(rows));
         self.clamp_sidebar_scroll(visible_rows);
-        let sidebar_lines = visible_sidebar_text_lines(
+        let sidebar_rows = visible_sidebar_text_rows_at_width(
             self.workspace.sidebar(),
             self.sidebar_scroll_offset,
             visible_rows,
+            self.sidebar_columns,
         );
-        let lines = if self.palette_open {
-            let mut lines =
-                palette_text_lines(self.workspace.palette(), self.palette_selection, &self.keys);
-            lines.extend(sidebar_lines);
-            lines
+        let rows = if self.palette_open {
+            let mut rows: Vec<_> =
+                palette_text_lines(self.workspace.palette(), self.palette_selection, &self.keys)
+                    .into_iter()
+                    .map(SidebarTextRow::chrome)
+                    .collect();
+            rows.extend(sidebar_rows);
+            rows
         } else {
-            sidebar_lines
+            sidebar_rows
         };
         let status = status_row.map(|source| {
             source.text(
@@ -3384,7 +3402,8 @@ impl NorenApp {
             .and_then(|_| noren_app::ui::palette_hint(self.keys, self.ui));
         let workspace_notice = (self.workspace.sidebar().is_empty() && self.terminal.is_none())
             .then(|| noren_app::ui::empty_workspace_recovery(self.keys));
-        let chrome = FrameChrome::new(Some(&lines), status)
+        let chrome = FrameChrome::new(None, status)
+            .with_sidebar_rows(Some(&rows))
             .with_palette_hint(palette_hint.as_deref())
             .with_workspace_notice(workspace_notice.as_deref())
             .with_selection(self.selection.as_ref());
@@ -3524,10 +3543,10 @@ struct RuntimeGridSize {
 }
 
 impl RuntimeGridSize {
-    fn from_window(grid: GridSize) -> Self {
+    fn from_window(grid: GridSize, sidebar_columns: usize) -> Self {
         Self {
             rows: NorenApp::content_terminal_rows(grid.rows()),
-            cols: terminal_cols(grid.cols()),
+            cols: terminal_cols_at_width(grid.cols(), sidebar_columns),
         }
     }
 
@@ -3544,46 +3563,14 @@ impl RuntimeGridSize {
     }
 }
 
-/// Convert the sidebar view into text lines the renderer can draw.
+/// Convert the sidebar view into text lines at the shipped width.
 ///
-/// Each row is prefixed with `>` when selected, space otherwise, followed by
-/// the label and optional detail — using [`SidebarRow::label`] and
-/// [`SidebarRow::detail`] verbatim. When the sidebar is empty the
-/// empty-state message is returned as the sole line.
+/// Production and the integration frame oracle share the width-aware
+/// implementation in `sidebar_text`; this test seam keeps existing binary
+/// tests on the exact same projection.
 #[cfg(test)]
 fn sidebar_text_lines(sidebar: &SidebarView) -> Vec<String> {
     visible_sidebar_text_lines(sidebar, 0, usize::MAX)
-}
-
-/// Format only the visible slice of the sidebar. The scroll offset is clamped
-/// to the last full page so redraw work stays proportional to frame rows, not
-/// to hidden entries.
-fn visible_sidebar_text_lines(
-    sidebar: &SidebarView,
-    offset: usize,
-    max_rows: usize,
-) -> Vec<String> {
-    if max_rows == 0 {
-        return Vec::new();
-    }
-    if sidebar.is_empty() {
-        return sidebar
-            .empty_state()
-            .map(|state| vec![state.message().to_string()])
-            .unwrap_or_default();
-    }
-    let offset = offset.min(sidebar.rows().len().saturating_sub(max_rows));
-    sidebar.rows()[offset..]
-        .iter()
-        .take(max_rows)
-        .map(|row| {
-            let marker = if row.is_selected() { '>' } else { ' ' };
-            match row.detail() {
-                Some(detail) => format!("{marker} {} {}", row.label(), detail),
-                None => format!("{marker} {}", row.label()),
-            }
-        })
-        .collect()
 }
 
 /// Build text lines for the palette display, drawn at the top of the sidebar

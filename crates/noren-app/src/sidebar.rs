@@ -46,6 +46,24 @@ pub enum EntryKind {
     Session,
 }
 
+/// The four user-visible lifecycle classes carried by a session row.
+///
+/// [`SessionStatus::Restored`] deliberately projects to [`Exited`](Self::Exited):
+/// a restored record has no running process, so the stopped marker is the
+/// truthful compact treatment. The persisted/restored detail remains available
+/// on the row; this enum exists only for the always-visible lifecycle signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum SessionLifecycle {
+    /// The session exists but has not yet reported a running observation.
+    Starting,
+    /// The session has a live observed process.
+    Running,
+    /// The process exited, or the row was restored without a live process.
+    Exited,
+    /// Session startup or operation failed.
+    Failed,
+}
+
 impl EntryKind {
     /// The fixed, content-free name of this kind.
     ///
@@ -75,6 +93,7 @@ pub struct SidebarRow {
     kind: EntryKind,
     label: String,
     detail: Option<String>,
+    lifecycle: Option<SessionLifecycle>,
     selected: bool,
 }
 
@@ -95,6 +114,12 @@ impl SidebarRow {
     #[must_use]
     pub fn detail(&self) -> Option<&str> {
         self.detail.as_deref()
+    }
+
+    /// Compact lifecycle carried only by session rows.
+    #[must_use]
+    pub const fn lifecycle(&self) -> Option<SessionLifecycle> {
+        self.lifecycle
     }
 
     /// Whether this row carries the single selection.
@@ -309,12 +334,14 @@ impl SidebarView {
                     kind: EntryKind::Project,
                     label: name.clone(),
                     detail: Some(root.clone()),
+                    lifecycle: None,
                     selected: false,
                 },
                 SidebarEntry::Worktree { name, branch } => SidebarRow {
                     kind: EntryKind::Worktree,
                     label: name.clone(),
                     detail: Some(branch.clone()),
+                    lifecycle: None,
                     selected: false,
                 },
                 SidebarEntry::SshConnection {
@@ -330,6 +357,7 @@ impl SidebarView {
                         kind: EntryKind::SshConnection,
                         label: label.clone(),
                         detail: Some(host.clone()),
+                        lifecycle: None,
                         selected: is_selected,
                     }
                 }
@@ -337,6 +365,7 @@ impl SidebarView {
                     kind: EntryKind::Agent,
                     label: label.clone(),
                     detail: Some(status.clone()),
+                    lifecycle: None,
                     selected: false,
                 },
                 SidebarEntry::Session(descriptor) => {
@@ -354,6 +383,7 @@ impl SidebarView {
                         kind: EntryKind::Session,
                         label: session_label(descriptor),
                         detail: Some(session_detail(descriptor)),
+                        lifecycle: Some(session_lifecycle(descriptor.status())),
                         selected: is_selected,
                     }
                 }
@@ -433,6 +463,15 @@ fn session_status_text(status: &SessionStatus) -> &'static str {
         SessionStatus::Running => "running",
         SessionStatus::Exited { .. } => "exited",
         SessionStatus::Failed { .. } => "failed",
+    }
+}
+
+fn session_lifecycle(status: &SessionStatus) -> SessionLifecycle {
+    match status {
+        SessionStatus::Starting => SessionLifecycle::Starting,
+        SessionStatus::Running => SessionLifecycle::Running,
+        SessionStatus::Restored | SessionStatus::Exited { .. } => SessionLifecycle::Exited,
+        SessionStatus::Failed { .. } => SessionLifecycle::Failed,
     }
 }
 
