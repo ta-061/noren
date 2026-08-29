@@ -1437,6 +1437,90 @@ fn wheel_is_local_without_mouse_mode_and_forwarded_with_mouse_mode() {
     );
 }
 
+fn assert_tracking_mode_forwards_wheel(decset: &[u8]) {
+    let mut app = NorenApp {
+        terminal: Some(history_terminal(3, 6)),
+        ..Default::default()
+    };
+    app.apply_pty_output(decset);
+    app.apply_pty_output(b"\x1b[?1006h");
+
+    assert_eq!(
+        app.route_terminal_wheel(MouseScrollDelta::LineDelta(0.0, 1.0), Some((1, 1))),
+        TerminalWheelRoute::ForwardedToApplication(vec![b"\x1b[<64;2;2M".to_vec()]),
+        "an application tracking mode must own the wheel"
+    );
+    assert_eq!(
+        app.scroll_offset, 0,
+        "forwarding must not consume the wheel as local history"
+    );
+}
+
+#[test]
+fn mode_1000_forwards_wheel_instead_of_consuming_scrollback() {
+    assert_tracking_mode_forwards_wheel(b"\x1b[?1000h");
+}
+
+#[test]
+fn mode_1002_forwards_wheel_instead_of_consuming_scrollback() {
+    assert_tracking_mode_forwards_wheel(b"\x1b[?1002h");
+}
+
+#[test]
+fn mode_1003_forwards_wheel_instead_of_consuming_scrollback() {
+    assert_tracking_mode_forwards_wheel(b"\x1b[?1003h");
+}
+
+#[test]
+fn mouse_tracking_enable_then_disable_restores_local_wheel_scrolling() {
+    let mut app = NorenApp {
+        terminal: Some(history_terminal(3, 6)),
+        ..Default::default()
+    };
+    app.apply_pty_output(b"\x1b[?1000;1006h");
+
+    assert!(matches!(
+        app.route_terminal_wheel(MouseScrollDelta::LineDelta(0.0, 1.0), Some((0, 0))),
+        TerminalWheelRoute::ForwardedToApplication(_)
+    ));
+    assert_eq!(app.scroll_offset, 0);
+
+    app.apply_pty_output(b"\x1b[?1000l");
+    assert_eq!(
+        app.route_terminal_wheel(MouseScrollDelta::LineDelta(0.0, 1.0), Some((0, 0))),
+        TerminalWheelRoute::ConsumedLocally {
+            before: 0,
+            after: 1,
+        },
+        "DECRST must return an unclaimed wheel to local scrollback"
+    );
+    assert_eq!(app.scroll_offset, 1);
+}
+
+#[test]
+fn claiming_mouse_while_scrolled_snaps_to_tail_before_forwarding_wheel() {
+    let mut app = NorenApp {
+        terminal: Some(history_terminal(3, 6)),
+        ..Default::default()
+    };
+    app.scroll_view(ScrollDirection::Older, 2);
+    assert_eq!(app.scroll_offset, 2, "fixture starts in history");
+
+    app.apply_pty_output(b"\x1b[?1002h");
+    assert_eq!(
+        app.scroll_offset, 0,
+        "a newly claimed mouse rejoins the application's live surface"
+    );
+    assert!(
+        matches!(
+            app.route_terminal_wheel(MouseScrollDelta::LineDelta(0.0, 1.0), Some((0, 0))),
+            TerminalWheelRoute::ForwardedToApplication(ref reports) if reports.len() == 1
+        ),
+        "the claiming mode must own the next wheel event"
+    );
+    assert_eq!(app.scroll_offset, 0);
+}
+
 // ── Authoritative application mouse modes ───────────────────────────
 
 #[test]
