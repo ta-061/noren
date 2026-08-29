@@ -1930,7 +1930,7 @@ impl NorenApp {
     /// become shell syntax. The registry observes `Running` when the spawn
     /// succeeds and `Failed` when it does not (a missing or non-executable
     /// command lands here as a visible failure: the configured row shows the
-    /// `AG-ERR` state, the session row shows `failed`, and the status row
+    /// shared failed shape, the session row shows the same shape, and the status row
     /// carries the fixed failure line — never a hang, never a silent
     /// no-op). A successful launch takes the live view and parks the
     /// previous session, the same convention as every other launch; a

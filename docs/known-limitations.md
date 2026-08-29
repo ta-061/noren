@@ -315,8 +315,8 @@ Each item states what you would actually see if you ran the build.
   and refused on selection — no panic, no child. Worktree sessions persist
   and restore through `sessions.toml` exactly like local ones.
   `[[projects]]` configuration entries appear as `EntryKind::Project` rows
-  (at most 24, capped like every other list; the fixed `PRJ-` state prefix
-  distinguishes them from prefix-less worktree rows), and selecting one
+  (at most 24, capped like every other list; fixed, collision-checked kind
+  shapes distinguish projects from worktrees without textual prefixes), and selecting one
   whose root still exists starts a real `SessionKind::Project` session — the
   same directory-rooted launch shape as a worktree, with the child's own
   `pwd` proof; a configured-but-gone root is refused visibly like a deleted

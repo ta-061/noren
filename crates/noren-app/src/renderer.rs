@@ -388,7 +388,7 @@ impl<'a> FrameChrome<'a> {
 
     /// Retain sidebar row kinds through the production chrome path.
     ///
-    /// Lifecycle colour is semantic reinforcement for session rows only, so
+    /// Kind and lifecycle colours reinforce structured row facts, so
     /// rendering must not flatten these rows to strings before colour choice.
     #[must_use]
     pub(crate) fn with_sidebar_rows(mut self, rows: Option<&'a [SidebarTextRow]>) -> Self {
@@ -714,8 +714,8 @@ pub(crate) fn glyph_vertices_for(
 
 /// Production vertex path for sidebar text that retains its domain row kind.
 ///
-/// Lifecycle colour is semantic reinforcement for session rows only; the
-/// text-only [`glyph_vertices_for`] seam deliberately supplies no row kind.
+/// Kind and lifecycle colours reinforce structured row facts; the text-only
+/// [`glyph_vertices_for`] seam deliberately supplies neither fact.
 // Re-included by the frame oracle, while the live binary supplies the same
 // typed rows through `FrameChrome::with_sidebar_rows`.
 #[allow(dead_code)]

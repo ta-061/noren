@@ -96,7 +96,7 @@ use std::process::Command;
 use noren_app::config::AppConfig;
 use noren_app::cursor::CursorShape;
 use noren_app::session::{SessionKind, SessionRegistry, SessionStatus};
-use noren_app::sidebar::{EntryKind, SidebarEntry, SidebarView};
+use noren_app::sidebar::{EntryKind, SessionLifecycle, SidebarEntry, SidebarView};
 use noren_app::sidebar_text::{SidebarTextRow, visible_sidebar_text_rows_at_width};
 use noren_app::theme::{DARK, HIGH_CONTRAST, LIGHT, Theme, contrast_ratio};
 use noren_app::ui::{empty_workspace_recovery, palette_hint, scrollback_indicator};
@@ -3115,6 +3115,59 @@ fn lifecycle_cases() -> [(SessionStatus, char, usize, [u8; 7]); 4] {
     ]
 }
 
+/// Build each kind through the real domain view and width-aware projection.
+/// The four non-session kinds deliberately share identical identity/detail
+/// text; project, SSH, and agent also share one lifecycle. Their frames can
+/// therefore differ only in the fixed kind cell, while worktree additionally
+/// differs in the intentionally blank lifecycle cell.
+fn kind_sidebar_row(kind: EntryKind) -> SidebarTextRow {
+    let entry = match kind {
+        EntryKind::Project => SidebarEntry::Project {
+            name: "same".to_owned(),
+            root: "same-detail".to_owned(),
+            lifecycle: SessionLifecycle::Exited,
+        },
+        EntryKind::Worktree => SidebarEntry::Worktree {
+            name: "same".to_owned(),
+            branch: "same-detail".to_owned(),
+        },
+        EntryKind::SshConnection => SidebarEntry::SshConnection {
+            label: "same".to_owned(),
+            host: "same-detail".to_owned(),
+            selected: false,
+            lifecycle: SessionLifecycle::Exited,
+        },
+        EntryKind::Agent => SidebarEntry::Agent {
+            label: "same".to_owned(),
+            status: "same-detail".to_owned(),
+            lifecycle: SessionLifecycle::Exited,
+        },
+        EntryKind::Session => {
+            let mut registry = SessionRegistry::new();
+            let id = registry.create(SessionKind::Local);
+            registry
+                .observe(id, SessionStatus::Exited { code: Some(0) })
+                .expect("fixture lifecycle advances monotonically");
+            SidebarEntry::Session(registry.get(id).expect("fixture id remains live"))
+        }
+    };
+    let view = SidebarView::build(&[entry], None);
+    visible_sidebar_text_rows_at_width(&view, 0, 1, SIDEBAR_COLS)
+        .into_iter()
+        .next()
+        .expect("one entry produces one sidebar row")
+}
+
+fn kind_cases() -> [(EntryKind, char, usize, [u8; 7]); 5] {
+    [
+        (EntryKind::Project, '◆', 13, [4, 14, 31, 27, 31, 14, 4]),
+        (EntryKind::Worktree, '⑂', 2, [4, 5, 5, 7, 4, 20, 28]),
+        (EntryKind::SshConnection, '⌁', 6, [0, 14, 17, 6, 12, 17, 14]),
+        (EntryKind::Agent, '♟', 3, [4, 14, 21, 31, 21, 14, 10]),
+        (EntryKind::Session, '▣', 7, [31, 17, 21, 19, 21, 17, 31]),
+    ]
+}
+
 /// Rectangle fingerprint and colours emitted inside one sidebar cell by the
 /// production vertex path. This is a frame oracle that needs no GPU adapter:
 /// the same vertices feed the shipped shader and the offscreen pixel capture.
@@ -3178,6 +3231,103 @@ fn sidebar_cell_vertex_oracle(
         colors.push(rectangle[0].color);
     }
     (signature, colors)
+}
+
+#[test]
+fn sidebar_kind_markers_are_identifiable_and_on_row_at_16_columns() {
+    let mut signatures = Vec::new();
+    for (kind, expected_marker, expected_ansi, expected_rows) in kind_cases() {
+        let row = kind_sidebar_row(kind);
+        assert_eq!(row.kind(), Some(kind));
+        assert_eq!(row.text().chars().count(), SIDEBAR_COLS);
+        assert_eq!(
+            row.text().chars().nth(1),
+            Some(expected_marker),
+            "{kind:?} must own its literal in fixed visible column 2"
+        );
+        assert_eq!(
+            row.text().chars().nth(2),
+            Some(' '),
+            "{kind:?} must retain the separator after its shape"
+        );
+
+        let (signature, _) = sidebar_cell_vertex_oracle(&row, &DARK, 1);
+        assert!(!signature.is_empty(), "{kind:?} emitted no kind geometry");
+        assert_eq!(
+            glyph_rows_from_rectangles(&signature),
+            expected_rows,
+            "{kind:?} moved or changed pixels inside fixed column 2"
+        );
+        assert!(
+            !signatures.contains(&signature),
+            "{kind:?} rendered the same shape as another row kind"
+        );
+        signatures.push(signature);
+
+        for theme in [DARK, LIGHT, HIGH_CONTRAST] {
+            let (_, colors) = sidebar_cell_vertex_oracle(&row, &theme, 1);
+            let expected = theme.ansi()[expected_ansi].map(|channel| f32::from(channel) / 255.0);
+            assert!(
+                !colors.is_empty() && colors.iter().all(|color| *color == expected),
+                "{kind:?} did not use ANSI slot {expected_ansi} on {:?}: {colors:?}",
+                theme.background_u8()
+            );
+            assert!(
+                contrast_ratio(theme.ansi()[expected_ansi], theme.background_u8()) >= 4.5,
+                "{kind:?} fails WCAG AA on {:?}",
+                theme.background_u8()
+            );
+        }
+    }
+    assert_eq!(signatures.len(), 5, "all five kind shapes were checked");
+}
+
+#[test]
+fn sidebar_kind_markers_reach_exact_distinct_frame_cells_at_16_columns() {
+    let Some(renderer) =
+        renderer_or_skip("sidebar_kind_markers_reach_exact_distinct_frame_cells_at_16_columns")
+    else {
+        return;
+    };
+    let width = SIDEBAR_COLS as u32 * CELL_WIDTH;
+    let mut patterns = Vec::new();
+    let mut frames = Vec::new();
+    for (kind, expected_marker, expected_ansi, _) in kind_cases() {
+        let row = kind_sidebar_row(kind);
+        let frame = renderer.capture_sidebar_rows(
+            Target::new(&DARK, width, CELL_HEIGHT, poc_metrics()),
+            None,
+            Some(std::slice::from_ref(&row)),
+            None,
+        );
+        assert!(
+            cell_is_lit(&frame, 0, 1),
+            "{kind:?} marker {expected_marker:?} is not visible in fixed column 2"
+        );
+        assert!(
+            colors_match(cell_color(&frame, 0, 1), DARK.ansi()[expected_ansi]),
+            "{kind:?} marker pixels do not use ANSI slot {expected_ansi}"
+        );
+        let pattern = cell_pattern(&frame, 0, 1);
+        assert!(
+            !patterns.contains(&pattern),
+            "{kind:?} has the same captured marker pixels as another kind"
+        );
+        patterns.push(pattern);
+        frames.push(frame);
+    }
+    assert_eq!(patterns.len(), 5, "all five captured shapes were checked");
+
+    // Project, SSH, and agent fixtures have byte-identical identity and state
+    // cells, so the kind cell is the EXACT full-frame difference. Worktree
+    // additionally owns a blank final state cell by design.
+    assert_eq!(changed_cells(&frames[0], &frames[2], 1, 16), vec![(0, 1)]);
+    assert_eq!(changed_cells(&frames[0], &frames[3], 1, 16), vec![(0, 1)]);
+    assert_eq!(changed_cells(&frames[2], &frames[3], 1, 16), vec![(0, 1)]);
+    assert_eq!(
+        changed_cells(&frames[0], &frames[1], 1, 16),
+        vec![(0, 1), (0, 15)]
+    );
 }
 
 #[test]

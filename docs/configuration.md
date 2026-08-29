@@ -348,10 +348,11 @@ root whose directory is gone is a runtime fact, refused visibly when the
 row is selected (exactly like a registered-but-deleted worktree), not a
 load-time guess.
 
-A project row is visually distinguishable from a worktree row: it carries
-the fixed eight-character state prefix (`PRJ-OFF` idle, `PRJ-ERR` after a
-refused launch) like the SSH and agent rows, while a worktree row shows its
-checkout's final path component and branch.
+A project row is visually distinguishable from a worktree row without a text
+prefix: every kind owns a collision-checked shape in column 1 (`◆` for a
+project, `⑂` for a worktree), reinforced by a theme colour. A project also
+uses the shared final-cell lifecycle vocabulary (`■` idle, `✕` after a refused
+launch); a worktree has no lifecycle and leaves that cell blank.
 
 Rejections follow the same hard-error discipline: an entry missing `name`
 or `root`, a wrong-typed field, a relative or tilde-relative `root`, an
