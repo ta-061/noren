@@ -20,6 +20,9 @@
 //! - the drawn grid dimensions match the state's dimensions;
 //! - per-cell, lit/blank agrees with `TerminalSnapshot` across the FR-005
 //!   fixture classes (prompt, ASCII, UTF-8, control, scrolling);
+//! - scrollback offsets select the exact expected logical lines in captured
+//!   pixels (`C/D/E`, `B/C/D`, then `A/B/C`), clamp at the oldest row, and
+//!   retain a wide glyph's lead/continuation pair across the history seam;
 //! - two cells carrying different SGR foreground colours draw *different*
 //!   pixel colours, each matching the palette; a cell with no SGR colour keeps
 //!   the unchanged default; truecolor and 256-colour both resolve to their
@@ -35,7 +38,8 @@
 //! - a combining mark is drawn over its base cell without consuming a cell.
 //! - the default palette affordance is drawn in permanent terminal-side
 //!   chrome, rebinding `palette_open` changes the captured key glyph, and the
-//!   explicit UI opt-out removes those pixels (issue #191);
+//!   explicit UI opt-out removes those pixels (issue #191); the scrollback
+//!   indicator likewise draws first and names the active return binding;
 //! - after the last session closes, recovery copy and its active create chord
 //!   draw in the otherwise blank terminal area, with status chrome following
 //!   the recovery rows instead of overwriting them (issue #201);
@@ -95,7 +99,7 @@ use noren_app::session::{SessionKind, SessionRegistry, SessionStatus};
 use noren_app::sidebar::{EntryKind, SidebarEntry, SidebarView};
 use noren_app::sidebar_text::{SidebarTextRow, visible_sidebar_text_rows_at_width};
 use noren_app::theme::{DARK, HIGH_CONTRAST, LIGHT, Theme, contrast_ratio};
-use noren_app::ui::{empty_workspace_recovery, palette_hint};
+use noren_app::ui::{empty_workspace_recovery, palette_hint, scrollback_indicator};
 use noren_app::{
     GridGeometry, MAX_RENDER_COLS, MAX_RENDER_ROWS, POC_CELL_HEIGHT as CELL_HEIGHT,
     POC_CELL_WIDTH as CELL_WIDTH,
@@ -145,6 +149,21 @@ fn render_with_theme(
     )
 }
 
+/// Render through the production chrome path with an explicit history offset.
+fn render_with_scroll_offset(
+    renderer: &OffscreenRenderer,
+    snapshot: &TerminalSnapshot,
+    offset: usize,
+) -> CapturedFrame {
+    let width = u32::from(snapshot.cols()) * CELL_WIDTH;
+    let height = u32::from(snapshot.rows()) * CELL_HEIGHT;
+    renderer.capture_chrome(
+        Target::new(&Theme::default(), width, height, poc_metrics()),
+        Some(snapshot),
+        FrameChrome::new(None, None).with_scroll_offset(offset),
+    )
+}
+
 /// Render one app-owned selection through the live frame seam.
 fn render_with_selection(
     renderer: &OffscreenRenderer,
@@ -152,12 +171,25 @@ fn render_with_selection(
     snapshot: &TerminalSnapshot,
     selection: &Selection,
 ) -> CapturedFrame {
+    render_with_selection_and_scroll_offset(renderer, theme, snapshot, selection, 0)
+}
+
+/// Render a selection and history offset together through the production seam.
+fn render_with_selection_and_scroll_offset(
+    renderer: &OffscreenRenderer,
+    theme: &Theme,
+    snapshot: &TerminalSnapshot,
+    selection: &Selection,
+    offset: usize,
+) -> CapturedFrame {
     let width = u32::from(snapshot.cols()) * CELL_WIDTH;
     let height = u32::from(snapshot.rows()) * CELL_HEIGHT;
     renderer.capture_chrome(
         Target::new(theme, width, height, poc_metrics()),
         Some(snapshot),
-        FrameChrome::new(None, None).with_selection(Some(selection)),
+        FrameChrome::new(None, None)
+            .with_scroll_offset(offset)
+            .with_selection(Some(selection)),
     )
 }
 
@@ -331,6 +363,16 @@ fn selection_background_vertex_cells(
     selection: &Selection,
     theme: &Theme,
 ) -> Vec<(u32, u32)> {
+    selection_background_vertex_cells_with_scroll_offset(snapshot, selection, theme, 0)
+}
+
+/// Selection-background cells emitted for an explicit history viewport.
+fn selection_background_vertex_cells_with_scroll_offset(
+    snapshot: &TerminalSnapshot,
+    selection: &Selection,
+    theme: &Theme,
+    scroll_offset: usize,
+) -> Vec<(u32, u32)> {
     let target = Target::new(
         theme,
         u32::from(snapshot.cols()) * CELL_WIDTH,
@@ -340,7 +382,9 @@ fn selection_background_vertex_cells(
     let vertices = glyph_vertices_for_chrome(
         target,
         Some(snapshot),
-        FrameChrome::new(None, None).with_selection(Some(selection)),
+        FrameChrome::new(None, None)
+            .with_scroll_offset(scroll_offset)
+            .with_selection(Some(selection)),
     );
     let expected_color = theme.selection_background();
     let mut cells = Vec::new();
@@ -677,6 +721,117 @@ fn distinct_ascii_glyphs_have_distinct_lit_patterns() {
     assert!(!a.iter().all(|&lit| !lit), "'A' cell drew nothing");
     assert!(!b.iter().all(|&lit| !lit), "'B' cell drew nothing");
     assert_ne!(a, b, "'A' and 'B' rendered the same lit pattern");
+}
+
+#[test]
+fn scrollback_viewport_captures_the_exact_lines_for_each_offset() {
+    let Some(renderer) =
+        renderer_or_skip("scrollback_viewport_captures_the_exact_lines_for_each_offset")
+    else {
+        return;
+    };
+    let snap = snapshot(3, 4, b"\x1b[?25lA\r\nB\r\nC\r\nD\r\nE");
+    assert_eq!(snap.scrollback_lines(), ["A", "B"], "fixture history");
+    assert_eq!(snap.lines(), ["C", "D", "E"], "fixture live rows");
+
+    // Each expected glyph is rendered independently in a one-row terminal.
+    // Comparing its complete cell mask pins identity and row placement; a
+    // global "some pixels changed" assertion would not catch a row shift.
+    let glyph_pattern = |character: char| {
+        let bytes = format!("\x1b[?25l{character}");
+        let reference = snapshot(1, 4, bytes.as_bytes());
+        cell_pattern(&render(&renderer, &reference), 0, 0)
+    };
+
+    for (offset, expected) in [
+        (0, ['C', 'D', 'E']),
+        (1, ['B', 'C', 'D']),
+        (2, ['A', 'B', 'C']),
+        (usize::MAX, ['A', 'B', 'C']),
+    ] {
+        let frame = render_with_scroll_offset(&renderer, &snap, offset);
+        for (row, character) in expected.into_iter().enumerate() {
+            assert_eq!(
+                cell_pattern(&frame, u32::try_from(row).unwrap_or(u32::MAX), 0),
+                glyph_pattern(character),
+                "offset {offset} row {row} must render exact glyph {character:?}"
+            );
+            for col in 1..u32::from(snap.cols()) {
+                assert!(
+                    !cell_is_lit(&frame, u32::try_from(row).unwrap_or(u32::MAX), col),
+                    "offset {offset} row {row} leaked content into blank column {col}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn scrollback_vertex_oracle_pins_exact_lines_without_a_gpu() {
+    let source = snapshot(3, 4, b"\x1b[?25lA\r\nB\r\nC\r\nD\r\nE");
+    let target = Target::new(
+        &Theme::default(),
+        u32::from(source.cols()) * CELL_WIDTH,
+        u32::from(source.rows()) * CELL_HEIGHT,
+        poc_metrics(),
+    );
+
+    for (offset, expected_bytes, expected_lines) in [
+        (0, b"\x1b[?25lC\r\nD\r\nE".as_slice(), ["C", "D", "E"]),
+        (1, b"\x1b[?25lB\r\nC\r\nD".as_slice(), ["B", "C", "D"]),
+        (2, b"\x1b[?25lA\r\nB\r\nC".as_slice(), ["A", "B", "C"]),
+        (
+            usize::MAX,
+            b"\x1b[?25lA\r\nB\r\nC".as_slice(),
+            ["A", "B", "C"],
+        ),
+    ] {
+        let expected = snapshot(3, 4, expected_bytes);
+        assert_eq!(expected.lines(), expected_lines, "expected frame fixture");
+        let actual_vertices = glyph_vertices_for_chrome(
+            target,
+            Some(&source),
+            FrameChrome::new(None, None).with_scroll_offset(offset),
+        );
+        let expected_vertices =
+            glyph_vertices_for_chrome(target, Some(&expected), FrameChrome::new(None, None));
+        assert_eq!(
+            actual_vertices, expected_vertices,
+            "offset {offset} must produce the complete frame for exact lines {expected_lines:?}"
+        );
+    }
+}
+
+#[test]
+fn scrollback_viewport_keeps_a_wide_pair_and_following_glyph_in_captured_pixels() {
+    let Some(renderer) = renderer_or_skip(
+        "scrollback_viewport_keeps_a_wide_pair_and_following_glyph_in_captured_pixels",
+    ) else {
+        return;
+    };
+    let snap = snapshot(2, 5, "\x1b[?25l日A\r\n語B\r\n界C".as_bytes());
+    assert_eq!(snap.scrollback_lines(), ["日A"], "fixture history");
+
+    let history_frame = render_with_scroll_offset(&renderer, &snap, 1);
+    let expected_row = render(&renderer, &snapshot(1, 5, "\x1b[?25l日A".as_bytes()));
+    for col in 0..u32::from(snap.cols()) {
+        assert_eq!(
+            cell_pattern(&history_frame, 0, col),
+            cell_pattern(&expected_row, 0, col),
+            "scrolled wide history row differs at display column {col}"
+        );
+    }
+    assert!(cell_is_lit(&history_frame, 0, 0), "wide lead is absent");
+    assert!(
+        !cell_is_lit(&history_frame, 0, 1),
+        "wide continuation column must remain blank"
+    );
+    let a_reference = render(&renderer, &snapshot(1, 1, b"\x1b[?25lA"));
+    assert_eq!(
+        cell_pattern(&history_frame, 0, 2),
+        cell_pattern(&a_reference, 0, 0),
+        "glyph after the wide pair must stay in display column 2"
+    );
 }
 
 #[test]
@@ -1669,6 +1824,72 @@ fn selection_highlight_vertex_oracle_pins_both_wide_columns() {
     assert_eq!(
         selection_background_vertex_cells(&state.snapshot(), &selection, &DARK),
         [(0, 1), (0, 2)]
+    );
+}
+
+#[test]
+fn selection_made_while_scrolled_highlights_visible_rows_and_matches_extract() {
+    let mut state = TerminalState::new(3, 8).expect("valid terminal");
+    state.feed_bytes(b"AAAA  \r\nBBBB  \r\nCCCC  \r\nDDDD  \r\nEEEE\x1b[?25l");
+    assert_eq!(state.scrollback_len(), 2, "fixture history");
+
+    // Offset one exposes logical rows B/C/D. Model a drag from B's second
+    // column through the row's blank tail: extraction must trim the blanks,
+    // and the renderer must paint only the surviving `BBB` span on frame row
+    // zero. At the live-tail mapping this absolute row would not be painted at
+    // all, so the assertion directly guards the merge's row-index boundary.
+    const SCROLL_OFFSET: usize = 1;
+    let visible_logical_start = state.scrollback_len() - SCROLL_OFFSET;
+    let selection = Selection::new(
+        &state,
+        SelectionMode::Char,
+        GridPoint::new(visible_logical_start, 1),
+        GridPoint::new(visible_logical_start, 7),
+    );
+    let copied = selection.extract(&state);
+    assert_eq!(copied, "BBB", "copy trims the visible row's blank tail");
+
+    let snap = state.snapshot();
+    let highlighted = selection_background_vertex_cells_with_scroll_offset(
+        &snap,
+        &selection,
+        &DARK,
+        SCROLL_OFFSET,
+    );
+    assert_eq!(
+        highlighted,
+        [(0, 1), (0, 2), (0, 3)],
+        "the absolute B-row selection must appear on the scrolled frame's first row"
+    );
+
+    let mut highlighted_text = String::new();
+    for &(frame_row, column) in &highlighted {
+        let logical_line = visible_logical_start + frame_row as usize;
+        let cells = snap
+            .logical_row(u32::try_from(logical_line).expect("fixture line fits u32"))
+            .expect("highlighted logical row exists");
+        let cell = &cells[column as usize];
+        if !cell.is_continuation() {
+            highlighted_text.push_str(cell.text());
+        }
+    }
+    assert_eq!(
+        highlighted_text, copied,
+        "text under the highlighted frame cells must equal extract"
+    );
+
+    let Some(renderer) = renderer_or_skip(
+        "selection_made_while_scrolled_highlights_visible_rows_and_matches_extract",
+    ) else {
+        return;
+    };
+    let before = render_with_scroll_offset(&renderer, &snap, SCROLL_OFFSET);
+    let after =
+        render_with_selection_and_scroll_offset(&renderer, &DARK, &snap, &selection, SCROLL_OFFSET);
+    assert_eq!(
+        changed_cells(&before, &after, snap.rows(), snap.cols()),
+        highlighted,
+        "captured pixels must agree with the production vertex oracle"
     );
 }
 
@@ -2700,6 +2921,51 @@ fn palette_hint_opt_out_removes_its_frame_pixels() {
             .chunks_exact(4)
             .all(|pixel| is_clear([pixel[0], pixel[1], pixel[2], pixel[3]])),
         "show_palette_hint=false must remove every affordance pixel"
+    );
+}
+
+#[test]
+fn scrollback_indicator_is_drawn_first_with_the_configured_return_chord() {
+    let Some(renderer) =
+        renderer_or_skip("scrollback_indicator_is_drawn_first_with_the_configured_return_chord")
+    else {
+        return;
+    };
+    const TERMINAL_COLS: u16 = 48;
+    let config = AppConfig::parse("[keys]\nscroll_page_down = \"ctrl+j\"\n")
+        .expect("custom history return chord is valid");
+    let indicator = scrollback_indicator(7, config.keys()).expect("nonzero offset is visible");
+    assert_eq!(indicator, "History -7 | Ctrl+J Latest");
+
+    let empty_sidebar: &[String] = &[];
+    let frame = renderer.capture_chrome(
+        Target::new(
+            &config.theme().palette(),
+            (SIDEBAR_COLS as u32 + u32::from(TERMINAL_COLS)) * CELL_WIDTH,
+            CELL_HEIGHT,
+            poc_metrics(),
+        ),
+        None,
+        FrameChrome::new(Some(empty_sidebar), None)
+            .with_viewport_indicator(Some(indicator.as_str())),
+    );
+
+    let mut reference_bytes = b"\x1b[?25l".to_vec();
+    reference_bytes.extend_from_slice(indicator.as_bytes());
+    let reference = render(
+        &renderer,
+        &snapshot(1, TERMINAL_COLS, reference_bytes.as_slice()),
+    );
+    for col in 0..u32::from(TERMINAL_COLS) {
+        assert_eq!(
+            cell_pattern(&frame, 0, SIDEBAR_COLS as u32 + col),
+            cell_pattern(&reference, 0, col),
+            "viewport indicator differs from configured copy at column {col}"
+        );
+    }
+    assert!(
+        cell_is_lit(&frame, 0, SIDEBAR_COLS as u32),
+        "the leading History indicator glyph was not drawn"
     );
 }
 

@@ -123,6 +123,7 @@ pub(crate) enum PrivateMode {
     /// re-show it at rest, so the renderer must honour both directions.
     CursorVisibility,
     BracketedPaste,
+    MouseTrackingX10,
     MouseTrackingNormal,
     MouseTrackingButtonEvent,
     MouseTrackingAnyEvent,
@@ -535,6 +536,7 @@ impl Csi {
             25 => Some(PrivateMode::CursorVisibility),
             1049 => Some(PrivateMode::AlternateScreen),
             2004 => Some(PrivateMode::BracketedPaste),
+            9 => Some(PrivateMode::MouseTrackingX10),
             1000 => Some(PrivateMode::MouseTrackingNormal),
             1002 => Some(PrivateMode::MouseTrackingButtonEvent),
             1003 => Some(PrivateMode::MouseTrackingAnyEvent),
@@ -796,6 +798,23 @@ mod tests {
                 },
                 Action::SetPrivateMode {
                     mode: PrivateMode::MouseEncodingSgr,
+                    enabled: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn x10_mouse_tracking_mode_9_is_tracked_as_a_private_mode() {
+        assert_eq!(
+            actions(b"\x1b[?9h\x1b[?9l"),
+            [
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseTrackingX10,
+                    enabled: true,
+                },
+                Action::SetPrivateMode {
+                    mode: PrivateMode::MouseTrackingX10,
                     enabled: false,
                 },
             ]

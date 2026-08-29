@@ -34,6 +34,22 @@ pub fn empty_workspace_recovery(keys: KeymapConfig) -> Vec<String> {
     ]
 }
 
+/// Orient a viewport that is deliberately above the live tail.
+///
+/// The indicator is absent at offset zero. Above the tail it names both the
+/// exact distance and the active configured page-down chord, so returning to
+/// current output is discoverable without documentation and remains truthful
+/// after a rebind.
+#[must_use]
+pub fn scrollback_indicator(offset: usize, keys: KeymapConfig) -> Option<String> {
+    (offset > 0).then(|| {
+        format!(
+            "History -{offset} | {} Latest",
+            chord_label(keys.scroll_page_down())
+        )
+    })
+}
+
 /// Human-readable text for one normalized configured chord.
 ///
 /// This is intentionally generated from [`Chord`] rather than copied from a
@@ -113,6 +129,23 @@ mod tests {
         assert_eq!(
             empty_workspace_recovery(rebound.keys()),
             ["No sessions yet", "Press Ctrl+N to create a session"]
+        );
+    }
+
+    #[test]
+    fn scrollback_indicator_is_off_at_live_tail_and_follows_the_down_binding() {
+        let default = AppConfig::default();
+        assert_eq!(scrollback_indicator(0, default.keys()), None);
+        assert_eq!(
+            scrollback_indicator(37, default.keys()).as_deref(),
+            Some("History -37 | Shift+PageDown Latest")
+        );
+
+        let rebound = AppConfig::parse("[keys]\nscroll_page_down = \"ctrl+j\"\n")
+            .expect("valid scroll-down rebind");
+        assert_eq!(
+            scrollback_indicator(2, rebound.keys()).as_deref(),
+            Some("History -2 | Ctrl+J Latest")
         );
     }
 }

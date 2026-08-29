@@ -54,6 +54,7 @@ use noren_app::{
     sidebar_text::{SidebarTextRow, visible_sidebar_text_rows_at_width},
     ssh_config::{HostDiscoveryKind, SshConfig},
     theme::Theme,
+    wheel_routing::{TerminalWheelOwner, terminal_wheel_owner},
 };
 use noren_pty::{
     PtyEvent, PtySession, PtySize, SshDestination, SshDestinationError, SshLaunchPolicy,
@@ -1125,6 +1126,23 @@ fn created_session_id(events: Vec<SessionEvent>) -> SessionId {
 struct ParkedSession {
     pty: PtySession,
     terminal: TerminalState,
+    scroll_offset: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScrollDirection {
+    Older,
+    Newer,
+}
+
+/// Boundary decision for one wheel delta over the terminal surface.
+///
+/// The variant is intentionally test-visible inside this binary: the central
+/// correctness property is ownership, not merely whether some state changed.
+#[derive(Debug, PartialEq, Eq)]
+enum TerminalWheelRoute {
+    ConsumedLocally { before: usize, after: usize },
+    ForwardedToApplication(Vec<Vec<u8>>),
 }
 
 struct NorenApp {
@@ -1136,6 +1154,10 @@ struct NorenApp {
     sidebar_columns: usize,
     pending_grid: Option<GridSize>,
     terminal: Option<TerminalState>,
+    /// Logical rows above the active terminal's live tail. Zero follows new
+    /// output automatically; a non-zero value is deliberate user history and
+    /// stays put until the user scrolls down. Rendering clamps defensively too.
+    scroll_offset: usize,
     pty: Option<PtySession>,
     pty_child: PtyChildStatus,
     modifiers: Modifiers,
@@ -1306,6 +1328,7 @@ impl NorenApp {
             sidebar_columns: config.sidebar().columns(),
             pending_grid: None,
             terminal: None,
+            scroll_offset: 0,
             pty: None,
             pty_child: PtyChildStatus::NotLaunched,
             modifiers: Modifiers::empty(),
@@ -1386,6 +1409,7 @@ impl NorenApp {
         let terminal = runtime.terminal_state()?;
         let pty = runtime.pty_size()?;
         self.terminal = Some(terminal);
+        self.scroll_offset = 0;
         Some(pty)
     }
 
@@ -1617,6 +1641,7 @@ impl NorenApp {
                 Ok(session) => {
                     self.retire_live_terminal();
                     self.pty = Some(session);
+                    self.scroll_offset = 0;
                     self.pty_child = PtyChildStatus::Running;
                     true
                 }
@@ -1690,8 +1715,15 @@ impl NorenApp {
             self.pty.take(),
             self.terminal.take(),
         ) {
-            self.parked_sessions
-                .insert(id, ParkedSession { pty, terminal });
+            let scroll_offset = std::mem::take(&mut self.scroll_offset);
+            self.parked_sessions.insert(
+                id,
+                ParkedSession {
+                    pty,
+                    terminal,
+                    scroll_offset,
+                },
+            );
             self.pty_child = PtyChildStatus::NotLaunched;
         }
     }
@@ -1737,6 +1769,7 @@ impl NorenApp {
                 self.park_active_session();
                 self.pty = Some(pty);
                 self.terminal = Some(terminal);
+                self.scroll_offset = 0;
                 self.active_session = Some(id);
                 self.pty_child = PtyChildStatus::Running;
                 // Grid coordinates captured on the previous session's screen
@@ -1817,6 +1850,7 @@ impl NorenApp {
                 self.park_active_session();
                 self.pty = Some(pty);
                 self.terminal = Some(terminal);
+                self.scroll_offset = 0;
                 self.active_session = Some(id);
                 self.pty_child = PtyChildStatus::Running;
                 self.selection = None;
@@ -1879,6 +1913,7 @@ impl NorenApp {
                 self.park_active_session();
                 self.pty = Some(pty);
                 self.terminal = Some(terminal);
+                self.scroll_offset = 0;
                 self.active_session = Some(id);
                 self.pty_child = PtyChildStatus::Running;
                 self.selection = None;
@@ -1954,6 +1989,7 @@ impl NorenApp {
                 self.park_active_session();
                 self.pty = Some(pty);
                 self.terminal = Some(terminal);
+                self.scroll_offset = 0;
                 self.active_session = Some(id);
                 self.pty_child = PtyChildStatus::Running;
                 self.selection = None;
@@ -2043,7 +2079,18 @@ impl NorenApp {
                         return None;
                     }
                     remaining -= bytes.len();
+                    let was_alternate = parked.terminal.modes().is_alternate_screen_active();
+                    let was_tracking_mouse = Self::application_tracks_mouse(&parked.terminal);
                     parked.terminal.feed_bytes(&bytes);
+                    let entered_alternate =
+                        !was_alternate && parked.terminal.modes().is_alternate_screen_active();
+                    let claimed_mouse =
+                        !was_tracking_mouse && Self::application_tracks_mouse(&parked.terminal);
+                    parked.scroll_offset = if entered_alternate || claimed_mouse {
+                        0
+                    } else {
+                        Self::clamped_scroll_offset(&parked.terminal, parked.scroll_offset)
+                    };
                 }
                 Ok(Some(PtyEvent::Eof)) => {
                     return Some(SessionStatus::Exited { code: None });
@@ -2102,6 +2149,9 @@ impl NorenApp {
         self.park_active_session();
         self.pty = Some(parked.pty);
         self.terminal = Some(parked.terminal);
+        self.scroll_offset = self.terminal.as_ref().map_or(0, |terminal| {
+            Self::clamped_scroll_offset(terminal, parked.scroll_offset)
+        });
         self.active_session = Some(id);
         self.pty_child = PtyChildStatus::Running;
         // Grid coordinates captured on the previous session's screen can
@@ -2155,6 +2205,7 @@ impl NorenApp {
             self.active_session = None;
             self.exited_surface_session = None;
             self.terminal = None;
+            self.scroll_offset = 0;
             self.pty_child = PtyChildStatus::NotLaunched;
             self.selection = None;
             self.drag_origin = None;
@@ -2297,6 +2348,69 @@ impl NorenApp {
         self.modifiers = modifiers;
     }
 
+    /// Maximum locally addressable history for one terminal surface.
+    /// Alternate-screen applications own their complete view and expose no
+    /// Noren scrollback, even though primary history remains retained.
+    fn max_scroll_offset(terminal: &TerminalState) -> usize {
+        if terminal.modes().is_alternate_screen_active() {
+            0
+        } else {
+            terminal.scrollback_len()
+        }
+    }
+
+    fn application_tracks_mouse(terminal: &TerminalState) -> bool {
+        terminal_wheel_owner(terminal.modes()) == TerminalWheelOwner::Application
+    }
+
+    fn clamped_scroll_offset(terminal: &TerminalState, requested: usize) -> usize {
+        requested.min(Self::max_scroll_offset(terminal))
+    }
+
+    fn clamp_active_scroll_offset(&mut self) {
+        self.scroll_offset = self.terminal.as_ref().map_or(0, |terminal| {
+            Self::clamped_scroll_offset(terminal, self.scroll_offset)
+        });
+    }
+
+    /// Move the active primary-screen viewport by a bounded number of rows.
+    /// Returns the before/after offsets so the wheel ownership test can prove
+    /// local consumption without relying on a frame merely changing.
+    fn scroll_view(&mut self, direction: ScrollDirection, rows: usize) -> (usize, usize) {
+        self.clamp_active_scroll_offset();
+        let before = self.scroll_offset;
+        let max_offset = self.terminal.as_ref().map_or(0, Self::max_scroll_offset);
+        self.scroll_offset = match direction {
+            ScrollDirection::Older => self.scroll_offset.saturating_add(rows).min(max_offset),
+            ScrollDirection::Newer => self.scroll_offset.saturating_sub(rows),
+        };
+        if self.scroll_offset != before {
+            self.selection = None;
+            self.drag_origin = None;
+            self.redraw_needed = true;
+        }
+        (before, self.scroll_offset)
+    }
+
+    fn handle_scrollback_chord(&mut self, chord: Chord) -> bool {
+        let Some(terminal) = self.terminal.as_ref() else {
+            return false;
+        };
+        if terminal.modes().is_alternate_screen_active() {
+            return false;
+        }
+        let direction = if chord == self.keys.scroll_page_up() {
+            ScrollDirection::Older
+        } else if chord == self.keys.scroll_page_down() {
+            ScrollDirection::Newer
+        } else {
+            return false;
+        };
+        let page_rows = usize::from(terminal.size().0).max(1);
+        self.scroll_view(direction, page_rows);
+        true
+    }
+
     fn handle_key(&mut self, event: &KeyEvent) {
         if self.handle_clipboard_shortcut(event) {
             return;
@@ -2312,6 +2426,12 @@ impl NorenApp {
         }
         if self.palette_open {
             self.handle_palette_key(event);
+            return;
+        }
+        if event.state == ElementState::Pressed
+            && let Some(chord) = chord_from_event(event, self.modifiers)
+            && self.handle_scrollback_chord(chord)
+        {
             return;
         }
         self.handle_passthrough_key(event);
@@ -2981,29 +3101,72 @@ impl NorenApp {
         self.encode_and_send_mouse(event);
     }
 
-    /// Handle a scroll-wheel event. Under tracking, each line of delta
-    /// generates one wheel report; without tracking, the event is ignored
-    /// (matching the pre-tracking behaviour where `MouseWheel` fell into the
-    /// `_ => {}` catch-all).
+    /// Resolve and apply the terminal-side ownership of one wheel delta.
+    ///
+    /// Any authoritative tracking mode (9/1000/1002/1003) gives the application
+    /// the wheel, including when Shift is held. Without tracking, Noren
+    /// consumes the delta as local primary-screen history navigation. This is
+    /// the ADR-0003 boundary in one branch: inside belongs to Zellij/vim when
+    /// they ask for it; otherwise the outer terminal supplies its own view.
+    fn route_terminal_wheel(
+        &mut self,
+        delta: MouseScrollDelta,
+        cell: Option<(u32, u32)>,
+    ) -> TerminalWheelRoute {
+        let clicks = wheel_clicks(delta, self.geometry.cell_metrics());
+        let owner = self
+            .terminal
+            .as_ref()
+            .map_or(TerminalWheelOwner::LocalHistory, |terminal| {
+                terminal_wheel_owner(terminal.modes())
+            });
+        if owner == TerminalWheelOwner::Application {
+            let mut reports = Vec::new();
+            if let Some((col, row)) = cell {
+                let modifiers = self.pointer_modifiers();
+                for direction in clicks {
+                    if let Some(report) =
+                        self.encode_mouse(PointerEvent::wheel(direction, col, row, modifiers))
+                    {
+                        reports.push(report);
+                    }
+                }
+            }
+            return TerminalWheelRoute::ForwardedToApplication(reports);
+        }
+
+        let before = self.scroll_offset;
+        for direction in clicks {
+            let direction = match direction {
+                noren_app::mouse::WheelDirection::Up => ScrollDirection::Older,
+                noren_app::mouse::WheelDirection::Down => ScrollDirection::Newer,
+            };
+            self.scroll_view(direction, 1);
+        }
+        TerminalWheelRoute::ConsumedLocally {
+            before,
+            after: self.scroll_offset,
+        }
+    }
+
+    /// Handle a scroll-wheel event. Sidebar chrome keeps its existing outside-
+    /// terminal ownership; over the terminal, [`Self::route_terminal_wheel`]
+    /// makes the application/local decision before any state is changed.
     fn handle_mouse_wheel(&mut self, delta: MouseScrollDelta) {
         if let Some(frame_size) = self.window.as_ref().map(|window| window.inner_size())
             && self.handle_sidebar_wheel_in_frame(delta, frame_size)
         {
             return;
         }
-        if !self.mouse_reportable() {
-            return;
-        }
-        let Some(position) = self.cursor_position else {
-            return;
-        };
-        let Some((col, row)) = self.mouse_cell_at(position) else {
-            return;
-        };
-        let mods = self.pointer_modifiers();
-        for direction in wheel_clicks(delta, self.geometry.cell_metrics()) {
-            let event = PointerEvent::wheel(direction, col, row, mods);
-            self.encode_and_send_mouse(event);
+        let cell = self
+            .cursor_position
+            .and_then(|position| self.mouse_cell_at(position));
+        if let TerminalWheelRoute::ForwardedToApplication(reports) =
+            self.route_terminal_wheel(delta, cell)
+        {
+            for report in reports {
+                self.send_input(&report);
+            }
         }
     }
 
@@ -3039,7 +3202,12 @@ impl NorenApp {
         if position.x < sidebar_pixel_width_at_width(cell_width, self.sidebar_columns) {
             return None;
         }
-        let content_rows = terminal.screen().display_row_count();
+        let scroll_offset = Self::clamped_scroll_offset(terminal, self.scroll_offset);
+        let content_rows = if scroll_offset == 0 {
+            terminal.screen().display_row_count()
+        } else {
+            usize::from(terminal.size().0)
+        };
         let window_rows =
             renderer::fully_drawable_rows(frame_size.height, self.geometry.cell_metrics())
                 .try_into()
@@ -3057,14 +3225,13 @@ impl NorenApp {
             return None;
         }
         let column = terminal_column_at_width(position.x, cols, cell_width, self.sidebar_columns)?;
-        Some(GridPoint::new(
-            terminal.scrollback_len() + line_index,
-            column,
-        ))
+        let logical_start = terminal.scrollback_len().saturating_sub(scroll_offset);
+        Some(GridPoint::new(logical_start + line_index, column))
     }
 
     /// Whether pointer events should be reported to the PTY instead of driving
-    /// local text selection. Active when a tracking mode (1000/1002/1003) is on
+    /// local text selection. Active when a tracking mode (9/1000/1002/1003) is
+    /// on
     /// and Shift is not held — Shift bypasses reporting so the user can still
     /// select text while a program tracks the mouse, matching xterm/iTerm.
     fn mouse_reportable(&self) -> bool {
@@ -3086,6 +3253,31 @@ impl NorenApp {
         frame_size: PhysicalSize<u32>,
     ) -> Option<(u32, u32)> {
         let terminal = self.terminal.as_ref()?;
+        if Self::application_tracks_mouse(terminal) {
+            if !position.x.is_finite()
+                || !position.y.is_finite()
+                || position.x < 0.0
+                || position.y < 0.0
+                || position.x >= f64::from(frame_size.width)
+                || position.y >= f64::from(frame_size.height)
+                || position.x
+                    < sidebar_pixel_width_at_width(self.geometry.cell_width(), self.sidebar_columns)
+            {
+                return None;
+            }
+            let (rows, cols) = terminal.size();
+            let row = pixel_row_index(position.y, self.geometry.cell_height())?;
+            if row >= usize::from(rows) {
+                return None;
+            }
+            let column = terminal_column_at_width(
+                position.x,
+                cols,
+                self.geometry.cell_width(),
+                self.sidebar_columns,
+            )?;
+            return Some((u32::try_from(column).ok()?, u32::try_from(row).ok()?));
+        }
         let point = self.grid_point_in_frame(position, frame_size)?;
         let visible_row = point.line().checked_sub(terminal.scrollback_len())?;
         let col = u32::try_from(point.column()).ok()?;
@@ -3110,6 +3302,7 @@ impl NorenApp {
             return MouseModes::disabled();
         };
         MouseModes::disabled()
+            .with_x10(modes.is_mouse_x10_tracking_enabled())
             .with_normal(modes.is_mouse_normal_tracking_enabled())
             .with_button_event(modes.is_mouse_button_event_tracking_enabled())
             .with_any_event(modes.is_mouse_any_event_tracking_enabled())
@@ -3256,6 +3449,7 @@ impl NorenApp {
                 self.status = "Noren terminal resize failed";
                 self.show_status = true;
             }
+            self.scroll_offset = Self::clamped_scroll_offset(terminal, self.scroll_offset);
         }
         if let (Some(session), Some(size)) = (&self.pty, runtime.pty_size()) {
             if session.resize(size).is_err() {
@@ -3271,6 +3465,8 @@ impl NorenApp {
                     self.status = "Noren terminal resize failed";
                     self.show_status = true;
                 }
+                parked.scroll_offset =
+                    Self::clamped_scroll_offset(&parked.terminal, parked.scroll_offset);
                 if parked.pty.resize(size).is_err() {
                     self.status = "Noren PTY resize failed";
                     self.show_status = true;
@@ -3284,7 +3480,21 @@ impl NorenApp {
     /// parser. Production and application tests share this exact byte path.
     fn apply_pty_output(&mut self, bytes: &[u8]) {
         if let Some(terminal) = &mut self.terminal {
+            let was_alternate = terminal.modes().is_alternate_screen_active();
+            let was_tracking_mouse = Self::application_tracks_mouse(terminal);
             terminal.feed_bytes(bytes);
+            // A program entering an alternate screen or claiming the mouse
+            // owns the visible terminal surface. Rejoin its live screen before
+            // routing subsequent input; ordinary output otherwise preserves a
+            // deliberate non-zero history offset and follows automatically at
+            // offset zero.
+            let entered_alternate = !was_alternate && terminal.modes().is_alternate_screen_active();
+            let claimed_mouse = !was_tracking_mouse && Self::application_tracks_mouse(terminal);
+            if entered_alternate || claimed_mouse {
+                self.scroll_offset = 0;
+            } else {
+                self.scroll_offset = Self::clamped_scroll_offset(terminal, self.scroll_offset);
+            }
         }
         // First output from an ssh child means the remote side is talking
         // through the normal I/O path: the launch is interactive now.
@@ -3412,6 +3622,7 @@ impl NorenApp {
         if let Some(window) = &self.window {
             self.set_ime_cursor_area(window);
         }
+        self.clamp_active_scroll_offset();
         let snapshot = self.terminal.as_ref().map(TerminalEngine::snapshot);
         let visible_rows = self
             .window
@@ -3460,12 +3671,17 @@ impl NorenApp {
         let palette_hint = status
             .as_ref()
             .and_then(|_| noren_app::ui::palette_hint(self.keys, self.ui));
+        let viewport_indicator = status
+            .as_ref()
+            .and_then(|_| noren_app::ui::scrollback_indicator(self.scroll_offset, self.keys));
         let workspace_notice = (self.workspace.sidebar().is_empty() && self.terminal.is_none())
             .then(|| noren_app::ui::empty_workspace_recovery(self.keys));
         let chrome = FrameChrome::new(None, status)
             .with_sidebar_rows(Some(&rows))
+            .with_viewport_indicator(viewport_indicator.as_deref())
             .with_palette_hint(palette_hint.as_deref())
             .with_workspace_notice(workspace_notice.as_deref())
+            .with_scroll_offset(self.scroll_offset)
             .with_selection(self.selection.as_ref());
         let outcome = self
             .renderer

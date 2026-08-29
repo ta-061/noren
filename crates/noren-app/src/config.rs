@@ -18,9 +18,9 @@
 //! one is waiting on.
 //!
 //! The `[keys]` table configures the workspace key chords (the palette
-//! opener and the four palette command shortcuts). It follows the same
-//! discipline: an absent table keeps the compiled-in defaults, an
-//! unparseable chord is a typed [`ConfigError::InvalidChord`] naming the
+//! opener, four palette command shortcuts, and two scrollback page actions).
+//! It follows the same discipline: an absent table keeps the compiled-in
+//! defaults, an unparseable chord is a typed [`ConfigError::InvalidChord`] naming the
 //! offending key and value, an unknown action name is
 //! [`ConfigError::UnknownKey`], two actions on one chord is
 //! [`ConfigError::DuplicateChord`], and a palette chord the pass-through
@@ -216,10 +216,11 @@ impl SidebarConfig {
 
 /// Configurable workspace key chords.
 ///
-/// [`KeymapConfig::default`] is exactly the chord set the app shipped with
-/// before configuration existed: `super+p` opens the palette, and the bare
-/// characters `c`/`s`/`x`/`f` dispatch the four palette commands. Every
-/// chord is a normalized pass-through [`Chord`], so the binary compares
+/// [`KeymapConfig::default`] preserves every workspace chord the app shipped
+/// with before configuration existed: `super+p` opens the palette, and the
+/// bare characters `c`/`s`/`x`/`f` dispatch its four commands. Conventional
+/// `shift+pageup` / `shift+pagedown` defaults add scrollback navigation.
+/// Every chord is a normalized pass-through [`Chord`], so the binary compares
 /// configured bindings against live key events without re-parsing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeymapConfig {
@@ -228,6 +229,8 @@ pub struct KeymapConfig {
     session_select: Chord,
     session_close: Chord,
     sidebar_focus: Chord,
+    scroll_page_up: Chord,
+    scroll_page_down: Chord,
 }
 
 impl Default for KeymapConfig {
@@ -238,6 +241,8 @@ impl Default for KeymapConfig {
             session_select: default_chord(KeyCode::Char('s'), Modifiers::empty()),
             session_close: default_chord(KeyCode::Char('x'), Modifiers::empty()),
             sidebar_focus: default_chord(KeyCode::Char('f'), Modifiers::empty()),
+            scroll_page_up: default_chord(KeyCode::PageUp, Modifiers::empty().shift()),
+            scroll_page_down: default_chord(KeyCode::PageDown, Modifiers::empty().shift()),
         }
     }
 }
@@ -271,6 +276,20 @@ impl KeymapConfig {
     #[must_use]
     pub const fn sidebar_focus(self) -> Chord {
         self.sidebar_focus
+    }
+
+    /// Scroll one terminal viewport toward older history; defaults to
+    /// `shift+pageup`.
+    #[must_use]
+    pub const fn scroll_page_up(self) -> Chord {
+        self.scroll_page_up
+    }
+
+    /// Scroll one terminal viewport toward the live tail; defaults to
+    /// `shift+pagedown`.
+    #[must_use]
+    pub const fn scroll_page_down(self) -> Chord {
+        self.scroll_page_down
     }
 }
 
@@ -865,7 +884,7 @@ fn parse_cursor(table: &dyn TableLike, cursor: &mut CursorConfig) -> Result<(), 
 /// holding one parseable chord. Palette-command chords must avoid the keys
 /// the open palette always interprets structurally (Escape, Enter, and the
 /// vertical arrows), the palette opener must stay claimable by the
-/// pass-through policy, and after applying the table all five chords must
+/// pass-through policy, and after applying the table all seven chords must
 /// stay pairwise distinct — including the chords of actions the table left
 /// at their defaults.
 fn parse_keys(table: &dyn TableLike, keys: &mut KeymapConfig) -> Result<(), ConfigError> {
@@ -875,7 +894,7 @@ fn parse_keys(table: &dyn TableLike, keys: &mut KeymapConfig) -> Result<(), Conf
         // value-type complaint.
         let value = match key {
             "palette_open" | "session_create" | "session_select" | "session_close"
-            | "sidebar_focus" => item
+            | "sidebar_focus" | "scroll_page_up" | "scroll_page_down" => item
                 .as_str()
                 .ok_or_else(|| ConfigError::ChordNotAString { key: clip(key) })?,
             _ => return Err(ConfigError::UnknownKey(clip(key))),
@@ -889,6 +908,8 @@ fn parse_keys(table: &dyn TableLike, keys: &mut KeymapConfig) -> Result<(), Conf
             "session_select" => keys.session_select = parse_command_chord(key, value)?,
             "session_close" => keys.session_close = parse_command_chord(key, value)?,
             "sidebar_focus" => keys.sidebar_focus = parse_command_chord(key, value)?,
+            "scroll_page_up" => keys.scroll_page_up = parse_scroll_chord(key, value)?,
+            "scroll_page_down" => keys.scroll_page_down = parse_scroll_chord(key, value)?,
             // Unreachable in practice: the value match above rejected every
             // other name as unknown.
             _ => return Err(ConfigError::UnknownKey(clip(key))),
@@ -945,6 +966,21 @@ fn parse_command_chord(key: &str, value: &str) -> Result<Chord, ConfigError> {
     Ok(chord)
 }
 
+/// Parse a global scrollback chord without allowing it to shadow Noren's
+/// frozen escape-to-workspace leader. Unlike the palette opener, an explicit
+/// scroll rebind may intentionally overlap a child/Zellij chord; only the
+/// application-owned exit leader is unconditionally reserved.
+fn parse_scroll_chord(key: &str, value: &str) -> Result<Chord, ConfigError> {
+    let chord = parse_configured_chord(key, value)?;
+    if default_exit_claim().seq.chords() == [chord] {
+        return Err(ConfigError::ReservedChord {
+            key: clip(key),
+            value: clip(value),
+        });
+    }
+    Ok(chord)
+}
+
 /// Validate that the pass-through policy could actually claim the configured
 /// palette chord, using the same enforcement point the live policy uses.
 ///
@@ -967,7 +1003,7 @@ fn validate_palette_claim(chord: Chord, key: &str, value: &str) -> Result<Chord,
     }
 }
 
-/// Reject any chord bound to two of the five actions.
+/// Reject any chord bound to two configured actions.
 ///
 /// The check runs on the final keymap, so it also catches a configured value
 /// that silently collides with an action the table left at its default.
@@ -978,6 +1014,8 @@ fn ensure_distinct_chords(keys: &KeymapConfig) -> Result<(), ConfigError> {
         ("session_select", keys.session_select),
         ("session_close", keys.session_close),
         ("sidebar_focus", keys.sidebar_focus),
+        ("scroll_page_up", keys.scroll_page_up),
+        ("scroll_page_down", keys.scroll_page_down),
     ];
     for (index, (first_name, first)) in bindings.iter().enumerate() {
         for (second_name, second) in bindings.iter().skip(index + 1) {
@@ -2011,10 +2049,10 @@ mod tests {
         Chord::new(code, modifiers).expect("test chords are normalized constants")
     }
 
-    /// With no `[keys]` surface at all, the keymap is exactly the chord set
-    /// the app shipped with before configuration existed.
+    /// With no `[keys]` surface at all, workspace chords remain unchanged and
+    /// scrollback receives conventional zero-configuration page chords.
     #[test]
-    fn default_keymap_matches_the_pre_configuration_chords() {
+    fn default_keymap_preserves_workspace_chords_and_adds_scrollback_pages() {
         let keys = KeymapConfig::default();
         assert_eq!(
             keys.palette_open(),
@@ -2036,6 +2074,14 @@ mod tests {
         assert_eq!(
             keys.sidebar_focus(),
             chord(KeyCode::Char('f'), Modifiers::empty())
+        );
+        assert_eq!(
+            keys.scroll_page_up(),
+            chord(KeyCode::PageUp, Modifiers::empty().shift())
+        );
+        assert_eq!(
+            keys.scroll_page_down(),
+            chord(KeyCode::PageDown, Modifiers::empty().shift())
         );
         assert_eq!(AppConfig::default().keys(), keys);
         assert_eq!(AppConfig::parse("# nothing\n").expect("valid").keys(), keys);
@@ -2095,6 +2141,26 @@ mod tests {
     }
 
     #[test]
+    fn custom_scrollback_chords_apply_without_changing_other_defaults() {
+        let config = AppConfig::parse(
+            "[keys]\nscroll_page_up = \"ctrl+u\"\nscroll_page_down = \"ctrl+d\"\n",
+        )
+        .expect("scrollback chords are configurable global actions");
+        assert_eq!(
+            config.keys().scroll_page_up(),
+            chord(KeyCode::Char('u'), Modifiers::empty().ctrl())
+        );
+        assert_eq!(
+            config.keys().scroll_page_down(),
+            chord(KeyCode::Char('d'), Modifiers::empty().ctrl())
+        );
+        assert_eq!(
+            config.keys().palette_open(),
+            KeymapConfig::default().palette_open()
+        );
+    }
+
+    #[test]
     fn keys_apply_alongside_font_in_one_file() {
         let config =
             AppConfig::parse("[font]\ncell_width = 12\n[keys]\npalette_open = \"super+b\"\n")
@@ -2139,6 +2205,8 @@ mod tests {
             "session_select",
             "session_close",
             "sidebar_focus",
+            "scroll_page_up",
+            "scroll_page_down",
         ];
         let reserved = [
             ("super+a", 'a'),
@@ -2309,6 +2377,19 @@ mod tests {
         assert!(AppConfig::parse("[keys]\npalette_open = \"super+enter\"\n").is_ok());
     }
 
+    #[test]
+    fn scrollback_chords_cannot_shadow_the_frozen_exit_leader() {
+        for action in ["scroll_page_up", "scroll_page_down"] {
+            assert_eq!(
+                AppConfig::parse(&format!("[keys]\n{action} = \"super+escape\"\n")),
+                Err(ConfigError::ReservedChord {
+                    key: action.to_owned(),
+                    value: "super+escape".to_owned(),
+                })
+            );
+        }
+    }
+
     /// `[keys]` values must be TOML strings.
     #[test]
     fn keys_values_must_be_chord_strings() {
@@ -2316,6 +2397,7 @@ mod tests {
             "[keys]\nsession_create = 3\n",
             "[keys]\npalette_open = true\n",
             "[keys]\nsession_select = ['c']\n",
+            "[keys]\nscroll_page_up = 3\n",
         ] {
             let error = AppConfig::parse(text).expect_err("non-string chord fails");
             assert!(

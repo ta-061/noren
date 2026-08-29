@@ -10,9 +10,9 @@
 //! `col=9, row=4` on any grid that contains it resolves to `Cx=10, Cy=5`.
 
 use noren_app::mouse::{
-    MODE_ANY_EVENT, MODE_BUTTON_EVENT, MODE_NORMAL, MODE_SGR, MODE_URXVT, MODE_UTF8, MouseButton,
-    MouseEncoder, MouseGrid, MouseModes, PointerEvent, PointerModifiers, WheelDirection,
-    X10_MAX_COORD,
+    MODE_ANY_EVENT, MODE_BUTTON_EVENT, MODE_NORMAL, MODE_SGR, MODE_URXVT, MODE_UTF8, MODE_X10,
+    MouseButton, MouseEncoder, MouseGrid, MouseModes, PointerEvent, PointerModifiers,
+    WheelDirection, X10_MAX_COORD,
 };
 
 /// 80x24 grid; `(9, 4)` is always in range and resolves to `Cx=10, Cy=5`.
@@ -43,6 +43,24 @@ fn sgr_modes() -> MouseModes {
 /// X10 byte form: only normal tracking, no parameterized encoding.
 fn x10_modes() -> MouseModes {
     MouseModes::disabled().with_normal(true)
+}
+
+#[test]
+fn mode_9_x10_tracking_encodes_wheel_but_not_button_release() {
+    let modes = MouseModes::disabled().set(MODE_X10, true);
+    let wheel = PointerEvent::wheel(WheelDirection::Up, P9, ROW4, NO_MODS);
+    assert_eq!(
+        MouseEncoder::encode(wheel, modes, GRID).as_deref(),
+        Some(b"\x1b[M\x60\x2a\x25".as_slice()),
+        "mode 9 must carry wheel-up in the legacy byte form"
+    );
+
+    let release = PointerEvent::release(MouseButton::Left, P9, ROW4, NO_MODS);
+    assert_eq!(
+        MouseEncoder::encode(release, modes, GRID),
+        None,
+        "plain mode 9 reports presses, not releases"
+    );
 }
 
 // ── SGR (1006) byte-exact forms ─────────────────────────────────────────

@@ -67,9 +67,10 @@ other tables.
 
 ### `[keys]`
 
-Configurable key chords for workspace chrome. Every key is optional; an
-absent `[keys]` table keeps the compiled-in defaults, which are exactly the
-chords the app shipped with before configuration existed.
+Configurable key chords for workspace chrome and the terminal scrollback
+viewport. Every key is optional; an absent `[keys]` table keeps the
+compiled-in defaults. Existing workspace defaults remain unchanged, and the
+scrollback actions follow conventional Shift+PageUp/Shift+PageDown defaults.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -78,6 +79,8 @@ chords the app shipped with before configuration existed.
 | `session_select` | string | `"s"` | Palette command dispatching `session.select` (Switch Session). |
 | `session_close` | string | `"x"` | Palette command dispatching `session.close` (Close Session). |
 | `sidebar_focus` | string | `"f"` | Palette command dispatching `sidebar.focus` (Focus Sidebar). |
+| `scroll_page_up` | string | `"shift+pageup"` | Scroll the primary terminal viewport one page toward older retained history. |
+| `scroll_page_down` | string | `"shift+pagedown"` | Scroll the primary terminal viewport one page toward the live tail. |
 
 A chord is zero or more modifiers followed by exactly one key, joined with
 `+`: the modifiers are `super`, `ctrl`, `alt`, and `shift` (each at most
@@ -101,7 +104,10 @@ never a silent fallback and never a silently dead binding:
   leader is an error, because Noren could never honor it;
 - the four palette command chords must not use `escape`, `enter`, `up`, or
   `down`, which the open palette always interprets as dismissal, confirm,
-  and navigation.
+  and navigation;
+- the two global scrollback chords cannot use the frozen `super+escape`
+  exit-to-workspace leader. Other child/Zellij overlap is allowed when a user
+  deliberately configures it.
 
 The four command chords normally apply only while the palette is open — the
 palette intercepts all keys then, so command chords never steal input from
@@ -112,6 +118,29 @@ sidebar is empty and no session can receive input, the configured
 empty-state action says. Chords with modifiers dispatch on the exact modifier
 set; inside the palette, a modifier-free character binding also matches the
 character with any modifiers held, as the pre-configuration palette did.
+
+The two scrollback chords apply only on the primary screen while the palette
+is closed. They are consumed locally even at a scroll boundary, matching an
+ordinary terminal's Shift+PageUp/Shift+PageDown ownership; on an alternate
+screen they are forwarded unchanged to the running application. Rebinding
+either action changes the live input match and the history indicator together.
+
+The mouse wheel follows the terminal/application boundary rather than a user
+toggle. When the running application has enabled DEC mouse tracking mode 9,
+1000, 1002, or 1003, every terminal-side wheel click is forwarded to it
+(including with Shift held); this preserves X10 applications and Zellij/vim
+ownership. With no tracking mode, the wheel scrolls Noren's retained
+primary-screen history locally. The sidebar is Noren-owned chrome and keeps its
+own local wheel behavior.
+
+At offset zero, new output follows the live tail automatically. After a user
+deliberately scrolls above it, ordinary output preserves that non-zero offset
+instead of yanking the view down. A `History -N` indicator is then the first
+status-row segment and names the configured `scroll_page_down` chord followed
+by `Latest`; reaching offset zero removes the indicator and restores the live
+caret. Entering an alternate screen or an application mouse mode rejoins the
+live surface immediately, and primary scrollback is never drawn into an
+alternate screen.
 
 ### `[ui]`
 

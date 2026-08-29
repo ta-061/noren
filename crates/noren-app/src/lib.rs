@@ -25,6 +25,7 @@ pub mod sidebar_text;
 pub mod ssh_config;
 pub mod theme;
 pub mod ui;
+pub mod wheel_routing;
 
 pub use clipboard::{
     BRACKET_PASTE_BEGIN, BRACKET_PASTE_END, ClipboardError, PasteReject, SystemClipboard,
