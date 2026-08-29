@@ -3031,7 +3031,7 @@ fn many_ssh_hosts_are_bounded_and_report_the_omitted_count() {
         line.chars().count() == renderer::SIDEBAR_COLS
             && line.chars().nth(1) == Some('⌁')
             && line.chars().skip(11).take(3).eq("...".chars())
-            && line.chars().last() == Some('■')
+            && line.ends_with('■')
     }));
     assert_eq!(app.workspace.ssh_hosts_omitted(), 6);
     assert!(
