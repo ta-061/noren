@@ -53,6 +53,7 @@ use noren_app::{
     sidebar_text::{SidebarTextRow, visible_sidebar_text_rows_at_width},
     ssh_config::{HostDiscoveryKind, SshConfig},
     theme::Theme,
+    wheel_routing::{TerminalWheelOwner, terminal_wheel_owner},
 };
 use noren_pty::{
     PtyEvent, PtySession, PtySize, SshDestination, SshDestinationError, SshLaunchPolicy,
@@ -2353,10 +2354,7 @@ impl NorenApp {
     }
 
     fn application_tracks_mouse(terminal: &TerminalState) -> bool {
-        let modes = terminal.modes();
-        modes.is_mouse_normal_tracking_enabled()
-            || modes.is_mouse_button_event_tracking_enabled()
-            || modes.is_mouse_any_event_tracking_enabled()
+        terminal_wheel_owner(terminal.modes()) == TerminalWheelOwner::Application
     }
 
     fn clamped_scroll_offset(terminal: &TerminalState, requested: usize) -> usize {
@@ -3069,7 +3067,13 @@ impl NorenApp {
         cell: Option<(u32, u32)>,
     ) -> TerminalWheelRoute {
         let clicks = wheel_clicks(delta, self.geometry.cell_metrics());
-        if self.current_mouse_modes().is_tracked() {
+        let owner = self
+            .terminal
+            .as_ref()
+            .map_or(TerminalWheelOwner::LocalHistory, |terminal| {
+                terminal_wheel_owner(terminal.modes())
+            });
+        if owner == TerminalWheelOwner::Application {
             let mut reports = Vec::new();
             if let Some((col, row)) = cell {
                 let modifiers = self.pointer_modifiers();
