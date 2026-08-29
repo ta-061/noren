@@ -1233,6 +1233,13 @@ struct NorenApp {
     /// arbitrarily long or read the terminal).
     #[cfg(test)]
     test_pty_home: Option<PathBuf>,
+    /// Test-only deterministic command-queue failure seam. Production learns
+    /// failure only from `PtySession::send_input`; tests use this counter to
+    /// prove a multi-chunk IME commit stops on the first rejected write.
+    #[cfg(test)]
+    test_input_send_attempts: usize,
+    #[cfg(test)]
+    test_input_failure_at: Option<usize>,
     palette_open: bool,
     palette_selection: usize,
     passthrough_gate: PassthroughGate,
@@ -1373,6 +1380,10 @@ impl NorenApp {
             parked_sessions: HashMap::new(),
             #[cfg(test)]
             test_pty_home: None,
+            #[cfg(test)]
+            test_input_send_attempts: 0,
+            #[cfg(test)]
+            test_input_failure_at: None,
             palette_open: false,
             palette_selection: 0,
             passthrough_gate: PassthroughGate::new(),
@@ -2470,9 +2481,13 @@ impl NorenApp {
                 // `PtySession` deliberately bounds one input command. Preserve
                 // a large commit in-order across that existing writer limit;
                 // an empty commit has no chunks and therefore performs no
-                // write at all.
+                // write at all. Stop after the first rejected chunk just as a
+                // bounded paste stops after its single rejected write, so the
+                // remainder is not silently dropped one chunk at a time.
                 for chunk in bytes.chunks(READ_CHUNK_BYTES) {
-                    self.send_input(chunk);
+                    if !self.send_input(chunk) {
+                        break;
+                    }
                 }
             }
             Ime::Enabled | Ime::Preedit(_, _) | Ime::Disabled => {}
@@ -2761,7 +2776,9 @@ impl NorenApp {
             }
         };
         match self.paste_bytes(&text) {
-            Ok(bytes) => self.send_input(&bytes),
+            Ok(bytes) => {
+                self.send_input(&bytes);
+            }
             Err(reject @ (PasteReject::Unbracketed | PasteReject::Oversized)) => {
                 self.show_paste_gate(reject);
             }
@@ -3357,14 +3374,34 @@ impl NorenApp {
         }
     }
 
-    fn send_input(&mut self, bytes: &[u8]) {
-        if let Some(session) = &self.pty {
-            if session.send_input(bytes).is_err() {
-                self.status = "Noren PTY input failed";
-                self.show_status = true;
-                self.redraw_needed = true;
+    /// Send one bounded input command, returning whether the caller may send
+    /// a subsequent chunk. Every input source shares the same visible failure
+    /// state; multi-chunk callers must stop when this returns `false`.
+    fn send_input(&mut self, bytes: &[u8]) -> bool {
+        #[cfg(test)]
+        {
+            self.test_input_send_attempts = self.test_input_send_attempts.saturating_add(1);
+            if self.test_input_failure_at == Some(self.test_input_send_attempts) {
+                self.show_pty_input_failure();
+                return false;
             }
         }
+
+        if self
+            .pty
+            .as_ref()
+            .is_some_and(|session| session.send_input(bytes).is_err())
+        {
+            self.show_pty_input_failure();
+            return false;
+        }
+        true
+    }
+
+    fn show_pty_input_failure(&mut self) {
+        self.status = "Noren PTY input failed";
+        self.show_status = true;
+        self.redraw_needed = true;
     }
 
     /// Keep the platform candidate window beside the terminal's insertion

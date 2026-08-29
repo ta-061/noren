@@ -4507,6 +4507,31 @@ fn ime_large_commit_arrives_in_order_across_the_read_chunk_boundary() {
 }
 
 #[test]
+fn ime_large_commit_stops_at_the_first_failed_write_and_surfaces_it() {
+    let mut app = NorenApp::default();
+    let failed_chunk = noren_pty::COMMAND_CHANNEL_CAPACITY + 1;
+    let offered_chunks = failed_chunk + 2;
+    app.test_input_failure_at = Some(failed_chunk);
+    let commit = "Q".repeat(READ_CHUNK_BYTES * offered_chunks);
+
+    assert!(app.handle_ime_window_event(&WindowEvent::Ime(Ime::Commit(commit))));
+
+    assert_eq!(
+        app.test_input_send_attempts, failed_chunk,
+        "chunks after the first rejected command must not be attempted"
+    );
+    assert_eq!(app.status, "Noren PTY input failed");
+    assert!(
+        app.show_status,
+        "the failed write must be visible to the user"
+    );
+    assert!(
+        app.redraw_needed,
+        "the visible failure must schedule a frame"
+    );
+}
+
+#[test]
 fn ime_large_multibyte_commit_keeps_scalar_bytes_ordered_between_chunks() {
     let commit = [
         "境".repeat(READ_CHUNK_BYTES / "境".len() + 1),

@@ -175,8 +175,8 @@ fn production_commit_handler_uses_the_encoder_and_forward_chunk_loop() {
         "large commits must traverse chunks in their original iterator order"
     );
     assert!(
-        handler.contains("self.send_input(chunk);"),
-        "every complete chunk must reach the production PTY writer"
+        handler.contains("if !self.send_input(chunk) {") && handler.contains("break;"),
+        "every complete chunk must reach the production PTY writer until its first failure"
     );
 }
 
