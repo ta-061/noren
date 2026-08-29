@@ -2207,6 +2207,34 @@ mod tests {
         GridGeometry::poc().cell_metrics()
     }
 
+    /// WCAG sRGB linearisation over the exact floats sent to the framebuffer.
+    /// DARK's clear colour is not an integer multiple of 1/255, so quantising
+    /// it before this calculation would test a nearby colour rather than the
+    /// one users actually see.
+    fn exact_srgb_channel(channel: f32) -> f64 {
+        let channel = f64::from(channel);
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn exact_framebuffer_contrast(first: [f32; 3], second: [f32; 3]) -> f64 {
+        let luminance = |[red, green, blue]: [f32; 3]| {
+            0.2126 * exact_srgb_channel(red)
+                + 0.7152 * exact_srgb_channel(green)
+                + 0.0722 * exact_srgb_channel(blue)
+        };
+        let (first, second) = (luminance(first), luminance(second));
+        let (lighter, darker) = if first >= second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
     #[test]
     fn scrollback_viewport_pins_exact_rows_at_each_offset_and_clamps() {
         let terminal = snapshot(3, 4, b"\x1b[?25lA\r\nB\r\nC\r\nD\r\nE");
@@ -3083,12 +3111,12 @@ mod tests {
         for theme in [DARK, LIGHT, HIGH_CONTRAST] {
             for marker in LIFECYCLE_MARKERS {
                 let ansi = lifecycle_marker_color(marker).expect("known lifecycle marker");
-                let color = theme.ansi()[usize::from(ansi.palette_index())];
-                let ratio = contrast_ratio(color, theme.background_u8());
+                let color = resolve_color(&theme, Color::Ansi(ansi), theme.foreground());
+                let ratio = exact_framebuffer_contrast(color, theme.background());
                 assert!(
                     ratio >= 4.5,
-                    "marker {marker:?} has only {ratio:.4}:1 contrast on {:?}",
-                    theme.background_u8()
+                    "marker {marker:?} has only {ratio:.6}:1 contrast on {:?}",
+                    theme.background()
                 );
             }
         }
@@ -3112,17 +3140,17 @@ mod tests {
                 .into_iter()
                 .map(|marker| {
                     let ansi = lifecycle_marker_color(marker).expect("known lifecycle marker");
-                    contrast_ratio(
-                        theme.ansi()[usize::from(ansi.palette_index())],
-                        theme.background_u8(),
+                    exact_framebuffer_contrast(
+                        resolve_color(&theme, Color::Ansi(ansi), theme.foreground()),
+                        theme.background(),
                     )
                 })
                 .fold(f64::INFINITY, f64::min);
             for kind in kinds {
                 let ansi = kind_marker_color(kind);
-                let ratio = contrast_ratio(
-                    theme.ansi()[usize::from(ansi.palette_index())],
-                    theme.background_u8(),
+                let ratio = exact_framebuffer_contrast(
+                    resolve_color(&theme, Color::Ansi(ansi), theme.foreground()),
+                    theme.background(),
                 );
                 assert!(ratio >= 4.5, "{kind:?} has only {ratio:.6}:1 contrast");
                 assert!(
