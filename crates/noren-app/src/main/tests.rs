@@ -517,6 +517,177 @@ fn configured_cell_sizes_drive_the_app_geometry() {
 }
 
 #[test]
+fn scale_factor_change_rederives_an_equal_grid_and_forces_runtime_sync() {
+    let mut app = NorenApp::default();
+    let original = app
+        .geometry
+        .update(Resize::new(900, 600))
+        .expect("initial physical size produces a grid");
+    let initial_pty = app
+        .prepare_initial_terminal(original)
+        .expect("initial grid produces terminal and PTY sizes");
+    assert_eq!(initial_pty.into_raw(), (29, 74));
+
+    app.handle_window_geometry_change(WindowGeometryChange::ScaleFactorChanged {
+        scale_factor: 2.0,
+        physical: PhysicalSize::new(1_800, 1_200),
+    });
+
+    assert_eq!(app.geometry.scale_factor(), 2.0);
+    assert_eq!(
+        (app.geometry.cell_width(), app.geometry.cell_height()),
+        (20, 40)
+    );
+    assert_eq!(
+        app.pending_grid,
+        Some(original),
+        "the equal 30x90 grid must still be marked pending on a scale event"
+    );
+
+    app.apply_pending_resize();
+    assert_eq!(
+        app.terminal.as_ref().expect("terminal retained").size(),
+        (29, 74),
+        "terminal state must be synchronized through the scale event"
+    );
+    assert_eq!(app.pending_grid, None);
+}
+
+#[test]
+fn fractional_scale_factor_change_uses_new_cells_for_the_new_runtime_grid() {
+    let mut app = NorenApp::default();
+    let original = app
+        .geometry
+        .update(Resize::new(900, 600))
+        .expect("initial physical size produces a grid");
+    app.prepare_initial_terminal(original)
+        .expect("initial grid produces terminal and PTY sizes");
+
+    app.handle_window_geometry_change(WindowGeometryChange::ScaleFactorChanged {
+        scale_factor: 1.5,
+        physical: PhysicalSize::new(1_530, 960),
+    });
+
+    assert_eq!(
+        (app.geometry.cell_width(), app.geometry.cell_height()),
+        (15, 30)
+    );
+    let pending = app.pending_grid.expect("scale event re-derives the grid");
+    assert_eq!((pending.rows(), pending.cols()), (32, 102));
+    app.apply_pending_resize();
+    assert_eq!(
+        app.terminal.as_ref().expect("terminal retained").size(),
+        (31, 86),
+        "terminal rows/columns use the fractional physical cells before chrome is reserved"
+    );
+}
+
+#[test]
+fn scale_factor_change_scales_configured_cells_once_in_the_app_path() {
+    let config = AppConfig::parse("[font]\ncell_width = 12\ncell_height = 24\n")
+        .expect("valid configured cells");
+    let mut app = NorenApp::new(config);
+    let original = app
+        .geometry
+        .update(Resize::new(900, 600))
+        .expect("initial configured grid");
+    app.prepare_initial_terminal(original)
+        .expect("initial configured runtime surfaces");
+
+    app.handle_window_geometry_change(WindowGeometryChange::ScaleFactorChanged {
+        scale_factor: 2.0,
+        physical: PhysicalSize::new(1_800, 1_200),
+    });
+
+    assert_eq!(
+        (app.geometry.cell_width(), app.geometry.cell_height()),
+        (24, 48),
+        "the configured 12x24 cell is scaled to 24x48 exactly once"
+    );
+    assert_eq!(app.pending_grid, Some(original));
+    app.apply_pending_resize();
+    assert_eq!(
+        app.terminal.as_ref().expect("terminal retained").size(),
+        (24, 59)
+    );
+}
+
+#[test]
+fn equal_grid_scale_change_preserves_selection_and_scrollback_offset() {
+    let mut terminal = TerminalState::new(3, 8).expect("valid terminal");
+    terminal.feed_bytes(b"one\r\ntwo\r\nthree\r\nfour");
+    assert_eq!(terminal.scrollback_len(), 1);
+    let selection = Selection::entire_grid(&terminal);
+    let mut app = NorenApp {
+        terminal: Some(terminal),
+        selection: Some(selection),
+        scroll_offset: 1,
+        ..Default::default()
+    };
+    let initial = app
+        .geometry
+        .update(Resize::new(240, 80))
+        .expect("4x24 window grid");
+    assert_eq!((initial.rows(), initial.cols()), (4, 24));
+
+    app.handle_window_geometry_change(WindowGeometryChange::ScaleFactorChanged {
+        scale_factor: 2.0,
+        physical: PhysicalSize::new(480, 160),
+    });
+    app.apply_pending_resize();
+
+    let terminal = app.terminal.as_ref().expect("terminal retained");
+    assert_eq!(terminal.size(), (3, 8));
+    assert_eq!(
+        app.scroll_offset, 1,
+        "valid history offset survives display move"
+    );
+    assert!(
+        app.selection
+            .as_ref()
+            .is_some_and(|selection| selection.is_valid(terminal)),
+        "an equal logical grid keeps the selection's grid coordinates valid"
+    );
+}
+
+#[test]
+fn scaled_metrics_keep_selection_hit_testing_and_ime_on_the_same_pixels() {
+    let mut terminal = TerminalState::new(3, 8).expect("valid terminal");
+    terminal.feed_bytes(b"\x1b[2;3HA\x1b[2;3H");
+    let mut app = NorenApp {
+        terminal: Some(terminal),
+        ..Default::default()
+    };
+    app.geometry
+        .update(Resize::new(240, 80))
+        .expect("4x24 window grid");
+    app.handle_window_geometry_change(WindowGeometryChange::ScaleFactorChanged {
+        scale_factor: 2.0,
+        physical: PhysicalSize::new(480, 160),
+    });
+    app.apply_pending_resize();
+
+    let terminal_edge = sidebar_pixel_width_at_width(20, app.sidebar_columns);
+    let caret_pixel = PhysicalPosition::new(terminal_edge + 2.0 * 20.0 + 1.0, 40.0 + 1.0);
+    assert_eq!(
+        app.grid_point_in_frame(caret_pixel, PhysicalSize::new(480, 160)),
+        Some(GridPoint::new(1, 2)),
+        "scaled selection hit testing must land on the cursor's logical cell"
+    );
+
+    let target = RecordingImeCursorArea::default();
+    app.prepare_redraw(Some(&target));
+    assert_eq!(
+        target.last(),
+        (
+            PhysicalPosition::new(terminal_edge + 2.0 * 20.0, 40.0),
+            PhysicalSize::new(20, 40),
+        ),
+        "IME candidate area must use the same scaled cell box as hit testing"
+    );
+}
+
+#[test]
 fn configured_sidebar_columns_reach_app_terminal_pty_and_text() {
     let config = AppConfig::parse("[sidebar]\ncolumns = 24\n").expect("valid configuration");
     let mut app = NorenApp::new(config);
@@ -2876,7 +3047,7 @@ fn sidebar_scroll_reveals_and_selects_ssh_without_terminal_mouse_output() {
     );
 
     let tall_frame = PhysicalSize::new(frame_size.width, 7 * metrics.height());
-    app.handle_resize(tall_frame);
+    app.handle_window_geometry_change(WindowGeometryChange::Resized(tall_frame));
     assert_eq!(
         app.sidebar_scroll_offset, 0,
         "a taller frame clamps the obsolete scroll offset"
@@ -4279,6 +4450,73 @@ fn wait_for_shell_output(app: &mut NorenApp) {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn scale_factor_change_sends_sigwinch_with_rederived_pty_size() {
+    const READY: &str = "HIDPI_TRAP_READY";
+    const OBSERVED: &str = "HIDPI_WINCH:33 86";
+
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    wait_for_shell_output(&mut app);
+    assert_eq!(
+        app.terminal.as_ref().expect("live terminal").size(),
+        (29, 74),
+        "headless test session starts at the 900x600 scale-one runtime grid"
+    );
+
+    assert!(app.send_input(
+        b"/bin/stty -echo\nTRAPWINCH() { printf 'HIDPI_WINCH:'; /bin/stty size; }\nprintf 'HIDPI_TRAP_READY\\n'\n"
+    ));
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.drain_pty();
+        let text = app.terminal.as_ref().map(terminal_text).unwrap_or_default();
+        if text.contains(READY) {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "SIGWINCH trap was not armed; terminal said: {text:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    app.handle_window_geometry_change(WindowGeometryChange::ScaleFactorChanged {
+        scale_factor: 2.0,
+        physical: PhysicalSize::new(2_040, 1_360),
+    });
+    let pending = app
+        .pending_grid
+        .expect("scale change queues the re-derived 34x102 window grid");
+    assert_eq!((pending.rows(), pending.cols()), (34, 102));
+    app.apply_pending_resize();
+    assert_eq!(
+        app.terminal
+            .as_ref()
+            .expect("live terminal retained")
+            .size(),
+        (33, 86),
+        "terminal state must receive the same status/sidebar-adjusted grid as the PTY"
+    );
+
+    let winch_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.drain_pty();
+        let text = app.terminal.as_ref().map(terminal_text).unwrap_or_default();
+        if text.contains(OBSERVED) {
+            break;
+        }
+        assert!(
+            Instant::now() < winch_deadline,
+            "running zsh did not observe SIGWINCH with 33x86; terminal said: {text:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    app.teardown();
 }
 
 #[derive(Clone, Copy)]

@@ -54,12 +54,17 @@ binary. What now actually happens on screen:
   that wheel navigates Noren's retained history. Clicks, drags, and the wheel
   therefore reach programs that ask for them — Zellij, `vim` with `set
   mouse=a`, and `tmux` among them.
-- **Configured cell size reaches the renderer.** `[font] cell_width` /
-  `cell_height` flow through `GridGeometry::with_cells` to the drawing path;
-  the regression test `configured_cell_sizes_drive_the_app_geometry` in the
-  binary's extracted test module (`src/main/tests.rs`) pins it, and a mutation
-  note in `renderer.rs`'s tests records that
-  reverting `push_glyph` to the fixed `POC_CELL_WIDTH` constants must fail.
+- **Configured cell size and display scaling reach the renderer together.**
+  `[font] cell_width` / `cell_height` are logical-pixel controls that flow
+  through `GridGeometry::with_cells`; the active window `scale_factor` derives
+  physical `CellMetrics` exactly once for drawing, grid conversion, pointer
+  mapping, sidebar placement, and IME placement. `ScaleFactorChanged` refreshes
+  those metrics and synchronizes terminal state plus every live PTY. The
+  `hidpi_default_scales_keep_renderer_terminal_and_pty_grids_equal` and
+  `hidpi_configured_cells_scale_once_and_keep_all_three_grids_equal` tests pin
+  the complete 1.0/1.5/2.0 chain, while
+  `scale_factor_change_sends_sigwinch_with_rederived_pty_size` observes a live
+  shell receive the changed kernel winsize.
 - **Sidebar state survives a restart.** State is written to `sessions.toml`
   (`SESSION_STATE_FILE_NAME`) in the directory `config::default_path` resolves —
   `~/Library/Application Support/Noren/` on macOS — resolved by
