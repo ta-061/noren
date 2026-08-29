@@ -695,15 +695,15 @@ fn sidebar_text_lines_format_a_real_workspace_sidebar() {
     let lines = sidebar_text_lines(state.sidebar());
     assert_eq!(lines.len(), 2, "one formatted line per sidebar row");
 
-    // The selected row is prefixed with '>' and the unselected with a
-    // space; both carry the real descriptor's label.
+    // Selection and the session kind occupy separate fixed cells; both rows
+    // carry the real descriptor's label.
     assert!(
-        lines[0].starts_with("> "),
+        lines[0].starts_with(">▣ "),
         "selected row must be marked with '>': {:?}",
         lines[0]
     );
     assert!(
-        lines[1].starts_with("  "),
+        lines[1].starts_with(" ▣ "),
         "unselected row must be marked with a space: {:?}",
         lines[1]
     );
@@ -2124,10 +2124,12 @@ fn configured_ssh_hosts_appear_as_distinct_sidebar_rows() {
     let rows = app.workspace.sidebar().rows();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].kind(), EntryKind::SshConnection);
-    assert_eq!(rows[0].label(), "SSH-OFF build");
+    assert_eq!(rows[0].label(), "build");
     assert_eq!(rows[0].detail(), Some("not connected"));
+    assert_eq!(rows[0].lifecycle(), Some(SessionLifecycle::Exited));
     assert_eq!(rows[1].kind(), EntryKind::SshConnection);
-    assert_eq!(rows[1].label(), "SSH-OFF db");
+    assert_eq!(rows[1].label(), "db");
+    assert_eq!(rows[1].lifecycle(), Some(SessionLifecycle::Exited));
     assert_eq!(
         app.workspace
             .ssh_hosts
@@ -2183,7 +2185,8 @@ fn wildcard_patterns_add_no_rows_but_the_notice_explains_them() {
 
     let rows = app.workspace.sidebar().rows();
     assert_eq!(rows.len(), 1, "only the literal alias becomes a row");
-    assert_eq!(rows[0].label(), "SSH-OFF build");
+    assert_eq!(rows[0].label(), "build");
+    assert_eq!(rows[0].lifecycle(), Some(SessionLifecycle::Exited));
     assert!(
         rows.iter().all(|row| !row.label().contains(['*', '?'])),
         "a wildcard pattern is a rule, not a launchable destination"
@@ -2230,18 +2233,21 @@ fn included_ssh_host_selection_shows_bounded_root_relative_provenance() {
 }
 
 #[test]
-fn ssh_sidebar_label_preserves_short_targets() {
-    assert_eq!(ssh_sidebar_label("stage"), "SSH-OFF stage");
-    assert_eq!(ssh_sidebar_label("abcdef"), "SSH-OFF abcdef");
-    assert_eq!(ssh_sidebar_label("abcdefg"), "SSH-OFF abc...");
+fn ssh_sidebar_label_preserves_identity_until_the_memory_bound() {
+    assert_eq!(ssh_sidebar_label("stage"), "stage");
+    assert_eq!(ssh_sidebar_label("abcdef"), "abcdef");
+    assert_eq!(
+        ssh_sidebar_label(&"x".repeat(MAX_SIDEBAR_IDENTITY_CHARS + 1)),
+        "x".repeat(MAX_SIDEBAR_IDENTITY_CHARS)
+    );
 }
 
 #[test]
-fn ssh_sidebar_label_truncates_multibyte_targets_on_a_scalar_boundary() {
-    let label = ssh_sidebar_label("東京大阪京都札幌仙台横浜");
+fn ssh_sidebar_label_bounds_multibyte_targets_on_a_scalar_boundary() {
+    let label = ssh_sidebar_label(&"東京".repeat(MAX_SIDEBAR_IDENTITY_CHARS));
 
-    assert_eq!(label, "SSH-OFF 東京大...");
-    assert_eq!(label.chars().count(), SSH_SIDEBAR_LABEL_CHARS);
+    assert_eq!(label.chars().count(), MAX_SIDEBAR_IDENTITY_CHARS);
+    assert_eq!(label, "東京".repeat(MAX_SIDEBAR_IDENTITY_CHARS / 2));
 }
 
 #[test]
@@ -2255,7 +2261,7 @@ fn ssh_status_source_keeps_tag_first_and_bounds_unicode_path() {
 }
 
 #[test]
-fn every_rendered_ssh_prefix_encodes_disconnected_state_within_sixteen_columns() {
+fn every_rendered_ssh_row_has_kind_and_stopped_shapes_within_sixteen_columns() {
     let fixture = SshConfigFixture::new();
     fixture.write_new("Host db\nHost configured-host-with-long-alias\nHost 東京大阪京都札幌\n");
     let mut workspace = WorkspaceState::new();
@@ -2265,18 +2271,16 @@ fn every_rendered_ssh_prefix_encodes_disconnected_state_within_sixteen_columns()
     let lines = sidebar_text_lines(workspace.sidebar());
     assert_eq!(lines.len(), 3);
     for line in lines {
-        let rendered_prefix: String = line.chars().take(renderer::SIDEBAR_COLS).collect();
-        assert!(
-            rendered_prefix.contains(SSH_SIDEBAR_LABEL_PREFIX),
-            "the rendered prefix must identify SSH as offline"
-        );
+        assert_eq!(line.chars().count(), renderer::SIDEBAR_COLS);
+        assert_eq!(line.chars().nth(1), Some('⌁'));
+        assert_eq!(line.chars().last(), Some('■'));
     }
 }
 
 #[test]
 fn pending_marker_identifies_exact_target_despite_colliding_truncated_labels() {
     let fixture = SshConfigFixture::new();
-    fixture.write_new(b"Host abcdef-first\nHost abcdef-second\n");
+    fixture.write_new(b"Host abcdefgh-first\nHost abcdefgh-second\n");
     let mut workspace = WorkspaceState::new();
     let local = workspace.create_session(SessionKind::Local);
     workspace
@@ -2286,10 +2290,13 @@ fn pending_marker_identifies_exact_target_despite_colliding_truncated_labels() {
     let config = SshConfig::read(fixture.path()).expect("bounded SSH fixture parses");
     workspace.load_ssh_config(&config);
 
-    assert_eq!(workspace.sidebar().rows()[1].label(), "SSH-OFF abc...");
-    assert_eq!(workspace.sidebar().rows()[2].label(), "SSH-OFF abc...");
+    assert_eq!(workspace.sidebar().rows()[1].label(), "abcdefgh-first");
+    assert_eq!(workspace.sidebar().rows()[2].label(), "abcdefgh-second");
+    let before = visible_sidebar_text_lines(workspace.sidebar(), 1, 2);
+    assert_eq!(before[0], " ⌁ abcdefgh... ■");
+    assert_eq!(before[1], " ⌁ abcdefgh... ■");
     assert!(workspace.select_ssh_sidebar_row(2));
-    assert_eq!(workspace.selected_ssh_target(), Some("abcdef-second"));
+    assert_eq!(workspace.selected_ssh_target(), Some("abcdefgh-second"));
 
     let rows = workspace.sidebar().rows();
     assert!(!rows[0].is_selected(), "pending SSH supersedes live marker");
@@ -2355,16 +2362,18 @@ fn near_one_mib_ssh_alias_keeps_full_identity_and_bounded_display_text() {
     );
 
     let row = &workspace.sidebar().rows()[0];
-    assert_eq!(row.label(), "SSH-OFF aaa...");
-    assert_eq!(row.label().chars().count(), SSH_SIDEBAR_LABEL_CHARS);
+    assert_eq!(row.label().chars().count(), MAX_SIDEBAR_IDENTITY_CHARS);
+    assert!(row.label().chars().all(|character| character == 'a'));
 
     let redraw_lines = sidebar_text_lines(workspace.sidebar());
     assert_eq!(redraw_lines.len(), 1);
+    assert_eq!(redraw_lines[0].chars().count(), renderer::SIDEBAR_COLS);
+    assert_eq!(redraw_lines[0].chars().nth(1), Some('⌁'));
     assert_eq!(
-        redraw_lines[0].chars().count(),
-        SIDEBAR_ROW_PREFIX_CHARS + SSH_SIDEBAR_LABEL_CHARS + 1 + SSH_SIDEBAR_DETAIL.chars().count(),
-        "redraw text stays bounded independently of target length"
+        &redraw_lines[0].chars().skip(11).take(3).collect::<String>(),
+        "..."
     );
+    assert_eq!(redraw_lines[0].chars().last(), Some('■'));
 
     assert!(workspace.select_ssh_sidebar_row(0));
     assert!(
@@ -2591,8 +2600,9 @@ fn ssh_rows_stay_distinguishable_from_local_rows() {
     assert_eq!(rows[0].kind(), EntryKind::Session);
     assert_eq!(rows[0].detail(), Some("local · starting"));
     assert_eq!(rows[1].kind(), EntryKind::SshConnection);
-    assert_eq!(rows[1].label(), "SSH-OFF sta...");
+    assert_eq!(rows[1].label(), "staging");
     assert_eq!(rows[1].detail(), Some("not connected"));
+    assert_eq!(rows[1].lifecycle(), Some(SessionLifecycle::Exited));
 }
 
 #[test]
@@ -2735,9 +2745,7 @@ fn sidebar_scroll_reveals_and_selects_ssh_without_terminal_mouse_output() {
     );
     let initial = visible_sidebar_text_lines(app.workspace.sidebar(), 0, 2);
     assert!(
-        initial
-            .iter()
-            .all(|line| !line.contains(SSH_SIDEBAR_LABEL_PREFIX)),
+        initial.iter().all(|line| line.chars().nth(1) != Some('⌁')),
         "restored/local rows initially hide SSH rows"
     );
 
@@ -2757,7 +2765,9 @@ fn sidebar_scroll_reveals_and_selects_ssh_without_terminal_mouse_output() {
     assert!(app.pty.is_none(), "the local scroll route opens no PTY");
 
     let visible = visible_sidebar_text_lines(app.workspace.sidebar(), app.sidebar_scroll_offset, 2);
-    assert!(visible[0].contains("SSH-OFF alpha"));
+    assert_eq!(visible[0].chars().nth(1), Some('⌁'));
+    assert!(visible[0].contains("alpha"));
+    assert_eq!(visible[0].chars().last(), Some('■'));
     assert!(app.handle_sidebar_click_in_frame(
         ElementState::Pressed,
         MouseButton::Left,
@@ -2915,17 +2925,17 @@ fn many_ssh_hosts_are_bounded_and_report_the_omitted_count() {
             }
     }));
     assert!(rows.iter().all(|row| {
-        row.label().chars().count() == SSH_SIDEBAR_LABEL_CHARS
-            && row.label().ends_with(SSH_SIDEBAR_TRUNCATION_MARKER)
+        row.label().chars().count() < MAX_SIDEBAR_IDENTITY_CHARS
+            && !row.label().ends_with(SSH_SIDEBAR_TRUNCATION_MARKER)
+            && row.lifecycle() == Some(SessionLifecycle::Exited)
     }));
     let redraw_lines = sidebar_text_lines(app.workspace.sidebar());
     assert_eq!(redraw_lines.len(), MAX_SSH_SIDEBAR_HOSTS);
     assert!(redraw_lines.iter().all(|line| {
-        line.chars().count()
-            == SIDEBAR_ROW_PREFIX_CHARS
-                + SSH_SIDEBAR_LABEL_CHARS
-                + 1
-                + SSH_SIDEBAR_DETAIL.chars().count()
+        line.chars().count() == renderer::SIDEBAR_COLS
+            && line.chars().nth(1) == Some('⌁')
+            && line.chars().skip(11).take(3).eq("...".chars())
+            && line.chars().last() == Some('■')
     }));
     assert_eq!(app.workspace.ssh_hosts_omitted(), 6);
     assert!(
@@ -3746,8 +3756,9 @@ fn ssh_click_surfaces_launch_failure_when_no_child_can_spawn() {
         Some("SSH partial source #0 config; launch failed")
     );
     let row = &app.workspace.sidebar().rows()[0];
-    assert_eq!(row.label(), "SSH-ERR web");
+    assert_eq!(row.label(), "web");
     assert_eq!(row.detail(), Some("launch failed"));
+    assert_eq!(row.lifecycle(), Some(SessionLifecycle::Failed));
     assert!(
         app.pty.is_none(),
         "a failed launch must leave no PTY behind"
@@ -3839,12 +3850,9 @@ fn ssh_click_refuses_a_raw_token_destination_without_spawning() {
     assert!(app.pty.is_none(), "a refused destination must not spawn");
     assert!(app.workspace.ssh_connection().is_none());
     let row = &app.workspace.sidebar().rows()[0];
-    assert!(
-        row.label().starts_with("SSH-OFF "),
-        "the row must stay disconnected: {}",
-        row.label()
-    );
+    assert_eq!(row.label(), format!("%p-{secret}"));
     assert_eq!(row.detail(), Some("not connected"));
+    assert_eq!(row.lifecycle(), Some(SessionLifecycle::Exited));
     // No debug surface may print the destination either.
     assert!(!format!("{:?}", app.workspace).contains(&secret));
 }
@@ -3885,48 +3893,36 @@ fn ssh_exit_observation_maps_every_child_outcome_to_a_visible_phase() {
     ] {
         assert!(!phase.status_text().is_empty());
         assert!(!phase.sidebar_detail().is_empty());
-        assert_eq!(
-            phase.sidebar_prefix().chars().count(),
-            SSH_SIDEBAR_LABEL_PREFIX_CHARS,
-            "the prefix must keep the fixed label arithmetic"
-        );
-        assert!(phase.sidebar_prefix().starts_with("SSH-"));
+        assert!(matches!(
+            phase.sidebar_lifecycle(),
+            SessionLifecycle::Starting
+                | SessionLifecycle::Running
+                | SessionLifecycle::Exited
+                | SessionLifecycle::Failed
+        ));
     }
 }
 
 #[test]
-fn ssh_sidebar_state_prefixes_encode_the_connection_phase() {
+fn ssh_sidebar_lifecycle_shapes_encode_every_connection_phase() {
     assert_eq!(
-        ssh_state_label(SshConnectionPhase::Connected, "abcdef"),
-        "SSH-ON  abcdef"
+        SshConnectionPhase::Connecting.sidebar_lifecycle(),
+        SessionLifecycle::Starting
     );
     assert_eq!(
-        ssh_state_label(SshConnectionPhase::Connecting, "abcdefg"),
-        "SSH-ON  abc..."
+        SshConnectionPhase::Connected.sidebar_lifecycle(),
+        SessionLifecycle::Running
     );
     assert_eq!(
-        ssh_state_label(SshConnectionPhase::ConnectFailed, "abcdefg"),
-        "SSH-ERR abc..."
+        SshConnectionPhase::Closed.sidebar_lifecycle(),
+        SessionLifecycle::Exited
     );
-    assert_eq!(
-        ssh_state_label(SshConnectionPhase::Disconnected, "abcdef"),
-        "SSH-ERR abcdef"
-    );
-    assert_eq!(
-        ssh_state_label(SshConnectionPhase::Closed, "abcdefg"),
-        "SSH-OFF abc..."
-    );
-    // Long targets stay bounded in every phase.
     for phase in [
-        SshConnectionPhase::Connecting,
-        SshConnectionPhase::Connected,
-        SshConnectionPhase::Closed,
         SshConnectionPhase::LaunchFailed,
         SshConnectionPhase::ConnectFailed,
         SshConnectionPhase::Disconnected,
     ] {
-        let label = ssh_state_label(phase, &"x".repeat(2048));
-        assert_eq!(label.chars().count(), SSH_SIDEBAR_LABEL_CHARS);
+        assert_eq!(phase.sidebar_lifecycle(), SessionLifecycle::Failed);
     }
 }
 
@@ -3940,25 +3936,15 @@ fn ssh_connection_marker_identifies_only_the_exact_connected_target() {
 
     workspace.set_ssh_connection("abcdef-second", SshConnectionPhase::Connected);
     let rows = workspace.sidebar().rows();
-    assert!(
-        rows[0].label().starts_with("SSH-OFF "),
-        "{}",
-        rows[0].label()
-    );
-    assert!(
-        rows[1].label().starts_with("SSH-ON  "),
-        "{}",
-        rows[1].label()
-    );
+    assert_eq!(rows[0].label(), "abcdef-first");
+    assert_eq!(rows[0].lifecycle(), Some(SessionLifecycle::Exited));
+    assert_eq!(rows[1].label(), "abcdef-second");
+    assert_eq!(rows[1].lifecycle(), Some(SessionLifecycle::Running));
     assert_eq!(rows[1].detail(), Some("connected"));
 
     workspace.set_ssh_connection("abcdef-second", SshConnectionPhase::ConnectFailed);
     let rows = workspace.sidebar().rows();
-    assert!(
-        rows[1].label().starts_with("SSH-ERR "),
-        "{}",
-        rows[1].label()
-    );
+    assert_eq!(rows[1].lifecycle(), Some(SessionLifecycle::Failed));
     assert_eq!(rows[1].detail(), Some("connection failed"));
 }
 
@@ -4410,7 +4396,7 @@ fn ssh_click_connects_the_system_client_end_to_end() {
 
     // The sidebar row carries the failure state.
     let row = &app.workspace.sidebar().rows()[0];
-    assert!(row.label().starts_with("SSH-ERR "), "{}", row.label());
+    assert_eq!(row.lifecycle(), Some(SessionLifecycle::Failed));
     assert_eq!(row.detail(), Some("connection failed"));
 }
 
@@ -5566,15 +5552,16 @@ fn sidebar_rows_render_sessions_then_projects_worktrees_ssh_hosts_agents() {
         "the fixed order is sessions, projects, worktrees, SSH hosts, agents"
     );
     // Project rows keep the configuration's declaration order and carry the
-    // fixed state prefix and detail, never the root path.
+    // shared stopped lifecycle, never the root path.
     assert_eq!(
         rows[2..4]
             .iter()
             .map(|row| row.label().to_owned())
             .collect::<Vec<_>>(),
-        vec!["PRJ-OFF pr-00", "PRJ-OFF pr-01"]
+        vec!["pr-00", "pr-01"]
     );
     assert_eq!(rows[2].detail(), Some("not running"));
+    assert_eq!(rows[2].lifecycle(), Some(SessionLifecycle::Exited));
     // Worktree rows keep git's listing order (main first).
     assert_eq!(
         rows[4..7]
@@ -5589,18 +5576,18 @@ fn sidebar_rows_render_sessions_then_projects_worktrees_ssh_hosts_agents() {
             .iter()
             .map(|row| row.label().to_owned())
             .collect::<Vec<_>>(),
-        vec!["SSH-OFF zulu", "SSH-OFF alpha"]
+        vec!["zulu", "alpha"]
     );
-    // Agent rows keep the configuration's declaration order (short names:
-    // the label target budget is six characters, like an SSH target's).
+    // Agent rows keep the configuration's declaration order.
     assert_eq!(
         rows[9..11]
             .iter()
             .map(|row| row.label().to_owned())
             .collect::<Vec<_>>(),
-        vec!["AGT-OFF m-one", "AGT-OFF m-two"]
+        vec!["m-one", "m-two"]
     );
     assert_eq!(rows[9].detail(), Some("not running"));
+    assert_eq!(rows[9].lifecycle(), Some(SessionLifecycle::Exited));
     assert!(
         app.agent_diagnostic.is_none(),
         "an in-cap agent list adds no notice"
@@ -5906,9 +5893,8 @@ fn many_agents_config(count: usize, command: &str) -> AppConfig {
 }
 
 /// Configured agents appear as `EntryKind::Agent` rows in configuration
-/// order, with bounded labels: a name longer than the target budget is
-/// truncated with the shared ASCII marker, never overflowing the sidebar
-/// column.
+/// order. The view model retains the configured identity; the one shared text
+/// projection truncates it with a visible ellipsis inside the sidebar.
 #[test]
 fn configured_agents_appear_as_sidebar_rows_with_bounded_labels() {
     let config = AppConfig::parse(
@@ -5922,17 +5908,20 @@ fn configured_agents_appear_as_sidebar_rows_with_bounded_labels() {
     let rows = app.workspace.sidebar().rows();
     let kinds: Vec<EntryKind> = rows.iter().map(|row| row.kind()).collect();
     assert_eq!(kinds, vec![EntryKind::Agent, EntryKind::Agent]);
-    assert_eq!(rows[0].label(), "AGT-OFF claude");
+    assert_eq!(rows[0].label(), "claude");
     assert_eq!(rows[0].detail(), Some("not running"));
-    // The label budget mirrors the SSH target budget (six characters after
-    // the state prefix): three kept characters plus the shared ASCII
-    // truncation marker — never the full overlong name.
+    assert_eq!(rows[0].lifecycle(), Some(SessionLifecycle::Exited));
     assert_eq!(
         rows[1].label(),
-        "AGT-OFF a-v...",
-        "an overlong name is truncated with the shared marker: {}",
-        rows[1].label()
+        "a-very-long-agent-name-that-exceeds-the-budget"
     );
+    let lines = sidebar_text_lines(app.workspace.sidebar());
+    assert_eq!(lines[1].chars().nth(1), Some('♟'));
+    assert_eq!(
+        &lines[1].chars().skip(11).take(3).collect::<String>(),
+        "..."
+    );
+    assert_eq!(lines[1].chars().last(), Some('■'));
     assert!(app.workspace.agents_omitted == 0);
 }
 
@@ -5950,10 +5939,10 @@ fn many_configured_agents_are_capped_and_the_omitted_count_is_reported() {
         MAX_AGENT_SIDEBAR_ROWS,
         "the sidebar keeps exactly the capped row count"
     );
-    assert_eq!(rows[0].label(), "AGT-OFF ag-00");
+    assert_eq!(rows[0].label(), "ag-00");
     assert_eq!(
         rows[MAX_AGENT_SIDEBAR_ROWS - 1].label(),
-        format!("AGT-OFF ag-{:02}", MAX_AGENT_SIDEBAR_ROWS - 1),
+        format!("ag-{:02}", MAX_AGENT_SIDEBAR_ROWS - 1),
         "the retained block is the FIRST {} in configuration order",
         MAX_AGENT_SIDEBAR_ROWS
     );
@@ -6066,8 +6055,8 @@ fn selecting_an_agent_row_launches_the_configured_command_in_a_pty() {
 }
 
 /// A configured command that does not exist is a clear, visible failure on
-/// the row — the configured row shows `AGT-ERR`, the created session row
-/// shows `failed`, and the fixed status line owns the status row — never a
+/// the row — the configured row shows the shared failed shape, the created
+/// session row shows `failed`, and the fixed status line owns the status row — never a
 /// hang and never a silent no-op.
 ///
 /// Mutation check (B): making a missing command report success (observe
@@ -6096,8 +6085,9 @@ fn an_agent_row_with_a_missing_command_is_a_visible_failure_never_a_hang() {
     let rows = app.workspace.sidebar().rows();
     // Session rows precede the configured agent rows: the failed launch
     // inserted its session row at position 0.
-    assert_eq!(rows[1].label(), "AGT-ERR ghost");
+    assert_eq!(rows[1].label(), "ghost");
     assert_eq!(rows[1].detail(), Some("launch failed"));
+    assert_eq!(rows[1].lifecycle(), Some(SessionLifecycle::Failed));
     // The created session row reports `failed`, never a phantom `Running`.
     let ids = registry_ids(&app);
     assert_eq!(
@@ -6331,11 +6321,9 @@ fn project_directories(count: usize) -> Vec<PathBuf> {
 }
 
 /// Configured projects appear as `EntryKind::Project` rows in configuration
-/// order with bounded labels — and are distinguishable at a glance from
-/// worktree rows shown beside them: a project row carries the fixed
-/// `PRJ-OFF` state prefix and a fixed state detail, while a worktree row
-/// shows its checkout's final path component and its branch. The row kinds
-/// are distinct discriminants, so they can never collide.
+/// order and are distinguishable at a glance from worktree rows shown beside
+/// them: fixed project/worktree kind shapes replace textual prefixes, while
+/// the shared lifecycle suffix carries project launch state.
 #[test]
 fn configured_projects_appear_as_rows_distinguishable_from_worktrees() {
     let roots = project_directories(2);
@@ -6362,30 +6350,30 @@ fn configured_projects_appear_as_rows_distinguishable_from_worktrees() {
         ],
         "project rows render before worktree rows, kinds never colliding"
     );
-    // Configuration order is preserved; the label is the shared
-    // state-prefix + name shape; the detail is a fixed state, never the
-    // configured root path.
-    assert_eq!(rows[0].label(), "PRJ-OFF pr-00");
+    // Configuration order is preserved; the detail is a fixed state, never
+    // the configured root path.
+    assert_eq!(rows[0].label(), "pr-00");
     assert_eq!(rows[0].detail(), Some("not running"));
-    assert_eq!(rows[1].label(), "PRJ-OFF pr-01");
-    // A worktree row beside them has no state prefix and a branch detail:
-    // the two kinds of directory-rooted rows are visually distinct. (The
+    assert_eq!(rows[0].lifecycle(), Some(SessionLifecycle::Exited));
+    assert_eq!(rows[1].label(), "pr-01");
+    // A worktree row beside them has a branch detail and no lifecycle: the
+    // two kinds of directory-rooted rows are visually distinct. (The
     // synthetic worktree directories do not exist, so the detail carries the
     // honest missing-directory marker.)
     assert_eq!(rows[2].label(), "pr-main");
     assert_eq!(rows[2].detail(), Some("pr-main (missing)"));
     assert_ne!(rows[0].kind(), rows[2].kind());
-    assert!(
-        !rows[2].label().starts_with("PRJ-"),
-        "a worktree row never carries the project state prefix"
-    );
+    assert_eq!(rows[2].lifecycle(), None);
+    let lines = sidebar_text_lines(app.workspace.sidebar());
+    assert_eq!(lines[0].chars().nth(1), Some('◆'));
+    assert_eq!(lines[2].chars().nth(1), Some('⑂'));
     for root in &roots {
         let _ = std::fs::remove_dir(root);
     }
 }
 
-/// An overlong project name is truncated with the shared ASCII marker
-/// inside the label budget, exactly like an agent name or an SSH target.
+/// An overlong project name is truncated with the shared visible marker by
+/// the row projection, exactly like an agent name or an SSH target.
 #[test]
 fn configured_project_labels_are_bounded_like_agent_labels() {
     let roots = project_directories(1);
@@ -6397,7 +6385,14 @@ fn configured_project_labels_are_bounded_like_agent_labels() {
     let app = NorenApp::new(config);
     let rows = app.workspace.sidebar().rows();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].label(), "PRJ-OFF a-v...");
+    assert_eq!(
+        rows[0].label(),
+        "a-very-long-project-name-that-exceeds-the-budget"
+    );
+    let line = &sidebar_text_lines(app.workspace.sidebar())[0];
+    assert_eq!(line.chars().nth(1), Some('◆'));
+    assert_eq!(&line.chars().skip(11).take(3).collect::<String>(), "...");
+    assert_eq!(line.chars().last(), Some('■'));
     let _ = std::fs::remove_dir(&roots[0]);
 }
 
@@ -6417,10 +6412,10 @@ fn many_configured_projects_are_capped_and_the_omitted_count_is_reported() {
         cap,
         "the sidebar keeps exactly the capped row count"
     );
-    assert_eq!(rows[0].label(), "PRJ-OFF pr-00");
+    assert_eq!(rows[0].label(), "pr-00");
     assert_eq!(
         rows[cap - 1].label(),
-        format!("PRJ-OFF pr-{:02}", cap - 1),
+        format!("pr-{:02}", cap - 1),
         "the retained block is the FIRST {cap} in configuration order"
     );
     assert_eq!(
@@ -6542,8 +6537,9 @@ fn a_project_row_with_a_missing_directory_is_a_visible_failure_never_a_session()
     assert!(app.show_status, "the refusal must be visible");
     let rows = app.workspace.sidebar().rows();
     assert_eq!(rows[0].kind(), EntryKind::Project);
-    assert_eq!(rows[0].label(), "PRJ-ERR ghost");
+    assert_eq!(rows[0].label(), "ghost");
     assert_eq!(rows[0].detail(), Some("launch failed"));
+    assert_eq!(rows[0].lifecycle(), Some(SessionLifecycle::Failed));
     assert!(
         app.workspace.registry().is_empty(),
         "a refused launch must not create a session row"

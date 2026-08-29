@@ -3284,35 +3284,37 @@ fn session_lifecycle_markers_reach_distinct_frame_pixels_at_16_columns() {
 }
 
 #[test]
-fn project_name_ending_in_running_marker_keeps_default_vertex_color() {
-    let entries = [SidebarEntry::Project {
-        name: "aaaaaaaaaaaaa▶".to_string(),
-        root: "/project".to_string(),
+fn worktree_text_shaped_like_running_keeps_default_vertex_color() {
+    let entries = [SidebarEntry::Worktree {
+        name: "aaaaaaaaa".to_string(),
+        branch: "▶".to_string(),
     }];
     let view = SidebarView::build(&entries, None);
     let rows = visible_sidebar_text_rows_at_width(&view, 0, 1, SIDEBAR_COLS);
-    let row = rows.first().expect("one project produces one sidebar row");
-    assert_eq!(row.kind(), Some(EntryKind::Project));
+    let row = rows.first().expect("one worktree produces one sidebar row");
+    assert_eq!(row.kind(), Some(EntryKind::Worktree));
+    assert_eq!(row.lifecycle(), None);
     assert_eq!(
-        row.text().chars().nth(SIDEBAR_COLS - 1),
+        row.text().chars().nth(SIDEBAR_COLS - 3),
         Some('▶'),
-        "fixture must truncate with the marker-shaped project character in column 16"
+        "fixture must place marker-shaped user text at the identity boundary"
     );
+    assert_eq!(row.text().chars().last(), Some(' '));
 
     let (_, colors) = sidebar_cell_vertex_oracle(
         row,
         &DARK,
-        u32::try_from(SIDEBAR_COLS - 1).expect("sidebar width fits u32"),
+        u32::try_from(SIDEBAR_COLS - 3).expect("sidebar width fits u32"),
     );
     let false_running_signal = DARK.ansi()[2].map(|channel| f32::from(channel) / 255.0);
     assert_ne!(DARK.foreground(), false_running_signal);
     assert!(
         !colors.is_empty(),
-        "project's final glyph emitted no vertices"
+        "worktree's marker-shaped text emitted no vertices"
     );
     assert!(
         colors.iter().all(|color| *color == DARK.foreground()),
-        "project text borrowed the running-session colour: {colors:?}"
+        "worktree text borrowed the running lifecycle colour: {colors:?}"
     );
 }
 
