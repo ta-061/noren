@@ -366,6 +366,38 @@ mod tests {
     }
 
     #[test]
+    fn cjk_identity_truncation_keeps_the_ellipsis_and_the_state_cell() {
+        // The ASCII truncation tests all pass under a mutation that drops the
+        // ellipsis only for non-ASCII names -- found by the independent review
+        // of #213, which probed ` ◆ 東京大阪京都札幌仙台横 ■` with no `...` at
+        // all. A Japanese name is the ordinary case for this product's own
+        // audience, so it gets its own assertion rather than riding on the
+        // ASCII ones.
+        let line = format_entry_row(
+            false,
+            EntryKind::Session,
+            "東京大阪京都札幌仙台横浜名古屋",
+            Some('▶'),
+            DEFAULT_SIDEBAR_COLUMNS,
+        );
+        assert_eq!(line.chars().count(), DEFAULT_SIDEBAR_COLUMNS);
+        assert_eq!(
+            line.chars().nth(KIND_MARKER_COLUMN),
+            Some(kind_marker(EntryKind::Session))
+        );
+        assert_eq!(
+            &line.chars().skip(11).take(3).collect::<String>(),
+            ELLIPSIS,
+            "a CJK identity must still show the ellipsis it was truncated by"
+        );
+        assert_eq!(
+            line.chars().last(),
+            Some('▶'),
+            "truncation must never eat the reserved lifecycle cell"
+        );
+    }
+
+    #[test]
     fn project_truncation_keeps_ellipsis_and_failed_lifecycle() {
         assert_kind_truncation(EntryKind::Project, Some('✕'), " ◆ abcdefgh... ✕");
     }
