@@ -46,12 +46,15 @@ pub enum EntryKind {
     Session,
 }
 
-/// The four user-visible lifecycle classes carried by a session row.
+/// The four user-visible lifecycle classes carried by a stateful row.
 ///
 /// [`SessionStatus::Restored`] deliberately projects to [`Exited`](Self::Exited):
 /// a restored record has no running process, so the stopped marker is the
 /// truthful compact treatment. The persisted/restored detail remains available
-/// on the row; this enum exists only for the always-visible lifecycle signal.
+/// on the row. Configured launch targets reuse this vocabulary instead of
+/// inventing parallel `OFF`/`ON`/`ERR` prefixes: waiting maps to starting, a
+/// live target to running, an idle target to exited/stopped, and an error to
+/// failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum SessionLifecycle {
     /// The session exists but has not yet reported a running observation.
@@ -143,6 +146,8 @@ pub enum SidebarEntry {
         name: String,
         /// The directory the project is rooted at, as display text.
         root: String,
+        /// Compact launch state, using the same four shapes as sessions.
+        lifecycle: SessionLifecycle,
     },
     /// A git worktree checked out at `branch`.
     Worktree {
@@ -162,6 +167,8 @@ pub enum SidebarEntry {
         /// This is display state only. It never denotes a live session,
         /// connection, process, or viewport.
         selected: bool,
+        /// Compact connection state, using the same four shapes as sessions.
+        lifecycle: SessionLifecycle,
     },
     /// A configured agent entry.
     Agent {
@@ -169,6 +176,8 @@ pub enum SidebarEntry {
         label: String,
         /// Fixed state text, such as `not running` or `launch failed`.
         status: String,
+        /// Compact launch state, using the same four shapes as sessions.
+        lifecycle: SessionLifecycle,
     },
     /// A live terminal session, described by the shared contract descriptor.
     Session(SessionDescriptor),
@@ -330,11 +339,15 @@ impl SidebarView {
         let mut rows: Vec<SidebarRow> = Vec::with_capacity(entries.len());
         for entry in entries {
             rows.push(match entry {
-                SidebarEntry::Project { name, root } => SidebarRow {
+                SidebarEntry::Project {
+                    name,
+                    root,
+                    lifecycle,
+                } => SidebarRow {
                     kind: EntryKind::Project,
                     label: name.clone(),
                     detail: Some(root.clone()),
-                    lifecycle: None,
+                    lifecycle: Some(*lifecycle),
                     selected: false,
                 },
                 SidebarEntry::Worktree { name, branch } => SidebarRow {
@@ -348,6 +361,7 @@ impl SidebarView {
                     label,
                     host,
                     selected,
+                    lifecycle,
                 } => {
                     let is_selected = *selected && !selected_row;
                     if is_selected {
@@ -357,15 +371,19 @@ impl SidebarView {
                         kind: EntryKind::SshConnection,
                         label: label.clone(),
                         detail: Some(host.clone()),
-                        lifecycle: None,
+                        lifecycle: Some(*lifecycle),
                         selected: is_selected,
                     }
                 }
-                SidebarEntry::Agent { label, status } => SidebarRow {
+                SidebarEntry::Agent {
+                    label,
+                    status,
+                    lifecycle,
+                } => SidebarRow {
                     kind: EntryKind::Agent,
                     label: label.clone(),
                     detail: Some(status.clone()),
-                    lifecycle: None,
+                    lifecycle: Some(*lifecycle),
                     selected: false,
                 },
                 SidebarEntry::Session(descriptor) => {
@@ -481,7 +499,7 @@ fn session_lifecycle(status: &SessionStatus) -> SessionLifecycle {
 /// pure state and spawns nothing; SSH and agent entries are text facts only.
 #[cfg(feature = "test-support")]
 pub mod fixtures {
-    use super::SidebarEntry;
+    use super::{SessionLifecycle, SidebarEntry};
     use crate::session::{SessionId, SessionKind, SessionRegistry, SessionStatus};
 
     /// A deterministic registry with three sessions and no selection: two
@@ -516,6 +534,7 @@ pub mod fixtures {
             SidebarEntry::Project {
                 name: "noren".to_string(),
                 root: "~/dev/noren".to_string(),
+                lifecycle: SessionLifecycle::Exited,
             },
             SidebarEntry::Worktree {
                 name: "pool-m3c".to_string(),
@@ -525,10 +544,12 @@ pub mod fixtures {
                 label: "web-1".to_string(),
                 host: "web1.internal:22".to_string(),
                 selected: false,
+                lifecycle: SessionLifecycle::Exited,
             },
             SidebarEntry::Agent {
                 label: "claude-code".to_string(),
                 status: "not running".to_string(),
+                lifecycle: SessionLifecycle::Exited,
             },
         ];
         entries.extend(registry.sessions().into_iter().map(SidebarEntry::Session));

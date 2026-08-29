@@ -45,8 +45,11 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use noren_app::cursor::CursorShape;
-use noren_app::sidebar::EntryKind;
-use noren_app::sidebar_text::{DEFAULT_SIDEBAR_COLUMNS, SidebarTextRow, lifecycle_marker_color};
+use noren_app::sidebar::{EntryKind, SessionLifecycle};
+use noren_app::sidebar_text::{
+    DEFAULT_SIDEBAR_COLUMNS, SidebarTextRow, kind_marker, kind_marker_color, lifecycle_marker,
+    lifecycle_marker_color,
+};
 use noren_app::theme::{Theme, contrast_ratio};
 use noren_app::{CellMetrics, MAX_RENDER_COLS, MAX_RENDER_ROWS};
 use noren_terminal::{Cell, CellAttributes, Color, Selection, TerminalSnapshot};
@@ -283,9 +286,20 @@ fn sidebar_glyph_color(
     column: usize,
     sidebar_columns: usize,
     row_kind: Option<EntryKind>,
+    row_lifecycle: Option<SessionLifecycle>,
 ) -> [f32; 3] {
-    if row_kind == Some(EntryKind::Session)
-        && column + 1 == sidebar_columns
+    if let Some(kind) = row_kind
+        && column == 1
+        && character == kind_marker(kind)
+    {
+        return resolve_color(
+            theme,
+            Color::Ansi(kind_marker_color(kind)),
+            theme.foreground(),
+        );
+    }
+    if column + 1 == sidebar_columns
+        && row_lifecycle.map(lifecycle_marker) == Some(character)
         && let Some(color) = lifecycle_marker_color(character)
     {
         return resolve_color(theme, Color::Ansi(color), theme.foreground());
@@ -374,7 +388,7 @@ impl<'a> FrameChrome<'a> {
 
     /// Retain sidebar row kinds through the production chrome path.
     ///
-    /// Lifecycle colour is semantic reinforcement for session rows only, so
+    /// Kind and lifecycle colours reinforce structured row facts, so
     /// rendering must not flatten these rows to strings before colour choice.
     #[must_use]
     pub(crate) fn with_sidebar_rows(mut self, rows: Option<&'a [SidebarTextRow]>) -> Self {
@@ -700,8 +714,8 @@ pub(crate) fn glyph_vertices_for(
 
 /// Production vertex path for sidebar text that retains its domain row kind.
 ///
-/// Lifecycle colour is semantic reinforcement for session rows only; the
-/// text-only [`glyph_vertices_for`] seam deliberately supplies no row kind.
+/// Kind and lifecycle colours reinforce structured row facts; the text-only
+/// [`glyph_vertices_for`] seam deliberately supplies neither fact.
 // Re-included by the frame oracle, while the live binary supplies the same
 // typed rows through `FrameChrome::with_sidebar_rows`.
 #[allow(dead_code)]
@@ -769,10 +783,14 @@ impl<'a> SidebarInput<'a> {
         }
     }
 
-    fn row(self, index: usize) -> (&'a str, Option<EntryKind>) {
+    fn row(self, index: usize) -> (&'a str, Option<EntryKind>, Option<SessionLifecycle>) {
         match self {
-            Self::Plain(lines) => (&lines[index], None),
-            Self::Typed(rows) => (rows[index].text(), rows[index].kind()),
+            Self::Plain(lines) => (&lines[index], None, None),
+            Self::Typed(rows) => (
+                rows[index].text(),
+                rows[index].kind(),
+                rows[index].lifecycle(),
+            ),
         }
     }
 }
@@ -880,12 +898,19 @@ fn glyph_vertices_with_chrome_budget(
     if let Some(lines) = sidebar {
         let visible_rows = lines.len().min(fully_drawable_rows(height, metrics));
         for row in 0..visible_rows {
-            let (line, row_kind) = lines.row(row);
+            let (line, row_kind, row_lifecycle) = lines.row(row);
             for (col, character) in line.chars().take(sidebar_columns).enumerate() {
                 push_glyph(
                     &mut vertices,
                     character,
-                    sidebar_glyph_color(&theme, character, col, sidebar_columns, row_kind),
+                    sidebar_glyph_color(
+                        &theme,
+                        character,
+                        col,
+                        sidebar_columns,
+                        row_kind,
+                        row_lifecycle,
+                    ),
                     col,
                     row,
                     target,
@@ -1675,6 +1700,11 @@ const STARTING_MARKER_GLYPH: [u8; 7] = [31, 27, 14, 4, 14, 27, 31];
 const RUNNING_MARKER_GLYPH: [u8; 7] = [8, 12, 14, 15, 14, 12, 8];
 const EXITED_MARKER_GLYPH: [u8; 7] = [0, 14, 14, 14, 14, 14, 0];
 const FAILED_MARKER_GLYPH: [u8; 7] = [17, 10, 4, 14, 4, 10, 17];
+const PROJECT_MARKER_GLYPH: [u8; 7] = [4, 14, 31, 27, 31, 14, 4];
+const WORKTREE_MARKER_GLYPH: [u8; 7] = [4, 5, 5, 7, 4, 20, 28];
+const SSH_MARKER_GLYPH: [u8; 7] = [0, 14, 17, 6, 12, 17, 14];
+const AGENT_MARKER_GLYPH: [u8; 7] = [4, 14, 21, 31, 21, 14, 10];
+const SESSION_MARKER_GLYPH: [u8; 7] = [31, 17, 21, 19, 21, 17, 31];
 
 /// Add one visible diacritic row to an ASCII base glyph.
 ///
@@ -2027,6 +2057,11 @@ fn glyph_rows(character: char) -> [u8; 7] {
         '▶' => RUNNING_MARKER_GLYPH,
         '■' => EXITED_MARKER_GLYPH,
         '✕' => FAILED_MARKER_GLYPH,
+        '◆' => PROJECT_MARKER_GLYPH,
+        '⑂' => WORKTREE_MARKER_GLYPH,
+        '⌁' => SSH_MARKER_GLYPH,
+        '♟' => AGENT_MARKER_GLYPH,
+        '▣' => SESSION_MARKER_GLYPH,
         ' ' => [0, 0, 0, 0, 0, 0, 0],
         'A' => [14, 17, 17, 31, 17, 17, 17],
         'B' => [30, 17, 17, 30, 17, 17, 30],
@@ -2170,6 +2205,34 @@ mod tests {
     /// The PoC default cell metrics for tests that exercise the default path.
     fn poc_metrics() -> CellMetrics {
         GridGeometry::poc().cell_metrics()
+    }
+
+    /// WCAG sRGB linearisation over the exact floats sent to the framebuffer.
+    /// DARK's clear colour is not an integer multiple of 1/255, so quantising
+    /// it before this calculation would test a nearby colour rather than the
+    /// one users actually see.
+    fn exact_srgb_channel(channel: f32) -> f64 {
+        let channel = f64::from(channel);
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn exact_framebuffer_contrast(first: [f32; 3], second: [f32; 3]) -> f64 {
+        let luminance = |[red, green, blue]: [f32; 3]| {
+            0.2126 * exact_srgb_channel(red)
+                + 0.7152 * exact_srgb_channel(green)
+                + 0.0722 * exact_srgb_channel(blue)
+        };
+        let (first, second) = (luminance(first), luminance(second));
+        let (lighter, darker) = if first >= second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        (lighter + 0.05) / (darker + 0.05)
     }
 
     #[test]
@@ -2901,6 +2964,23 @@ mod tests {
         assert_eq!(seen.len(), 95, "printable ASCII must contain 95 glyphs");
     }
 
+    fn existing_sidebar_glyphs() -> Vec<char> {
+        let mut existing: Vec<char> = (0x20_u8..=0x7e).map(char::from).collect();
+        existing.extend((0x00a0..=0x00ff).filter_map(char::from_u32));
+        existing.extend((0x2500..=0x257f).filter_map(char::from_u32));
+        existing.push('\u{fffd}');
+        assert_eq!(existing.len(), 320);
+        existing
+    }
+
+    fn glyph_bit_distance(first: [u8; 7], second: [u8; 7]) -> u32 {
+        first
+            .iter()
+            .zip(second)
+            .map(|(a, b)| (a ^ b).count_ones())
+            .sum()
+    }
+
     #[test]
     fn lifecycle_markers_collide_with_none_of_320_existing_sidebar_glyphs() {
         use noren_app::sidebar_text::LIFECYCLE_MARKERS;
@@ -2910,11 +2990,7 @@ mod tests {
         // Supplement, and 128 Box Drawing characters. Unsupported Unicode
         // adds one replacement glyph. Check marker shapes against all 320
         // inputs, not only against the three pre-existing chrome markers.
-        let mut existing: Vec<char> = (0x20_u8..=0x7e).map(char::from).collect();
-        existing.extend((0x00a0..=0x00ff).filter_map(char::from_u32));
-        existing.extend((0x2500..=0x257f).filter_map(char::from_u32));
-        existing.push('\u{fffd}');
-        assert_eq!(existing.len(), 320);
+        let existing = existing_sidebar_glyphs();
 
         for (index, marker) in LIFECYCLE_MARKERS.into_iter().enumerate() {
             let marker_rows = glyph_rows(marker);
@@ -2940,13 +3016,6 @@ mod tests {
         // three shrink its margin unnoticed. The comparison set is the full
         // sidebar glyph inventory plus the other markers, so the assertion
         // covers the marker-vs-marker minimum as well.
-        let bit_distance = |first: [u8; 7], second: [u8; 7]| -> u32 {
-            first
-                .iter()
-                .zip(second)
-                .map(|(a, b)| (a ^ b).count_ones())
-                .sum()
-        };
         let (global_minimum, worst_pair) = LIFECYCLE_MARKERS
             .iter()
             .enumerate()
@@ -2958,7 +3027,7 @@ mod tests {
                     .chain(LIFECYCLE_MARKERS[index + 1..].iter().copied())
                     .map(move |other| {
                         (
-                            bit_distance(marker_rows, glyph_rows(other)),
+                            glyph_bit_distance(marker_rows, glyph_rows(other)),
                             (*marker, other),
                         )
                     })
@@ -2976,6 +3045,65 @@ mod tests {
     }
 
     #[test]
+    fn kind_markers_collide_with_neither_320_sidebar_glyphs_nor_lifecycle() {
+        use noren_app::sidebar_text::{KIND_MARKERS, LIFECYCLE_MARKERS};
+
+        let existing = existing_sidebar_glyphs();
+        for (index, marker) in KIND_MARKERS.into_iter().enumerate() {
+            let marker_rows = glyph_rows(marker);
+            for existing_glyph in &existing {
+                assert_ne!(
+                    marker_rows,
+                    glyph_rows(*existing_glyph),
+                    "kind marker {marker:?} collides with existing sidebar glyph \
+                     {existing_glyph:?}"
+                );
+            }
+            for lifecycle in LIFECYCLE_MARKERS {
+                assert_ne!(
+                    marker_rows,
+                    glyph_rows(lifecycle),
+                    "kind marker {marker:?} collides with lifecycle marker {lifecycle:?}"
+                );
+            }
+            for other in &KIND_MARKERS[index + 1..] {
+                assert_ne!(
+                    marker_rows,
+                    glyph_rows(*other),
+                    "kind markers {marker:?} and {other:?} collide"
+                );
+            }
+        }
+
+        let (global_minimum, worst_pair) = KIND_MARKERS
+            .iter()
+            .enumerate()
+            .flat_map(|(index, marker)| {
+                let marker_rows = glyph_rows(*marker);
+                existing
+                    .iter()
+                    .copied()
+                    .chain(LIFECYCLE_MARKERS)
+                    .chain(KIND_MARKERS[index + 1..].iter().copied())
+                    .map(move |other| {
+                        (
+                            glyph_bit_distance(marker_rows, glyph_rows(other)),
+                            (*marker, other),
+                        )
+                    })
+            })
+            .min()
+            .expect("the full kind-marker comparison set is non-empty");
+        // `⑂` vs the covered box-drawing `├` is the true minimum. Five bit
+        // flips retain the same margin #209 pins for its closest lifecycle
+        // pair (`▶` vs `■`) while keeping the branch topology recognizable.
+        assert_eq!(
+            global_minimum, 5,
+            "closest kind marker pair {worst_pair:?} is only {global_minimum} bits apart"
+        );
+    }
+
+    #[test]
     fn lifecycle_marker_colors_clear_aa_on_every_shipped_sidebar_background() {
         use noren_app::sidebar_text::LIFECYCLE_MARKERS;
         use noren_app::theme::{DARK, HIGH_CONTRAST, LIGHT};
@@ -2983,12 +3111,52 @@ mod tests {
         for theme in [DARK, LIGHT, HIGH_CONTRAST] {
             for marker in LIFECYCLE_MARKERS {
                 let ansi = lifecycle_marker_color(marker).expect("known lifecycle marker");
-                let color = theme.ansi()[usize::from(ansi.palette_index())];
-                let ratio = contrast_ratio(color, theme.background_u8());
+                let color = resolve_color(&theme, Color::Ansi(ansi), theme.foreground());
+                let ratio = exact_framebuffer_contrast(color, theme.background());
                 assert!(
                     ratio >= 4.5,
-                    "marker {marker:?} has only {ratio:.4}:1 contrast on {:?}",
-                    theme.background_u8()
+                    "marker {marker:?} has only {ratio:.6}:1 contrast on {:?}",
+                    theme.background()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kind_marker_colors_clear_aa_without_lowering_the_lifecycle_floor() {
+        use noren_app::sidebar::EntryKind;
+        use noren_app::sidebar_text::{LIFECYCLE_MARKERS, kind_marker_color};
+        use noren_app::theme::{DARK, HIGH_CONTRAST, LIGHT};
+
+        let kinds = [
+            EntryKind::Project,
+            EntryKind::Worktree,
+            EntryKind::SshConnection,
+            EntryKind::Agent,
+            EntryKind::Session,
+        ];
+        for theme in [DARK, LIGHT, HIGH_CONTRAST] {
+            let lifecycle_floor = LIFECYCLE_MARKERS
+                .into_iter()
+                .map(|marker| {
+                    let ansi = lifecycle_marker_color(marker).expect("known lifecycle marker");
+                    exact_framebuffer_contrast(
+                        resolve_color(&theme, Color::Ansi(ansi), theme.foreground()),
+                        theme.background(),
+                    )
+                })
+                .fold(f64::INFINITY, f64::min);
+            for kind in kinds {
+                let ansi = kind_marker_color(kind);
+                let ratio = exact_framebuffer_contrast(
+                    resolve_color(&theme, Color::Ansi(ansi), theme.foreground()),
+                    theme.background(),
+                );
+                assert!(ratio >= 4.5, "{kind:?} has only {ratio:.6}:1 contrast");
+                assert!(
+                    ratio >= lifecycle_floor,
+                    "{kind:?} lowers the existing lifecycle floor: \
+                     {ratio:.6}:1 < {lifecycle_floor:.6}:1"
                 );
             }
         }

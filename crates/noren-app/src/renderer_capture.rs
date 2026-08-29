@@ -260,7 +260,7 @@ impl OffscreenRenderer {
     }
 
     /// Render sidebar rows whose domain kinds are retained by the production
-    /// text projection, including the session-only lifecycle colour gate.
+    /// text projection, including its structured kind/lifecycle colour gates.
     pub(crate) fn capture_sidebar_rows(
         &self,
         target: Target,
