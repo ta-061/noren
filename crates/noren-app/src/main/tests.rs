@@ -3,9 +3,105 @@ use noren_app::palette::CommandId;
 use noren_app::passthrough::{self, collisions};
 use noren_app::session_persistence::{MAX_SESSION_STATE_BYTES, load};
 use noren_app::sidebar::EntryKind;
+use noren_app::{BRACKET_PASTE_BEGIN, BRACKET_PASTE_END};
 
 include!("../input_translation/tests.rs");
 include!("../frame_geometry/tests.rs");
+
+#[derive(Default)]
+struct RecordingImeCursorArea {
+    areas: std::cell::RefCell<Vec<(PhysicalPosition<f64>, PhysicalSize<u32>)>>,
+}
+
+impl ImeCursorAreaTarget for RecordingImeCursorArea {
+    fn set_ime_cursor_area(&self, position: PhysicalPosition<f64>, size: PhysicalSize<u32>) {
+        self.areas.borrow_mut().push((position, size));
+    }
+}
+
+impl RecordingImeCursorArea {
+    fn last(&self) -> (PhysicalPosition<f64>, PhysicalSize<u32>) {
+        self.areas
+            .borrow()
+            .last()
+            .copied()
+            .expect("redraw preparation must set the platform IME cursor area")
+    }
+
+    fn len(&self) -> usize {
+        self.areas.borrow().len()
+    }
+}
+
+#[test]
+fn redraw_preparation_sets_the_platform_ime_cursor_area() {
+    let mut app = NorenApp::default();
+    let target = RecordingImeCursorArea::default();
+    let metrics = app.geometry.cell_metrics();
+
+    let snapshot = app.prepare_redraw(Some(&target));
+
+    assert!(snapshot.is_none());
+    assert_eq!(target.len(), 1, "one redraw sets the area exactly once");
+    assert_eq!(
+        target.last(),
+        (
+            PhysicalPosition::new(
+                sidebar_pixel_width_at_width(metrics.width(), app.sidebar_columns),
+                0.0,
+            ),
+            PhysicalSize::new(metrics.width(), metrics.height()),
+        )
+    );
+}
+
+#[test]
+fn platform_ime_cursor_area_follows_the_caret_and_scrolled_viewport() {
+    let mut terminal = TerminalState::new(3, 8).expect("valid terminal");
+    terminal.feed_bytes(b"one\r\ntwo\r\nthree\r\nfour");
+    assert_eq!(terminal.scrollback_len(), 1, "fixture retains one row");
+
+    let mut app = NorenApp {
+        terminal: Some(terminal),
+        ..NorenApp::default()
+    };
+    let target = RecordingImeCursorArea::default();
+    let metrics = app.geometry.cell_metrics();
+    let sidebar_width = sidebar_pixel_width_at_width(metrics.width(), app.sidebar_columns);
+    let position_for = |row: u32, column: u16| {
+        PhysicalPosition::new(
+            sidebar_width + f64::from(column) * f64::from(metrics.width()),
+            f64::from(row) * f64::from(metrics.height()),
+        )
+    };
+
+    app.prepare_redraw(Some(&target));
+    assert_eq!(target.last().0, position_for(2, 4));
+
+    app.terminal
+        .as_mut()
+        .expect("terminal remains attached")
+        .feed_bytes(b"\x1b[2;3H");
+    app.prepare_redraw(Some(&target));
+    assert_eq!(
+        target.last().0,
+        position_for(1, 2),
+        "the platform area follows both caret axes at the live tail"
+    );
+
+    app.scroll_offset = usize::MAX;
+    app.prepare_redraw(Some(&target));
+    assert_eq!(
+        app.scroll_offset, 1,
+        "the retained history clamps the request"
+    );
+    assert_eq!(
+        target.last().0,
+        position_for(2, 2),
+        "the same clamped offset that moves the rendered live row also moves the IME area"
+    );
+    assert_eq!(target.len(), 3, "each redraw refreshes the platform area");
+}
 
 /// Issue #185: the artifact's own surfaces read the single product string,
 /// the title states the version the binary was built as, and no surface
@@ -4196,6 +4292,469 @@ fn wait_for_shell_output(app: &mut NorenApp) {
             );
         }
         std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ImeCaptureScreen {
+    Primary,
+    Alternate,
+    BracketedPaste,
+}
+
+impl ImeCaptureScreen {
+    const fn enable_sequence(self) -> &'static str {
+        match self {
+            Self::Primary => "",
+            Self::Alternate => "\\033[?1049h",
+            Self::BracketedPaste => "\\033[?2004h",
+        }
+    }
+
+    fn is_ready(self, app: &NorenApp) -> bool {
+        let Some(modes) = app.terminal.as_ref().map(TerminalState::modes) else {
+            return false;
+        };
+        match self {
+            Self::Primary => true,
+            Self::Alternate => modes.is_alternate_screen_active(),
+            Self::BracketedPaste => modes.is_bracketed_paste_enabled(),
+        }
+    }
+}
+
+/// Run committed IME events through the production handler and capture the
+/// bytes downstream of the real PTY-master write.
+///
+/// Each caller gets an isolated shell and capture file. The child opens the
+/// file before blocking in a raw one-byte `dd`, which gives the test a positive
+/// readiness signal. Fallback bytes are sent only if the commit has not filled
+/// the file during a short settling window: mutations that drop or truncate a
+/// commit therefore fail promptly, while the working path leaves no large
+/// fallback command queued in the shell during teardown.
+fn capture_ime_events<I>(events: I, byte_count: usize, screen: ImeCaptureScreen) -> Vec<u8>
+where
+    I: IntoIterator<Item = WindowEvent>,
+{
+    static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _capture_guard = CAPTURE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    const DONE: &str = "IME204_CAPTURE_DONE";
+
+    let home = AppTestHome::new();
+    let capture_path = home.0.join("ime-commit-capture.bin");
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    wait_for_shell_output(&mut app);
+
+    let setup = format!(
+        "printf '{}'; /bin/stty raw -echo; \
+         /bin/dd bs=1 count={byte_count} of=\"$HOME/ime-commit-capture.bin\" 2>/dev/null; \
+         /bin/stty sane; printf '\\r\\nIME204_%s_DONE\\r\\n' CAPTURE\r",
+        screen.enable_sequence()
+    );
+    app.send_input(setup.as_bytes());
+
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.drain_pty();
+        if capture_path.exists() && screen.is_ready(&app) {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "raw IME capture never became ready; screen_ready={}, terminal said: {:?}",
+            screen.is_ready(&app),
+            app.terminal.as_ref().map(terminal_text).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    for event in events {
+        assert!(
+            app.handle_ime_window_event(&event),
+            "the production handler must consume every supplied IME event"
+        );
+    }
+
+    let settle_deadline = Instant::now() + Duration::from_millis(250);
+    loop {
+        let captured = std::fs::metadata(&capture_path)
+            .map(|metadata| metadata.len() as usize)
+            .unwrap_or(0);
+        if captured >= byte_count || Instant::now() >= settle_deadline {
+            if captured < byte_count {
+                let fallback = vec![b'U'; byte_count - captured];
+                for chunk in fallback.chunks(READ_CHUNK_BYTES) {
+                    app.send_input(chunk);
+                }
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let done_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.drain_pty();
+        let done = app
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal_text(terminal).contains(DONE));
+        let captured = std::fs::metadata(&capture_path)
+            .map(|metadata| metadata.len() as usize)
+            .unwrap_or(0);
+        if done && captured == byte_count {
+            break;
+        }
+        assert!(
+            Instant::now() < done_deadline,
+            "raw IME capture did not finish: captured={captured}/{byte_count}, terminal said: {:?}",
+            app.terminal.as_ref().map(terminal_text).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    std::fs::read(capture_path).expect("read the child-side IME byte capture")
+}
+
+#[test]
+fn ime_multibyte_japanese_commit_reaches_the_pty_byte_for_byte() {
+    let received = capture_ime_events(
+        [WindowEvent::Ime(Ime::Commit("日本語".to_owned()))],
+        "日本語".len(),
+        ImeCaptureScreen::Primary,
+    );
+    assert_eq!(received, "日本語".as_bytes());
+}
+
+#[test]
+fn ime_dead_key_composition_reaches_the_pty_as_the_composed_scalar() {
+    let received = capture_ime_events(
+        [
+            WindowEvent::Ime(Ime::Preedit("´".to_owned(), Some((2, 2)))),
+            WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+            WindowEvent::Ime(Ime::Commit("é".to_owned())),
+        ],
+        "é".len(),
+        ImeCaptureScreen::Primary,
+    );
+    assert_eq!(received, "é".as_bytes());
+}
+
+#[test]
+fn ime_commit_reaches_the_pty_while_the_alternate_screen_is_active() {
+    let commit = "ALT-日本語";
+    let received = capture_ime_events(
+        [WindowEvent::Ime(Ime::Commit(commit.to_owned()))],
+        commit.len(),
+        ImeCaptureScreen::Alternate,
+    );
+    assert_eq!(received, commit.as_bytes());
+}
+
+#[test]
+fn ime_empty_commit_writes_nothing_to_the_pty() {
+    let received = capture_ime_events(
+        [WindowEvent::Ime(Ime::Commit(String::new()))],
+        1,
+        ImeCaptureScreen::Primary,
+    );
+    assert_eq!(
+        received, b"U",
+        "the fallback must remain the first byte when an empty commit is a no-op"
+    );
+}
+
+#[test]
+fn ime_commit_is_never_wrapped_as_bracketed_paste() {
+    let commit = "typed-日本語-not-paste";
+    let received = capture_ime_events(
+        [WindowEvent::Ime(Ime::Commit(commit.to_owned()))],
+        commit.len(),
+        ImeCaptureScreen::BracketedPaste,
+    );
+    assert_eq!(received, commit.as_bytes());
+    for marker in [BRACKET_PASTE_BEGIN, BRACKET_PASTE_END] {
+        assert!(
+            !received
+                .windows(marker.len())
+                .any(|window| window == marker),
+            "IME commits are typed input even when mode 2004 is active"
+        );
+    }
+}
+
+#[test]
+fn ime_large_commit_arrives_in_order_across_the_read_chunk_boundary() {
+    let commit = [
+        "A".repeat(READ_CHUNK_BYTES),
+        "B".repeat(READ_CHUNK_BYTES),
+        "C".to_owned(),
+    ]
+    .concat();
+    let received = capture_ime_events(
+        [WindowEvent::Ime(Ime::Commit(commit.clone()))],
+        commit.len(),
+        ImeCaptureScreen::Primary,
+    );
+
+    assert_eq!(received, commit.as_bytes());
+    assert_eq!(received[READ_CHUNK_BYTES - 1], b'A');
+    assert_eq!(received[READ_CHUNK_BYTES], b'B');
+    assert_eq!(received[READ_CHUNK_BYTES * 2], b'C');
+}
+
+#[test]
+fn ime_large_commit_stops_at_the_first_failed_write_and_surfaces_it() {
+    let mut app = NorenApp::default();
+    let failed_chunk = noren_pty::COMMAND_CHANNEL_CAPACITY + 1;
+    let offered_chunks = failed_chunk + 2;
+    app.test_input_failure_at = Some(failed_chunk);
+    let commit = "Q".repeat(READ_CHUNK_BYTES * offered_chunks);
+
+    assert!(app.handle_ime_window_event(&WindowEvent::Ime(Ime::Commit(commit))));
+
+    assert_eq!(
+        app.test_input_send_attempts, failed_chunk,
+        "chunks after the first rejected command must not be attempted"
+    );
+    assert_eq!(app.status, "Noren PTY input failed");
+    assert!(
+        app.show_status,
+        "the failed write must be visible to the user"
+    );
+    assert!(
+        app.redraw_needed,
+        "the visible failure must schedule a frame"
+    );
+}
+
+#[test]
+fn ime_large_multibyte_commit_keeps_scalar_bytes_ordered_between_chunks() {
+    let commit = [
+        "境".repeat(READ_CHUNK_BYTES / "境".len() + 1),
+        "界".repeat(READ_CHUNK_BYTES / "界".len() + 1),
+        "終".to_owned(),
+    ]
+    .concat();
+    assert!(commit.len() > READ_CHUNK_BYTES * 2);
+    let received = capture_ime_events(
+        [WindowEvent::Ime(Ime::Commit(commit.clone()))],
+        commit.len(),
+        ImeCaptureScreen::Primary,
+    );
+
+    assert_eq!(received, commit.as_bytes());
+    assert!(received.starts_with("境".as_bytes()));
+    assert!(received.ends_with("終".as_bytes()));
+}
+
+#[test]
+fn ime_large_commit_encodes_a_newline_at_the_chunk_boundary_without_reordering() {
+    let commit = [
+        "L".repeat(READ_CHUNK_BYTES - 1),
+        "\n".to_owned(),
+        "R".repeat(READ_CHUNK_BYTES + 1),
+    ]
+    .concat();
+    let expected = [
+        vec![b'L'; READ_CHUNK_BYTES - 1],
+        b"\r".to_vec(),
+        vec![b'R'; READ_CHUNK_BYTES + 1],
+    ]
+    .concat();
+    let received = capture_ime_events(
+        [WindowEvent::Ime(Ime::Commit(commit))],
+        expected.len(),
+        ImeCaptureScreen::Primary,
+    );
+
+    assert_eq!(received, expected);
+    assert_eq!(received[READ_CHUNK_BYTES - 1], b'\r');
+    assert_eq!(received[READ_CHUNK_BYTES], b'R');
+}
+
+#[test]
+fn ime_committed_newline_reaches_the_pty_through_enter_encoding() {
+    let received = capture_ime_events(
+        [WindowEvent::Ime(Ime::Commit("\n".to_owned()))],
+        1,
+        ImeCaptureScreen::Primary,
+    );
+    assert_eq!(received, b"\r");
+}
+
+#[test]
+fn ime_multiline_commit_preserves_utf8_around_the_encoded_newline() {
+    let commit = "before日本\n語after";
+    let expected = ["before日本".as_bytes(), b"\r", "語after".as_bytes()].concat();
+    let received = capture_ime_events(
+        [WindowEvent::Ime(Ime::Commit(commit.to_owned()))],
+        expected.len(),
+        ImeCaptureScreen::Primary,
+    );
+    assert_eq!(received, expected);
+}
+
+#[test]
+fn ime_committed_control_character_reaches_the_pty_through_control_encoding() {
+    let received = capture_ime_events(
+        [WindowEvent::Ime(Ime::Commit("\u{3}".to_owned()))],
+        1,
+        ImeCaptureScreen::Primary,
+    );
+    assert_eq!(received, b"\x03");
+}
+
+#[test]
+fn ime_commit_and_preedit_paths_never_increment_the_drop_counter() {
+    let before = diagnostics::ime_drop_count();
+    let mut app = NorenApp::default();
+    for event in [
+        WindowEvent::Ime(Ime::Enabled),
+        WindowEvent::Ime(Ime::Preedit("入力中".to_owned(), Some((0, 3)))),
+        WindowEvent::Ime(Ime::Commit("入力".to_owned())),
+        WindowEvent::Ime(Ime::Disabled),
+    ] {
+        assert!(app.handle_ime_window_event(&event));
+    }
+    assert_eq!(
+        diagnostics::ime_drop_count(),
+        before,
+        "accepted composition events cannot reach record_ime_drop"
+    );
+}
+
+/// A real `WindowEvent::Ime` commit must survive the complete production path:
+/// event dispatch -> typed-input encoding -> `PtySession::send_input` -> the
+/// supervisor's PTY-master `write_all` -> bytes read by the child.
+///
+/// The child switches its slave to raw mode and lets `dd` read exactly the
+/// expected byte count before `od` reports those bytes back. The assertion is
+/// therefore downstream of the actual PTY write, not an assertion on the
+/// encoder result or the supervisor command buffer. Fallback bytes are queued
+/// after the IME events so dropping a commit or writing only its first byte
+/// makes `dd` finish promptly with visibly wrong bytes instead of timing out.
+#[test]
+fn ime_window_events_reach_the_real_pty_write_byte_for_byte() {
+    const READY: &str = "IME204_READY";
+    const DONE: &str = "IME204_DONE";
+    const EXPECTED: &[u8] = &[
+        0xe6, 0x97, 0xa5, // 日
+        0xe6, 0x9c, 0xac, // 本
+        0xe8, 0xaa, 0x9e, // 語
+        0xc3, 0xa9, // é (dead-key composition)
+        0x0d, // committed newline follows the ordinary Enter path
+        0x03, // committed ETX follows the ordinary Ctrl+C path
+    ];
+
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    wait_for_shell_output(&mut app);
+
+    // The child enables both alternate-screen and bracketed-paste modes before
+    // reading. IME remains typed input in that state: it must neither be gated
+    // by the alternate screen nor wrapped in paste markers just because mode
+    // 2004 is active.
+    let setup = format!(
+        "printf '\\033[?1049h\\033[?2004h{READY}\\r\\n'; \
+         /bin/stty raw -echo; \
+         /bin/dd bs=1 count={} 2>/dev/null | /usr/bin/od -An -v -tx1; \
+         /bin/stty sane; printf '\\r\\n{DONE}\\r\\n'\r",
+        EXPECTED.len()
+    );
+    app.send_input(setup.as_bytes());
+
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.drain_pty();
+        let ready = app.terminal.as_ref().is_some_and(|terminal| {
+            let modes = terminal.modes();
+            modes.is_alternate_screen_active()
+                && modes.is_bracketed_paste_enabled()
+                && terminal_text(terminal).contains(READY)
+        });
+        if ready {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "the raw-byte reader never became ready in alternate-screen + mode 2004; \
+             terminal said: {:?}",
+            app.terminal.as_ref().map(terminal_text).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let drops_before = diagnostics::ime_drop_count();
+    for event in [
+        WindowEvent::Ime(Ime::Enabled),
+        WindowEvent::Ime(Ime::Preedit("に".to_owned(), Some((3, 3)))),
+        WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+        WindowEvent::Ime(Ime::Commit(String::new())),
+        WindowEvent::Ime(Ime::Commit("日本語".to_owned())),
+        WindowEvent::Ime(Ime::Preedit("´".to_owned(), Some((2, 2)))),
+        WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+        WindowEvent::Ime(Ime::Commit("é".to_owned())),
+        WindowEvent::Ime(Ime::Commit("\n".to_owned())),
+        WindowEvent::Ime(Ime::Commit("\u{3}".to_owned())),
+        WindowEvent::Ime(Ime::Disabled),
+    ] {
+        assert!(
+            app.handle_ime_window_event(&event),
+            "the production IME branch must consume every winit IME variant"
+        );
+    }
+    assert_eq!(
+        diagnostics::ime_drop_count(),
+        drops_before,
+        "no preedit lifecycle or commit may reach the IME-drop diagnostic"
+    );
+
+    // FIFO ordering puts these bytes after everything the IME path wrote. In
+    // the working implementation `dd` has already consumed EXPECTED; under a
+    // drop/first-byte mutation it consumes this fallback and reports a
+    // deterministic mismatch without waiting for a timeout.
+    app.send_input(&vec![b'U'; EXPECTED.len()]);
+
+    let done_deadline = Instant::now() + Duration::from_secs(5);
+    let text = loop {
+        app.drain_pty();
+        let text = app.terminal.as_ref().map(terminal_text).unwrap_or_default();
+        if text.contains(DONE) {
+            break text;
+        }
+        assert!(
+            Instant::now() < done_deadline,
+            "the child never reported the bytes it read from the PTY write; terminal said: {text:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    let between_markers = text
+        .split_once(READY)
+        .and_then(|(_, after_ready)| after_ready.split_once(DONE).map(|(bytes, _)| bytes))
+        .expect("the child's byte report is bounded by both markers");
+    let received: Vec<u8> = between_markers
+        .split_whitespace()
+        .filter(|token| token.len() == 2 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(|token| u8::from_str_radix(token, 16).expect("od emitted a two-digit hex byte"))
+        .collect();
+
+    assert_eq!(
+        received, EXPECTED,
+        "the child must read the exact encoded commits from the PTY master write"
+    );
+    for marker in [b"\x1b[200~".as_slice(), b"\x1b[201~".as_slice()] {
+        assert!(
+            !received
+                .windows(marker.len())
+                .any(|window| window == marker),
+            "an IME commit is typed input and must not use bracketed-paste markers"
+        );
     }
 }
 

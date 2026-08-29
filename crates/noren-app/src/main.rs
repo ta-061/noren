@@ -31,7 +31,8 @@ use noren_app::{
 };
 use noren_app::{
     CursorKeyMode, GridGeometry, GridSize, InputMode, KeyEncoder, KeypadMode, Modifiers,
-    PARSE_BUDGET_BYTES_PER_TURN, PRODUCT_NAME, PasteReject, Resize, SystemClipboard,
+    PARSE_BUDGET_BYTES_PER_TURN, PRODUCT_NAME, PasteReject, READ_CHUNK_BYTES, Resize,
+    SystemClipboard,
     config::{AppConfig, KeymapConfig, UiConfig},
     diagnostics::{self, PtyChildStatus},
     encode_paste,
@@ -69,7 +70,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey};
 #[cfg(test)]
@@ -1128,6 +1129,21 @@ struct ParkedSession {
     scroll_offset: usize,
 }
 
+/// Narrow window seam for positioning the platform IME candidate window.
+///
+/// Keeping this operation separate from the concrete winit window lets the
+/// frame lifecycle tests observe the area that production sends to the
+/// platform without creating a native window.
+trait ImeCursorAreaTarget {
+    fn set_ime_cursor_area(&self, position: PhysicalPosition<f64>, size: PhysicalSize<u32>);
+}
+
+impl ImeCursorAreaTarget for Window {
+    fn set_ime_cursor_area(&self, position: PhysicalPosition<f64>, size: PhysicalSize<u32>) {
+        Window::set_ime_cursor_area(self, position, size);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScrollDirection {
     Older,
@@ -1217,6 +1233,13 @@ struct NorenApp {
     /// arbitrarily long or read the terminal).
     #[cfg(test)]
     test_pty_home: Option<PathBuf>,
+    /// Test-only deterministic command-queue failure seam. Production learns
+    /// failure only from `PtySession::send_input`; tests use this counter to
+    /// prove a multi-chunk IME commit stops on the first rejected write.
+    #[cfg(test)]
+    test_input_send_attempts: usize,
+    #[cfg(test)]
+    test_input_failure_at: Option<usize>,
     palette_open: bool,
     palette_selection: usize,
     passthrough_gate: PassthroughGate,
@@ -1357,6 +1380,10 @@ impl NorenApp {
             parked_sessions: HashMap::new(),
             #[cfg(test)]
             test_pty_home: None,
+            #[cfg(test)]
+            test_input_send_attempts: 0,
+            #[cfg(test)]
+            test_input_failure_at: None,
             palette_open: false,
             palette_selection: 0,
             passthrough_gate: PassthroughGate::new(),
@@ -2279,6 +2306,10 @@ impl NorenApp {
             return;
         };
         let window = Arc::new(window);
+        // winit disables IME delivery by default. On macOS this call is also
+        // what makes composed dead-key text arrive as `Ime::Commit` instead
+        // of being lost between keyboard events.
+        window.set_ime_allowed(true);
         let physical = window.inner_size();
         let Some(grid) = self
             .geometry
@@ -2321,6 +2352,8 @@ impl NorenApp {
                 None
             }
         };
+        let snapshot = self.terminal.as_ref().map(TerminalEngine::snapshot);
+        self.set_ime_cursor_area(window.as_ref(), snapshot.as_ref());
         window.request_redraw();
         self.window = Some(window);
     }
@@ -2429,6 +2462,37 @@ impl NorenApp {
             return;
         }
         self.handle_passthrough_key(event);
+    }
+
+    /// Consume the winit IME branch shared by the production event loop and
+    /// the event-to-PTY integration test.
+    ///
+    /// Preedit lifecycle events are acknowledged for now without drawing the
+    /// composing string. A later `Commit` is independent of that display gap:
+    /// it always takes the same typed-input encoder and PTY writer as ordinary
+    /// key input. No IME event reaches the drop diagnostic from this path.
+    fn handle_ime_window_event(&mut self, event: &WindowEvent) -> bool {
+        let WindowEvent::Ime(ime) = event else {
+            return false;
+        };
+        match ime {
+            Ime::Commit(text) => {
+                let bytes = KeyEncoder::encode_committed_text(text, self.current_input_mode());
+                // `PtySession` deliberately bounds one input command. Preserve
+                // a large commit in-order across that existing writer limit;
+                // an empty commit has no chunks and therefore performs no
+                // write at all. Stop after the first rejected chunk just as a
+                // bounded paste stops after its single rejected write, so the
+                // remainder is not silently dropped one chunk at a time.
+                for chunk in bytes.chunks(READ_CHUNK_BYTES) {
+                    if !self.send_input(chunk) {
+                        break;
+                    }
+                }
+            }
+            Ime::Enabled | Ime::Preedit(_, _) | Ime::Disabled => {}
+        }
+        true
     }
 
     /// Route one key event through the pass-through gate.
@@ -2712,7 +2776,9 @@ impl NorenApp {
             }
         };
         match self.paste_bytes(&text) {
-            Ok(bytes) => self.send_input(&bytes),
+            Ok(bytes) => {
+                self.send_input(&bytes);
+            }
             Err(reject @ (PasteReject::Unbracketed | PasteReject::Oversized)) => {
                 self.show_paste_gate(reject);
             }
@@ -3308,14 +3374,80 @@ impl NorenApp {
         }
     }
 
-    fn send_input(&mut self, bytes: &[u8]) {
-        if let Some(session) = &self.pty {
-            if session.send_input(bytes).is_err() {
-                self.status = "Noren PTY input failed";
-                self.show_status = true;
-                self.redraw_needed = true;
+    /// Send one bounded input command, returning whether the caller may send
+    /// a subsequent chunk. Every input source shares the same visible failure
+    /// state; multi-chunk callers must stop when this returns `false`.
+    fn send_input(&mut self, bytes: &[u8]) -> bool {
+        #[cfg(test)]
+        {
+            self.test_input_send_attempts = self.test_input_send_attempts.saturating_add(1);
+            if self.test_input_failure_at == Some(self.test_input_send_attempts) {
+                self.show_pty_input_failure();
+                return false;
             }
         }
+
+        if self
+            .pty
+            .as_ref()
+            .is_some_and(|session| session.send_input(bytes).is_err())
+        {
+            self.show_pty_input_failure();
+            return false;
+        }
+        true
+    }
+
+    fn show_pty_input_failure(&mut self) {
+        self.status = "Noren PTY input failed";
+        self.show_status = true;
+        self.redraw_needed = true;
+    }
+
+    /// Keep the platform candidate window beside the terminal's insertion
+    /// cell. The terminal grid is sized after reserving the sidebar and status
+    /// chrome. A scrolled viewport shifts the live insertion row down by its
+    /// renderer-clamped offset, so the platform area follows the same cell.
+    fn set_ime_cursor_area<T: ImeCursorAreaTarget + ?Sized>(
+        &self,
+        window: &T,
+        snapshot: Option<&noren_terminal::TerminalSnapshot>,
+    ) {
+        let metrics = self.geometry.cell_metrics();
+        let (row, column) = snapshot
+            .map(|snapshot| {
+                let cursor = snapshot.cursor();
+                let scroll_offset = renderer::clamped_scroll_offset(snapshot, self.scroll_offset);
+                (
+                    usize::from(cursor.row()).saturating_add(scroll_offset),
+                    cursor.column(),
+                )
+            })
+            .unwrap_or((0, 0));
+        let position = PhysicalPosition::new(
+            sidebar_pixel_width_at_width(metrics.width(), self.sidebar_columns)
+                + f64::from(column) * f64::from(metrics.width()),
+            f64::from(u32::try_from(row).unwrap_or(u32::MAX)) * f64::from(metrics.height()),
+        );
+        window.set_ime_cursor_area(
+            position,
+            PhysicalSize::new(metrics.width(), metrics.height()),
+        );
+    }
+
+    /// Prepare the terminal snapshot and platform IME area consumed by one
+    /// redraw. Tests drive this window-independent seam with a recording
+    /// target, while production hands the returned snapshot to the renderer.
+    fn prepare_redraw<T: ImeCursorAreaTarget + ?Sized>(
+        &mut self,
+        window: Option<&T>,
+    ) -> Option<noren_terminal::TerminalSnapshot> {
+        self.clamp_active_scroll_offset();
+        let snapshot = self.terminal.as_ref().map(TerminalEngine::snapshot);
+        if let Some(window) = window {
+            self.set_ime_cursor_area(window, snapshot.as_ref());
+        }
+        snapshot
     }
 
     /// Toggle the opt-in diagnostics overlay.
@@ -3562,8 +3694,8 @@ impl NorenApp {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
-        self.clamp_active_scroll_offset();
-        let snapshot = self.terminal.as_ref().map(TerminalEngine::snapshot);
+        let window = self.window.as_ref().map(Arc::clone);
+        let snapshot = self.prepare_redraw(window.as_deref());
         let visible_rows = self
             .window
             .as_ref()
@@ -3694,6 +3826,9 @@ impl ApplicationHandler for NorenApp {
         if self.window.as_ref().map(|window| window.id()) != Some(window_id) {
             return;
         }
+        if self.handle_ime_window_event(&event) {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => self.close(event_loop),
             WindowEvent::Resized(physical) => self.handle_resize(physical),
@@ -3713,14 +3848,6 @@ impl ApplicationHandler for NorenApp {
             }
             WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_wheel(delta),
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(&event),
-            WindowEvent::Ime(_) => {
-                // An Ime event means composition replaced the keyboard path:
-                // the typed content is dropped unread because IME support
-                // itself is deferred. The record is argument-free, so the
-                // drop surfaces in diagnostics as a count that can never
-                // carry the composed text.
-                diagnostics::record_ime_drop();
-            }
             WindowEvent::RedrawRequested => self.redraw(event_loop),
             _ => {}
         }

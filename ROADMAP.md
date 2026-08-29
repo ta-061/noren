@@ -11,7 +11,7 @@ Only evidence-backed work is marked complete.
 | 3 — Workspace | External workspace management (sidebar: projects, git worktrees, SSH connections, agents, terminal sessions), single-session view, session lifecycle, sidebar-state persistence, palette, configurable keybindings, Zellij pass-through — no native tabs/panes/layout (delegated to Zellij per [ADR 0003](docs/adr/0003-noren-zellij-responsibility-boundary.md)) | In progress — vertical slice landed; see [Milestone 3 status](#milestone-3-status) |
 | 4 — SSH and remote | OpenSSH configuration, connections, reconnect, remote panes, daemon decision/PoC and recovery | In progress — bounded, explicitly partial literal-alias discovery landed, and selecting an alias launches the fixed system `ssh` client in the terminal's PTY (PR #138); reconnect, remote panes, the daemon decision/PoC, and recovery are not started |
 | 5 — Agent experience | Launchers, verified adapters, trustworthy state, notifications and jump-to-source | In progress — the first launcher slice landed: `[[agents]]` configuration rows launch a configured, shell-free argv command in a real PTY (`AgentLaunchPolicy` requires an absolute program path, no shell, no `PATH` lookup; a missing or non-executable command is a visible per-row and status-row failure; agent sessions persist through `sessions.toml`). Verified adapters, trustworthy state, notifications, and jump-to-source are not started |
-| 6 — Themes and accessibility | Light/dark/high-contrast palettes, contrast checks, IME/CJK/HiDPI and keyboard/accessibility work | In progress — the foundation slice landed: `[theme]` selects built-in `dark`/`light`/`high-contrast` palettes with measured, test-pinned WCAG contrast floors (`theme.rs`, `crates/noren-app/tests/theme.rs`; the default `dark` palette clears AA on every theme-owned slot since the issue-168 lift), and CJK display width is verified end to end through real pixels (`crates/noren-app/tests/frame_oracle.rs`). IME input is still discarded, and HiDPI, keyboard accessibility, custom palettes, and colour-vision-friendly work remain not started |
+| 6 — Themes and accessibility | Light/dark/high-contrast palettes, contrast checks, IME/CJK/HiDPI and keyboard/accessibility work | In progress — the foundation slice landed: `[theme]` selects built-in `dark`/`light`/`high-contrast` palettes with measured, test-pinned WCAG contrast floors (`theme.rs`, `crates/noren-app/tests/theme.rs`; the default `dark` palette clears AA on every theme-owned slot since the issue-168 lift), CJK display width is verified end to end through real pixels (`crates/noren-app/tests/frame_oracle.rs`), and IME/dead-key commits reach the PTY by default. IME preedit display, CJK glyph rendering, HiDPI, keyboard accessibility, custom palettes, and colour-vision-friendly work remain not started |
 | 7 — Quality | Unit/integration/compatibility/fault/security/visual tests, fuzzing, soak tests and benchmarks | In progress — the benchmark slice landed (PR #171): a criterion suite over the paths with a defect history (`feed_bytes`, `ssh_config_parse` incl. the #137 shape, renderer frame prep, per-frame `snapshot`, `search`) behind a `bench-support` feature gate with a recorded reference-machine baseline and a report-never-gate policy ([docs/testing/benchmarks.md](docs/testing/benchmarks.md)); its first finding (46.3 ms per-frame `snapshot` at full scrollback, filed as #172) has since been remediated — `TerminalSnapshot::from_state` shares scrollback rows instead of deep-copying them. A seeded soak harness (`crates/noren-terminal/tests/soak_feed_bytes.rs`) and a hand-rolled, dependency-free fuzz harness with a decoded-content oracle (`crates/noren-terminal/tests/fuzz_feed_bytes.rs`) landed; the fuzz campaign's first finding — SD/SU/DL stranding the cursor
 on a wide-character continuation cell — is remediated at this tree: those
 operations now end in the same shared `snap_cursor_to_lead` re-snap as
@@ -273,11 +273,12 @@ against it:
   non-ASCII rendering as `?` — are retired and guarded by running, passing
   tests (`lowercase_distinct_from_uppercase`,
   `non_ascii_glyph_is_not_the_question_mark`), not `#[ignore]`d ones.
-- **IME input is discarded, and there is no accessibility surface.** The
-  `WindowEvent::Ime(_)` arm in `main.rs`'s event handler drops the event
-  without forwarding it, so Japanese, Chinese, and Korean input methods
-  produce nothing; nothing in the tree integrates with assistive
-  technology. Both are Milestone 6 scope and neither has started.
+- **IME commits work, but preedit is not displayed; there is no accessibility
+  surface.** The window enables IME delivery by default and forwards composed
+  `Ime::Commit` text through typed-input encoding to the PTY, including
+  Japanese UTF-8 and dead-key commits. The in-progress `Ime::Preedit` string is
+  acknowledged without being drawn, CJK output still uses replacement boxes,
+  and nothing in the tree integrates with assistive technology.
 - **HiDPI / Retina displays are unhandled.** No scale-factor awareness
   exists anywhere in the app: the window is created at a fixed physical
   900x600 (`with_inner_size(PhysicalSize::new(WINDOW_WIDTH,

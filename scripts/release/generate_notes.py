@@ -293,7 +293,8 @@ def render(
     lines.append("> preview, not a finished terminal. Decision"
                  " [D-M8-001](../../coordination/decisions/D-M8-001-preview-scope.md)")
     lines.append("> scoped it honestly: a bitmap font with bounded coverage (no CJK")
-    lines.append("> or emoji glyphs), no IME input, no accessibility surface, macOS")
+    lines.append("> or emoji glyphs), IME commits but no preedit display, no")
+    lines.append("> accessibility surface, macOS")
     lines.append("> (Apple Silicon) only, a workspace sidebar that is a first vertical")
     lines.append("> slice rather than the full product, and fixed built-in themes. What")
     lines.append("> does not work is enumerated clause by clause in"
