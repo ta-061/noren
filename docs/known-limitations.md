@@ -246,11 +246,13 @@ Each item states what you would actually see if you ran the build.
 - **There is no accessibility surface.** Nothing in the tree integrates with
   assistive technology (no AccessKit, AT-SPI, or AppKit accessibility wiring);
   a screen reader has nothing to work with.
-- **Selection and scrollback work, but you cannot see them.** Selection is
-  tracked and copy extracts it, yet the renderer does not highlight the selected
-  region — the comment on the `selection` field in `main.rs` says so in the
-  source itself ("The renderer does not highlight it yet"). Scrollback is
-  bounded and searchable, but `FrameRowLayout::new` derives
+- **Selection is visible; scrollback still is not navigable.** Selection is
+  tracked, copy extracts it, and the renderer paints the same inclusive cell
+  spans with the active theme's inverse-video selection pair. Wrapped ranges
+  stay partial on their first and last rows, and a selected wide character
+  paints its lead and continuation columns together; exact changed-cell frame
+  oracles pin all three cases in `tests/frame_oracle.rs`. Scrollback is bounded
+  and searchable, but `FrameRowLayout::new` derives
   `terminal_row_count` from `content_rows.min(terminal_capacity)`, then
   `first_terminal_line` as `content_rows - terminal_row_count`. There is no
   scroll-offset input, so rendering stays on the newest suffix and you cannot

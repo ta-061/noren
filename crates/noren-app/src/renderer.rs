@@ -16,6 +16,12 @@
 //! resolution, default foreground, clear colour — reads from it, so a theme
 //! that exists in configuration changes what is drawn.
 //!
+//! A live [`Selection`] is painted as theme-owned inverse video over the exact
+//! inclusive cell spans exposed by the terminal selection model. Because that
+//! model expands a wide endpoint over its continuation, both CJK columns are
+//! painted together; because wrapped rows retain separate spans, neither row
+//! is widened beyond the range that copy extracts (issue #202).
+//!
 //! The cursor is drawn, not configured into existence (issues #197/#200):
 //! the caret appears at the tracked position with no configuration, honouring
 //! DECTCEM (`CSI ?25l` hides it, `?25h` restores it) because programs like vim
@@ -43,7 +49,7 @@ use noren_app::sidebar::EntryKind;
 use noren_app::sidebar_text::{DEFAULT_SIDEBAR_COLUMNS, SidebarTextRow, lifecycle_marker_color};
 use noren_app::theme::{Theme, contrast_ratio};
 use noren_app::{CellMetrics, MAX_RENDER_COLS, MAX_RENDER_ROWS};
-use noren_terminal::{Cell, CellAttributes, Color, TerminalSnapshot};
+use noren_terminal::{Cell, CellAttributes, Color, Selection, TerminalSnapshot};
 const GLYPH_SCALE: u32 = 2;
 const GLYPH_TOP: u32 = 3;
 const MAX_GLYPH_PIXELS: usize = 35;
@@ -347,6 +353,7 @@ pub(crate) struct FrameChrome<'a> {
     status: Option<&'a str>,
     palette_hint: Option<&'a str>,
     workspace_notice: Option<&'a [String]>,
+    selection: Option<&'a Selection>,
 }
 
 impl<'a> FrameChrome<'a> {
@@ -356,6 +363,7 @@ impl<'a> FrameChrome<'a> {
             status,
             palette_hint: None,
             workspace_notice: None,
+            selection: None,
         }
     }
 
@@ -379,6 +387,13 @@ impl<'a> FrameChrome<'a> {
     #[must_use]
     pub(crate) const fn with_workspace_notice(mut self, lines: Option<&'a [String]>) -> Self {
         self.workspace_notice = lines;
+        self
+    }
+
+    /// Add the app-owned grid selection to paint in this frame.
+    #[must_use]
+    pub(crate) const fn with_selection(mut self, selection: Option<&'a Selection>) -> Self {
+        self.selection = selection;
         self
     }
 
@@ -759,6 +774,7 @@ fn glyph_vertices_with_chrome_budget(
     let sidebar = chrome.sidebar;
     let status = chrome.status_line();
     let workspace_notice = chrome.workspace_notice;
+    let selection = chrome.selection;
     let has_sidebar = sidebar.is_some();
     let col_offset = if has_sidebar { sidebar_columns } else { 0 };
     // Reserve the sidebar, then clamp the terminal to the renderer's drawable
@@ -844,8 +860,20 @@ fn glyph_vertices_with_chrome_budget(
         {
             FrameRow::Terminal(line_index) => {
                 if let Some(cells) = rows.get(line_index) {
+                    let paint = CellPaint {
+                        row,
+                        col_offset,
+                        target,
+                        vertex_budget,
+                    };
                     let visible_len = cells.len().min(terminal_cols);
                     let visible = &cells[..visible_len];
+                    let selected_columns = terminal.and_then(|snapshot| {
+                        selection.and_then(|selection| {
+                            selection
+                                .columns_in_line(snapshot, snapshot.scrollback().len() + line_index)
+                        })
+                    });
                     if let Some(plan) = cursor_plan
                         && plan.frame_row == row
                         && plan.column < visible_len
@@ -859,10 +887,8 @@ fn glyph_vertices_with_chrome_budget(
                             &mut vertices,
                             before,
                             0,
-                            row,
-                            col_offset,
-                            target,
-                            vertex_budget,
+                            paint,
+                            selected_columns.as_ref(),
                         ) {
                             return vertices;
                         }
@@ -872,10 +898,10 @@ fn glyph_vertices_with_chrome_budget(
                             &mut vertices,
                             cursor_cells,
                             plan,
-                            row,
-                            col_offset,
-                            target,
-                            vertex_budget,
+                            paint,
+                            selected_columns
+                                .as_ref()
+                                .is_some_and(|columns| columns.contains(&plan.column)),
                         ) {
                             return vertices;
                         }
@@ -883,10 +909,8 @@ fn glyph_vertices_with_chrome_budget(
                             &mut vertices,
                             after,
                             plan.column + cursor_len,
-                            row,
-                            col_offset,
-                            target,
-                            vertex_budget,
+                            paint,
+                            selected_columns.as_ref(),
                         ) {
                             return vertices;
                         }
@@ -894,10 +918,8 @@ fn glyph_vertices_with_chrome_budget(
                         &mut vertices,
                         visible,
                         0,
-                        row,
-                        col_offset,
-                        target,
-                        vertex_budget,
+                        paint,
+                        selected_columns.as_ref(),
                     ) {
                         return vertices;
                     }
@@ -945,6 +967,15 @@ fn glyph_vertices_with_chrome_budget(
     vertices
 }
 
+/// Immutable drawing context shared by every terminal cell in one frame row.
+#[derive(Clone, Copy)]
+struct CellPaint {
+    row: usize,
+    col_offset: usize,
+    target: Target,
+    vertex_budget: usize,
+}
+
 /// Draw a run of ordinary terminal cells. Cursor-bearing rows are split
 /// around their one affected span before reaching this helper, so this hot
 /// path contains no per-cell cursor checks.
@@ -953,20 +984,17 @@ fn push_terminal_cells(
     vertices: &mut Vec<Vertex>,
     cells: &[Cell],
     start_column: usize,
-    row: usize,
-    col_offset: usize,
-    target: Target,
-    vertex_budget: usize,
+    paint: CellPaint,
+    selected_columns: Option<&std::ops::RangeInclusive<usize>>,
 ) -> bool {
     for (offset, cell) in cells.iter().enumerate() {
+        let column = start_column + offset;
         if push_terminal_cell(
             vertices,
             cell,
-            start_column + offset,
-            row,
-            col_offset,
-            target,
-            vertex_budget,
+            column,
+            paint,
+            selected_columns.is_some_and(|columns| columns.contains(&column)),
         ) {
             return true;
         }
@@ -981,12 +1009,21 @@ fn push_terminal_cell(
     vertices: &mut Vec<Vertex>,
     cell: &Cell,
     column: usize,
-    row: usize,
-    col_offset: usize,
-    target: Target,
-    vertex_budget: usize,
+    paint: CellPaint,
+    selected: bool,
 ) -> bool {
-    if let Some(color) = resolve_background(&target.theme, cell.attributes()) {
+    let CellPaint {
+        row,
+        col_offset,
+        target,
+        vertex_budget,
+    } = paint;
+    let background = if selected {
+        Some(target.theme.selection_background())
+    } else {
+        resolve_background(&target.theme, cell.attributes())
+    };
+    if let Some(color) = background {
         push_rect(
             vertices,
             u32::try_from(col_offset + column).unwrap_or(u32::MAX) * target.metrics.width(),
@@ -1005,7 +1042,11 @@ fn push_terminal_cell(
     if cell.is_continuation() {
         return false;
     }
-    let color = resolve_foreground(&target.theme, cell.attributes());
+    let color = if selected {
+        target.theme.selection_foreground()
+    } else {
+        resolve_foreground(&target.theme, cell.attributes())
+    };
     for character in cell.text().chars() {
         push_glyph(vertices, character, color, col_offset + column, row, target);
         if vertices.len() >= vertex_budget {
@@ -1023,22 +1064,35 @@ fn push_cursor_cells(
     vertices: &mut Vec<Vertex>,
     cells: &[Cell],
     plan: CursorPlacement,
-    row: usize,
-    col_offset: usize,
-    target: Target,
-    vertex_budget: usize,
+    paint: CellPaint,
+    selected: bool,
 ) -> bool {
+    let CellPaint {
+        row,
+        col_offset,
+        target,
+        vertex_budget,
+    } = paint;
     let Some(lead) = cells.first() else {
         return false;
     };
-    let foreground = resolve_foreground(&target.theme, lead.attributes());
-    let inverse_foreground = if lead.attributes().foreground() == Color::Default {
+    let foreground = if selected {
+        target.theme.selection_foreground()
+    } else {
+        resolve_foreground(&target.theme, lead.attributes())
+    };
+    let inverse_foreground = if selected {
+        foreground
+    } else if lead.attributes().foreground() == Color::Default {
         target.cursor.theme_color
     } else {
         foreground
     };
-    let background =
-        resolve_background(&target.theme, lead.attributes()).unwrap_or(target.theme.background());
+    let background = if selected {
+        target.theme.selection_background()
+    } else {
+        resolve_background(&target.theme, lead.attributes()).unwrap_or(target.theme.background())
+    };
     let cursor_color = target.cursor.visible_color(inverse_foreground, background);
 
     if target.cursor.focused && target.cursor.shape == CursorShape::Block {
@@ -1047,7 +1101,12 @@ fn push_cursor_cells(
         // particular, a continuation background must not overwrite half of
         // the cursor after the block has been drawn.
         for (offset, cell) in cells.iter().enumerate() {
-            if let Some(color) = resolve_background(&target.theme, cell.attributes()) {
+            let cell_background = if selected {
+                Some(target.theme.selection_background())
+            } else {
+                resolve_background(&target.theme, cell.attributes())
+            };
+            if let Some(color) = cell_background {
                 push_rect(
                     vertices,
                     u32::try_from(col_offset + plan.column + offset).unwrap_or(u32::MAX)
@@ -1085,16 +1144,10 @@ fn push_cursor_cells(
         return false;
     }
 
-    if push_terminal_cells(
-        vertices,
-        cells,
-        plan.column,
-        row,
-        col_offset,
-        target,
-        vertex_budget,
-    ) {
-        return true;
+    for (offset, cell) in cells.iter().enumerate() {
+        if push_terminal_cell(vertices, cell, plan.column + offset, paint, selected) {
+            return true;
+        }
     }
     if target.cursor.focused {
         match target.cursor.shape {

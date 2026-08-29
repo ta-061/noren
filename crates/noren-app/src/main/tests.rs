@@ -299,6 +299,7 @@ fn select_entire_grid_captures_all_visible_content() {
     let mut terminal = TerminalState::new(3, 6).expect("valid terminal");
     terminal.feed_bytes(b"abc\r\ndef");
     app.terminal = Some(terminal);
+    app.redraw_needed = false;
 
     app.select_entire_grid();
     let terminal = app.terminal.as_ref().expect("terminal present");
@@ -307,6 +308,40 @@ fn select_entire_grid_captures_all_visible_content() {
             .as_ref()
             .map(|selection| selection.extract(terminal)),
         Some("abc\ndef".to_owned())
+    );
+    assert!(
+        app.redraw_needed,
+        "select-all must schedule the frame that reveals its range"
+    );
+}
+
+#[test]
+fn installing_a_drag_selection_schedules_its_visible_frame() {
+    let mut terminal = TerminalState::new(2, 6).expect("valid terminal");
+    terminal.feed_bytes(b"abcdef");
+    let selection = Selection::new(
+        &terminal,
+        SelectionMode::Char,
+        GridPoint::new(0, 1),
+        GridPoint::new(0, 3),
+    );
+    let mut app = NorenApp {
+        terminal: Some(terminal),
+        ..Default::default()
+    };
+    app.redraw_needed = false;
+
+    app.show_selection(selection);
+
+    assert_eq!(
+        app.selection
+            .as_ref()
+            .map(|selection| selection.extract(app.terminal.as_ref().expect("terminal present"))),
+        Some("bcd".to_owned())
+    );
+    assert!(
+        app.redraw_needed,
+        "mouse press and drag use show_selection, which must request their frame"
     );
 }
 

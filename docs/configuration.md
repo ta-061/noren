@@ -155,6 +155,16 @@ Accepted names, matched exactly (case-sensitive, closed vocabulary):
   every theme-owned foreground keeps WCAG AAA (≥ 7:1), strictly exceeding
   the other themes' measured minima.
 
+Each built-in palette also owns its selection foreground and background.
+Selection is visible with no setting: the pair is the palette's normal
+foreground/background inverted, painted over exactly the cells that copy will
+extract. Choosing `[theme] name` therefore controls the selection treatment as
+well as ordinary terminal colours; it is not a renderer constant that requires
+patching source. Measured from the RGBA8 channel values with the WCAG sRGB
+transfer and luminance formula, selected text is 15.3887:1 in `dark`,
+14.5632:1 in `light`, and 21.0000:1 in `high-contrast`, all above the 4.5:1 AA
+floor for normal text.
+
 Rejections follow the hard-error discipline: a non-string value is an
 error naming the key, and an unknown name is a typed error naming the
 offending value (clipped to 120 characters, like the `[keys]` chord echo:
@@ -164,13 +174,12 @@ never a silent fallback to `dark`. Near-misses such as `Dark` or
 
 The contrast contract: the checked set is every theme-owned foreground —
 the default foreground and the sixteen ANSI entries — against the theme's
-default background, the colours programs use for ordinary text on the
-screen they are given. The floor is WCAG AA for normal text (4.5:1)
-because terminal glyphs are normal-size text; `high-contrast` targets AAA
-(7:1). Program-paired colours (`SGR 31;41`) and the shared 256-colour
-cube (`16..=255`) are outside any palette's control (identical colours
-are 1:1 by definition; the cube's black corner fails on every possible
-background) and are therefore not part of the checked set.
+default background, plus the theme-owned selection pair above. The floor is
+WCAG AA for normal text (4.5:1) because terminal glyphs are normal-size text;
+`high-contrast` targets AAA (7:1). Program-paired colours (`SGR 31;41`) and
+the shared 256-colour cube (`16..=255`) are outside any palette's control
+(identical colours are 1:1 by definition; the cube's black corner fails on
+every possible background) and are therefore not part of the checked set.
 
 **Fixed with issue #168:** the default `dark` palette used to fail the
 4.5:1 floor for five ANSI slots on its own background — black at 1.06:1,

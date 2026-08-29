@@ -308,14 +308,15 @@ against it:
   and the word "cursor" does not appear in that file. There is no scrollback
   viewport: rendering stays on the newest suffix of the content because no
   scroll-offset input exists (the only scroll offset in `main.rs` is the
-  sidebar's own). Selection is tracked and copies correctly but is never
-  highlighted. Scrollback search is unreachable: the terminal core ships a
+  sidebar's own). Selection is tracked, copies correctly, and now paints the
+  exact copied cell span with a theme-owned inverse pair, including partial
+  wrapped rows and both columns of wide characters. Scrollback search is
+  unreachable: the terminal core ships a
   real snapshot search engine (`crates/noren-terminal/src/search.rs`:
   `Search`, ranked matches, case sensitivity), but nothing in the app
   references it — no key or palette command starts a search and no renderer
-  surface draws one. A terminal in which a stranger cannot see the cursor,
-  cannot scroll back, cannot see their selection, and cannot search is not
-  preview-ready.
+  surface draws one. Cursor, scrollback navigation, and search remain separate
+  preview-readiness gates.
 - **The FR-005 rendered-frame oracle exists and runs, and its boundary is
   the honesty requirement.** It drives the real `wgpu` pipeline offscreen
   (`crates/noren-app/src/renderer_capture.rs`,
