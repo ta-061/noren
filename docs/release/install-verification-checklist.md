@@ -66,7 +66,8 @@ version** (`window_title()` in `crates/noren-app/src/main.rs` builds it from
 binary was built as) with a workspace
 sidebar and a working local `zsh` — but **no visible cursor**, a 5x7 bitmap
 font with bounded coverage (CJK and emoji draw as replacement boxes),
-discarded IME input, no accessibility surface, and no native tabs or panes
+IME commits that reach the PTY but no on-screen preedit, no accessibility
+surface, and no native tabs or panes
 (panes are Zellij's job by design). Programs that emit colour do render
 colour; the default dark theme clears the WCAG AA floor on every
 theme-owned slot (the issue-168 fix lifted the five entries that used to
