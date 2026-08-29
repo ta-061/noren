@@ -32,7 +32,7 @@ use noren_app::{
 use noren_app::{
     CursorKeyMode, GridGeometry, GridSize, InputMode, KeyEncoder, KeypadMode, Modifiers,
     PARSE_BUDGET_BYTES_PER_TURN, PRODUCT_NAME, PasteReject, Resize, SystemClipboard,
-    config::{AppConfig, KeymapConfig, UiConfig},
+    config::{AppConfig, DEFAULT_SIDEBAR_KIND_ORDER, KeymapConfig, UiConfig},
     diagnostics::{self, PtyChildStatus},
     encode_paste,
     git_worktree::{self, DiscoveredWorktree, WorktreeDiscovery, WorktreeListError},
@@ -49,7 +49,7 @@ use noren_app::{
     session_persistence::{
         SESSION_STATE_FILE_NAME, SessionPersistenceError, load_snapshot, save_snapshot, snapshot,
     },
-    sidebar::{SessionLifecycle, SidebarEntry, SidebarView},
+    sidebar::{EntryKind, SessionLifecycle, SidebarEntry, SidebarView},
     sidebar_text::{SidebarTextRow, visible_sidebar_text_rows_at_width},
     ssh_config::{HostDiscoveryKind, SshConfig},
     theme::Theme,
@@ -472,6 +472,9 @@ fn session_state_path() -> Option<PathBuf> {
 struct WorkspaceState {
     registry: SessionRegistry,
     sidebar: SidebarView,
+    /// Complete, validated group priority. Keeping this beside the model
+    /// makes rendering and pointer resolution use one ordering authority.
+    sidebar_kind_order: [EntryKind; 5],
     /// Configured projects (`[[projects]]`), bounded by
     /// [`MAX_PROJECT_SIDEBAR_ROWS`]. Sidebar facts until a row is selected:
     /// no registry entry or child exists for one. Selecting a row creates a
@@ -536,6 +539,10 @@ impl fmt::Debug for WorkspaceState {
             .field("registry", &self.registry.len())
             .field("registry_selection", &self.registry.selected())
             .field("sidebar", &self.sidebar)
+            .field(
+                "sidebar_kind_order",
+                &self.sidebar_kind_order.map(EntryKind::name),
+            )
             .field("projects", &self.projects.len())
             .field("projects_omitted", &self.projects_omitted)
             .field(
@@ -585,6 +592,7 @@ impl WorkspaceState {
         Self {
             registry: SessionRegistry::new(),
             sidebar: SidebarView::build(&[], None),
+            sidebar_kind_order: DEFAULT_SIDEBAR_KIND_ORDER,
             projects: Vec::new(),
             projects_omitted: 0,
             project_launch_failures: std::collections::HashSet::new(),
@@ -615,6 +623,42 @@ impl WorkspaceState {
     /// this impl, so the binary cannot rewrite persistence mid-run.
     fn set_state_path(&mut self, state_path: Option<PathBuf>) {
         self.state_path = state_path;
+    }
+
+    /// Replace the complete sidebar group priority with the permutation that
+    /// configuration already validated. Rebuilding here keeps callers from
+    /// observing rows in the old order after changing the authority.
+    fn set_sidebar_kind_order(&mut self, order: [EntryKind; 5]) {
+        self.sidebar_kind_order = order;
+        self.rebuild_sidebar();
+    }
+
+    /// Number of model rows owned by one kind. This is the single counting
+    /// vocabulary shared by rendering and every pointer lookup.
+    fn sidebar_kind_len(&self, kind: EntryKind) -> usize {
+        match kind {
+            EntryKind::Session => self.registry.len(),
+            EntryKind::Project => self.projects.len(),
+            EntryKind::Worktree => self.worktrees.len(),
+            EntryKind::SshConnection => self.ssh_hosts.len(),
+            EntryKind::Agent => self.agents.len(),
+        }
+    }
+
+    /// Resolve an absolute rendered row to its within-kind index under the
+    /// configured ordering. A full permutation is guaranteed by config, so
+    /// each kind has exactly one contiguous range.
+    fn sidebar_kind_index(&self, row_index: usize, wanted: EntryKind) -> Option<usize> {
+        let start = self
+            .sidebar_kind_order
+            .iter()
+            .copied()
+            .take_while(|kind| *kind != wanted)
+            .map(|kind| self.sidebar_kind_len(kind))
+            .sum::<usize>();
+        row_index
+            .checked_sub(start)
+            .filter(|index| *index < self.sidebar_kind_len(wanted))
     }
 
     /// Load saved sidebar state from [`state_path`](Self::state_path) into the
@@ -749,16 +793,14 @@ impl WorkspaceState {
         self.projects_omitted
     }
 
-    /// The configured project fact at a stable sidebar position, if that
-    /// position is a project row. Session rows precede project rows; worktree
-    /// rows follow them.
+    /// The configured project fact at a stable rendered sidebar position.
     fn project_sidebar_row(&self, row_index: usize) -> Option<&ConfiguredProject> {
-        let index = row_index.checked_sub(self.registry.len())?;
+        let index = self.sidebar_kind_index(row_index, EntryKind::Project)?;
         self.projects.get(index)
     }
 
     /// Mark a configured project's most recent launch as failed, so its row
-    /// carries the visible `PRJ-ERR` state.
+    /// carries the shared failed lifecycle marker.
     fn record_project_launch_failure(&mut self, name: &str) {
         self.project_launch_failures.insert(name.to_owned());
     }
@@ -777,11 +819,9 @@ impl WorkspaceState {
         self.rebuild_sidebar();
     }
 
-    /// The worktree fact at a stable sidebar position, if that position is
-    /// a worktree row. Session rows and project rows precede worktree rows;
-    /// SSH host rows follow them.
+    /// The worktree fact at a stable rendered sidebar position.
     fn worktree_sidebar_row(&self, row_index: usize) -> Option<&DiscoveredWorktree> {
-        let index = row_index.checked_sub(self.registry.len() + self.projects.len())?;
+        let index = self.sidebar_kind_index(row_index, EntryKind::Worktree)?;
         self.worktrees.get(index)
     }
 
@@ -811,10 +851,7 @@ impl WorkspaceState {
 
     /// Select an SSH row as a pending UI choice, never as a live session.
     fn select_ssh_sidebar_row(&mut self, row_index: usize) -> bool {
-        let session_rows = self.registry.len();
-        let project_rows = self.projects.len();
-        let worktree_rows = self.worktrees.len();
-        let host_index = row_index.checked_sub(session_rows + project_rows + worktree_rows);
+        let host_index = self.sidebar_kind_index(row_index, EntryKind::SshConnection);
         let Some(Some(ConfiguredSshHost {
             kind: SessionKind::Ssh { target },
             source_label,
@@ -848,20 +885,14 @@ impl WorkspaceState {
         self.agents_omitted
     }
 
-    /// The configured agent fact at a stable sidebar position, if that
-    /// position is an agent row. Session rows precede project rows, project
-    /// rows precede worktree rows, SSH host rows follow them, and agent rows
-    /// follow the SSH hosts; the subtraction chain mirrors the order the
-    /// sidebar renders.
+    /// The configured agent fact at a stable rendered sidebar position.
     fn agent_sidebar_row(&self, row_index: usize) -> Option<&ConfiguredAgent> {
-        let index = row_index.checked_sub(
-            self.registry.len() + self.projects.len() + self.worktrees.len() + self.ssh_hosts.len(),
-        )?;
+        let index = self.sidebar_kind_index(row_index, EntryKind::Agent)?;
         self.agents.get(index)
     }
 
     /// Mark a configured agent's most recent launch as failed, so its row
-    /// carries the visible `AG-ERR` state.
+    /// carries the shared failed lifecycle marker.
     fn record_agent_launch_failure(&mut self, name: &str) {
         self.agent_launch_failures.insert(name.to_owned());
     }
@@ -884,16 +915,14 @@ impl WorkspaceState {
 
     /// Resolve the local session id at a stable sidebar position.
     ///
-    /// Session rows precede SSH facts and are generated from the registry's
-    /// deterministic id ordering. The application decides whether that model
-    /// entry owns the one live PTY before changing selection.
+    /// Session rows use the registry's deterministic id ordering inside their
+    /// configured group. The application decides whether that model entry
+    /// owns the one live PTY before changing selection.
     fn local_sidebar_session(&self, row_index: usize) -> Option<SessionId> {
-        if row_index >= self.registry.len() {
-            return None;
-        }
+        let index = self.sidebar_kind_index(row_index, EntryKind::Session)?;
         self.registry
             .sessions()
-            .get(row_index)
+            .get(index)
             .map(|descriptor| descriptor.id())
     }
 
@@ -915,71 +944,93 @@ impl WorkspaceState {
 
     /// Rebuild the sidebar from the registry's current sessions and selection.
     ///
-    /// Called after every mutation so the view never lags the model. Row
-    /// order is stable: session rows first, then configured project facts,
-    /// then discovered worktree facts, then configured SSH host facts, then
-    /// configured agent facts.
+    /// Called after every mutation so the view never lags the model. Each
+    /// kind remains a stable contiguous group; group priority comes from the
+    /// validated sidebar configuration.
     fn rebuild_sidebar(&mut self) {
-        let entries: Vec<SidebarEntry> = self
+        let mut sessions: Vec<SidebarEntry> = self
             .registry
             .sessions()
             .into_iter()
             .map(SidebarEntry::Session)
             .collect();
-        let mut entries = entries;
         // Project identity is the configured display name, never the root
         // path. Kind and launch state occupy their fixed shape cells, leaving
         // the complete 16-column identity budget free of textual prefixes.
-        entries.extend(self.projects.iter().map(|project| {
-            let failed = self.project_launch_failures.contains(&project.name);
-            SidebarEntry::Project {
-                name: project.name.clone(),
-                root: project_sidebar_detail(failed).to_owned(),
-                lifecycle: configured_target_lifecycle(failed),
-            }
-        }));
-        entries.extend(
-            self.worktrees
-                .iter()
-                .map(|worktree| SidebarEntry::Worktree {
-                    name: worktree.name_display(),
-                    branch: worktree.branch_display(),
-                }),
-        );
-        let mut pending_marked = false;
-        entries.extend(self.ssh_hosts.iter().filter_map(|host| {
-            let SessionKind::Ssh { target } = &host.kind else {
-                return None;
-            };
-            let selected =
-                !pending_marked && self.selected_ssh_target.as_deref() == Some(target.as_str());
-            pending_marked |= selected;
-            // The one live connection, if any, is matched by exact target so
-            // colliding truncated labels cannot mark the wrong row.
-            let phase = self
-                .ssh_connection
-                .as_ref()
-                .filter(|(connected, _)| connected == target)
-                .map(|(_, phase)| *phase);
-            let (detail, lifecycle) = match phase {
-                Some(phase) => (phase.sidebar_detail(), phase.sidebar_lifecycle()),
-                None => (SSH_SIDEBAR_DETAIL, SessionLifecycle::Exited),
-            };
-            Some(SidebarEntry::SshConnection {
-                label: ssh_sidebar_label(target),
-                host: detail.to_owned(),
-                selected,
-                lifecycle,
+        let mut projects = self
+            .projects
+            .iter()
+            .map(|project| {
+                let failed = self.project_launch_failures.contains(&project.name);
+                SidebarEntry::Project {
+                    name: project.name.clone(),
+                    root: project_sidebar_detail(failed).to_owned(),
+                    lifecycle: configured_target_lifecycle(failed),
+                }
             })
-        }));
-        entries.extend(self.agents.iter().map(|agent| {
-            let failed = self.agent_launch_failures.contains(&agent.name);
-            SidebarEntry::Agent {
-                label: agent.name.clone(),
-                status: agent_sidebar_detail(failed).to_owned(),
-                lifecycle: configured_target_lifecycle(failed),
+            .collect::<Vec<_>>();
+        let mut worktrees = self
+            .worktrees
+            .iter()
+            .map(|worktree| SidebarEntry::Worktree {
+                name: worktree.name_display(),
+                branch: worktree.branch_display(),
+            })
+            .collect::<Vec<_>>();
+        let mut pending_marked = false;
+        let mut ssh_hosts = self
+            .ssh_hosts
+            .iter()
+            .filter_map(|host| {
+                let SessionKind::Ssh { target } = &host.kind else {
+                    return None;
+                };
+                let selected =
+                    !pending_marked && self.selected_ssh_target.as_deref() == Some(target.as_str());
+                pending_marked |= selected;
+                // The one live connection, if any, is matched by exact target so
+                // colliding truncated labels cannot mark the wrong row.
+                let phase = self
+                    .ssh_connection
+                    .as_ref()
+                    .filter(|(connected, _)| connected == target)
+                    .map(|(_, phase)| *phase);
+                let (detail, lifecycle) = match phase {
+                    Some(phase) => (phase.sidebar_detail(), phase.sidebar_lifecycle()),
+                    None => (SSH_SIDEBAR_DETAIL, SessionLifecycle::Exited),
+                };
+                Some(SidebarEntry::SshConnection {
+                    label: ssh_sidebar_label(target),
+                    host: detail.to_owned(),
+                    selected,
+                    lifecycle,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut agents = self
+            .agents
+            .iter()
+            .map(|agent| {
+                let failed = self.agent_launch_failures.contains(&agent.name);
+                SidebarEntry::Agent {
+                    label: agent.name.clone(),
+                    status: agent_sidebar_detail(failed).to_owned(),
+                    lifecycle: configured_target_lifecycle(failed),
+                }
+            })
+            .collect::<Vec<_>>();
+        let capacity =
+            sessions.len() + projects.len() + worktrees.len() + ssh_hosts.len() + agents.len();
+        let mut entries = Vec::with_capacity(capacity);
+        for kind in self.sidebar_kind_order {
+            match kind {
+                EntryKind::Session => entries.append(&mut sessions),
+                EntryKind::Project => entries.append(&mut projects),
+                EntryKind::Worktree => entries.append(&mut worktrees),
+                EntryKind::SshConnection => entries.append(&mut ssh_hosts),
+                EntryKind::Agent => entries.append(&mut agents),
             }
-        }));
+        }
         self.sidebar = SidebarView::build(&entries, self.registry.selected());
     }
 
@@ -1231,6 +1282,7 @@ impl NorenApp {
         // bounded), the sidebar bound applies on top, and the omitted count
         // reaches the status row.
         let mut workspace = WorkspaceState::new();
+        workspace.set_sidebar_kind_order(config.sidebar().kind_order());
         let projects_omitted = workspace.load_projects(config.projects());
         let project_diagnostic = (projects_omitted > 0).then(|| {
             format!(

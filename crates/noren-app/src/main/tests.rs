@@ -5495,17 +5495,17 @@ fn worktree_session_paths(app: &NorenApp) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Row order is FIXED — sessions first, then configured project facts, then
-/// discovered worktree facts, then configured SSH hosts, then configured
-/// agents — and the click-path offset arithmetic silently depends on it, so
-/// the rendered order is pinned here with all five kinds present at once,
+/// The default priority is FIXED — sessions, configured project facts,
+/// configured SSH hosts, configured agents, then discovered worktree facts.
+/// Worktrees come last so a repository-scale discovery result cannot bury
+/// every other kind. The rendered order is pinned here with all five kinds,
 /// including each kind's internal order (registry order, configuration
 /// order, git listing order). Agent-kind sessions render as ordinary
 /// session rows; a configured agent row (`EntryKind::Agent`) appears only
 /// for `[[agents]]` configuration entries, and a configured project row
 /// (`EntryKind::Project`) only for `[[projects]]` entries.
 #[test]
-fn sidebar_rows_render_sessions_then_projects_worktrees_ssh_hosts_agents() {
+fn default_sidebar_priority_keeps_worktrees_after_every_other_kind() {
     let fixture = SshConfigFixture::new();
     fixture.write_new(b"Host zulu\nHost alpha\n");
     let records = git_worktree::parse_worktree_porcelain(
@@ -5541,15 +5541,15 @@ fn sidebar_rows_render_sessions_then_projects_worktrees_ssh_hosts_agents() {
             EntryKind::Session,
             EntryKind::Project,
             EntryKind::Project,
-            EntryKind::Worktree,
-            EntryKind::Worktree,
-            EntryKind::Worktree,
             EntryKind::SshConnection,
             EntryKind::SshConnection,
             EntryKind::Agent,
             EntryKind::Agent,
+            EntryKind::Worktree,
+            EntryKind::Worktree,
+            EntryKind::Worktree,
         ],
-        "the fixed order is sessions, projects, worktrees, SSH hosts, agents"
+        "the default priority is sessions, projects, SSH hosts, agents, worktrees"
     );
     // Project rows keep the configuration's declaration order and carry the
     // shared stopped lifecycle, never the root path.
@@ -5562,17 +5562,9 @@ fn sidebar_rows_render_sessions_then_projects_worktrees_ssh_hosts_agents() {
     );
     assert_eq!(rows[2].detail(), Some("not running"));
     assert_eq!(rows[2].lifecycle(), Some(SessionLifecycle::Exited));
-    // Worktree rows keep git's listing order (main first).
-    assert_eq!(
-        rows[4..7]
-            .iter()
-            .map(|row| row.label().to_owned())
-            .collect::<Vec<_>>(),
-        vec!["mix-main", "mix-a", "mix-b"]
-    );
     // SSH rows keep the config's declaration order.
     assert_eq!(
-        rows[7..9]
+        rows[4..6]
             .iter()
             .map(|row| row.label().to_owned())
             .collect::<Vec<_>>(),
@@ -5580,14 +5572,23 @@ fn sidebar_rows_render_sessions_then_projects_worktrees_ssh_hosts_agents() {
     );
     // Agent rows keep the configuration's declaration order.
     assert_eq!(
-        rows[9..11]
+        rows[6..8]
             .iter()
             .map(|row| row.label().to_owned())
             .collect::<Vec<_>>(),
         vec!["m-one", "m-two"]
     );
-    assert_eq!(rows[9].detail(), Some("not running"));
-    assert_eq!(rows[9].lifecycle(), Some(SessionLifecycle::Exited));
+    assert_eq!(rows[6].detail(), Some("not running"));
+    assert_eq!(rows[6].lifecycle(), Some(SessionLifecycle::Exited));
+    // Worktree rows keep git's listing order (main first), but the entire
+    // potentially large group follows every launch/state kind.
+    assert_eq!(
+        rows[8..11]
+            .iter()
+            .map(|row| row.label().to_owned())
+            .collect::<Vec<_>>(),
+        vec!["mix-main", "mix-a", "mix-b"]
+    );
     assert!(
         app.agent_diagnostic.is_none(),
         "an in-cap agent list adds no notice"
@@ -5599,6 +5600,115 @@ fn sidebar_rows_render_sessions_then_projects_worktrees_ssh_hosts_agents() {
     for root in &project_roots {
         let _ = std::fs::remove_dir(root);
     }
+}
+
+/// Scale regression for #198: filling the entire discovered-worktree row cap
+/// must not push the four launch/state kinds below that block. This pins the
+/// consequential property independently of the smaller all-kind order test.
+#[test]
+fn twenty_four_worktrees_cannot_bury_sessions_projects_ssh_or_agents() {
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(b"Host scale-host\n");
+    let mut porcelain = String::new();
+    for index in 0..git_worktree::MAX_WORKTREE_SIDEBAR_ROWS {
+        porcelain.push_str(&format!(
+            "worktree /srv/scale-{index:02}\nbranch refs/heads/scale-{index:02}\n\n"
+        ));
+    }
+    let records =
+        git_worktree::parse_worktree_porcelain(&porcelain).expect("24 synthetic worktrees parse");
+    let config = AppConfig::parse(
+        "[[projects]]\nname = \"scale-project\"\nroot = \"/srv/scale-project\"\n\
+         [[agents]]\nname = \"scale-agent\"\ncommand = \"/bin/true\"\n",
+    )
+    .expect("valid project and agent configuration");
+    let mut app = NorenApp::new(config);
+    app.workspace
+        .load_worktrees(WorktreeDiscovery::from_records(records));
+    app.load_ssh_hosts_from(fixture.path());
+    app.workspace.create_session(SessionKind::Local);
+
+    let rows = app.workspace.sidebar().rows();
+    assert_eq!(rows.len(), 4 + git_worktree::MAX_WORKTREE_SIDEBAR_ROWS);
+    assert_eq!(
+        rows[..4].iter().map(|row| row.kind()).collect::<Vec<_>>(),
+        vec![
+            EntryKind::Session,
+            EntryKind::Project,
+            EntryKind::SshConnection,
+            EntryKind::Agent,
+        ],
+        "all non-worktree kinds stay above a full 24-row worktree group"
+    );
+    assert!(
+        rows[4..]
+            .iter()
+            .all(|row| row.kind() == EntryKind::Worktree),
+        "only the bounded worktree group follows the priority rows"
+    );
+}
+
+/// The useful default is not a source-code policy trap: one validated config
+/// permutation reorders rendering and every click resolver together.
+#[test]
+fn configured_sidebar_kind_order_controls_all_five_groups_and_click_ranges() {
+    let fixture = SshConfigFixture::new();
+    fixture.write_new(b"Host custom-host\n");
+    let records = git_worktree::parse_worktree_porcelain(
+        "worktree /srv/custom-worktree\nbranch refs/heads/custom-branch\n\n",
+    )
+    .expect("synthetic worktree parses");
+    let config = AppConfig::parse(
+        "[sidebar]\nkind_order = [\"worktree\", \"agent\", \"ssh\", \"project\", \"session\"]\n\
+         [[projects]]\nname = \"custom-project\"\nroot = \"/srv/custom-project\"\n\
+         [[agents]]\nname = \"custom-agent\"\ncommand = \"/bin/true\"\n",
+    )
+    .expect("valid custom kind order");
+    let mut app = NorenApp::new(config);
+    app.workspace
+        .load_worktrees(WorktreeDiscovery::from_records(records));
+    app.load_ssh_hosts_from(fixture.path());
+    let session = app.workspace.create_session(SessionKind::Local);
+
+    assert_eq!(
+        app.workspace
+            .sidebar()
+            .rows()
+            .iter()
+            .map(|row| row.kind())
+            .collect::<Vec<_>>(),
+        vec![
+            EntryKind::Worktree,
+            EntryKind::Agent,
+            EntryKind::SshConnection,
+            EntryKind::Project,
+            EntryKind::Session,
+        ]
+    );
+    assert_eq!(
+        app.workspace
+            .worktree_sidebar_row(0)
+            .map(DiscoveredWorktree::name_display)
+            .as_deref(),
+        Some("custom-worktree")
+    );
+    assert_eq!(
+        app.workspace
+            .agent_sidebar_row(1)
+            .map(|agent| agent.name.as_str()),
+        Some("custom-agent")
+    );
+    assert!(app.workspace.select_ssh_sidebar_row(2));
+    assert_eq!(app.workspace.selected_ssh_target(), Some("custom-host"));
+    assert_eq!(
+        app.workspace
+            .project_sidebar_row(3)
+            .map(|project| project.name.as_str()),
+        Some("custom-project")
+    );
+    assert_eq!(app.workspace.local_sidebar_session(4), Some(session));
+    assert!(app.workspace.local_sidebar_session(0).is_none());
+    assert!(app.workspace.project_sidebar_row(4).is_none());
 }
 
 /// The roots of every registry session launched from a project row, in
@@ -5621,27 +5731,16 @@ fn project_session_roots(app: &NorenApp) -> Vec<PathBuf> {
 /// actually clicked — the default sidebar shape of this repository, which
 /// holds sessions, configured projects, worktrees, SSH hosts, and configured
 /// agents at once. The boundaries are asserted explicitly: the first and
-/// last project rows, the last worktree row, the first SSH row, the last SSH
-/// row, the first and last agent rows, and the row immediately after the
-/// last agent row (a dead click that must select nothing, not wrap).
+/// last project rows, the first SSH row, the last SSH row, the first and last
+/// agent rows, the first and last worktree rows, and the row immediately after
+/// the last group (a dead click that must select nothing, not wrap).
 ///
 /// Mutation checks:
-/// - dropping `+ self.projects.len()` (the project offset) from
-///   `worktree_sidebar_row` makes a worktree click resolve to a PROJECT row
-///   or dead-click instead of the worktree the user pointed at;
-/// - dropping `+ project_rows` from `select_ssh_sidebar_row` makes the
-///   first-SSH-row click resolve to a DIFFERENT host (the host list here is
-///   longer than the worktree list, so the misresolved index lands on a
-///   real host, not a dead click);
-/// - dropping `+ self.projects.len()` from `agent_sidebar_row` (the agent
-///   block's offset arithmetic) makes the first-agent-row click a dead
-///   click, a project launch, or an SSH connect instead of an agent launch;
-/// - dropping the session-row offset from `project_sidebar_row` resolves a
-///   session click to a project row and launches instead of selecting;
-/// - dropping the session-row offset from `worktree_sidebar_row` resolves a
-///   worktree click to another worktree's row;
-/// - dropping the session bound from `local_sidebar_session` makes
-///   non-session rows claim a session id.
+/// - omitting any preceding group's length from `sidebar_kind_index` makes a
+///   boundary click resolve to another identity or dead-click;
+/// - using the old hard-coded group order in one click resolver disagrees
+///   with the rendered priority and launches/selects another kind;
+/// - dropping the within-kind bound makes a neighbouring group claim a row.
 #[cfg(target_os = "macos")]
 #[test]
 fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
@@ -5679,8 +5778,8 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
         }),
     ];
 
-    // Layout: rows 0-1 sessions, rows 2-3 configured projects, rows 4-6
-    // worktrees, rows 7-11 SSH hosts, rows 12-13 configured agents.
+    // Layout: rows 0-1 sessions, rows 2-3 configured projects, rows 4-8 SSH
+    // hosts, rows 9-10 configured agents, rows 11-13 worktrees.
     assert_eq!(
         app.workspace.sidebar().rows().len(),
         14,
@@ -5720,24 +5819,24 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
         "the last project row launches the second project, not the first again"
     );
 
-    // With four sessions the layout is sessions 0-3, projects 4-5, worktrees
-    // 6-8, SSH 9-13, agents 14-15. First SSH row (9): selects the FIRST
+    // With four sessions the layout is sessions 0-3, projects 4-5, SSH 6-10,
+    // agents 11-12, worktrees 13-15. First SSH row (6): selects the FIRST
     // host, and never moves the registry selection (still the last launched
     // project's own session).
     let selected_before_ssh = app.workspace.registry().selected();
-    assert!(click_sidebar_row(&mut app, 9), "the first SSH row");
+    assert!(click_sidebar_row(&mut app, 6), "the first SSH row");
     assert_eq!(app.workspace.selected_ssh_target(), Some("alpha"));
     assert_eq!(
         app.workspace.registry().selected(),
         selected_before_ssh,
         "an SSH row click never selects a registry session"
     );
-    // Last SSH row (13): selects the LAST host.
-    assert!(click_sidebar_row(&mut app, 13), "the last SSH row");
+    // Last SSH row (10): selects the LAST host.
+    assert!(click_sidebar_row(&mut app, 10), "the last SSH row");
     assert_eq!(app.workspace.selected_ssh_target(), Some("echo"));
 
-    // First agent row (14): launches the FIRST configured agent.
-    assert!(click_sidebar_row(&mut app, 14), "the first agent row");
+    // First agent row (11): launches the FIRST configured agent.
+    assert!(click_sidebar_row(&mut app, 11), "the first agent row");
     assert_eq!(
         agent_session_names(&app),
         vec!["mix-agent-one".to_owned()],
@@ -5745,8 +5844,8 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
     );
 
     // Each launch adds a session row, shifting the rows below: with five
-    // sessions the agent block occupies rows 15-16. Last agent row.
-    assert!(click_sidebar_row(&mut app, 16), "the last agent row");
+    // sessions the agent block occupies rows 12-13. Last agent row.
+    assert!(click_sidebar_row(&mut app, 13), "the last agent row");
     assert_eq!(
         agent_session_names(&app),
         vec!["mix-agent-one".to_owned(), "mix-agent-two".to_owned()],
@@ -5757,9 +5856,9 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
         "the two agent clicks resolved to two DIFFERENT agents"
     );
 
-    // Row 18 — immediately after the last agent row (with six sessions the
-    // layout is sessions 0-5, projects 6-7, worktrees 8-10, SSH 11-15,
-    // agents 16-17) — selects nothing: not a session, not a project, not a
+    // Row 18 — immediately after the worktree group (with six sessions the
+    // layout is sessions 0-5, projects 6-7, SSH 8-12, agents 13-14,
+    // worktrees 15-17) — selects nothing: not a session, not a project, not a
     // host, not an agent, no wrap-around, and no state changes at all. (The
     // launches already cleared the pending SSH choice by selecting their own
     // sessions, so the invariant here is that a dead click changes NOTHING.)
@@ -5768,7 +5867,7 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
     let project_roots = project_session_roots(&app);
     assert!(
         !click_sidebar_row(&mut app, 18),
-        "the row after the last agent row is a dead click"
+        "the row after the last group is a dead click"
     );
     assert_eq!(
         app.workspace.registry().selected(),
@@ -5786,27 +5885,27 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
         "a dead click must not launch a project"
     );
 
-    // Last worktree row (row 10 with six sessions): launches a session
+    // Last worktree row (row 17 with six sessions): launches a session
     // rooted at the THIRD worktree — the row the user clicked, not the one
     // an offset error would resolve to.
-    assert!(click_sidebar_row(&mut app, 10), "the last worktree row");
+    assert!(click_sidebar_row(&mut app, 17), "the last worktree row");
     assert_eq!(
         worktree_session_paths(&app),
         vec![worktree_paths[2].clone()],
         "the click launches the worktree the user pointed at"
     );
 
-    // With seven sessions the worktree block occupies rows 9-11. First
+    // With seven sessions the worktree block occupies rows 16-18. First
     // worktree row.
-    assert!(click_sidebar_row(&mut app, 9), "the first worktree row");
+    assert!(click_sidebar_row(&mut app, 16), "the first worktree row");
     assert_eq!(
         worktree_session_paths(&app),
         vec![worktree_paths[2].clone(), worktree_paths[0].clone()]
     );
 
-    // With eight sessions the worktree block occupies rows 10-12; the middle
-    // worktree is row 11.
-    assert!(click_sidebar_row(&mut app, 11), "a middle worktree row");
+    // With eight sessions the worktree block occupies rows 17-19; the middle
+    // worktree is row 18.
+    assert!(click_sidebar_row(&mut app, 18), "a middle worktree row");
     assert_eq!(
         worktree_session_paths(&app),
         vec![
@@ -5818,8 +5917,8 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
 
     // After the launches the accumulated counts changed (nine sessions), so
     // the project, SSH, and agent boundaries are re-asserted at their new
-    // offsets: sessions 0-8, projects 9-10, worktrees 11-13, SSH 14-18,
-    // agents 19-20.
+    // offsets: sessions 0-8, projects 9-10, SSH 11-15, agents 16-17,
+    // worktrees 18-20.
     assert_eq!(
         app.workspace.sidebar().rows().len(),
         21,
@@ -5836,8 +5935,8 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
         "the project offset must track the grown session block"
     );
     // That launch grew the session block again (ten sessions): sessions
-    // 0-9, projects 10-11, worktrees 12-14, SSH 15-19, agents 20-21.
-    assert!(click_sidebar_row(&mut app, 15), "the first SSH row again");
+    // 0-9, projects 10-11, SSH 12-16, agents 17-18, worktrees 19-21.
+    assert!(click_sidebar_row(&mut app, 12), "the first SSH row again");
     assert_eq!(
         app.workspace.selected_ssh_target(),
         Some("alpha"),
@@ -5845,7 +5944,7 @@ fn mixed_sidebar_clicks_select_the_row_the_user_clicked() {
     );
     assert!(
         !click_sidebar_row(&mut app, 22),
-        "the row after the last agent row stays dead after the shifts"
+        "the row after the last group stays dead after the shifts"
     );
 
     for path in &worktree_paths {
@@ -6638,13 +6737,13 @@ fn quitting_persists_project_sessions_beside_every_creatable_kind() {
     app.workspace
         .load_worktrees(WorktreeDiscovery::from_records(worktree_records));
 
-    // One local session (palette), then the project row (row 1), the
-    // worktree row (row 3 after the project launch), and the agent row
-    // (row 5 after the worktree launch).
+    // One local session (palette), then the project row (row 1), the agent
+    // row (row 3 after the project launch), and the worktree row (row 5 after
+    // the agent launch), following the default group priority.
     app.run_workspace_action(WorkspaceAction::CreateSession);
     assert!(click_sidebar_row(&mut app, 1), "the project row launches");
-    assert!(click_sidebar_row(&mut app, 3), "the worktree row launches");
-    assert!(click_sidebar_row(&mut app, 5), "the agent row launches");
+    assert!(click_sidebar_row(&mut app, 3), "the agent row launches");
+    assert!(click_sidebar_row(&mut app, 5), "the worktree row launches");
     let ids = registry_ids(&app);
     assert_eq!(ids.len(), 4);
     for id in &ids {
@@ -6696,11 +6795,11 @@ fn quitting_persists_project_sessions_beside_every_creatable_kind() {
             SessionKind::Project {
                 root: project_paths[0].clone()
             },
-            SessionKind::Worktree {
-                path: worktree_paths[0].clone()
-            },
             SessionKind::Agent {
                 name: "persist-agent".to_owned()
+            },
+            SessionKind::Worktree {
+                path: worktree_paths[0].clone()
             },
         ]
     );

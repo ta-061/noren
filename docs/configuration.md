@@ -50,20 +50,28 @@ can push the grid past that ceiling.
 
 ### `[sidebar]`
 
-Controls how many cell columns the sidebar occupies. This is an optional
-workspace preference: the default 16-column row already shows a distinct
-lifecycle marker in its final cell, without configuration.
+Controls the sidebar width and the order of its five row-kind groups. Both
+settings are optional. At the defaults, every 16-column row has a kind shape
+in column 1 and stateful rows keep a lifecycle shape in the final cell.
 
-| Key | Type | Default | Accepted range | Meaning |
+| Key | Type | Default | Accepted values | Meaning |
 | --- | --- | --- | --- | --- |
 | `columns` | integer | `16` | `8..=159` | Sidebar width in terminal cell columns. |
+| `kind_order` | array of strings | `["session", "project", "ssh", "agent", "worktree"]` | One complete permutation of `session`, `project`, `ssh`, `agent`, `worktree` | Top-to-bottom priority of contiguous row-kind groups. |
 
-Session identity text uses the available cells and truncates with `...` when
-necessary; the lifecycle cell is always reserved and never truncated. The
-upper bound is one less than `MAX_RENDER_COLS`, so even the widest configured
-sidebar leaves one drawable terminal column. Unknown keys, wrong types, and
-out-of-range widths are hard errors under the same closed-schema rules as the
-other tables.
+The default ordering deliberately puts discovered worktrees last: even when a
+repository reaches the 24-worktree display cap, sessions and configured
+project, SSH, and agent targets remain at the top instead of being buried.
+Users may replace that priority without patching source. Omitting, repeating,
+or inventing a kind is an error, so rendering and click mapping always share
+one unambiguous order.
+
+Every kind uses the same identity region and truncates with `...` when
+necessary; the ellipsis is kept inside the region and the lifecycle cell is
+always reserved. The width upper bound is one less than `MAX_RENDER_COLS`, so
+even the widest configured sidebar leaves one drawable terminal column.
+Unknown keys, wrong types, and invalid values are hard errors under the same
+closed-schema rules as the other tables.
 
 ### `[keys]`
 
@@ -374,6 +382,7 @@ cell_height = 24
 
 [sidebar]
 columns = 24
+kind_order = ["session", "project", "ssh", "agent", "worktree"]
 
 [keys]
 palette_open = "super+k"
