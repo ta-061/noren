@@ -4131,6 +4131,31 @@ fn ime_large_multibyte_commit_keeps_scalar_bytes_ordered_between_chunks() {
 }
 
 #[test]
+fn ime_large_commit_encodes_a_newline_at_the_chunk_boundary_without_reordering() {
+    let commit = [
+        "L".repeat(READ_CHUNK_BYTES - 1),
+        "\n".to_owned(),
+        "R".repeat(READ_CHUNK_BYTES + 1),
+    ]
+    .concat();
+    let expected = [
+        vec![b'L'; READ_CHUNK_BYTES - 1],
+        b"\r".to_vec(),
+        vec![b'R'; READ_CHUNK_BYTES + 1],
+    ]
+    .concat();
+    let received = capture_ime_events(
+        [WindowEvent::Ime(Ime::Commit(commit))],
+        expected.len(),
+        ImeCaptureScreen::Primary,
+    );
+
+    assert_eq!(received, expected);
+    assert_eq!(received[READ_CHUNK_BYTES - 1], b'\r');
+    assert_eq!(received[READ_CHUNK_BYTES], b'R');
+}
+
+#[test]
 fn ime_committed_newline_reaches_the_pty_through_enter_encoding() {
     let received = capture_ime_events(
         [WindowEvent::Ime(Ime::Commit("\n".to_owned()))],
@@ -4138,6 +4163,18 @@ fn ime_committed_newline_reaches_the_pty_through_enter_encoding() {
         ImeCaptureScreen::Primary,
     );
     assert_eq!(received, b"\r");
+}
+
+#[test]
+fn ime_multiline_commit_preserves_utf8_around_the_encoded_newline() {
+    let commit = "before日本\n語after";
+    let expected = ["before日本".as_bytes(), b"\r", "語after".as_bytes()].concat();
+    let received = capture_ime_events(
+        [WindowEvent::Ime(Ime::Commit(commit.to_owned()))],
+        expected.len(),
+        ImeCaptureScreen::Primary,
+    );
+    assert_eq!(received, expected);
 }
 
 #[test]
