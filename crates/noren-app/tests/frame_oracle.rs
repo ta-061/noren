@@ -3250,6 +3250,23 @@ fn sidebar_kind_markers_are_identifiable_and_on_row_at_16_columns() {
             Some(' '),
             "{kind:?} must retain the separator after its shape"
         );
+        let expected_final = if kind == EntryKind::Worktree {
+            ' '
+        } else {
+            '■'
+        };
+        assert_eq!(
+            row.text().chars().nth(SIDEBAR_COLS - 1),
+            Some(expected_final),
+            "{kind:?} must retain its structured final lifecycle cell"
+        );
+        if kind != EntryKind::Session {
+            assert_eq!(
+                row.text().chars().skip(11).take(3).collect::<String>(),
+                "...",
+                "{kind:?} must keep the exact ellipsis pixels before its suffix"
+            );
+        }
 
         let (signature, _) = sidebar_cell_vertex_oracle(&row, &DARK, 1);
         assert!(!signature.is_empty(), "{kind:?} emitted no kind geometry");
