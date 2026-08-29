@@ -1044,7 +1044,7 @@ fn glyph_vertices_with_chrome_budget(
 /// scrollback rows is the inclusive upper bound. Alternate-screen content is
 /// intentionally isolated: its effective offset is always zero even if the
 /// application carries a stale primary-screen view request.
-fn clamped_scroll_offset(snapshot: &TerminalSnapshot, requested: usize) -> usize {
+pub(crate) fn clamped_scroll_offset(snapshot: &TerminalSnapshot, requested: usize) -> usize {
     if snapshot.modes().is_alternate_screen_active() {
         0
     } else {

@@ -235,17 +235,18 @@ Each item states what you would actually see if you ran the build.
   pins the collision set to exactly that hardcoded allowlist, so a future
   glyph edit cannot reintroduce a case-blind or diacritic-losing collision
   (or invent a new box-drawing alias) silently.
-- **IME input is discarded.** `WindowEvent::Ime(_)` is dropped without reaching
-  the terminal — the `WindowEvent::Ime(_)` arm in `main.rs`'s event handler
-  drops the event without forwarding it. Japanese, Chinese, and
-  Korean input methods produce nothing. For a user typing Japanese into
-  Noren today this means: composing with an IME inserts no text at all
-  (the composition never reaches the PTY), and any Japanese that a running
-  program *outputs* (`cat`, `ls`, a build log) draws as unreadable
-  replacement boxes — laid out at the correct two-column width so the
-  surrounding ASCII stays aligned, but the characters themselves cannot be
-  read. Neither half works today; both are Milestone 6 scope, and the width
-  half is the only half that is verified.
+- **IME commits work, but preedit is not displayed and CJK glyphs remain
+  unreadable.** Noren enables IME delivery on the window with zero
+  configuration, keeps the platform candidate area at the terminal cursor,
+  and sends every `WindowEvent::Ime(Ime::Commit(text))` through the ordinary
+  typed-input encoder and PTY writer. Japanese multi-byte commits and composed
+  dead-key text such as `é` therefore reach the running program byte-for-byte;
+  committed newlines and controls retain ordinary key semantics, and commits
+  are never treated as bracketed paste. `Ime::Preedit`, enable, and disable are
+  acknowledged but the in-progress composition is not drawn inside Noren yet.
+  The separate output limitation also remains: when a program echoes Japanese
+  input, the terminal model keeps its correct two-column layout but the 5x7
+  renderer draws unreadable replacement boxes rather than CJK glyphs.
 - **There is no accessibility surface.** Nothing in the tree integrates with
   assistive technology (no AccessKit, AT-SPI, or AppKit accessibility wiring);
   a screen reader has nothing to work with.
