@@ -104,7 +104,7 @@ use toml_edit::{DocumentMut, Item, TableLike};
 /// input is a [`ConfigError::TooLarge`] error instead.
 pub const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
-/// Largest accepted font cell edge in physical pixels.
+/// Largest accepted font cell edge in logical pixels.
 ///
 /// Zero is rejected outright because grid division would fault; the ceiling
 /// is policy, keeping absurdly large values an explicit error rather than a
@@ -165,7 +165,7 @@ impl Default for FontConfig {
 }
 
 impl FontConfig {
-    /// Cell width in physical pixels; defaults to [`POC_CELL_WIDTH`].
+    /// Cell width in logical pixels; defaults to [`POC_CELL_WIDTH`].
     ///
     /// Validation rejects values below the renderer's built-in
     /// [`POC_CELL_WIDTH`] or above [`MAX_CELL_EDGE`], keeping the configured
@@ -175,7 +175,7 @@ impl FontConfig {
         self.cell_width
     }
 
-    /// Cell height in physical pixels; defaults to [`POC_CELL_HEIGHT`].
+    /// Cell height in logical pixels; defaults to [`POC_CELL_HEIGHT`].
     ///
     /// Validation rejects values below the renderer's built-in
     /// [`POC_CELL_HEIGHT`] or above [`MAX_CELL_EDGE`], keeping the configured

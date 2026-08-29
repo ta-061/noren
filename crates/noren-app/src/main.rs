@@ -69,7 +69,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key as WinitKey, ModifiersState, NamedKey};
@@ -1160,6 +1160,19 @@ enum TerminalWheelRoute {
     ForwardedToApplication(Vec<Vec<u8>>),
 }
 
+/// Native window geometry reduced to the physical facts the application
+/// consumes. Tests drive this seam without constructing winit's private
+/// `InnerSizeWriter`, while production maps both relevant `WindowEvent`
+/// variants into it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WindowGeometryChange {
+    Resized(PhysicalSize<u32>),
+    ScaleFactorChanged {
+        scale_factor: f64,
+        physical: PhysicalSize<u32>,
+    },
+}
+
 struct NorenApp {
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
@@ -1717,7 +1730,8 @@ impl NorenApp {
         let changed = match self.window.as_ref() {
             Some(window) => {
                 let size = window.inner_size();
-                self.geometry.update(Resize::new(size.width, size.height))
+                self.geometry
+                    .rescale(window.scale_factor(), Resize::new(size.width, size.height))
             }
             None => self
                 .geometry
@@ -2299,7 +2313,7 @@ impl NorenApp {
         }
         let attributes = Window::default_attributes()
             .with_title(window_title())
-            .with_inner_size(PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
+            .with_inner_size(LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT));
         let Ok(window) = event_loop.create_window(attributes) else {
             eprintln!("Noren window creation failed");
             event_loop.exit();
@@ -2311,10 +2325,10 @@ impl NorenApp {
         // of being lost between keyboard events.
         window.set_ime_allowed(true);
         let physical = window.inner_size();
-        let Some(grid) = self
-            .geometry
-            .update(Resize::new(physical.width, physical.height))
-        else {
+        let Some(grid) = self.geometry.rescale(
+            window.scale_factor(),
+            Resize::new(physical.width, physical.height),
+        ) else {
             eprintln!("Noren initial window size was invalid");
             event_loop.exit();
             return;
@@ -3495,14 +3509,26 @@ impl NorenApp {
             .with_keypad(keypad_mode)
     }
 
-    fn handle_resize(&mut self, physical: PhysicalSize<u32>) {
+    fn handle_window_geometry_change(&mut self, change: WindowGeometryChange) {
+        let physical = match change {
+            WindowGeometryChange::Resized(physical)
+            | WindowGeometryChange::ScaleFactorChanged { physical, .. } => physical,
+        };
         if let Some(renderer) = &mut self.renderer {
             renderer.resize(physical);
         }
-        if let Some(grid) = self
-            .geometry
-            .update(Resize::new(physical.width, physical.height))
-        {
+        let resize = Resize::new(physical.width, physical.height);
+        let changed_grid = match change {
+            WindowGeometryChange::Resized(_) => self.geometry.update(resize),
+            WindowGeometryChange::ScaleFactorChanged { scale_factor, .. } => {
+                let grid = self.geometry.rescale(scale_factor, resize);
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_cell_metrics(self.geometry.cell_metrics());
+                }
+                grid
+            }
+        };
+        if let Some(grid) = changed_grid {
             self.pending_grid = Some(grid);
         }
         let visible_rows =
@@ -3515,10 +3541,19 @@ impl NorenApp {
         let Some(grid) = self.pending_grid.take() else {
             return;
         };
-        // Resize re-addresses the grid, so captured coordinates expire.
-        self.selection = None;
-        self.drag_origin = None;
         let runtime = RuntimeGridSize::from_window(grid, self.sidebar_columns);
+        // A changed grid re-addresses captured coordinates. A display move
+        // can force this synchronization with the same row/column counts;
+        // preserve a still-valid selection in that case while still updating
+        // terminal state and the PTY winsize.
+        let active_grid_changed = self
+            .terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.size() != (runtime.rows, runtime.cols));
+        if active_grid_changed {
+            self.selection = None;
+            self.drag_origin = None;
+        }
         if let Some(terminal) = &mut self.terminal {
             if runtime.resize_terminal(terminal).is_err() {
                 self.status = "Noren terminal resize failed";
@@ -3831,7 +3866,20 @@ impl ApplicationHandler for NorenApp {
         }
         match event {
             WindowEvent::CloseRequested => self.close(event_loop),
-            WindowEvent::Resized(physical) => self.handle_resize(physical),
+            WindowEvent::Resized(physical) => {
+                self.handle_window_geometry_change(WindowGeometryChange::Resized(physical));
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                let physical = self
+                    .window
+                    .as_ref()
+                    .expect("accepted window event has a live window")
+                    .inner_size();
+                self.handle_window_geometry_change(WindowGeometryChange::ScaleFactorChanged {
+                    scale_factor,
+                    physical,
+                });
+            }
             WindowEvent::Focused(focused) => {
                 // Focus loss must be visible in the caret (issue #200): the
                 // renderer switches between the focused mark and the
