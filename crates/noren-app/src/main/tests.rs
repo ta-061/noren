@@ -8,6 +8,101 @@ use noren_app::{BRACKET_PASTE_BEGIN, BRACKET_PASTE_END};
 include!("../input_translation/tests.rs");
 include!("../frame_geometry/tests.rs");
 
+#[derive(Default)]
+struct RecordingImeCursorArea {
+    areas: std::cell::RefCell<Vec<(PhysicalPosition<f64>, PhysicalSize<u32>)>>,
+}
+
+impl ImeCursorAreaTarget for RecordingImeCursorArea {
+    fn set_ime_cursor_area(&self, position: PhysicalPosition<f64>, size: PhysicalSize<u32>) {
+        self.areas.borrow_mut().push((position, size));
+    }
+}
+
+impl RecordingImeCursorArea {
+    fn last(&self) -> (PhysicalPosition<f64>, PhysicalSize<u32>) {
+        self.areas
+            .borrow()
+            .last()
+            .copied()
+            .expect("redraw preparation must set the platform IME cursor area")
+    }
+
+    fn len(&self) -> usize {
+        self.areas.borrow().len()
+    }
+}
+
+#[test]
+fn redraw_preparation_sets_the_platform_ime_cursor_area() {
+    let mut app = NorenApp::default();
+    let target = RecordingImeCursorArea::default();
+    let metrics = app.geometry.cell_metrics();
+
+    let snapshot = app.prepare_redraw(Some(&target));
+
+    assert!(snapshot.is_none());
+    assert_eq!(target.len(), 1, "one redraw sets the area exactly once");
+    assert_eq!(
+        target.last(),
+        (
+            PhysicalPosition::new(
+                sidebar_pixel_width_at_width(metrics.width(), app.sidebar_columns),
+                0.0,
+            ),
+            PhysicalSize::new(metrics.width(), metrics.height()),
+        )
+    );
+}
+
+#[test]
+fn platform_ime_cursor_area_follows_the_caret_and_scrolled_viewport() {
+    let mut terminal = TerminalState::new(3, 8).expect("valid terminal");
+    terminal.feed_bytes(b"one\r\ntwo\r\nthree\r\nfour");
+    assert_eq!(terminal.scrollback_len(), 1, "fixture retains one row");
+
+    let mut app = NorenApp {
+        terminal: Some(terminal),
+        ..NorenApp::default()
+    };
+    let target = RecordingImeCursorArea::default();
+    let metrics = app.geometry.cell_metrics();
+    let sidebar_width = sidebar_pixel_width_at_width(metrics.width(), app.sidebar_columns);
+    let position_for = |row: u32, column: u16| {
+        PhysicalPosition::new(
+            sidebar_width + f64::from(column) * f64::from(metrics.width()),
+            f64::from(row) * f64::from(metrics.height()),
+        )
+    };
+
+    app.prepare_redraw(Some(&target));
+    assert_eq!(target.last().0, position_for(2, 4));
+
+    app.terminal
+        .as_mut()
+        .expect("terminal remains attached")
+        .feed_bytes(b"\x1b[2;3H");
+    app.prepare_redraw(Some(&target));
+    assert_eq!(
+        target.last().0,
+        position_for(1, 2),
+        "the platform area follows both caret axes at the live tail"
+    );
+
+    app.scroll_offset = usize::MAX;
+    app.prepare_redraw(Some(&target));
+    assert_eq!(
+        app.scroll_offset, 1,
+        "the retained history clamps the request"
+    );
+    assert_eq!(
+        target.last().0,
+        position_for(2, 2),
+        "the same clamped offset that moves the rendered live row also moves the IME area"
+    );
+    assert_eq!(target.len(), 3, "each redraw refreshes the platform area");
+}
+
 /// Issue #185: the artifact's own surfaces read the single product string,
 /// the title states the version the binary was built as, and no surface
 /// calls the binary a proof of concept.

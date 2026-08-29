@@ -1129,6 +1129,21 @@ struct ParkedSession {
     scroll_offset: usize,
 }
 
+/// Narrow window seam for positioning the platform IME candidate window.
+///
+/// Keeping this operation separate from the concrete winit window lets the
+/// frame lifecycle tests observe the area that production sends to the
+/// platform without creating a native window.
+trait ImeCursorAreaTarget {
+    fn set_ime_cursor_area(&self, position: PhysicalPosition<f64>, size: PhysicalSize<u32>);
+}
+
+impl ImeCursorAreaTarget for Window {
+    fn set_ime_cursor_area(&self, position: PhysicalPosition<f64>, size: PhysicalSize<u32>) {
+        Window::set_ime_cursor_area(self, position, size);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScrollDirection {
     Older,
@@ -2326,7 +2341,8 @@ impl NorenApp {
                 None
             }
         };
-        self.set_ime_cursor_area(&window);
+        let snapshot = self.terminal.as_ref().map(TerminalEngine::snapshot);
+        self.set_ime_cursor_area(window.as_ref(), snapshot.as_ref());
         window.request_redraw();
         self.window = Some(window);
     }
@@ -3353,26 +3369,48 @@ impl NorenApp {
 
     /// Keep the platform candidate window beside the terminal's insertion
     /// cell. The terminal grid is sized after reserving the sidebar and status
-    /// chrome, so its tracked cursor row maps directly to a frame row.
-    fn set_ime_cursor_area(&self, window: &Window) {
+    /// chrome. A scrolled viewport shifts the live insertion row down by its
+    /// renderer-clamped offset, so the platform area follows the same cell.
+    fn set_ime_cursor_area<T: ImeCursorAreaTarget + ?Sized>(
+        &self,
+        window: &T,
+        snapshot: Option<&noren_terminal::TerminalSnapshot>,
+    ) {
         let metrics = self.geometry.cell_metrics();
-        let (row, column) = self
-            .terminal
-            .as_ref()
-            .map(|terminal| {
-                let cursor = terminal.cursor();
-                (cursor.row(), cursor.column())
+        let (row, column) = snapshot
+            .map(|snapshot| {
+                let cursor = snapshot.cursor();
+                let scroll_offset = renderer::clamped_scroll_offset(snapshot, self.scroll_offset);
+                (
+                    usize::from(cursor.row()).saturating_add(scroll_offset),
+                    cursor.column(),
+                )
             })
             .unwrap_or((0, 0));
         let position = PhysicalPosition::new(
             sidebar_pixel_width_at_width(metrics.width(), self.sidebar_columns)
                 + f64::from(column) * f64::from(metrics.width()),
-            f64::from(row) * f64::from(metrics.height()),
+            f64::from(u32::try_from(row).unwrap_or(u32::MAX)) * f64::from(metrics.height()),
         );
         window.set_ime_cursor_area(
             position,
             PhysicalSize::new(metrics.width(), metrics.height()),
         );
+    }
+
+    /// Prepare the terminal snapshot and platform IME area consumed by one
+    /// redraw. Tests drive this window-independent seam with a recording
+    /// target, while production hands the returned snapshot to the renderer.
+    fn prepare_redraw<T: ImeCursorAreaTarget + ?Sized>(
+        &mut self,
+        window: Option<&T>,
+    ) -> Option<noren_terminal::TerminalSnapshot> {
+        self.clamp_active_scroll_offset();
+        let snapshot = self.terminal.as_ref().map(TerminalEngine::snapshot);
+        if let Some(window) = window {
+            self.set_ime_cursor_area(window, snapshot.as_ref());
+        }
+        snapshot
     }
 
     /// Toggle the opt-in diagnostics overlay.
@@ -3619,11 +3657,8 @@ impl NorenApp {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
-            self.set_ime_cursor_area(window);
-        }
-        self.clamp_active_scroll_offset();
-        let snapshot = self.terminal.as_ref().map(TerminalEngine::snapshot);
+        let window = self.window.as_ref().map(Arc::clone);
+        let snapshot = self.prepare_redraw(window.as_deref());
         let visible_rows = self
             .window
             .as_ref()
