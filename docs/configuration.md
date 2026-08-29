@@ -126,11 +126,12 @@ screen they are forwarded unchanged to the running application. Rebinding
 either action changes the live input match and the history indicator together.
 
 The mouse wheel follows the terminal/application boundary rather than a user
-toggle. When the running application has enabled DEC mouse tracking mode 1000,
-1002, or 1003, every terminal-side wheel click is forwarded to it (including
-with Shift held); this preserves Zellij/vim ownership. With no tracking mode,
-the wheel scrolls Noren's retained primary-screen history locally. The sidebar
-is Noren-owned chrome and keeps its own local wheel behavior.
+toggle. When the running application has enabled DEC mouse tracking mode 9,
+1000, 1002, or 1003, every terminal-side wheel click is forwarded to it
+(including with Shift held); this preserves X10 applications and Zellij/vim
+ownership. With no tracking mode, the wheel scrolls Noren's retained
+primary-screen history locally. The sidebar is Noren-owned chrome and keeps its
+own local wheel behavior.
 
 At offset zero, new output follows the live tail automatically. After a user
 deliberately scrolls above it, ordinary output preserves that non-zero offset

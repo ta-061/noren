@@ -13,6 +13,7 @@
 //! # Mode model
 //!
 //! Tracking modes decide *whether* a report is produced:
+//! - **9** — X10 tracking: report button presses and wheel clicks.
 //! - **1000** — normal mouse tracking: report press, release, and wheel.
 //! - **1002** — button-event tracking: also report motion while a button is held.
 //! - **1003** — any-event tracking: report all motion, with or without a button.
@@ -54,7 +55,9 @@
 /// DEC private mode numbers for mouse tracking and encoding.
 ///
 /// These are the values carried by `CSI ? <mode> h` (DECSET) and
-/// `CSI ? <mode> l` (DECRST). Zellij's client enables all of these on attach.
+/// `CSI ? <mode> l` (DECRST). Zellij's client enables the 1000-series modes;
+/// mode 9 is the older X10 tracking claim.
+pub const MODE_X10: u16 = 9;
 pub const MODE_NORMAL: u16 = 1000;
 pub const MODE_BUTTON_EVENT: u16 = 1002;
 pub const MODE_ANY_EVENT: u16 = 1003;
@@ -81,13 +84,14 @@ const CB_CTRL: u32 = 16;
 
 /// Encoder-facing projection of the terminal's active mouse modes.
 ///
-/// Tracking flags (1000/1002/1003) gate *whether* a report is produced;
+/// Tracking flags (9/1000/1002/1003) gate *whether* a report is produced;
 /// encoding flags (1005/1006/1015) gate *how* it is formatted. The two
 /// groups are independent. The application derives this value from the active
 /// `TerminalState::modes()` for each pointer event; it is not a second source
 /// of DECSET/DECRST state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MouseModes {
+    x10: bool,
     normal: bool,
     button_event: bool,
     any_event: bool,
@@ -101,6 +105,7 @@ impl MouseModes {
     #[must_use]
     pub const fn disabled() -> Self {
         Self {
+            x10: false,
             normal: false,
             button_event: false,
             any_event: false,
@@ -108,6 +113,13 @@ impl MouseModes {
             sgr: false,
             urxvt: false,
         }
+    }
+
+    /// Set X10 mouse tracking (mode 9): button presses and wheel clicks.
+    #[must_use]
+    pub const fn with_x10(mut self, on: bool) -> Self {
+        self.x10 = on;
+        self
     }
 
     /// Set normal mouse tracking (mode 1000): press/release/wheel.
@@ -163,6 +175,7 @@ impl MouseModes {
     #[must_use]
     pub fn set(self, mode: u16, on: bool) -> Self {
         match mode {
+            MODE_X10 => self.with_x10(on),
             MODE_NORMAL => self.with_normal(on),
             MODE_BUTTON_EVENT => self.with_button_event(on),
             MODE_ANY_EVENT => self.with_any_event(on),
@@ -177,6 +190,14 @@ impl MouseModes {
     /// all. With this false every event produces `None`.
     #[must_use]
     pub const fn is_tracked(self) -> bool {
+        self.x10 || self.normal || self.button_event || self.any_event
+    }
+
+    /// Whether release reports are part of the active tracking mode.
+    ///
+    /// Plain mode 9 reports presses only. Any 1000-series tracking claim adds
+    /// release reporting even if mode 9 remains enabled alongside it.
+    const fn reports_release(self) -> bool {
         self.normal || self.button_event || self.any_event
     }
 
@@ -417,6 +438,9 @@ impl MouseEncoder {
             PointerKind::Press(button) => (button_code(button) | modifiers, false),
             PointerKind::Wheel(direction) => (wheel_code(direction) | modifiers, false),
             PointerKind::Release(button) => {
+                if !modes.reports_release() {
+                    return None;
+                }
                 // SGR is the only form that distinguishes the released button
                 // (it keeps the button code and switches the terminator to 'm').
                 // Legacy X10 and urxvt collapse every release to Cb = 3.

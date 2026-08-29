@@ -23,7 +23,8 @@ pub enum TerminalWheelOwner {
 /// tracked wheel back to Noren.
 #[must_use]
 pub const fn terminal_wheel_owner(modes: TerminalModes) -> TerminalWheelOwner {
-    if modes.is_mouse_normal_tracking_enabled()
+    if modes.is_mouse_x10_tracking_enabled()
+        || modes.is_mouse_normal_tracking_enabled()
         || modes.is_mouse_button_event_tracking_enabled()
         || modes.is_mouse_any_event_tracking_enabled()
     {

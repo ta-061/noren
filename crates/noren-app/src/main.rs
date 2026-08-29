@@ -3056,7 +3056,7 @@ impl NorenApp {
 
     /// Resolve and apply the terminal-side ownership of one wheel delta.
     ///
-    /// Any authoritative tracking mode (1000/1002/1003) gives the application
+    /// Any authoritative tracking mode (9/1000/1002/1003) gives the application
     /// the wheel, including when Shift is held. Without tracking, Noren
     /// consumes the delta as local primary-screen history navigation. This is
     /// the ADR-0003 boundary in one branch: inside belongs to Zellij/vim when
@@ -3183,7 +3183,8 @@ impl NorenApp {
     }
 
     /// Whether pointer events should be reported to the PTY instead of driving
-    /// local text selection. Active when a tracking mode (1000/1002/1003) is on
+    /// local text selection. Active when a tracking mode (9/1000/1002/1003) is
+    /// on
     /// and Shift is not held — Shift bypasses reporting so the user can still
     /// select text while a program tracks the mouse, matching xterm/iTerm.
     fn mouse_reportable(&self) -> bool {
@@ -3254,6 +3255,7 @@ impl NorenApp {
             return MouseModes::disabled();
         };
         MouseModes::disabled()
+            .with_x10(modes.is_mouse_x10_tracking_enabled())
             .with_normal(modes.is_mouse_normal_tracking_enabled())
             .with_button_event(modes.is_mouse_button_event_tracking_enabled())
             .with_any_event(modes.is_mouse_any_event_tracking_enabled())

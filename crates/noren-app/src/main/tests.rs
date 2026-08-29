@@ -1472,6 +1472,11 @@ fn mode_1003_forwards_wheel_instead_of_consuming_scrollback() {
 }
 
 #[test]
+fn mode_9_forwards_wheel_instead_of_consuming_scrollback() {
+    assert_tracking_mode_forwards_wheel(b"\x1b[?9h");
+}
+
+#[test]
 fn mouse_tracking_enable_then_disable_restores_local_wheel_scrolling() {
     let mut app = NorenApp {
         terminal: Some(history_terminal(3, 6)),
@@ -1588,8 +1593,9 @@ fn app_decrst_mouse_output_disables_encoding() {
 }
 
 #[test]
-fn app_current_mouse_modes_projects_all_six_terminal_flags() {
+fn app_current_mouse_modes_projects_all_seven_terminal_flags() {
     let cases: &[(&[u8], MouseModes)] = &[
+        (b"\x1b[?9h", MouseModes::disabled().with_x10(true)),
         (b"\x1b[?1000h", MouseModes::disabled().with_normal(true)),
         (
             b"\x1b[?1002h",

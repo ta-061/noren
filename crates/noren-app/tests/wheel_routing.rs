@@ -35,3 +35,21 @@ fn app_routes_wheel_by_authoritative_terminal_tracking_mode() {
         );
     }
 }
+
+#[test]
+fn x10_mode_9_routes_wheel_to_the_application() {
+    let mut terminal = TerminalState::new(3, 8).expect("valid terminal");
+    terminal.feed_bytes(b"\x1b[?9h");
+    assert_eq!(
+        terminal_wheel_owner(terminal.modes()),
+        TerminalWheelOwner::Application,
+        "mode 9 is an application wheel claim"
+    );
+
+    terminal.feed_bytes(b"\x1b[?9l");
+    assert_eq!(
+        terminal_wheel_owner(terminal.modes()),
+        TerminalWheelOwner::LocalHistory,
+        "resetting mode 9 restores local wheel ownership"
+    );
+}

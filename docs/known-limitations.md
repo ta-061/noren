@@ -49,10 +49,11 @@ binary. What now actually happens on screen:
   terminal state's authoritative mode tracking (`current_mouse_modes` in
   `main.rs`): a program that never enables a tracking mode receives no
   reports. Shift bypasses button/motion reporting so local text selection
-  still works (`mouse_reportable`), but a tracked wheel remains application
-  input even with Shift held; without tracking, that wheel navigates Noren's
-  retained history. Clicks, drags, and the wheel therefore reach programs that
-  ask for them — Zellij, `vim` with `set mouse=a`, and `tmux` among them.
+  still works (`mouse_reportable`), but a wheel claimed by mode 9, 1000, 1002,
+  or 1003 remains application input even with Shift held; without tracking,
+  that wheel navigates Noren's retained history. Clicks, drags, and the wheel
+  therefore reach programs that ask for them — Zellij, `vim` with `set
+  mouse=a`, and `tmux` among them.
 - **Configured cell size reaches the renderer.** `[font] cell_width` /
   `cell_height` flow through `GridGeometry::with_cells` to the drawing path;
   the regression test `configured_cell_sizes_drive_the_app_geometry` in the
