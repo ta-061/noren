@@ -225,6 +225,15 @@ fn cell_pattern(frame: &CapturedFrame, row: u32, col: u32) -> Vec<bool> {
     pattern
 }
 
+/// Every RGBA pixel in cell `(row, col)`, including its background.
+fn cell_pixels(frame: &CapturedFrame, row: u32, col: u32) -> Vec<[u8; 4]> {
+    (0..CELL_HEIGHT)
+        .flat_map(|y| {
+            (0..CELL_WIDTH).map(move |x| frame.pixel(col * CELL_WIDTH + x, row * CELL_HEIGHT + y))
+        })
+        .collect()
+}
+
 /// The distinct lit (non-background) colours inside cell `(row, col)`.
 ///
 /// This is the colour-aware counterpart of [`cell_pattern`]: where that
@@ -370,6 +379,52 @@ fn rectangle_pixel_bounds(rectangle: &[Vertex], target: Target) -> (u32, u32, u3
     let x = |ndc: f32| (((ndc + 1.0) * target.width as f32) / 2.0).round() as u32;
     let y = |ndc: f32| (((1.0 - ndc) * target.height as f32) / 2.0).round() as u32;
     (x(left), y(top), x(right), y(bottom))
+}
+
+/// Rasterize the production rectangle stream exactly enough to keep pixel
+/// mutation guards active on adapter-less machines. The real wgpu readback is
+/// still asserted when Metal exists; this fallback has no parallel glyph or
+/// cursor logic because all positions, ordering, and colours come from the
+/// shipped vertex generator and its constant-colour fragment shader.
+fn rasterized_vertex_frame(target: Target, vertices: &[Vertex]) -> CapturedFrame {
+    let [red, green, blue] = target.theme.background_u8();
+    let pixel_count = usize::try_from(target.width)
+        .unwrap_or(0)
+        .saturating_mul(usize::try_from(target.height).unwrap_or(0));
+    let mut rgba = vec![0; pixel_count.saturating_mul(4)];
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[red, green, blue, u8::MAX]);
+    }
+    assert_eq!(
+        vertices.len() % 6,
+        0,
+        "the production stream must contain complete rectangles"
+    );
+    for rectangle in vertices.chunks_exact(6) {
+        assert!(
+            rectangle
+                .iter()
+                .all(|vertex| vertex.color == rectangle[0].color),
+            "one renderer rectangle must use one constant colour"
+        );
+        let [red, green, blue] = rectangle[0]
+            .color
+            .map(|channel| (channel * 255.0).round() as u8);
+        let (x0, y0, x1, y1) = rectangle_pixel_bounds(rectangle, target);
+        for y in y0.min(target.height)..y1.min(target.height) {
+            for x in x0.min(target.width)..x1.min(target.width) {
+                let index = (usize::try_from(y).unwrap_or(0)
+                    * usize::try_from(target.width).unwrap_or(0)
+                    + usize::try_from(x).unwrap_or(0))
+                    * 4;
+                rgba[index..index + 4].copy_from_slice(&[red, green, blue, u8::MAX]);
+            }
+        }
+    }
+    CapturedFrame {
+        width: target.width,
+        rgba,
+    }
 }
 
 /// The default foreground as captured bytes, derived from the renderer's own
@@ -1749,6 +1804,89 @@ fn selection_highlight_follows_each_configured_theme_in_frame_pixels() {
             "{name}: selected glyph does not use the readable theme foreground"
         );
     }
+}
+
+/// A selected cell still exposes the focused block caret by reversing the
+/// selection pair. The control frame differs only by DECTCEM visibility, so
+/// every compared pixel belongs to the same glyph in the same selected cell.
+#[test]
+fn cursor_inside_selection_inverts_the_same_cell_pixels() {
+    // Reuse the passing cursor oracle's visible/hidden mechanism: `Target::new`
+    // supplies the focused block style, while DECTCEM alone controls whether
+    // the otherwise-identical frame draws it.
+    let visible = snapshot(1, 3, b"A\r\x1b[?25h");
+    let hidden = snapshot(1, 3, b"A\r\x1b[?25l");
+    assert_eq!(visible.cursor(), hidden.cursor());
+    assert_eq!(
+        (visible.cursor().row(), visible.cursor().column()),
+        (0, 0),
+        "fixture must put the caret inside the selected cell"
+    );
+    assert!(visible.is_cursor_visible());
+    assert!(!hidden.is_cursor_visible());
+
+    let selection = Selection::new(
+        &visible,
+        SelectionMode::Char,
+        GridPoint::new(0, 0),
+        GridPoint::new(0, 0),
+    );
+    assert_eq!(selection.extract(&visible), "A");
+    assert_eq!(selection.extract(&hidden), "A");
+
+    let foreground = DARK.selection_foreground_u8();
+    let background = DARK.selection_background_u8();
+    let assert_same_cell_inversion = |caret: &CapturedFrame, plain: &CapturedFrame| {
+        let caret_pixels = cell_pixels(caret, 0, 0);
+        let plain_pixels = cell_pixels(plain, 0, 0);
+        assert_ne!(
+            caret_pixels, plain_pixels,
+            "the caret must change its own selected cell"
+        );
+        for (index, (caret, plain)) in caret_pixels.iter().zip(&plain_pixels).enumerate() {
+            let caret_rgb = [caret[0], caret[1], caret[2]];
+            let plain_rgb = [plain[0], plain[1], plain[2]];
+            let expected = if colors_match(plain_rgb, foreground) {
+                background
+            } else {
+                assert!(
+                    colors_match(plain_rgb, background),
+                    "plain selected-cell pixel {index} is outside the selection pair: {plain:?}"
+                );
+                foreground
+            };
+            assert!(
+                colors_match(caret_rgb, expected),
+                "caret pixel {index} must invert the same plain selected-cell pixel: \
+                 plain={plain:?}, caret={caret:?}, expected RGB {expected:?}"
+            );
+            assert_eq!(
+                caret[3], plain[3],
+                "caret pixel {index} must preserve the same cell pixel's alpha"
+            );
+        }
+    };
+
+    let target = Target::new(
+        &DARK,
+        u32::from(visible.cols()) * CELL_WIDTH,
+        u32::from(visible.rows()) * CELL_HEIGHT,
+        poc_metrics(),
+    );
+    let chrome = FrameChrome::new(None, None).with_selection(Some(&selection));
+    let caret_vertices = glyph_vertices_for_chrome(target, Some(&visible), chrome);
+    let plain_vertices = glyph_vertices_for_chrome(target, Some(&hidden), chrome);
+    let caret_vertex_frame = rasterized_vertex_frame(target, &caret_vertices);
+    let plain_vertex_frame = rasterized_vertex_frame(target, &plain_vertices);
+    assert_same_cell_inversion(&caret_vertex_frame, &plain_vertex_frame);
+
+    let Some(renderer) = renderer_or_skip("cursor_inside_selection_inverts_the_same_cell_pixels")
+    else {
+        return;
+    };
+    let caret_frame = render_with_selection(&renderer, &DARK, &visible, &selection);
+    let plain_frame = render_with_selection(&renderer, &DARK, &hidden, &selection);
+    assert_same_cell_inversion(&caret_frame, &plain_frame);
 }
 
 // ===========================================================================
