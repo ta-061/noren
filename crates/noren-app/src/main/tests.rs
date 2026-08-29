@@ -3898,6 +3898,137 @@ fn wait_for_shell_output(app: &mut NorenApp) {
     }
 }
 
+/// A real `WindowEvent::Ime` commit must survive the complete production path:
+/// event dispatch -> typed-input encoding -> `PtySession::send_input` -> the
+/// supervisor's PTY-master `write_all` -> bytes read by the child.
+///
+/// The child switches its slave to raw mode and lets `dd` read exactly the
+/// expected byte count before `od` reports those bytes back. The assertion is
+/// therefore downstream of the actual PTY write, not an assertion on the
+/// encoder result or the supervisor command buffer. Fallback bytes are queued
+/// after the IME events so dropping a commit or writing only its first byte
+/// makes `dd` finish promptly with visibly wrong bytes instead of timing out.
+#[test]
+fn ime_window_events_reach_the_real_pty_write_byte_for_byte() {
+    const READY: &str = "IME204_READY";
+    const DONE: &str = "IME204_DONE";
+    const EXPECTED: &[u8] = &[
+        0xe6, 0x97, 0xa5, // 日
+        0xe6, 0x9c, 0xac, // 本
+        0xe8, 0xaa, 0x9e, // 語
+        0xc3, 0xa9, // é (dead-key composition)
+        0x0d, // committed newline follows the ordinary Enter path
+        0x03, // committed ETX follows the ordinary Ctrl+C path
+    ];
+
+    let home = AppTestHome::new();
+    let mut app = home.app();
+    app.run_workspace_action(WorkspaceAction::CreateSession);
+    wait_for_shell_output(&mut app);
+
+    // The child enables both alternate-screen and bracketed-paste modes before
+    // reading. IME remains typed input in that state: it must neither be gated
+    // by the alternate screen nor wrapped in paste markers just because mode
+    // 2004 is active.
+    let setup = format!(
+        "printf '\\033[?1049h\\033[?2004h{READY}\\r\\n'; \
+         /bin/stty raw -echo; \
+         /bin/dd bs=1 count={} 2>/dev/null | /usr/bin/od -An -v -tx1; \
+         /bin/stty sane; printf '\\r\\n{DONE}\\r\\n'\r",
+        EXPECTED.len()
+    );
+    app.send_input(setup.as_bytes());
+
+    let ready_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        app.drain_pty();
+        let ready = app.terminal.as_ref().is_some_and(|terminal| {
+            let modes = terminal.modes();
+            modes.is_alternate_screen_active()
+                && modes.is_bracketed_paste_enabled()
+                && terminal_text(terminal).contains(READY)
+        });
+        if ready {
+            break;
+        }
+        assert!(
+            Instant::now() < ready_deadline,
+            "the raw-byte reader never became ready in alternate-screen + mode 2004; \
+             terminal said: {:?}",
+            app.terminal.as_ref().map(terminal_text).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let drops_before = diagnostics::ime_drop_count();
+    for event in [
+        WindowEvent::Ime(Ime::Enabled),
+        WindowEvent::Ime(Ime::Preedit("に".to_owned(), Some((3, 3)))),
+        WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+        WindowEvent::Ime(Ime::Commit(String::new())),
+        WindowEvent::Ime(Ime::Commit("日本語".to_owned())),
+        WindowEvent::Ime(Ime::Preedit("´".to_owned(), Some((2, 2)))),
+        WindowEvent::Ime(Ime::Preedit(String::new(), None)),
+        WindowEvent::Ime(Ime::Commit("é".to_owned())),
+        WindowEvent::Ime(Ime::Commit("\n".to_owned())),
+        WindowEvent::Ime(Ime::Commit("\u{3}".to_owned())),
+        WindowEvent::Ime(Ime::Disabled),
+    ] {
+        assert!(
+            app.handle_ime_window_event(&event),
+            "the production IME branch must consume every winit IME variant"
+        );
+    }
+    assert_eq!(
+        diagnostics::ime_drop_count(),
+        drops_before,
+        "no preedit lifecycle or commit may reach the IME-drop diagnostic"
+    );
+
+    // FIFO ordering puts these bytes after everything the IME path wrote. In
+    // the working implementation `dd` has already consumed EXPECTED; under a
+    // drop/first-byte mutation it consumes this fallback and reports a
+    // deterministic mismatch without waiting for a timeout.
+    app.send_input(&vec![b'U'; EXPECTED.len()]);
+
+    let done_deadline = Instant::now() + Duration::from_secs(5);
+    let text = loop {
+        app.drain_pty();
+        let text = app.terminal.as_ref().map(terminal_text).unwrap_or_default();
+        if text.contains(DONE) {
+            break text;
+        }
+        assert!(
+            Instant::now() < done_deadline,
+            "the child never reported the bytes it read from the PTY write; terminal said: {text:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    let between_markers = text
+        .split_once(READY)
+        .and_then(|(_, after_ready)| after_ready.split_once(DONE).map(|(bytes, _)| bytes))
+        .expect("the child's byte report is bounded by both markers");
+    let received: Vec<u8> = between_markers
+        .split_whitespace()
+        .filter(|token| token.len() == 2 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(|token| u8::from_str_radix(token, 16).expect("od emitted a two-digit hex byte"))
+        .collect();
+
+    assert_eq!(
+        received, EXPECTED,
+        "the child must read the exact encoded commits from the PTY master write"
+    );
+    for marker in [b"\x1b[200~".as_slice(), b"\x1b[201~".as_slice()] {
+        assert!(
+            !received
+                .windows(marker.len())
+                .any(|window| window == marker),
+            "an IME commit is typed input and must not use bracketed-paste markers"
+        );
+    }
+}
+
 /// The palette's session_create must spawn a real local PTY: the row is
 /// observed `Running` (never left `Starting`), it owns the live surface, and a
 /// second create parks the first live session instead of killing it.
