@@ -64,7 +64,7 @@ jobs:
       # design and a stale cache can never satisfy a new lockfile. Pinned
       # by SHA like every action here; dependabot bumps it weekly.
       - name: Cache the Rust build
-        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # The corpus fixture and the live binary must not be able to drift
       # apart silently, so the download is DERIVED from `ZELLIJ_FIXTURE_TAG`
       # in `crates/noren-app/src/passthrough.rs` rather than re-hard-coded
