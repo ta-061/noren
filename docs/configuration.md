@@ -35,8 +35,8 @@ symlinks are followed like any user-owned file under those same bounds.
 
 | Key | Type | Default | Accepted range | Meaning |
 | --- | --- | --- | --- | --- |
-| `cell_width` | integer | `10` (`POC_CELL_WIDTH`) | `POC_CELL_WIDTH..=1024` | Cell width in physical pixels used to convert window size into the terminal grid. |
-| `cell_height` | integer | `20` (`POC_CELL_HEIGHT`) | `POC_CELL_HEIGHT..=1024` | Cell height in physical pixels used to convert window size into the terminal grid. |
+| `cell_width` | integer | `10` (`POC_CELL_WIDTH`) | `POC_CELL_WIDTH..=1024` | Cell width in logical pixels; the active window scale factor produces the physical renderer/grid width. |
+| `cell_height` | integer | `20` (`POC_CELL_HEIGHT`) | `POC_CELL_HEIGHT..=1024` | Cell height in logical pixels; the active window scale factor produces the physical renderer/grid height. |
 
 The lower bound is the renderer's built-in cell constant (`MAX_CELL_EDGE`,
 1024, is the upper bound). A cell smaller than the renderer constant would
@@ -47,6 +47,13 @@ would fault. The derived grid is still clamped to the renderer's drawable
 grid (`MAX_RENDER_ROWS` by `MAX_RENDER_COLS`, 60 by 160), which is far inside
 the terminal foundation's `MAX_SCREEN_CELLS` bound, so no configuration value
 can push the grid past that ceiling.
+
+Scaling is automatic and does not replace configured control. For example,
+`cell_width = 12` and `cell_height = 24` produce a 12x24 physical cell at
+scale 1.0 and a 24x48 physical cell at scale 2.0. Each physical edge is
+rounded once to the nearest pixel at fractional factors; scale changes always
+start from the configured logical value, so moving between displays cannot
+compound scaling.
 
 ### `[sidebar]`
 

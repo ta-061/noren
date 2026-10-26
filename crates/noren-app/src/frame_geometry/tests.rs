@@ -124,6 +124,143 @@ fn assert_three_consumers_agree_at(
     );
 }
 
+/// Drive the production scale -> geometry -> runtime-grid seam and compare
+/// all three consumers. Unlike `assert_three_consumers_agree_at`, this starts
+/// with configured logical cells and a window scale factor, then lets
+/// `NorenApp::prepare_initial_terminal` reserve application chrome before the
+/// terminal and PTY are created.
+fn assert_scaled_runtime_grids_agree(
+    config_text: &str,
+    scale_factor: f64,
+    physical: PhysicalSize<u32>,
+    expected_metrics: (u32, u32),
+    expected_window_grid: (u16, u16),
+) {
+    let config = AppConfig::parse(config_text).expect("valid scale test configuration");
+    let mut app = NorenApp::new(config);
+    let grid = app
+        .geometry
+        .rescale(
+            scale_factor,
+            Resize::new(physical.width, physical.height),
+        )
+        .expect("scale-aware geometry produces a window grid");
+    let metrics = app.geometry.cell_metrics();
+    assert_eq!(
+        (metrics.width(), metrics.height()),
+        expected_metrics,
+        "scale {scale_factor} must produce the expected physical cell"
+    );
+    assert_eq!(
+        (grid.rows(), grid.cols()),
+        expected_window_grid,
+        "scale {scale_factor} must produce the expected window grid"
+    );
+
+    let pty = app
+        .prepare_initial_terminal(grid)
+        .expect("window grid produces a PTY size");
+    let terminal_size = app
+        .terminal
+        .as_ref()
+        .expect("terminal installed")
+        .size();
+    assert_eq!(
+        pty.into_raw(),
+        terminal_size,
+        "scale {scale_factor}: terminal state and PTY winsize must agree"
+    );
+
+    let renderer_rows = renderer::fully_drawable_rows(physical.height, metrics);
+    assert_eq!(
+        renderer_rows,
+        usize::from(grid.rows()),
+        "scale {scale_factor}: renderer and window grid row counts must agree"
+    );
+    let layout = renderer::FrameRowLayout::new(
+        physical.height,
+        metrics,
+        usize::from(terminal_size.0),
+        true,
+    )
+    .expect("non-zero scaled frame");
+    assert_eq!(
+        layout.rendered_rows(),
+        renderer_rows,
+        "scale {scale_factor}: terminal rows plus status chrome must fill the renderer grid"
+    );
+    assert_eq!(
+        layout.row_at(usize::from(terminal_size.0)),
+        Some(renderer::FrameRow::Status),
+        "scale {scale_factor}: renderer must reserve the same status row omitted from PTY/state"
+    );
+
+    let terminal = app.terminal.as_mut().expect("terminal remains installed");
+    terminal.feed_bytes(b"\x1b[?25l");
+    terminal.feed_bytes(&vec![b'B'; usize::from(terminal_size.1)]);
+    let snapshot = terminal.snapshot();
+    let sidebar: Vec<String> = Vec::new();
+    let vertices = renderer::glyph_vertices_for(
+        renderer::Target::new(
+            &noren_app::theme::Theme::default(),
+            physical.width,
+            physical.height,
+            metrics,
+        )
+        .with_sidebar_columns(app.sidebar_columns),
+        Some(&snapshot),
+        Some(sidebar.as_slice()),
+        None,
+    );
+    let renderer_cols = rendered_terminal_columns(
+        &vertices,
+        physical.width,
+        metrics.width(),
+        app.sidebar_columns,
+    );
+    assert_eq!(
+        renderer_cols,
+        usize::from(terminal_size.1),
+        "scale {scale_factor}: renderer columns, terminal state, and PTY winsize must agree"
+    );
+}
+
+#[test]
+fn hidpi_default_scales_keep_renderer_terminal_and_pty_grids_equal() {
+    for (scale_factor, physical, expected_metrics) in [
+        (1.0, PhysicalSize::new(900, 600), (10, 20)),
+        (1.5, PhysicalSize::new(1_350, 900), (15, 30)),
+        (2.0, PhysicalSize::new(1_800, 1_200), (20, 40)),
+    ] {
+        assert_scaled_runtime_grids_agree(
+            "",
+            scale_factor,
+            physical,
+            expected_metrics,
+            (30, 90),
+        );
+    }
+}
+
+#[test]
+fn hidpi_configured_cells_scale_once_and_keep_all_three_grids_equal() {
+    let config = "[font]\ncell_width = 12\ncell_height = 24\n";
+    assert_scaled_runtime_grids_agree(
+        config,
+        1.0,
+        PhysicalSize::new(900, 600),
+        (12, 24),
+        (25, 75),
+    );
+    assert_scaled_runtime_grids_agree(
+        config,
+        2.0,
+        PhysicalSize::new(1_800, 1_200),
+        (24, 48),
+        (25, 75),
+    );
+}
+
 /// The PR's headline property: the three consumers agree once the sidebar
 /// reserves 16 columns — swept across the input range rather than pinned at
 /// one width. A single point cannot support "agreement across the range",

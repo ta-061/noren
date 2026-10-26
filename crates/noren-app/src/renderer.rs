@@ -570,6 +570,16 @@ impl Renderer {
         self.cursor = self.cursor.with_focus(focused);
     }
 
+    /// Replace the physical cell metrics after a window scale-factor change.
+    ///
+    /// The surface size and cell metrics change as one application geometry
+    /// event. Keeping this setter on the live renderer prevents the issue #76
+    /// split where grid derivation changed but glyph placement retained stale
+    /// metrics.
+    pub(crate) fn set_cell_metrics(&mut self, metrics: CellMetrics) {
+        self.metrics = metrics;
+    }
+
     pub(crate) fn resize(&mut self, size: PhysicalSize<u32>) {
         if size.width == 0 || size.height == 0 {
             return;
@@ -2166,11 +2176,11 @@ fn glyph_rows(character: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use noren_app::GridGeometry;
     use noren_app::config::AppConfig;
     use noren_app::theme::DARK;
     use noren_app::ui::palette_hint;
-    use noren_terminal::TerminalState;
+    use noren_app::{GridGeometry, Resize};
+    use noren_terminal::{GridPoint, SelectionMode, TerminalState};
 
     /// Default-theme vertex emission for test call sites: the shape the
     /// pre-theme tests used, now entering through the [`Target`] seam.
@@ -3435,6 +3445,147 @@ mod tests {
                 .chunks_exact(6)
                 .any(|rect| (rect[0].position[0] - small_edge_1).abs() < 1e-5),
             "at cell_width=20, no vertex should land at the 10px column boundary"
+        );
+    }
+
+    #[test]
+    fn scale_one_keeps_renderer_vertex_bytes_identical() {
+        let terminal = snapshot(2, 8, b"AB\r\nCD");
+        let baseline_metrics = poc_metrics();
+        let baseline = frame_vertices(
+            Some(&terminal),
+            None,
+            Some("Noren ready"),
+            900,
+            600,
+            baseline_metrics,
+        );
+        let mut geometry = GridGeometry::poc();
+        geometry
+            .rescale(1.0, Resize::new(900, 600))
+            .expect("fresh scale-one geometry produces a grid");
+        let scaled = frame_vertices(
+            Some(&terminal),
+            None,
+            Some("Noren ready"),
+            900,
+            600,
+            geometry.cell_metrics(),
+        );
+
+        assert_eq!(
+            vertex_bytes(&scaled),
+            vertex_bytes(&baseline),
+            "scale 1.0 must preserve every renderer byte from the pre-HiDPI path"
+        );
+    }
+
+    #[test]
+    fn scaled_cells_keep_cursor_selection_scrollback_and_sidebar_marker_aligned() {
+        let mut geometry = GridGeometry::poc();
+        geometry
+            .rescale(2.0, Resize::new(480, 120))
+            .expect("2x geometry produces a grid");
+        let metrics = geometry.cell_metrics();
+        assert_eq!((metrics.width(), metrics.height()), (20, 40));
+        let target = Target::new(&Theme::default(), 480, 120, metrics);
+        let terminal_left = SIDEBAR_COLS as u32 * metrics.width();
+        let pixel_x = |ndc: f32| (((ndc + 1.0) * 0.5 * target.width as f32).round()) as u32;
+        let pixel_y = |ndc: f32| (((1.0 - ndc) * 0.5 * target.height as f32).round()) as u32;
+        let bounds = |vertices: &[Vertex]| {
+            let left = vertices
+                .iter()
+                .map(|vertex| pixel_x(vertex.position[0]))
+                .min()
+                .expect("geometry emits vertices");
+            let right = vertices
+                .iter()
+                .map(|vertex| pixel_x(vertex.position[0]))
+                .max()
+                .expect("geometry emits vertices");
+            let top = vertices
+                .iter()
+                .map(|vertex| pixel_y(vertex.position[1]))
+                .min()
+                .expect("geometry emits vertices");
+            let bottom = vertices
+                .iter()
+                .map(|vertex| pixel_y(vertex.position[1]))
+                .max()
+                .expect("geometry emits vertices");
+            (left, top, right, bottom)
+        };
+
+        let cursor = snapshot(3, 8, b"\x1b[2;3H");
+        let cursor_vertices =
+            glyph_vertices_for_chrome(target, Some(&cursor), FrameChrome::new(Some(&[]), None));
+        assert_eq!(
+            bounds(&cursor_vertices),
+            (terminal_left + 2 * 20, 40, terminal_left + 3 * 20, 80),
+            "the 2x cursor block must occupy exactly row 1, column 2"
+        );
+
+        let mut selected_terminal = TerminalState::new(3, 8).expect("valid selected terminal");
+        selected_terminal.feed_bytes(b"\x1b[?25l\x1b[2;3HAB");
+        let selection = Selection::new(
+            &selected_terminal,
+            SelectionMode::Char,
+            GridPoint::new(1, 2),
+            GridPoint::new(1, 3),
+        );
+        let selected = selected_terminal.snapshot();
+        let selected_vertices = glyph_vertices_for_chrome(
+            target,
+            Some(&selected),
+            FrameChrome::new(Some(&[]), None).with_selection(Some(&selection)),
+        );
+        let selection_color = target.theme.selection_background();
+        let selection_backgrounds: Vec<Vertex> = selected_vertices
+            .chunks_exact(VERTICES_PER_RECT)
+            .filter(|rectangle| {
+                rectangle
+                    .iter()
+                    .all(|vertex| vertex.color == selection_color)
+            })
+            .flat_map(|rectangle| rectangle.iter().copied())
+            .collect();
+        assert_eq!(selection_backgrounds.len(), 2 * VERTICES_PER_RECT);
+        assert_eq!(
+            bounds(&selection_backgrounds),
+            (terminal_left + 2 * 20, 40, terminal_left + 4 * 20, 80),
+            "the selected two-cell span must cover exactly the scaled cells"
+        );
+
+        let history = snapshot(2, 8, b"\x1b[?25l\x1b[1;4HA\r\nB\r\nC");
+        assert_eq!(history.scrollback_lines(), ["   A"], "history fixture");
+        let history_vertices = glyph_vertices_for_chrome(
+            target,
+            Some(&history),
+            FrameChrome::new(Some(&[]), None).with_scroll_offset(1),
+        );
+        assert!(
+            history_vertices.iter().any(|vertex| {
+                let x = pixel_x(vertex.position[0]);
+                let y = pixel_y(vertex.position[1]);
+                (terminal_left + 3 * 20..=terminal_left + 4 * 20).contains(&x) && y <= 40
+            }),
+            "the scrolled-back column-3 glyph must land in scaled row 0, column 3"
+        );
+
+        let marker = SidebarTextRow::chrome(format!("{:>width$}", '▶', width = SIDEBAR_COLS));
+        let marker_vertices = glyph_vertices_for_sidebar_rows(
+            target,
+            None,
+            Some(std::slice::from_ref(&marker)),
+            None,
+        );
+        let marker_bounds = bounds(&marker_vertices);
+        assert!(
+            marker_bounds.0 >= (SIDEBAR_COLS as u32 - 1) * 20
+                && marker_bounds.2 <= SIDEBAR_COLS as u32 * 20
+                && marker_bounds.1 < 40
+                && marker_bounds.3 <= 40,
+            "sidebar marker must remain inside its final scaled sidebar cell: {marker_bounds:?}"
         );
     }
 }

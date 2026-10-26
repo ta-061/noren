@@ -72,9 +72,9 @@ pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
 /// (issue #185) so they cannot drift apart again.
 pub const PRODUCT_NAME: &str = "Noren";
 
-/// Fixed PoC cell width in physical pixels.
+/// Default terminal-cell width in logical pixels.
 pub const POC_CELL_WIDTH: u32 = 10;
-/// Fixed PoC cell height in physical pixels.
+/// Default terminal-cell height in logical pixels.
 pub const POC_CELL_HEIGHT: u32 = 20;
 
 /// Maximum terminal grid rows the PoC renderer can draw.
@@ -150,16 +150,16 @@ impl GridSize {
     }
 }
 
-/// Runtime cell metrics: the configured width and height of one terminal grid
-/// cell in physical pixels.
+/// Runtime cell metrics: the scale-adjusted width and height of one terminal
+/// grid cell in physical pixels.
 ///
-/// `GridGeometry` produces this from configuration; every consumer — the
+/// [`GridGeometry`] applies the window scale factor exactly once to the
+/// configured logical cell size. Every physical-pixel consumer — the
 /// renderer's `glyph_vertices`, the offscreen capture path, and the binary's
-/// click-to-grid mappers — reads width and height from this single value
-/// rather than from a compile-time constant. Bundling the two dimensions
-/// prevents width and height from drifting to different origins at a call
-/// site (the defect from issue #76: the renderer drew at the constant while
-/// the geometry used the configured value).
+/// click-to-grid mappers — reads width and height from this single value.
+/// Bundling the two dimensions prevents width and height from drifting to
+/// different origins at a call site (the defect from issue #76: the renderer
+/// drew at the constant while the geometry used the configured value).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CellMetrics {
     width: u32,
@@ -180,26 +180,33 @@ impl CellMetrics {
     }
 }
 
-/// Deterministic fixed-cell geometry and resize coalescing.
+/// Deterministic scale-aware fixed-cell geometry and resize coalescing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GridGeometry {
+    configured_cell_width: u32,
+    configured_cell_height: u32,
     cell_width: u32,
     cell_height: u32,
+    scale_factor_bits: u64,
     current: Option<GridSize>,
 }
 
 impl GridGeometry {
-    /// PoC geometry: 10 physical pixels wide by 20 physical pixels high.
+    /// Default geometry: 10 logical pixels wide by 20 logical pixels high at
+    /// scale factor 1.0.
     #[must_use]
     pub const fn poc() -> Self {
         Self {
+            configured_cell_width: POC_CELL_WIDTH,
+            configured_cell_height: POC_CELL_HEIGHT,
             cell_width: POC_CELL_WIDTH,
             cell_height: POC_CELL_HEIGHT,
+            scale_factor_bits: 1.0_f64.to_bits(),
             current: None,
         }
     }
 
-    /// Geometry with configuration-chosen cell dimensions.
+    /// Geometry with configuration-chosen logical cell dimensions.
     ///
     /// A zero edge is rejected because grid division would fault; the
     /// configuration loader ([`crate::config`]) range-checks values before
@@ -210,13 +217,16 @@ impl GridGeometry {
             return None;
         }
         Some(Self {
+            configured_cell_width: cell_width,
+            configured_cell_height: cell_height,
             cell_width,
             cell_height,
+            scale_factor_bits: 1.0_f64.to_bits(),
             current: None,
         })
     }
 
-    /// Configured cell width in physical pixels.
+    /// Scale-adjusted cell width in physical pixels.
     ///
     /// This is the single runtime source of truth for cell width: the renderer,
     /// the click-to-grid mapper, and the sidebar boundary all read it from here
@@ -226,7 +236,7 @@ impl GridGeometry {
         self.cell_width
     }
 
-    /// Configured cell height in physical pixels.
+    /// Scale-adjusted cell height in physical pixels.
     ///
     /// See [`cell_width`](Self::cell_width) for the single-source rationale.
     #[must_use]
@@ -234,9 +244,9 @@ impl GridGeometry {
         self.cell_height
     }
 
-    /// The configured [`CellMetrics`] — the single runtime source of truth
-    /// for cell size, threaded to the renderer and click-handling code so
-    /// every consumer reads the same width and height.
+    /// The scale-adjusted [`CellMetrics`] — the single runtime source of truth
+    /// for physical cell size, threaded to the renderer and click-handling
+    /// code so every consumer reads the same width and height.
     #[must_use]
     pub const fn cell_metrics(self) -> CellMetrics {
         CellMetrics {
@@ -251,6 +261,12 @@ impl GridGeometry {
         self.current
     }
 
+    /// Window scale factor used to derive the current physical cell metrics.
+    #[must_use]
+    pub const fn scale_factor(self) -> f64 {
+        f64::from_bits(self.scale_factor_bits)
+    }
+
     /// Convert a physical resize and return only a changed, non-zero grid.
     ///
     /// A zero physical dimension keeps the previous grid. Pixel sizes smaller
@@ -260,6 +276,33 @@ impl GridGeometry {
     /// rendered grids can never disagree. This is the only place a grid is
     /// calculated; every consumer observes the same clamp.
     pub fn update(&mut self, resize: Resize) -> Option<GridSize> {
+        self.update_inner(resize, false)
+    }
+
+    /// Apply a window scale factor exactly once and re-derive the grid.
+    ///
+    /// Configured cell dimensions are logical pixels. They are always scaled
+    /// from their original configured values, never from the previously
+    /// scaled metrics, so moving 1.0 -> 2.0 -> 1.0 cannot accumulate or
+    /// double-apply scaling. A valid changed factor forces a returned grid
+    /// even when the resulting row/column counts equal the current grid; the
+    /// application uses that notification to refresh terminal state and the
+    /// PTY winsize on `ScaleFactorChanged`.
+    ///
+    /// Non-positive and non-finite factors are ignored. A zero-sized window
+    /// still updates the physical cell metrics but retains the last valid grid
+    /// until a subsequent non-zero resize arrives.
+    pub fn rescale(&mut self, scale_factor: f64, resize: Resize) -> Option<GridSize> {
+        let cell_width = scaled_cell_edge(self.configured_cell_width, scale_factor)?;
+        let cell_height = scaled_cell_edge(self.configured_cell_height, scale_factor)?;
+        let scale_changed = self.scale_factor_bits != scale_factor.to_bits();
+        self.cell_width = cell_width;
+        self.cell_height = cell_height;
+        self.scale_factor_bits = scale_factor.to_bits();
+        self.update_inner(resize, scale_changed)
+    }
+
+    fn update_inner(&mut self, resize: Resize, force: bool) -> Option<GridSize> {
         if resize.is_zero() {
             return None;
         }
@@ -272,13 +315,26 @@ impl GridGeometry {
             .try_into()
             .unwrap_or(MAX_RENDER_ROWS);
         let next = GridSize { rows, cols };
-        if self.current == Some(next) {
+        if !force && self.current == Some(next) {
             None
         } else {
             self.current = Some(next);
             Some(next)
         }
     }
+}
+
+/// Scale one configured logical cell edge with the same round-to-nearest
+/// convention winit uses for logical-to-physical conversion.
+fn scaled_cell_edge(configured: u32, scale_factor: f64) -> Option<u32> {
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return None;
+    }
+    let scaled = f64::from(configured) * scale_factor;
+    if !scaled.is_finite() {
+        return None;
+    }
+    Some(scaled.round().clamp(1.0, f64::from(u32::MAX)) as u32)
 }
 
 /// Active modifier keys on an app-owned key event.
@@ -836,6 +892,133 @@ mod tests {
             (at_cap.rows(), at_cap.cols()),
             (MAX_RENDER_ROWS, MAX_RENDER_COLS)
         );
+    }
+
+    #[test]
+    fn scale_one_keeps_the_previous_cell_metrics_and_grid_exactly() {
+        let mut geometry = GridGeometry::poc();
+        let before = geometry.cell_metrics();
+        let grid = geometry.update(Resize::new(900, 600)).expect("new grid");
+
+        assert_eq!((before.width(), before.height()), (10, 20));
+        assert_eq!((grid.rows(), grid.cols()), (30, 90));
+        assert_eq!(geometry.rescale(1.0, Resize::new(900, 600)), None);
+        assert_eq!(geometry.cell_metrics(), before);
+        assert_eq!(geometry.current(), Some(grid));
+        assert_eq!(geometry.scale_factor(), 1.0);
+    }
+
+    #[test]
+    fn non_unit_scale_factors_change_physical_cells_without_changing_logical_grid() {
+        for (scale_factor, physical, expected_cell) in [
+            (1.5, Resize::new(1_350, 900), (15, 30)),
+            (2.0, Resize::new(1_800, 1_200), (20, 40)),
+        ] {
+            let mut geometry = GridGeometry::poc();
+            let grid = geometry
+                .rescale(scale_factor, physical)
+                .expect("scale change re-derives the grid");
+
+            assert_eq!(
+                (
+                    geometry.cell_metrics().width(),
+                    geometry.cell_metrics().height()
+                ),
+                expected_cell,
+                "scale {scale_factor} must change the physical cell"
+            );
+            assert_eq!(
+                (grid.rows(), grid.cols()),
+                (30, 90),
+                "scale {scale_factor} must preserve the 900x600 logical grid"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_cells_are_scaled_from_the_config_once() {
+        let mut geometry = GridGeometry::with_cells(12, 24).expect("valid configured cell");
+
+        let grid = geometry
+            .rescale(2.0, Resize::new(2_160, 1_440))
+            .expect("scale change re-derives configured geometry");
+        assert_eq!(
+            (
+                geometry.cell_metrics().width(),
+                geometry.cell_metrics().height()
+            ),
+            (24, 48),
+            "12x24 at 2x is 24x48, not the 48x96 produced by double scaling"
+        );
+        assert_eq!((grid.rows(), grid.cols()), (30, 90));
+
+        geometry
+            .rescale(1.5, Resize::new(1_620, 1_080))
+            .expect("second scale change re-derives from configured cells");
+        assert_eq!(
+            (
+                geometry.cell_metrics().width(),
+                geometry.cell_metrics().height()
+            ),
+            (18, 36)
+        );
+        geometry
+            .rescale(2.0, Resize::new(2_160, 1_440))
+            .expect("returning to 2x re-derives from configured cells");
+        assert_eq!(
+            (
+                geometry.cell_metrics().width(),
+                geometry.cell_metrics().height()
+            ),
+            (24, 48),
+            "scale changes must not compound on the last physical metrics"
+        );
+    }
+
+    #[test]
+    fn fractional_scale_rounds_cell_edges_without_losing_a_default_row_or_column() {
+        let mut geometry = GridGeometry::poc();
+        let grid = geometry
+            .rescale(1.5, Resize::new(1_350, 900))
+            .expect("fractional scale is valid");
+
+        assert_eq!((geometry.cell_width(), geometry.cell_height()), (15, 30));
+        assert_eq!((grid.rows(), grid.cols()), (30, 90));
+        assert_eq!(
+            geometry.update(Resize::new(1_349, 899)),
+            Some(GridSize { rows: 29, cols: 89 }),
+            "only a genuinely incomplete physical cell may reduce the grid"
+        );
+    }
+
+    #[test]
+    fn a_changed_scale_forces_a_grid_notification_even_when_dimensions_match() {
+        let mut geometry = GridGeometry::poc();
+        let original = geometry.update(Resize::new(900, 600)).expect("new grid");
+
+        let rederived = geometry
+            .rescale(2.0, Resize::new(1_800, 1_200))
+            .expect("a scale event must not be coalesced as a duplicate grid");
+
+        assert_eq!(rederived, original);
+        assert_eq!(geometry.current(), Some(original));
+        assert_eq!((geometry.cell_width(), geometry.cell_height()), (20, 40));
+    }
+
+    #[test]
+    fn invalid_scale_factors_leave_metrics_and_grid_unchanged() {
+        for scale_factor in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut geometry = GridGeometry::poc();
+            let original = geometry.update(Resize::new(900, 600)).expect("new grid");
+
+            assert_eq!(
+                geometry.rescale(scale_factor, Resize::new(1_800, 1_200)),
+                None
+            );
+            assert_eq!((geometry.cell_width(), geometry.cell_height()), (10, 20));
+            assert_eq!(geometry.current(), Some(original));
+            assert_eq!(geometry.scale_factor(), 1.0);
+        }
     }
 
     #[test]
