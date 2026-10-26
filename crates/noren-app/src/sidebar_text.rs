@@ -1,9 +1,12 @@
 //! Width-aware text projection for the sidebar view.
 //!
-//! Session rows reserve their final cell for a lifecycle marker. Identity may
-//! truncate to a visible ASCII ellipsis, but the marker never competes with
-//! the name for space. This projection stays separate from [`crate::sidebar`]
-//! so the view model remains renderer- and geometry-independent.
+//! Every entry row reserves a fixed cell for a kind shape and the same bounded
+//! identity region. Rows carrying lifecycle reserve their final cell for the
+//! #209 marker; rows without lifecycle leave that cell blank. Identity always
+//! truncates to a visible ASCII ellipsis before the reserved suffix, so neither
+//! a kind nor a lifecycle can be clipped by user-derived text. This projection
+//! stays separate from [`crate::sidebar`] so the view model remains renderer-
+//! and geometry-independent.
 
 use crate::MAX_RENDER_COLS;
 use crate::sidebar::{EntryKind, SessionLifecycle, SidebarRow, SidebarView};
@@ -12,7 +15,7 @@ use noren_terminal::AnsiColor;
 /// Shipped sidebar width in cell columns.
 pub const DEFAULT_SIDEBAR_COLUMNS: usize = 16;
 
-/// Narrowest configurable sidebar: selection, one identity cell, ellipsis,
+/// Narrowest configurable sidebar: selection, kind, a complete ellipsis,
 /// separator, and the reserved lifecycle cell all remain representable.
 pub const MIN_SIDEBAR_COLUMNS: usize = 8;
 
@@ -26,7 +29,17 @@ pub const MAX_SIDEBAR_COLUMNS: usize = MAX_RENDER_COLS as usize - 1;
 /// palettes and colour-vision differences cannot collapse the four states.
 pub const LIFECYCLE_MARKERS: [char; 4] = ['⌛', '▶', '■', '✕'];
 
-const ROW_PREFIX_COLUMNS: usize = 2;
+/// Marker glyphs in [`EntryKind`] order: project, worktree, SSH, agent,
+/// session.
+///
+/// Like [`LIFECYCLE_MARKERS`], these code points receive explicit,
+/// collision-checked 5x7 bitmaps in the production renderer. Their shapes are
+/// the primary signal and colour is reinforcement, so palette remapping and
+/// colour-vision differences cannot collapse the five row kinds.
+pub const KIND_MARKERS: [char; 5] = ['◆', '⑂', '⌁', '♟', '▣'];
+
+const KIND_MARKER_COLUMN: usize = 1;
+const IDENTITY_START_COLUMN: usize = 3;
 const STATE_SUFFIX_COLUMNS: usize = 2;
 const ELLIPSIS: &str = "...";
 
@@ -40,13 +53,18 @@ const ELLIPSIS: &str = "...";
 pub struct SidebarTextRow {
     text: String,
     kind: Option<EntryKind>,
+    lifecycle: Option<SessionLifecycle>,
 }
 
 impl SidebarTextRow {
     /// Build a text-only chrome row that carries no workspace entry kind.
     #[must_use]
     pub fn chrome(text: String) -> Self {
-        Self { text, kind: None }
+        Self {
+            text,
+            kind: None,
+            lifecycle: None,
+        }
     }
 
     /// The text cells emitted for this row.
@@ -61,10 +79,18 @@ impl SidebarTextRow {
         self.kind
     }
 
-    fn entry(text: String, kind: EntryKind) -> Self {
+    /// Structured lifecycle carried by the final cell, or `None` when the
+    /// row has no lifecycle signal.
+    #[must_use]
+    pub const fn lifecycle(&self) -> Option<SessionLifecycle> {
+        self.lifecycle
+    }
+
+    fn entry(text: String, kind: EntryKind, lifecycle: Option<SessionLifecycle>) -> Self {
         Self {
             text,
             kind: Some(kind),
+            lifecycle,
         }
     }
 
@@ -96,6 +122,30 @@ pub const fn lifecycle_marker_color(marker: char) -> Option<AnsiColor> {
     }
 }
 
+/// The marker glyph assigned to one sidebar entry kind.
+#[must_use]
+pub const fn kind_marker(kind: EntryKind) -> char {
+    match kind {
+        EntryKind::Project => KIND_MARKERS[0],
+        EntryKind::Worktree => KIND_MARKERS[1],
+        EntryKind::SshConnection => KIND_MARKERS[2],
+        EntryKind::Agent => KIND_MARKERS[3],
+        EntryKind::Session => KIND_MARKERS[4],
+    }
+}
+
+/// Theme palette role reinforcing a kind marker's shape.
+#[must_use]
+pub const fn kind_marker_color(kind: EntryKind) -> AnsiColor {
+    match kind {
+        EntryKind::Project => AnsiColor::BrightMagenta,
+        EntryKind::Worktree => AnsiColor::Green,
+        EntryKind::SshConnection => AnsiColor::Cyan,
+        EntryKind::Agent => AnsiColor::Yellow,
+        EntryKind::Session => AnsiColor::White,
+    }
+}
+
 /// Format the visible sidebar slice at the shipped 16-column width.
 #[must_use]
 pub fn visible_sidebar_text_lines(
@@ -109,9 +159,9 @@ pub fn visible_sidebar_text_lines(
 /// Format the visible sidebar slice at an explicit cell width.
 ///
 /// The scroll offset is clamped to the last full page so formatting work stays
-/// proportional to visible rows. Non-session rows preserve their established
-/// text. Session rows reserve the last cell for lifecycle and truncate only
-/// the identity region.
+/// proportional to visible rows. Every entry uses one grammar: selection,
+/// kind shape, identity, a suffix separator, and an optional lifecycle marker.
+/// Only the identity region truncates.
 #[must_use]
 pub fn visible_sidebar_text_lines_at_width(
     sidebar: &SidebarView,
@@ -127,8 +177,8 @@ pub fn visible_sidebar_text_lines_at_width(
 
 /// Format visible rows while preserving the entry kind each line came from.
 ///
-/// The renderer consumes this projection so semantic lifecycle colour is
-/// gated by `EntryKind::Session`, never by user-controlled text alone.
+/// The renderer consumes this projection so kind and lifecycle colours are
+/// gated by structured row facts, never by user-controlled text alone.
 #[must_use]
 pub fn visible_sidebar_text_rows_at_width(
     sidebar: &SidebarView,
@@ -149,43 +199,58 @@ pub fn visible_sidebar_text_rows_at_width(
     sidebar.rows()[offset..]
         .iter()
         .take(max_rows)
-        .map(|row| SidebarTextRow::entry(format_row(row, columns), row.kind()))
+        .map(|row| SidebarTextRow::entry(format_row(row, columns), row.kind(), row.lifecycle()))
         .collect()
 }
 
 fn format_row(row: &SidebarRow, columns: usize) -> String {
-    match row.lifecycle() {
-        Some(lifecycle) => format_session_row(
-            row.is_selected(),
-            row.label(),
-            lifecycle_marker(lifecycle),
-            columns,
-        ),
-        None => {
-            let selection = if row.is_selected() { '>' } else { ' ' };
-            match row.detail() {
-                Some(detail) => format!("{selection} {} {detail}", row.label()),
-                None => format!("{selection} {}", row.label()),
-            }
-        }
-    }
+    // #209 already compresses a session's status into the reserved marker;
+    // repeating its detail would force a fitting `session-N` identity to
+    // ellipsize. Other kinds retain their secondary identity/status text and
+    // pass through the same truncator as one string.
+    let identity = match (row.kind(), row.detail()) {
+        (EntryKind::Session, _) | (_, None) => row.label().to_owned(),
+        (_, Some(detail)) => format!("{} {detail}", row.label()),
+    };
+    format_entry_row(
+        row.is_selected(),
+        row.kind(),
+        &identity,
+        row.lifecycle().map(lifecycle_marker),
+        columns,
+    )
 }
 
-fn format_session_row(selected: bool, label: &str, state: char, columns: usize) -> String {
+fn format_entry_row(
+    selected: bool,
+    kind: EntryKind,
+    identity: &str,
+    state: Option<char>,
+    columns: usize,
+) -> String {
     let mut cells = vec![' '; columns];
-    let last = columns - 1;
-    cells[last] = state;
-
-    if columns > 1 {
+    if columns > 0 {
         cells[0] = if selected { '>' } else { ' ' };
     }
+    if columns > KIND_MARKER_COLUMN {
+        cells[KIND_MARKER_COLUMN] = kind_marker(kind);
+    }
 
-    let name_end = columns.saturating_sub(STATE_SUFFIX_COLUMNS);
-    if name_end > ROW_PREFIX_COLUMNS {
-        let available = name_end - ROW_PREFIX_COLUMNS;
-        for (index, character) in truncated_label(label, available).chars().enumerate() {
-            cells[ROW_PREFIX_COLUMNS + index] = character;
+    let identity_end = columns.saturating_sub(STATE_SUFFIX_COLUMNS);
+    if identity_end > IDENTITY_START_COLUMN {
+        let available = identity_end - IDENTITY_START_COLUMN;
+        for (index, character) in truncated_label(identity, available).chars().enumerate() {
+            cells[IDENTITY_START_COLUMN + index] = character;
         }
+    }
+
+    // Lifecycle owns the final cell even below the configurable width floor.
+    // Writing it last preserves #209 if an internal caller supplies a tiny
+    // synthetic width where the prefix cells overlap the suffix.
+    if let Some(state) = state
+        && let Some(last) = cells.last_mut()
+    {
+        *last = state;
     }
 
     cells.into_iter().collect()
@@ -198,7 +263,7 @@ fn truncated_label(label: &str, columns: usize) -> String {
     }
     let ellipsis_columns = ELLIPSIS.chars().count();
     if columns <= ellipsis_columns {
-        return label.chars().take(columns).collect();
+        return ELLIPSIS.chars().take(columns).collect();
     }
     label
         .chars()
@@ -211,16 +276,36 @@ fn truncated_label(label: &str, columns: usize) -> String {
 mod tests {
     use super::*;
 
+    fn assert_kind_truncation(kind: EntryKind, state: Option<char>, expected: &str) {
+        let line = format_entry_row(
+            false,
+            kind,
+            "abcdefgh-identity-that-cannot-fit",
+            state,
+            DEFAULT_SIDEBAR_COLUMNS,
+        );
+        assert_eq!(line, expected);
+        assert_eq!(line.chars().count(), DEFAULT_SIDEBAR_COLUMNS);
+        assert_eq!(
+            line.chars().nth(KIND_MARKER_COLUMN),
+            Some(kind_marker(kind))
+        );
+        assert_eq!(&line.chars().skip(11).take(3).collect::<String>(), "...");
+        assert_eq!(line.chars().nth(14), Some(' '));
+        assert_eq!(line.chars().last(), state.or(Some(' ')));
+    }
+
     #[test]
     fn long_session_identity_truncates_before_the_reserved_state_cell() {
-        let line = format_session_row(
+        let line = format_entry_row(
             true,
+            EntryKind::Session,
             "session-name-that-is-much-too-long",
-            lifecycle_marker(SessionLifecycle::Failed),
+            Some(lifecycle_marker(SessionLifecycle::Failed)),
             DEFAULT_SIDEBAR_COLUMNS,
         );
 
-        assert_eq!(line, "> session-n... ✕");
+        assert_eq!(line, ">▣ session-... ✕");
         assert_eq!(line.chars().count(), DEFAULT_SIDEBAR_COLUMNS);
         assert_eq!(line.chars().last(), Some('✕'));
     }
@@ -228,9 +313,136 @@ mod tests {
     #[test]
     fn even_tiny_widths_keep_state_as_the_final_visible_cell() {
         for columns in 1..DEFAULT_SIDEBAR_COLUMNS {
-            let line = format_session_row(false, "session-long", '▶', columns);
+            let line = format_entry_row(
+                false,
+                EntryKind::Session,
+                "session-long",
+                Some('▶'),
+                columns,
+            );
             assert_eq!(line.chars().count(), columns);
             assert_eq!(line.chars().last(), Some('▶'));
+        }
+    }
+
+    #[test]
+    fn every_kind_uses_its_own_shape_in_the_same_fixed_cell() {
+        let cases = [
+            (EntryKind::Project, '◆'),
+            (EntryKind::Worktree, '⑂'),
+            (EntryKind::SshConnection, '⌁'),
+            (EntryKind::Agent, '♟'),
+            (EntryKind::Session, '▣'),
+        ];
+
+        for (kind, marker) in cases {
+            let line = format_entry_row(false, kind, "short", None, DEFAULT_SIDEBAR_COLUMNS);
+            assert_eq!(line.chars().nth(KIND_MARKER_COLUMN), Some(marker));
+            assert_eq!(line.chars().count(), DEFAULT_SIDEBAR_COLUMNS);
+        }
+    }
+
+    #[test]
+    fn every_kind_shows_the_complete_ellipsis_before_the_reserved_suffix() {
+        for kind in [
+            EntryKind::Project,
+            EntryKind::Worktree,
+            EntryKind::SshConnection,
+            EntryKind::Agent,
+            EntryKind::Session,
+        ] {
+            let state = (kind == EntryKind::Session).then_some('✕');
+            let line = format_entry_row(
+                false,
+                kind,
+                "identity-that-cannot-fit",
+                state,
+                DEFAULT_SIDEBAR_COLUMNS,
+            );
+            assert_eq!(&line.chars().skip(11).take(3).collect::<String>(), "...");
+            assert_eq!(line.chars().count(), DEFAULT_SIDEBAR_COLUMNS);
+            assert_eq!(line.chars().last(), state.or(Some(' ')));
+        }
+    }
+
+    #[test]
+    fn cjk_identity_truncation_keeps_the_ellipsis_and_the_state_cell() {
+        // The ASCII truncation tests all pass under a mutation that drops the
+        // ellipsis only for non-ASCII names -- found by the independent review
+        // of #213, which probed ` ◆ 東京大阪京都札幌仙台横 ■` with no `...` at
+        // all. A Japanese name is the ordinary case for this product's own
+        // audience, so it gets its own assertion rather than riding on the
+        // ASCII ones.
+        let line = format_entry_row(
+            false,
+            EntryKind::Session,
+            "東京大阪京都札幌仙台横浜名古屋",
+            Some('▶'),
+            DEFAULT_SIDEBAR_COLUMNS,
+        );
+        assert_eq!(line.chars().count(), DEFAULT_SIDEBAR_COLUMNS);
+        assert_eq!(
+            line.chars().nth(KIND_MARKER_COLUMN),
+            Some(kind_marker(EntryKind::Session))
+        );
+        assert_eq!(
+            &line.chars().skip(11).take(3).collect::<String>(),
+            ELLIPSIS,
+            "a CJK identity must still show the ellipsis it was truncated by"
+        );
+        assert_eq!(
+            line.chars().last(),
+            Some('▶'),
+            "truncation must never eat the reserved lifecycle cell"
+        );
+    }
+
+    #[test]
+    fn project_truncation_keeps_ellipsis_and_failed_lifecycle() {
+        assert_kind_truncation(EntryKind::Project, Some('✕'), " ◆ abcdefgh... ✕");
+    }
+
+    #[test]
+    fn worktree_truncation_keeps_ellipsis_and_blank_lifecycle_cell() {
+        assert_kind_truncation(EntryKind::Worktree, None, " ⑂ abcdefgh...  ");
+    }
+
+    #[test]
+    fn ssh_truncation_keeps_ellipsis_and_starting_lifecycle() {
+        assert_kind_truncation(EntryKind::SshConnection, Some('⌛'), " ⌁ abcdefgh... ⌛");
+    }
+
+    #[test]
+    fn agent_truncation_keeps_ellipsis_and_stopped_lifecycle() {
+        assert_kind_truncation(EntryKind::Agent, Some('■'), " ♟ abcdefgh... ■");
+    }
+
+    #[test]
+    fn session_truncation_keeps_ellipsis_and_running_lifecycle() {
+        assert_kind_truncation(EntryKind::Session, Some('▶'), " ▣ abcdefgh... ▶");
+    }
+
+    #[test]
+    fn every_supported_width_keeps_a_complete_ellipsis_before_the_final_cell() {
+        for columns in MIN_SIDEBAR_COLUMNS..=32 {
+            for kind in [
+                EntryKind::Project,
+                EntryKind::Worktree,
+                EntryKind::SshConnection,
+                EntryKind::Agent,
+                EntryKind::Session,
+            ] {
+                let state = (kind != EntryKind::Worktree).then_some('✕');
+                let line = format_entry_row(false, kind, &"x".repeat(columns + 20), state, columns);
+                assert_eq!(line.chars().count(), columns);
+                assert_eq!(
+                    line.chars().skip(columns - 5).take(3).collect::<String>(),
+                    "...",
+                    "{kind:?} lost the ellipsis at {columns} columns: {line:?}"
+                );
+                assert_eq!(line.chars().nth(columns - 2), Some(' '));
+                assert_eq!(line.chars().last(), state.or(Some(' ')));
+            }
         }
     }
 }

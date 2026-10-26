@@ -158,6 +158,7 @@ fn a_selection_matching_no_entry_is_dropped_not_rendered() {
     let project_only = [SidebarEntry::Project {
         name: "noren".to_string(),
         root: "~/dev/noren".to_string(),
+        lifecycle: SessionLifecycle::Exited,
     }];
 
     let view = SidebarView::build(&project_only, Some(ids[0]));
@@ -335,6 +336,7 @@ fn sentinel_entries(sentinel: &str) -> (Vec<SidebarEntry>, SessionId) {
             SidebarEntry::Project {
                 name: sentinel.to_string(),
                 root: sentinel.to_string(),
+                lifecycle: SessionLifecycle::Failed,
             },
             SidebarEntry::Worktree {
                 name: sentinel.to_string(),
@@ -344,10 +346,12 @@ fn sentinel_entries(sentinel: &str) -> (Vec<SidebarEntry>, SessionId) {
                 label: sentinel.to_string(),
                 host: sentinel.to_string(),
                 selected: true,
+                lifecycle: SessionLifecycle::Running,
             },
             SidebarEntry::Agent {
                 label: sentinel.to_string(),
                 status: sentinel.to_string(),
+                lifecycle: SessionLifecycle::Failed,
             },
             SidebarEntry::Session(descriptor),
         ],

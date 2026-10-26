@@ -87,6 +87,7 @@ use crate::passthrough::{
     CLAIM_ID_PALETTE, Chord, ChordError, ChordSeq, KeyCode, Modifiers, PassthroughAction,
     PassthroughClaim, PassthroughPolicy, default_exit_claim,
 };
+use crate::sidebar::EntryKind;
 use crate::sidebar_text::{DEFAULT_SIDEBAR_COLUMNS, MAX_SIDEBAR_COLUMNS, MIN_SIDEBAR_COLUMNS};
 use crate::theme::{Theme, ThemeName};
 use crate::{POC_CELL_HEIGHT, POC_CELL_WIDTH};
@@ -196,12 +197,25 @@ impl FontConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SidebarConfig {
     columns: usize,
+    kind_order: [EntryKind; 5],
 }
+
+/// Default grouped priority: launch/state rows remain above discovered
+/// worktrees, so a repository-scale worktree list cannot bury every other
+/// kind. Users can replace the complete permutation through `[sidebar]`.
+pub const DEFAULT_SIDEBAR_KIND_ORDER: [EntryKind; 5] = [
+    EntryKind::Session,
+    EntryKind::Project,
+    EntryKind::SshConnection,
+    EntryKind::Agent,
+    EntryKind::Worktree,
+];
 
 impl Default for SidebarConfig {
     fn default() -> Self {
         Self {
             columns: DEFAULT_SIDEBAR_COLUMNS,
+            kind_order: DEFAULT_SIDEBAR_KIND_ORDER,
         }
     }
 }
@@ -211,6 +225,12 @@ impl SidebarConfig {
     #[must_use]
     pub const fn columns(self) -> usize {
         self.columns
+    }
+
+    /// Group priority as one validated permutation of all five entry kinds.
+    #[must_use]
+    pub const fn kind_order(self) -> [EntryKind; 5] {
+        self.kind_order
     }
 }
 
@@ -786,10 +806,42 @@ fn parse_sidebar(table: &dyn TableLike, sidebar: &mut SidebarConfig) -> Result<(
                 sidebar.columns =
                     integer_in_range(key, item, MIN_SIDEBAR_COLUMNS, MAX_SIDEBAR_COLUMNS)?;
             }
+            "kind_order" => sidebar.kind_order = parse_sidebar_kind_order(key, item)?,
             _ => return Err(ConfigError::UnknownKey(clip(key))),
         }
     }
     Ok(())
+}
+
+fn parse_sidebar_kind_order(key: &str, item: &Item) -> Result<[EntryKind; 5], ConfigError> {
+    let values = item
+        .as_array()
+        .ok_or_else(|| ConfigError::WrongType { key: clip(key) })?;
+    if values.len() != DEFAULT_SIDEBAR_KIND_ORDER.len() {
+        return Err(ConfigError::OutOfRange { key: clip(key) });
+    }
+
+    let mut parsed = Vec::with_capacity(DEFAULT_SIDEBAR_KIND_ORDER.len());
+    for value in values.iter() {
+        let name = value
+            .as_str()
+            .ok_or_else(|| ConfigError::WrongType { key: clip(key) })?;
+        let kind = match name {
+            "session" => EntryKind::Session,
+            "project" => EntryKind::Project,
+            "ssh" => EntryKind::SshConnection,
+            "agent" => EntryKind::Agent,
+            "worktree" => EntryKind::Worktree,
+            _ => return Err(ConfigError::OutOfRange { key: clip(key) }),
+        };
+        if parsed.contains(&kind) {
+            return Err(ConfigError::OutOfRange { key: clip(key) });
+        }
+        parsed.push(kind);
+    }
+    parsed
+        .try_into()
+        .map_err(|_| ConfigError::OutOfRange { key: clip(key) })
 }
 
 fn integer_in_range(key: &str, item: &Item, min: usize, max: usize) -> Result<usize, ConfigError> {
@@ -1656,6 +1708,7 @@ mod tests {
         assert_eq!(config.font().cell_width(), POC_CELL_WIDTH);
         assert_eq!(config.font().cell_height(), POC_CELL_HEIGHT);
         assert_eq!(config.sidebar().columns(), DEFAULT_SIDEBAR_COLUMNS);
+        assert_eq!(config.sidebar().kind_order(), DEFAULT_SIDEBAR_KIND_ORDER);
         assert_eq!(config, AppConfig::default());
     }
 
@@ -1732,6 +1785,69 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_kind_order_defaults_to_priority_groups_and_accepts_a_complete_permutation() {
+        assert_eq!(
+            SidebarConfig::default().kind_order(),
+            [
+                EntryKind::Session,
+                EntryKind::Project,
+                EntryKind::SshConnection,
+                EntryKind::Agent,
+                EntryKind::Worktree,
+            ]
+        );
+        let config = AppConfig::parse(
+            "[sidebar]\nkind_order = [\"worktree\", \"agent\", \"ssh\", \"project\", \"session\"]\n",
+        )
+        .expect("a complete kind permutation is valid");
+        assert_eq!(
+            config.sidebar().kind_order(),
+            [
+                EntryKind::Worktree,
+                EntryKind::Agent,
+                EntryKind::SshConnection,
+                EntryKind::Project,
+                EntryKind::Session,
+            ]
+        );
+        assert_eq!(config.sidebar().columns(), DEFAULT_SIDEBAR_COLUMNS);
+    }
+
+    #[test]
+    fn sidebar_kind_order_rejects_missing_extra_duplicate_and_unknown_kinds() {
+        for value in [
+            "[\"session\", \"project\", \"ssh\", \"agent\"]",
+            "[\"session\", \"project\", \"ssh\", \"agent\", \"worktree\", \"session\"]",
+            "[\"session\", \"project\", \"ssh\", \"agent\", \"agent\"]",
+            "[\"session\", \"project\", \"ssh\", \"agent\", \"folder\"]",
+        ] {
+            assert_eq!(
+                AppConfig::parse(&format!("[sidebar]\nkind_order = {value}\n")),
+                Err(ConfigError::OutOfRange {
+                    key: "kind_order".to_owned()
+                }),
+                "invalid permutation {value} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sidebar_kind_order_rejects_wrong_container_and_element_types() {
+        for value in [
+            "\"session,project,ssh,agent,worktree\"",
+            "[\"session\", \"project\", \"ssh\", \"agent\", 5]",
+        ] {
+            assert_eq!(
+                AppConfig::parse(&format!("[sidebar]\nkind_order = {value}\n")),
+                Err(ConfigError::WrongType {
+                    key: "kind_order".to_owned()
+                }),
+                "wrongly typed kind order {value} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn the_terminal_table_is_rejected_until_the_cap_is_enforceable() {
         // `scrollback_lines` cannot be honored yet (the terminal foundation
         // retains a fixed hard cap), so accepting it would be a silent no-op.
@@ -1749,11 +1865,21 @@ mod tests {
 
     #[test]
     fn every_supported_key_applies_together() {
-        let text = "[font]\ncell_width = 11\ncell_height = 22\n\n[sidebar]\ncolumns = 24\n";
+        let text = "[font]\ncell_width = 11\ncell_height = 22\n\n[sidebar]\ncolumns = 24\nkind_order = [\"agent\", \"ssh\", \"session\", \"project\", \"worktree\"]\n";
         let config = AppConfig::parse(text).expect("valid configuration");
         assert_eq!(config.font().cell_width(), 11);
         assert_eq!(config.font().cell_height(), 22);
         assert_eq!(config.sidebar().columns(), 24);
+        assert_eq!(
+            config.sidebar().kind_order(),
+            [
+                EntryKind::Agent,
+                EntryKind::SshConnection,
+                EntryKind::Session,
+                EntryKind::Project,
+                EntryKind::Worktree,
+            ]
+        );
     }
 
     #[test]
