@@ -30,7 +30,7 @@ portable-pty = { version = "=0.9.0" }
 # optional configuration file with it. Parsing only: default features are
 # disabled so the writer crate never enters the dependency graph.
 toml_edit = { version = "=0.25.13", default-features = false, features = ["parse"] }
-unicode-width = { version = "=0.2.2" }
+unicode-width = { version = "=0.2.3" }
 winit = { version = "=0.30.13", default-features = false, features = ["rwh_06"] }
 wgpu = { version = "=30.0.0", default-features = false, features = ["std", "metal", "wgsl"] }
 noren-pty = { path = "crates/noren-pty" }
